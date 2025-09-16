@@ -236,3 +236,8 @@ if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(test)
 endif()
+
+# Add Vulkan AprilTag extension if Vulkan is available
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_apriltag/CMakeLists.txt)
+    add_subdirectory(vulkan_apriltag)
+endif()

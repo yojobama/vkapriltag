@@ -1,0 +1,82 @@
+#version 450
+
+// Gaussian blur compute shader
+// Optimized separable implementation for better performance
+
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set = 0, binding = 0, r8ui) uniform readonly uimage2D input_image;
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimage2D output_image;
+
+layout(set = 0, binding = 2) uniform UniformBufferObject {
+    uint width;
+    uint height;
+    uint kernel_size;
+    uint direction; // 0 = horizontal, 1 = vertical
+    float sigma;
+} ubo;
+
+// Precomputed Gaussian kernel weights (up to radius 15)
+layout(set = 0, binding = 3) uniform KernelWeights {
+    float weights[31]; // Maximum kernel size: 31 (radius 15)
+} kernel;
+
+shared float shared_data[256 + 30]; // Work group size + max kernel size
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+    uint local_id = gl_LocalInvocationID.x;
+    uint group_id = gl_WorkGroupID.x;
+    
+    uint radius = ubo.kernel_size / 2;
+    
+    if (ubo.direction == 0) {
+        // Horizontal pass
+        uint y = group_id;
+        if (y >= ubo.height) return;
+        
+        // Load data into shared memory with padding
+        for (uint i = local_id; i < 256 + 2 * radius; i += 256) {
+            int x = int(group_id * 256) + int(i) - int(radius);
+            x = clamp(x, 0, int(ubo.width) - 1);
+            shared_data[i] = float(imageLoad(input_image, ivec2(x, y)).r);
+        }
+        
+        barrier();
+        
+        if (global_id >= ubo.width) return;
+        
+        // Apply horizontal Gaussian filter
+        float sum = 0.0;
+        for (uint i = 0; i < ubo.kernel_size; i++) {
+            sum += shared_data[local_id + i] * kernel.weights[i];
+        }
+        
+        imageStore(output_image, ivec2(global_id, y), uvec4(uint(clamp(sum, 0.0, 255.0))));
+    }
+    else {
+        // Vertical pass
+        uint x = group_id;
+        if (x >= ubo.width) return;
+        
+        // Load data into shared memory with padding
+        for (uint i = local_id; i < 256 + 2 * radius; i += 256) {
+            int y = int(gl_WorkGroupID.y * 256) + int(i) - int(radius);
+            y = clamp(y, 0, int(ubo.height) - 1);
+            shared_data[i] = float(imageLoad(input_image, ivec2(x, y)).r);
+        }
+        
+        barrier();
+        
+        uint y = gl_WorkGroupID.y * 256 + local_id;
+        if (y >= ubo.height) return;
+        
+        // Apply vertical Gaussian filter
+        float sum = 0.0;
+        for (uint i = 0; i < ubo.kernel_size; i++) {
+            sum += shared_data[local_id + i] * kernel.weights[i];
+        }
+        
+        imageStore(output_image, ivec2(x, y), uvec4(uint(clamp(sum, 0.0, 255.0))));
+    }
+}

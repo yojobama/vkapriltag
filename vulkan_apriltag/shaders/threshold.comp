@@ -1,0 +1,104 @@
+#version 450
+
+// Adaptive thresholding compute shader
+// Based on the original AprilTag quad thresholding algorithm
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, r8ui) uniform readonly uimage2D input_image;
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimage2D threshold_image;
+
+layout(set = 0, binding = 2) uniform UniformBufferObject {
+    uint width;
+    uint height;
+    uint tile_size;
+    uint min_white_black_diff;
+} ubo;
+
+// Shared memory for tile processing
+shared uint tile_data[18][18]; // 16x16 + 1 pixel border
+
+void main() {
+    uvec2 global_id = gl_GlobalInvocationID.xy;
+    uvec2 local_id = gl_LocalInvocationID.xy;
+    uvec2 group_id = gl_WorkGroupID.xy;
+    
+    // Check bounds
+    if (global_id.x >= ubo.width || global_id.y >= ubo.height) {
+        return;
+    }
+    
+    // Load tile data into shared memory with border
+    uint local_x = local_id.x + 1;
+    uint local_y = local_id.y + 1;
+    
+    // Load center pixel
+    tile_data[local_y][local_x] = imageLoad(input_image, ivec2(global_id)).r;
+    
+    // Load border pixels
+    if (local_id.x == 0 && global_id.x > 0) {
+        tile_data[local_y][0] = imageLoad(input_image, ivec2(global_id.x - 1, global_id.y)).r;
+    }
+    if (local_id.x == 15 && global_id.x < ubo.width - 1) {
+        tile_data[local_y][17] = imageLoad(input_image, ivec2(global_id.x + 1, global_id.y)).r;
+    }
+    if (local_id.y == 0 && global_id.y > 0) {
+        tile_data[0][local_x] = imageLoad(input_image, ivec2(global_id.x, global_id.y - 1)).r;
+    }
+    if (local_id.y == 15 && global_id.y < ubo.height - 1) {
+        tile_data[17][local_x] = imageLoad(input_image, ivec2(global_id.x, global_id.y + 1)).r;
+    }
+    
+    // Load corner pixels
+    if (local_id.x == 0 && local_id.y == 0 && global_id.x > 0 && global_id.y > 0) {
+        tile_data[0][0] = imageLoad(input_image, ivec2(global_id.x - 1, global_id.y - 1)).r;
+    }
+    if (local_id.x == 15 && local_id.y == 0 && global_id.x < ubo.width - 1 && global_id.y > 0) {
+        tile_data[0][17] = imageLoad(input_image, ivec2(global_id.x + 1, global_id.y - 1)).r;
+    }
+    if (local_id.x == 0 && local_id.y == 15 && global_id.x > 0 && global_id.y < ubo.height - 1) {
+        tile_data[17][0] = imageLoad(input_image, ivec2(global_id.x - 1, global_id.y + 1)).r;
+    }
+    if (local_id.x == 15 && local_id.y == 15 && global_id.x < ubo.width - 1 && global_id.y < ubo.height - 1) {
+        tile_data[17][17] = imageLoad(input_image, ivec2(global_id.x + 1, global_id.y + 1)).r;
+    }
+    
+    barrier();
+    
+    // Calculate tile-based adaptive threshold
+    uint tile_x = global_id.x / ubo.tile_size;
+    uint tile_y = global_id.y / ubo.tile_size;
+    
+    // Find min/max in local 3x3 neighborhood for better threshold estimation
+    uint min_val = 255;
+    uint max_val = 0;
+    
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int sample_x = int(local_x) + dx;
+            int sample_y = int(local_y) + dy;
+            
+            if (sample_x >= 0 && sample_x < 18 && sample_y >= 0 && sample_y < 18) {
+                uint val = tile_data[sample_y][sample_x];
+                min_val = min(min_val, val);
+                max_val = max(max_val, val);
+            }
+        }
+    }
+    
+    // Check if there's enough contrast
+    if (max_val - min_val < ubo.min_white_black_diff) {
+        // Not enough contrast, output 0
+        imageStore(threshold_image, ivec2(global_id), uvec4(0));
+        return;
+    }
+    
+    // Calculate threshold (bias towards dark, as in original)
+    uint threshold = min_val + (max_val - min_val) / 2;
+    
+    // Apply threshold
+    uint pixel_value = tile_data[local_y][local_x];
+    uint result = (pixel_value > threshold) ? 1 : 0;
+    
+    imageStore(threshold_image, ivec2(global_id), uvec4(result));
+}

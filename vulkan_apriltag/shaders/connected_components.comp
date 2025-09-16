@@ -1,0 +1,110 @@
+#version 450
+
+// Connected components labeling using parallel union-find
+// Implements a GPU-friendly variant of the CCL algorithm
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, r8ui) uniform readonly uimage2D threshold_image;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D labels;
+layout(set = 0, binding = 2) uniform writeonly buffer ComponentBuffer {
+    uint component_count;
+    uint component_sizes[];
+} components;
+
+layout(set = 0, binding = 3) uniform UniformBufferObject {
+    uint width;
+    uint height;
+    uint iteration;
+    uint max_iterations;
+} ubo;
+
+// Shared memory for local processing
+shared uint local_labels[18][18];
+shared bool changed;
+
+uint find_root(uint label) {
+    // Simple find operation for union-find
+    uint current = label;
+    uint parent = imageLoad(labels, ivec2(current % ubo.width, current / ubo.width)).r;
+    
+    while (parent != current) {
+        current = parent;
+        if (current >= ubo.width * ubo.height) break;
+        parent = imageLoad(labels, ivec2(current % ubo.width, current / ubo.width)).r;
+    }
+    
+    return current;
+}
+
+void main() {
+    uvec2 global_id = gl_GlobalInvocationID.xy;
+    uvec2 local_id = gl_LocalInvocationID.xy;
+    
+    if (global_id.x >= ubo.width || global_id.y >= ubo.height) {
+        return;
+    }
+    
+    uint pixel_idx = global_id.y * ubo.width + global_id.x;
+    
+    if (ubo.iteration == 0) {
+        // Initialize labels
+        uint pixel_value = imageLoad(threshold_image, ivec2(global_id)).r;
+        if (pixel_value > 0) {
+            imageStore(labels, ivec2(global_id), uvec4(pixel_idx));
+        } else {
+            imageStore(labels, ivec2(global_id), uvec4(0xFFFFFFFF)); // Background
+        }
+        return;
+    }
+    
+    // Load current label
+    uint current_label = imageLoad(labels, ivec2(global_id)).r;
+    
+    if (current_label == 0xFFFFFFFF) {
+        return; // Background pixel
+    }
+    
+    // Check 8-connected neighborhood
+    uint min_label = current_label;
+    
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            
+            ivec2 neighbor_pos = ivec2(global_id) + ivec2(dx, dy);
+            
+            if (neighbor_pos.x >= 0 && neighbor_pos.x < int(ubo.width) &&
+                neighbor_pos.y >= 0 && neighbor_pos.y < int(ubo.height)) {
+                
+                uint neighbor_label = imageLoad(labels, neighbor_pos).r;
+                
+                if (neighbor_label != 0xFFFFFFFF && neighbor_label < min_label) {
+                    min_label = neighbor_label;
+                }
+            }
+        }
+    }
+    
+    // Update label if changed
+    if (min_label < current_label) {
+        imageStore(labels, ivec2(global_id), uvec4(min_label));
+        
+        // Mark that something changed (for convergence check)
+        if (local_id.x == 0 && local_id.y == 0) {
+            changed = true;
+        }
+    }
+    
+    barrier();
+    
+    // Final pass: count component sizes
+    if (ubo.iteration == ubo.max_iterations - 1) {
+        uint final_label = imageLoad(labels, ivec2(global_id)).r;
+        
+        if (final_label != 0xFFFFFFFF) {
+            // Atomic increment for component size
+            atomicAdd(components.component_sizes[final_label % (ubo.width * ubo.height)], 1);
+        }
+    }
+}

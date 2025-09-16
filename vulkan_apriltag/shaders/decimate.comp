@@ -1,0 +1,89 @@
+#version 450
+
+// Image decimation compute shader
+// Efficiently downsamples images by the specified factor
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, r8ui) uniform readonly uimage2D input_image;
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimage2D output_image;
+
+layout(set = 0, binding = 2) uniform UniformBufferObject {
+    uint input_width;
+    uint input_height;
+    uint output_width;
+    uint output_height;
+    float decimate_factor;
+} ubo;
+
+void main() {
+    uvec2 output_coord = gl_GlobalInvocationID.xy;
+    
+    if (output_coord.x >= ubo.output_width || output_coord.y >= ubo.output_height) {
+        return;
+    }
+    
+    // Calculate input coordinates
+    vec2 input_coord_float = vec2(output_coord) * ubo.decimate_factor;
+    
+    if (ubo.decimate_factor == 2.0) {
+        // Fast path for 2x decimation using 2x2 box filter
+        uvec2 input_coord = uvec2(output_coord) * 2;
+        
+        uint sum = 0;
+        uint count = 0;
+        
+        for (uint dy = 0; dy < 2; dy++) {
+            for (uint dx = 0; dx < 2; dx++) {
+                uvec2 sample_coord = input_coord + uvec2(dx, dy);
+                if (sample_coord.x < ubo.input_width && sample_coord.y < ubo.input_height) {
+                    sum += imageLoad(input_image, ivec2(sample_coord)).r;
+                    count++;
+                }
+            }
+        }
+        
+        uint result = (count > 0) ? (sum / count) : 0;
+        imageStore(output_image, ivec2(output_coord), uvec4(result));
+    }
+    else if (ubo.decimate_factor == 3.0) {
+        // Fast path for 3x decimation using 3x3 box filter
+        uvec2 input_coord = uvec2(output_coord) * 3;
+        
+        uint sum = 0;
+        uint count = 0;
+        
+        for (uint dy = 0; dy < 3; dy++) {
+            for (uint dx = 0; dx < 3; dx++) {
+                uvec2 sample_coord = input_coord + uvec2(dx, dy);
+                if (sample_coord.x < ubo.input_width && sample_coord.y < ubo.input_height) {
+                    sum += imageLoad(input_image, ivec2(sample_coord)).r;
+                    count++;
+                }
+            }
+        }
+        
+        uint result = (count > 0) ? (sum / count) : 0;
+        imageStore(output_image, ivec2(output_coord), uvec4(result));
+    }
+    else {
+        // General case using bilinear interpolation
+        uvec2 input_coord = uvec2(floor(input_coord_float));
+        vec2 fract_part = fract(input_coord_float);
+        
+        // Bilinear interpolation
+        uint tl = imageLoad(input_image, ivec2(input_coord)).r;
+        uint tr = (input_coord.x + 1 < ubo.input_width) ? 
+                  imageLoad(input_image, ivec2(input_coord.x + 1, input_coord.y)).r : tl;
+        uint bl = (input_coord.y + 1 < ubo.input_height) ? 
+                  imageLoad(input_image, ivec2(input_coord.x, input_coord.y + 1)).r : tl;
+        uint br = (input_coord.x + 1 < ubo.input_width && input_coord.y + 1 < ubo.input_height) ? 
+                  imageLoad(input_image, ivec2(input_coord.x + 1, input_coord.y + 1)).r : tl;
+        
+        float top = mix(float(tl), float(tr), fract_part.x);
+        float bottom = mix(float(bl), float(br), fract_part.x);
+        float result = mix(top, bottom, fract_part.y);
+        
+        imageStore(output_image, ivec2(output_coord), uvec4(uint(result)));
+    }
+}
