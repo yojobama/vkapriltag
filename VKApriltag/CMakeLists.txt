@@ -12,10 +12,12 @@ endif()
 project ("VKApriltag")
 
 # Add source to this project's executable.
-add_executable (VKApriltag "VKApriltag.cpp" "VKApriltag.h")
+add_executable (VKApriltag "VKApriltag.cpp" "VKApriltag.h" "Accelerator.h" "Accelerator.cpp" "ApriltagDetector.h" "IApriltagFamily.h" "ApriltagDetector.cpp")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET VKApriltag PROPERTY CXX_STANDARD 20)
 endif()
 
 # TODO: Add tests and install targets if needed.
+find_package(Vulkan REQUIRED)
+target_link_libraries(VKApriltag PRIVATE Vulkan::Vulkan)
