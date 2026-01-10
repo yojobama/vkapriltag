@@ -8,6 +8,8 @@ namespace vk {
 }
 
 namespace apriltag {
+	std::vector<char> readShader(std::string filename);
+
 	struct ApriltagDetection {
 		int id;
 		float hammingDistance;
@@ -28,7 +30,7 @@ namespace apriltag {
 	public:
 		ApriltagDetector(const DetectorSettings& settings);
 		~ApriltagDetector();
-		std::vector<ApriltagDetection> detect(const Image& image);
+		std::vector<ApriltagDetection> Detect(const Image& image);
 	private:
 		DetectorSettings m_Settings;
 

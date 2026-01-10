@@ -21,3 +21,7 @@ endif()
 # TODO: Add tests and install targets if needed.
 find_package(Vulkan REQUIRED)
 target_link_libraries(VKApriltag PRIVATE Vulkan::Vulkan)
+
+# adding opencv
+# find_package(OpenCV REQUIRED)
+# target_link_libraries(VKApriltag PRIVATE ${OpenCV_LIBS})
