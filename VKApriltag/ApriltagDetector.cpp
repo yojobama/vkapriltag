@@ -67,6 +67,9 @@ apriltag::ApriltagDetector::ApriltagDetector(Accelerator accelerator, ImageSize 
     preProcessPipeline = device.createComputePipeline(pipelineCache, pipelineCreateInfo).value;
 }
 
+std::vector<apriltag::ApriltagDetection> apriltag::ApriltagDetector::Detect(const char *ImageData) {
+}
+
 vk::ShaderModule apriltag::ApriltagDetector::createShaderModule(const std::string &filename) const {
     std::vector<char> contents;
     if (std::ifstream shaderFile{filename, std::ios::binary | std::ios::ate}) {

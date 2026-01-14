@@ -7,6 +7,7 @@
 
 #include "Accelerator.h"
 #include <vulkan/vulkan.hpp>
+#include <memory>
 
 namespace apriltag {
     struct ImageSize {
@@ -22,7 +23,7 @@ namespace apriltag {
     class ApriltagDetector {
     public:
         ApriltagDetector(Accelerator accelerator, ImageSize imageSize);
-
+        std::vector<ApriltagDetection> Detect(const char* ImageData);
     private:
         // todo: should these members be unique_ptr's?
         vk::Instance instance;

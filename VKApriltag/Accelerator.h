@@ -11,6 +11,7 @@
 namespace apriltag {
     class Accelerator {
     public:
+        Accelerator(std::string name) : name(name) {};
         std::string GetName() const { return name; }
     private:
         std::string name;
