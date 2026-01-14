@@ -1,29 +1,22 @@
-#include <string>
+//
+// Created by john on 1/7/26.
+//
+
+#ifndef VKAPRILTAG_ACCELERATOR_H
+#define VKAPRILTAG_ACCELERATOR_H
+
 #include <vector>
-#include <vulkan/vulkan.hpp>
+#include <string>
 
 namespace apriltag {
-	// struct AcceleratorExtensions {
-	// 	bool ExternalMemoryHost;
-	// 	bool ByteStorage;
-	// 	bool ShaderGroupArithmatic;
-	// 	bool ImageCompressionControl;
-	// 	bool PushDescriptor;
-	// 	bool DescriptorBuffer;
-	// 	bool ShaderSubgroupExtendedTypes;
-	// 	bool ShaderFloat16Int8;
-	// };
+    class Accelerator {
+    public:
+        std::string GetName() const { return name; }
+    private:
+        std::string name;
+    };
 
-	class Accelerator {
-	public:
-		Accelerator(const std::string& name, std::vector<std::string> supportedExtensions);
-		// bool SetAcceleratorExtensions(AcceleratorExtensions acceleratorExtensions);
-		// AcceleratorExtensions GetAcceleratorExtensions();
-		std::vector<std::string> GetSupportedExtensions();
-	private:
-		std::string m_Name;
-		std::vector<std::string> m_SupportedExtensions;
-	};
+    std::vector<Accelerator> getAvailableAccelerators();
+} // apriltag
 
-	std::vector<Accelerator> getAvailableAccelerators(const vk::Instance& instance);
-}
+#endif //VKAPRILTAG_ACCELERATOR_H

@@ -1,46 +1,39 @@
-#include "Accelerator.h"
-#include <memory>
+//
+// Created by john on 1/7/26.
+//
 
-namespace vk {
-	class Device;
-	class PhysicalDevice;
-	class ShaderModule;
-}
+#ifndef VKAPRILTAG_APRILTAGDETECTOR_H
+#define VKAPRILTAG_APRILTAGDETECTOR_H
+
+#include "Accelerator.h"
+#include <vulkan/vulkan.hpp>
 
 namespace apriltag {
-	std::vector<char> readShader(std::string filename);
+    struct ImageSize {
+        int height;
+        int width;
+    };
 
-	struct ApriltagDetection {
-		int id;
-		float hammingDistance;
-		std::vector<std::pair<float, float>> corners;
-	};
+    class ApriltagDetector {
+    public:
+        ApriltagDetector(Accelerator accelerator, ImageSize imageSize);
+    private:
+        // todo: should these members be unique_ptr's?
+        vk::Instance instance;
+        vk::PhysicalDevice physicalDevice;
+        vk::Device device;
 
-	struct DetectorSettings {
-		Accelerator accelerator;
-	};
+        // shader moduls
+        // todo: add all of the required shader modules
+        vk::ShaderModule PreProcessionShaderModule;
+        // vk::ShaderModule DecimationGrayscaleShaderModule;
+        // vk::ShaderModule GaussianBlurShaderModule;
+        // vk::ShaderModule AdaptiveThresholdingShaderModule;
 
-	struct Image {
-		int width;
-		int height;
-		std::vector<uint8_t> data;
-	};
-	
-	class ApriltagDetector {
-	public:
-		ApriltagDetector(const DetectorSettings& settings);
-		~ApriltagDetector();
-		std::vector<ApriltagDetection> Detect(const Image& image);
-	private:
-		DetectorSettings m_Settings;
+        vk::ShaderModule createShaderModule(const std::string &filename) const;
+    };
+}
 
-		// Vulkan device and physical device
-		std::unique_ptr<vk::Device> m_Device;
-		std::unique_ptr<vk::PhysicalDevice> m_PhysicalDevice;
 
-		// shader modules for detection
-		std::unique_ptr<vk::ShaderModule> m_PreProcessingShaderModule;
-		std::unique_ptr<vk::ShaderModule> m_GradientAndEdgeComputingShaderModule;
-		std::unique_ptr<vk::ShaderModule> m_SegmentationAndQuadExtractionShaderModule;
-	};
-};
+
+#endif //VKAPRILTAG_APRILTAGDETECTOR_H
