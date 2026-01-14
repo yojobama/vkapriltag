@@ -14,21 +14,26 @@ namespace apriltag {
         int width;
     };
 
+    // todo: fill this struct with relevant stuff for apriltag detection
+    struct ApriltagDetection {
+
+    };
+
     class ApriltagDetector {
     public:
         ApriltagDetector(Accelerator accelerator, ImageSize imageSize);
+
     private:
         // todo: should these members be unique_ptr's?
         vk::Instance instance;
         vk::PhysicalDevice physicalDevice;
         vk::Device device;
+        vk::Buffer outBuffer;
+        vk::Pipeline preProcessPipeline;
 
         // shader moduls
         // todo: add all of the required shader modules
         vk::ShaderModule PreProcessionShaderModule;
-        // vk::ShaderModule DecimationGrayscaleShaderModule;
-        // vk::ShaderModule GaussianBlurShaderModule;
-        // vk::ShaderModule AdaptiveThresholdingShaderModule;
 
         vk::ShaderModule createShaderModule(const std::string &filename) const;
     };

@@ -10,7 +10,7 @@
 #include <string>
 #include <stdexcept>
 
-apriltag::ApriltagDetector::ApriltagDetector(Accelerator accelerator) {
+apriltag::ApriltagDetector::ApriltagDetector(Accelerator accelerator, ImageSize imageSize) {
     vk::ApplicationInfo appInfo("vulkan-apriltag", 1, nullptr, 0, VK_API_VERSION_1_1);
     // todo: remove all validation layers for release builds
     const std::vector<const char*> layers = { "VK_LAYER_KHRONOS_validation" };
@@ -38,7 +38,33 @@ apriltag::ApriltagDetector::ApriltagDetector(Accelerator accelerator) {
 
     PreProcessionShaderModule = createShaderModule("shaders/PreProcess.spv");
 
-    // todo: memory allocation for the detector
+    // todo: check whether this is the correct size of the pixels, or should it be one byte of data per pixel?
+    vk::BufferCreateInfo bufferCreateInfo(vk::BufferCreateFlags(), imageSize.width * imageSize.height * sizeof(float), vk::BufferUsageFlagBits::eStorageBuffer);
+    outBuffer = device.createBuffer(bufferCreateInfo);
+
+    vk::MemoryRequirements memRequirements = device.getBufferMemoryRequirements(outBuffer);
+
+    vk::MemoryAllocateInfo allocInfo(memRequirements.size, static_cast<uint32_t>(vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent));
+    vk::DeviceMemory outBufferMemory = device.allocateMemory(allocInfo);
+    device.bindBufferMemory(outBuffer, outBufferMemory, 0); // todo: check what the memory offset parameter means and change it if necessary
+
+    // todo: create descriptor sets and pipelines
+
+    const std::vector<vk::DescriptorSetLayoutBinding> bindings = {
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}
+    };
+
+    vk::DescriptorSetLayoutCreateInfo descriptorSetLayoutCreateInfo(vk::DescriptorSetLayoutCreateFlags(), bindings);
+    vk::DescriptorSetLayout descriptorSetLayout = device.createDescriptorSetLayout(descriptorSetLayoutCreateInfo);
+
+    vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(vk::PipelineLayoutCreateFlags(), 1, &descriptorSetLayout);
+    vk::PipelineLayout pipelineLayout = device.createPipelineLayout(pipelineLayoutCreateInfo);
+    vk::PipelineCache pipelineCache = device.createPipelineCache(vk::PipelineCacheCreateInfo());
+    // todo: change the entry point of the shaderStageCreateInfo to the correct one (this is just the deafult option)
+    vk::PipelineShaderStageCreateInfo shaderStageCreateInfo(vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, PreProcessionShaderModule, "main");
+    vk::ComputePipelineCreateInfo pipelineCreateInfo(vk::PipelineCreateFlags(), shaderStageCreateInfo, pipelineLayout);
+    // todo: check the result of the operation and throw a runtime exception if the operation failed
+    preProcessPipeline = device.createComputePipeline(pipelineCache, pipelineCreateInfo).value;
 }
 
 vk::ShaderModule apriltag::ApriltagDetector::createShaderModule(const std::string &filename) const {
