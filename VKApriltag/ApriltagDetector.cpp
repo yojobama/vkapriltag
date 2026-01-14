@@ -10,7 +10,7 @@
 #include <string>
 #include <stdexcept>
 
-apriltag::ApriltagDetector::ApriltagDetector(Accelerator accelerator, ImageSize imageSize) {
+apriltag::ApriltagDetector::ApriltagDetector(GPU accelerator, ImageSize imageSize) {
     vk::ApplicationInfo appInfo("vulkan-apriltag", 1, nullptr, 0, VK_API_VERSION_1_1);
     // todo: remove all validation layers for release builds
     const std::vector<const char*> layers = { "VK_LAYER_KHRONOS_validation" };
@@ -68,6 +68,9 @@ apriltag::ApriltagDetector::ApriltagDetector(Accelerator accelerator, ImageSize 
 }
 
 std::vector<apriltag::ApriltagDetection> apriltag::ApriltagDetector::Detect(const char *ImageData) {
+    std::vector<ApriltagDetection> detections;
+
+    return detections;
 }
 
 vk::ShaderModule apriltag::ApriltagDetector::createShaderModule(const std::string &filename) const {

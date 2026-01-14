@@ -12,7 +12,7 @@ endif()
 project ("VKApriltag")
 
 # Add source to this project's executable.
-add_library (VKApriltag "VKApriltag.cpp" "VKApriltag.h" "Accelerator.h" "Accelerator.cpp" "ApriltagDetector.h" "IApriltagFamily.h" "ApriltagDetector.cpp")
+add_library (VKApriltag "VKApriltag.cpp" "VKApriltag.h" "GPU.h" "GPU.cpp" "ApriltagDetector.h" "IApriltagFamily.h" "ApriltagDetector.cpp")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET VKApriltag PROPERTY CXX_STANDARD 20)

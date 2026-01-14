@@ -2,12 +2,12 @@
 // Created by john on 1/7/26.
 //
 
-#include "Accelerator.h"
+#include "GPU.h"
 #include <vulkan/vulkan.hpp>
 
 namespace apriltag {
-    std::vector<Accelerator> getAvailableAccelerators() {
-        std::vector<Accelerator> accelerators;
+    std::vector<GPU> getAvailableAccelerators() {
+        std::vector<GPU> gpus;
 
         vk::ApplicationInfo appInfo("vulkan-apriltag", 1, nullptr, 0, VK_API_VERSION_1_1);
         // todo: remove all validation layers for release builds
@@ -16,7 +16,8 @@ namespace apriltag {
         vk::Instance instance = vk::createInstance(instanceInfo);
         for (auto device : instance.enumeratePhysicalDevices()) {
             vk::PhysicalDeviceProperties deviceProperties = device.getProperties();
-            accelerators.emplace_back(Accelerator(deviceProperties.deviceName));
+            gpus.emplace_back(deviceProperties.deviceName);
         }
+        return gpus;
     }
 } // apriltag

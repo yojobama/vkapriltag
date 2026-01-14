@@ -9,15 +9,15 @@
 #include <string>
 
 namespace apriltag {
-    class Accelerator {
+    class GPU {
     public:
-        Accelerator(std::string name) : name(name) {};
+        GPU(std::string name) : name(name) {};
         std::string GetName() const { return name; }
     private:
         std::string name;
     };
 
-    std::vector<Accelerator> getAvailableAccelerators();
+    std::vector<GPU> getAvailableAccelerators();
 } // apriltag
 
 #endif //VKAPRILTAG_ACCELERATOR_H

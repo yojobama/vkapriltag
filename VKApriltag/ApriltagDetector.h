@@ -5,7 +5,7 @@
 #ifndef VKAPRILTAG_APRILTAGDETECTOR_H
 #define VKAPRILTAG_APRILTAGDETECTOR_H
 
-#include "Accelerator.h"
+#include "GPU.h"
 #include <vulkan/vulkan.hpp>
 #include <memory>
 
@@ -22,7 +22,7 @@ namespace apriltag {
 
     class ApriltagDetector {
     public:
-        ApriltagDetector(Accelerator accelerator, ImageSize imageSize);
+        ApriltagDetector(GPU accelerator, ImageSize imageSize);
         std::vector<ApriltagDetection> Detect(const char* ImageData);
     private:
         // todo: should these members be unique_ptr's?
