@@ -74,6 +74,13 @@ endif()
 aux_source_directory(common COMMON_SRC)
 set(APRILTAG_SRCS apriltag.c apriltag_pose.c apriltag_quad_thresh.c)
 
+
+# Add Vulkan AprilTag extension if Vulkan is available
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_apriltag/CMakeLists.txt)
+    add_subdirectory(vulkan_apriltag)
+endif()
+
+
 # Library
 file(GLOB TAG_FILES ${CMAKE_CURRENT_SOURCE_DIR}/tag*.c)
 add_library(${PROJECT_NAME} ${APRILTAG_SRCS} ${COMMON_SRC} ${TAG_FILES})
@@ -224,6 +231,15 @@ if (BUILD_EXAMPLES)
         target_link_libraries(opencv_demo apriltag ${OpenCV_LIBRARIES})
         set_target_properties(opencv_demo PROPERTIES CXX_STANDARD 11)
         install(TARGETS opencv_demo RUNTIME DESTINATION bin)
+
+        # vulkan_demo (built if Vulkan AprilTag extension exists)
+        
+        if(TARGET vulkan_apriltag)
+            add_executable(vulkan_demo example/vulkan_demo.cpp)
+            target_link_libraries(vulkan_demo apriltag vulkan_apriltag ${OpenCV_LIBRARIES})
+            set_target_properties(vulkan_demo PROPERTIES CXX_STANDARD 11)
+            install(TARGETS vulkan_demo RUNTIME DESTINATION bin)
+        endif()
     else()
         message(STATUS "OpenCV not found: Not building demo")
     endif(OpenCV_FOUND)
@@ -237,7 +253,3 @@ if(BUILD_TESTING)
     add_subdirectory(test)
 endif()
 
-# Add Vulkan AprilTag extension if Vulkan is available
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_apriltag/CMakeLists.txt)
-    add_subdirectory(vulkan_apriltag)
-endif()

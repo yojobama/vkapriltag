@@ -16,9 +16,7 @@ static const char* validation_layers[] = {
     "VK_LAYER_KHRONOS_validation"
 };
 
-static const char* device_extensions[] = {
-    // No additional extensions needed for compute-only
-};
+static const char* device_extensions[1] = { NULL };
 
 static const uint32_t validation_layer_count = sizeof(validation_layers) / sizeof(validation_layers[0]);
 static const uint32_t device_extension_count = 0; // Empty array
@@ -51,11 +49,12 @@ static uint32_t find_memory_type(vulkan_apriltag_context_t* ctx, uint32_t type_f
 static VkResult create_buffer(vulkan_apriltag_context_t* ctx, VkDeviceSize size, 
                              VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
                              VkBuffer* buffer, VkDeviceMemory* buffer_memory) {
-    VkBufferCreateInfo buffer_info = {};
-    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer_info.size = size;
-    buffer_info.usage = usage;
-    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
     
     VkResult result = vkCreateBuffer(ctx->device, &buffer_info, NULL, buffer);
     if (result != VK_SUCCESS) return result;
@@ -63,10 +62,11 @@ static VkResult create_buffer(vulkan_apriltag_context_t* ctx, VkDeviceSize size,
     VkMemoryRequirements mem_requirements;
     vkGetBufferMemoryRequirements(ctx->device, *buffer, &mem_requirements);
     
-    VkMemoryAllocateInfo alloc_info = {};
-    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc_info.allocationSize = mem_requirements.size;
-    alloc_info.memoryTypeIndex = find_memory_type(ctx, mem_requirements.memoryTypeBits, properties);
+    VkMemoryAllocateInfo alloc_info = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_requirements.size,
+        .memoryTypeIndex = find_memory_type(ctx, mem_requirements.memoryTypeBits, properties)
+    };
     
     if (alloc_info.memoryTypeIndex == UINT32_MAX) {
         vkDestroyBuffer(ctx->device, *buffer, NULL);
@@ -109,17 +109,19 @@ static bool check_validation_layer_support() {
 }
 
 static VkResult create_instance(vulkan_apriltag_context_t* ctx, bool enable_validation) {
-    VkApplicationInfo app_info = {};
-    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app_info.pApplicationName = "Vulkan AprilTag";
-    app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.pEngineName = "No Engine";
-    app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.apiVersion = VK_API_VERSION_1_1;
+    VkApplicationInfo app_info = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "Vulkan AprilTag",
+        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+        .pEngineName = "No Engine",
+        .engineVersion = VK_MAKE_VERSION(1, 0, 0),
+        .apiVersion = VK_API_VERSION_1_1
+    };
     
-    VkInstanceCreateInfo create_info = {};
-    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    create_info.pApplicationInfo = &app_info;
+    VkInstanceCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &app_info
+    };
     
     // Extensions for debug
     const char* extensions[] = {
@@ -146,15 +148,16 @@ static VkResult create_instance(vulkan_apriltag_context_t* ctx, bool enable_vali
 static VkResult setup_debug_messenger(vulkan_apriltag_context_t* ctx) {
     if (!ctx->debug_enabled) return VK_SUCCESS;
     
-    VkDebugUtilsMessengerCreateInfoEXT create_info = {};
-    create_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
-    create_info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
+    VkDebugUtilsMessengerCreateInfoEXT create_info = {
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
                                   VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-    create_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
                               VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-    create_info.pfnUserCallback = debug_callback;
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = debug_callback
+    };
     
     PFN_vkCreateDebugUtilsMessengerEXT func = (PFN_vkCreateDebugUtilsMessengerEXT)
         vkGetInstanceProcAddr(ctx->instance, "vkCreateDebugUtilsMessengerEXT");
@@ -238,23 +241,24 @@ static VkResult pick_physical_device(vulkan_apriltag_context_t* ctx) {
 }
 
 static VkResult create_logical_device(vulkan_apriltag_context_t* ctx) {
-    VkDeviceQueueCreateInfo queue_create_info = {};
-    queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queue_create_info.queueFamilyIndex = ctx->compute_queue_family_index;
-    queue_create_info.queueCount = 1;
+    VkDeviceQueueCreateInfo queue_create_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = ctx->compute_queue_family_index,
+        .queueCount = 1
+    };
     
     float queue_priority = 1.0f;
     queue_create_info.pQueuePriorities = &queue_priority;
     
-    VkPhysicalDeviceFeatures device_features = {};
     
-    VkDeviceCreateInfo create_info = {};
-    create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    create_info.pQueueCreateInfos = &queue_create_info;
-    create_info.queueCreateInfoCount = 1;
-    create_info.pEnabledFeatures = &device_features;
-    create_info.enabledExtensionCount = device_extension_count;
-    create_info.ppEnabledExtensionNames = device_extensions;
+    VkDeviceCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pQueueCreateInfos = &queue_create_info,
+        .queueCreateInfoCount = 1,
+        .pEnabledFeatures = NULL,
+        .enabledExtensionCount = device_extension_count,
+        .ppEnabledExtensionNames = device_extensions
+    };
     
     if (ctx->debug_enabled) {
         create_info.enabledLayerCount = validation_layer_count;
@@ -272,10 +276,11 @@ static VkResult create_logical_device(vulkan_apriltag_context_t* ctx) {
 }
 
 static VkResult create_command_pool(vulkan_apriltag_context_t* ctx) {
-    VkCommandPoolCreateInfo pool_info = {};
-    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pool_info.queueFamilyIndex = ctx->compute_queue_family_index;
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = ctx->compute_queue_family_index
+    };
     
     return vkCreateCommandPool(ctx->device, &pool_info, NULL, &ctx->command_pool);
 }
@@ -286,12 +291,13 @@ static VkResult create_descriptor_pool(vulkan_apriltag_context_t* ctx) {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 50 }
     };
     
-    VkDescriptorPoolCreateInfo pool_info = {};
-    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pool_info.poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]);
-    pool_info.pPoolSizes = pool_sizes;
-    pool_info.maxSets = 1000;
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
+        .pPoolSizes = pool_sizes,
+        .maxSets = 1000
+    };
     
     return vkCreateDescriptorPool(ctx->device, &pool_info, NULL, &ctx->descriptor_pool);
 }
@@ -441,13 +447,15 @@ void vulkan_apriltag_context_destroy(vulkan_apriltag_context_t* ctx) {
 bool vulkan_apriltag_is_supported() {
     // Check if Vulkan loader is available
     VkInstance test_instance;
-    VkApplicationInfo app_info = {};
-    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app_info.apiVersion = VK_API_VERSION_1_1;
+    VkApplicationInfo app_info = {
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .apiVersion = VK_API_VERSION_1_1
+    };
     
-    VkInstanceCreateInfo create_info = {};
-    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    create_info.pApplicationInfo = &app_info;
+    VkInstanceCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .pApplicationInfo = &app_info
+    };
     
     VkResult result = vkCreateInstance(&create_info, NULL, &test_instance);
     if (result == VK_SUCCESS) {

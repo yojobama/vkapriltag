@@ -1,7 +1,7 @@
 #include <iostream>
 #include <iomanip>
 #include <chrono>
-#include "opencv2/opencv.hpp"
+#include <opencv2/opencv.hpp>
 
 extern "C" {
 #include "vulkan_apriltag/vulkan_apriltag.h"
