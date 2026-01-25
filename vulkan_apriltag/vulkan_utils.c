@@ -4,11 +4,12 @@
 #include <string.h>
 
 VkResult load_shader_from_spirv(VkDevice device, const uint32_t* spirv_data, size_t spirv_size, VkShaderModule* shader_module) {
-    VkShaderModuleCreateInfo create_info = {};
-    create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    create_info.codeSize = spirv_size;
-    create_info.pCode = spirv_data;
-    
+    VkShaderModuleCreateInfo create_info = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = spirv_size,
+        .pCode = spirv_data
+    };
+
     return vkCreateShaderModule(device, &create_info, NULL, shader_module);
 }
 
@@ -51,11 +52,12 @@ static uint32_t find_memory_type(VkPhysicalDeviceMemoryProperties memory_propert
 
 VkResult create_storage_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties memory_properties,
                               VkDeviceSize size, VkBuffer* buffer, VkDeviceMemory* buffer_memory) {
-    VkBufferCreateInfo buffer_info = {};
-    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer_info.size = size;
-    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
     
     VkResult result = vkCreateBuffer(device, &buffer_info, NULL, buffer);
     if (result != VK_SUCCESS) return result;
@@ -63,11 +65,11 @@ VkResult create_storage_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties
     VkMemoryRequirements mem_requirements;
     vkGetBufferMemoryRequirements(device, *buffer, &mem_requirements);
     
-    VkMemoryAllocateInfo alloc_info = {};
-    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc_info.allocationSize = mem_requirements.size;
-    alloc_info.memoryTypeIndex = find_memory_type(memory_properties, mem_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_requirements.size,
+        .memoryTypeIndex = find_memory_type(memory_properties, mem_requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
     if (alloc_info.memoryTypeIndex == UINT32_MAX) {
         vkDestroyBuffer(device, *buffer, NULL);
         return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -85,11 +87,12 @@ VkResult create_storage_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties
 
 VkResult create_uniform_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties memory_properties,
                               VkDeviceSize size, VkBuffer* buffer, VkDeviceMemory* buffer_memory) {
-    VkBufferCreateInfo buffer_info = {};
-    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer_info.size = size;
-    buffer_info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
     
     VkResult result = vkCreateBuffer(device, &buffer_info, NULL, buffer);
     if (result != VK_SUCCESS) return result;
@@ -97,11 +100,12 @@ VkResult create_uniform_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties
     VkMemoryRequirements mem_requirements;
     vkGetBufferMemoryRequirements(device, *buffer, &mem_requirements);
     
-    VkMemoryAllocateInfo alloc_info = {};
-    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc_info.allocationSize = mem_requirements.size;
-    alloc_info.memoryTypeIndex = find_memory_type(memory_properties, mem_requirements.memoryTypeBits, 
-                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_requirements.size,
+        .memoryTypeIndex = find_memory_type(memory_properties, mem_requirements.memoryTypeBits,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+    };
     
     if (alloc_info.memoryTypeIndex == UINT32_MAX) {
         vkDestroyBuffer(device, *buffer, NULL);
@@ -121,22 +125,22 @@ VkResult create_uniform_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties
 VkResult create_descriptor_set_layout(VkDevice device, uint32_t binding_count, 
                                      VkDescriptorSetLayoutBinding* bindings,
                                      VkDescriptorSetLayout* layout) {
-    VkDescriptorSetLayoutCreateInfo layout_info = {};
-    layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_info.bindingCount = binding_count;
-    layout_info.pBindings = bindings;
-    
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = binding_count,
+        .pBindings = bindings,
+    };
     return vkCreateDescriptorSetLayout(device, &layout_info, NULL, layout);
 }
 
 VkResult allocate_descriptor_set(VkDevice device, VkDescriptorPool descriptor_pool,
                                 VkDescriptorSetLayout layout, VkDescriptorSet* descriptor_set) {
-    VkDescriptorSetAllocateInfo alloc_info = {};
-    alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc_info.descriptorPool = descriptor_pool;
-    alloc_info.descriptorSetCount = 1;
-    alloc_info.pSetLayouts = &layout;
-    
+    VkDescriptorSetAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &layout,
+    };
     return vkAllocateDescriptorSets(device, &alloc_info, descriptor_set);
 }
 
@@ -145,35 +149,37 @@ VkResult create_compute_pipeline(VkDevice device, VkShaderModule shader_module,
                                 VkPipelineLayout* pipeline_layout,
                                 VkPipeline* pipeline) {
     // Create pipeline layout
-    VkPipelineLayoutCreateInfo pipeline_layout_info = {};
-    pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeline_layout_info.setLayoutCount = 1;
-    pipeline_layout_info.pSetLayouts = &descriptor_set_layout;
-    
+    VkPipelineLayoutCreateInfo pipeline_layout_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &descriptor_set_layout,
+    };
     VkResult result = vkCreatePipelineLayout(device, &pipeline_layout_info, NULL, pipeline_layout);
     if (result != VK_SUCCESS) return result;
     
     // Create compute pipeline
-    VkPipelineShaderStageCreateInfo compute_stage_info = {};
-    compute_stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    compute_stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    compute_stage_info.module = shader_module;
-    compute_stage_info.pName = "main";
-    
-    VkComputePipelineCreateInfo pipeline_info = {};
-    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    pipeline_info.stage = compute_stage_info;
-    pipeline_info.layout = *pipeline_layout;
+    VkPipelineShaderStageCreateInfo compute_stage_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = shader_module,
+        .pName = "main",
+    };
+    VkComputePipelineCreateInfo pipeline_info = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = compute_stage_info,
+        .layout = *pipeline_layout,
+    };
     
     return vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, pipeline);
 }
 
 VkResult allocate_command_buffer(VkDevice device, VkCommandPool command_pool, VkCommandBuffer* command_buffer) {
-    VkCommandBufferAllocateInfo alloc_info = {};
-    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool = command_pool;
-    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc_info.commandBufferCount = 1;
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
     
     return vkAllocateCommandBuffers(device, &alloc_info, command_buffer);
 }
@@ -182,9 +188,10 @@ VkResult begin_single_time_commands(VkDevice device, VkCommandPool command_pool,
     VkResult result = allocate_command_buffer(device, command_pool, command_buffer);
     if (result != VK_SUCCESS) return result;
     
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
     
     return vkBeginCommandBuffer(*command_buffer, &begin_info);
 }
@@ -193,10 +200,11 @@ VkResult end_single_time_commands(VkDevice device, VkQueue queue, VkCommandPool 
     VkResult result = vkEndCommandBuffer(command_buffer);
     if (result != VK_SUCCESS) return result;
     
-    VkSubmitInfo submit_info = {};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &command_buffer;
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &command_buffer,
+    };
     
     result = vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) return result;
@@ -213,8 +221,9 @@ VkResult copy_buffer(VkDevice device, VkQueue queue, VkCommandPool command_pool,
     VkResult result = begin_single_time_commands(device, command_pool, &command_buffer);
     if (result != VK_SUCCESS) return result;
     
-    VkBufferCopy copy_region = {};
-    copy_region.size = size;
+    VkBufferCopy copy_region = {
+        .size = size,
+    };
     vkCmdCopyBuffer(command_buffer, src_buffer, dst_buffer, 1, &copy_region);
     
     return end_single_time_commands(device, queue, command_pool, command_buffer);
@@ -233,10 +242,11 @@ VkResult copy_data_to_buffer(VkDevice device, VkDeviceMemory buffer_memory,
 }
 
 VkResult create_timestamp_query_pool(VkDevice device, uint32_t query_count, VkQueryPool* query_pool) {
-    VkQueryPoolCreateInfo pool_info = {};
-    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    pool_info.queryCount = query_count;
+    VkQueryPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = query_count,
+    };
     
     return vkCreateQueryPool(device, &pool_info, NULL, query_pool);
 }

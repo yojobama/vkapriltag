@@ -204,4 +204,4 @@ void vulkan_apriltag_print_device_info(vulkan_apriltag_context_t* ctx);
 
 #ifdef __cplusplus
 }
-#endif#endif
+#endif

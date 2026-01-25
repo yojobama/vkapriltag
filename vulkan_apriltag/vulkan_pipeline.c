@@ -19,10 +19,11 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
     if (result != VK_SUCCESS) return result;
     
     // Begin command buffer recording
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+
     result = vkBeginCommandBuffer(detector->preprocess_cmd, &begin_info);
     if (result != VK_SUCCESS) return result;
     
@@ -55,11 +56,12 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
         vkCmdDispatch(detector->preprocess_cmd, group_x, group_y, 1);
         
         // Memory barrier
-        VkMemoryBarrier barrier = {};
-        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        
+        VkMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+        };
+
         vkCmdPipelineBarrier(detector->preprocess_cmd,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -87,11 +89,12 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
         };
         
         // Memory barrier
-        VkMemoryBarrier barrier = {};
-        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        
+        VkMemoryBarrier barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+        };
+
         // TODO: Precompute Gaussian kernel weights
         
         // Horizontal pass
@@ -121,13 +124,14 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
     if (result != VK_SUCCESS) return result;
     
     // Submit preprocessing
-    VkSubmitInfo submit_info = {};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &detector->preprocess_cmd;
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &detector->preprocess_semaphore;
-    
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &detector->preprocess_cmd,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &detector->preprocess_semaphore
+    };
+
     return vkQueueSubmit(ctx->compute_queue, 1, &submit_info, VK_NULL_HANDLE);
 }
 
@@ -135,10 +139,11 @@ static VkResult execute_threshold_pipeline(vulkan_apriltag_detector_t* detector,
     vulkan_apriltag_context_t* ctx = detector->vulkan_ctx;
     VkResult result;
     
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+
     result = vkBeginCommandBuffer(detector->threshold_cmd, &begin_info);
     if (result != VK_SUCCESS) return result;
     
@@ -167,16 +172,17 @@ static VkResult execute_threshold_pipeline(vulkan_apriltag_detector_t* detector,
     
     // Submit threshold pass
     VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT };
-    VkSubmitInfo submit_info = {};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.waitSemaphoreCount = 1;
-    submit_info.pWaitSemaphores = &detector->preprocess_semaphore;
-    submit_info.pWaitDstStageMask = wait_stages;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &detector->threshold_cmd;
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &detector->threshold_semaphore;
-    
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &detector->preprocess_semaphore,
+        .pWaitDstStageMask = wait_stages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &detector->threshold_cmd,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &detector->threshold_semaphore
+    };
+
     return vkQueueSubmit(ctx->compute_queue, 1, &submit_info, VK_NULL_HANDLE);
 }
 
@@ -184,10 +190,11 @@ static VkResult execute_connected_components_pipeline(vulkan_apriltag_detector_t
     vulkan_apriltag_context_t* ctx = detector->vulkan_ctx;
     VkResult result;
     
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+
     result = vkBeginCommandBuffer(detector->connected_components_cmd, &begin_info);
     if (result != VK_SUCCESS) return result;
     
@@ -215,11 +222,12 @@ static VkResult execute_connected_components_pipeline(vulkan_apriltag_detector_t
         vkCmdDispatch(detector->connected_components_cmd, group_x, group_y, 1);
         
         if (iteration < max_iterations - 1) {
-            VkMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            
+            VkMemoryBarrier barrier = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            };
+
             vkCmdPipelineBarrier(detector->connected_components_cmd,
                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -232,16 +240,17 @@ static VkResult execute_connected_components_pipeline(vulkan_apriltag_detector_t
     
     // Submit connected components pass
     VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT };
-    VkSubmitInfo submit_info = {};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.waitSemaphoreCount = 1;
-    submit_info.pWaitSemaphores = &detector->threshold_semaphore;
-    submit_info.pWaitDstStageMask = wait_stages;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &detector->connected_components_cmd;
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &detector->connected_components_semaphore;
-    
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &detector->threshold_semaphore,
+        .pWaitDstStageMask = wait_stages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &detector->connected_components_cmd,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &detector->connected_components_semaphore
+    };
+
     return vkQueueSubmit(ctx->compute_queue, 1, &submit_info, VK_NULL_HANDLE);
 }
 
@@ -249,10 +258,11 @@ static VkResult execute_gradient_pipeline(vulkan_apriltag_detector_t* detector, 
     vulkan_apriltag_context_t* ctx = detector->vulkan_ctx;
     VkResult result;
     
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+
     result = vkBeginCommandBuffer(detector->gradient_cmd, &begin_info);
     if (result != VK_SUCCESS) return result;
     
@@ -278,16 +288,17 @@ static VkResult execute_gradient_pipeline(vulkan_apriltag_detector_t* detector, 
     
     // Submit gradient pass
     VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT };
-    VkSubmitInfo submit_info = {};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.waitSemaphoreCount = 1;
-    submit_info.pWaitSemaphores = &detector->connected_components_semaphore;
-    submit_info.pWaitDstStageMask = wait_stages;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &detector->gradient_cmd;
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &detector->gradient_semaphore;
-    
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &detector->connected_components_semaphore,
+        .pWaitDstStageMask = wait_stages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &detector->gradient_cmd,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &detector->gradient_semaphore
+    };
+
     return vkQueueSubmit(ctx->compute_queue, 1, &submit_info, VK_NULL_HANDLE);
 }
 
@@ -359,10 +370,11 @@ zarray_t* vulkan_apriltag_detector_detect(vulkan_apriltag_detector_t* detector, 
     }
     
     // Final fence for completion
-    VkSubmitInfo final_submit = {};
-    final_submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    final_submit.waitSemaphoreCount = 1;
-    final_submit.pWaitSemaphores = &detector->gradient_semaphore;
+    VkSubmitInfo final_submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &detector->gradient_semaphore,
+    };
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     final_submit.pWaitDstStageMask = &wait_stage;
     

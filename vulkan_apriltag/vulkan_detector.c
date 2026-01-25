@@ -257,13 +257,15 @@ vulkan_apriltag_detector_t* vulkan_apriltag_detector_create(
     }
     
     // Create synchronization objects
-    VkSemaphoreCreateInfo semaphore_info = {};
-    semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    
-    VkFenceCreateInfo fence_info = {};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    
+    VkSemaphoreCreateInfo semaphore_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    };
+
+    VkFenceCreateInfo fence_info = {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT
+    };
+
     if (vkCreateSemaphore(ctx->device, &semaphore_info, NULL, &detector->preprocess_semaphore) != VK_SUCCESS ||
         vkCreateSemaphore(ctx->device, &semaphore_info, NULL, &detector->threshold_semaphore) != VK_SUCCESS ||
         vkCreateSemaphore(ctx->device, &semaphore_info, NULL, &detector->connected_components_semaphore) != VK_SUCCESS ||
