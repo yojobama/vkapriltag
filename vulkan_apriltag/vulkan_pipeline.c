@@ -50,11 +50,18 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
             detector->base_detector->quad_decimate
         };
         
-        // TODO: Update descriptor sets and dispatch
+        // Update push constants with decimation parameters
+        vkCmdPushConstants(detector->preprocess_cmd, ctx->decimate_layout,
+                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(decimate_params), &decimate_params);
+        
+        // Bind descriptor sets for input and output buffers
+        vkCmdBindDescriptorSets(detector->preprocess_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               ctx->decimate_layout, 0, 1, &detector->input_image.descriptor_set,
+                               0, NULL);
+        
         uint32_t group_x = (decimate_params.output_width + 15) / 16;
         uint32_t group_y = (decimate_params.output_height + 15) / 16;
-        vkCmdDispatch(detector->preproc
-            ess_cmd, group_x, group_y, 1);
+        vkCmdDispatch(detector->preprocess_cmd, group_x, group_y, 1);
         
         // Memory barrier
         VkMemoryBarrier barrier = {
@@ -96,7 +103,16 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
         };
 
-        // TODO: Precompute Gaussian kernel weights
+
+        // Update push constants with blur parameters
+        vkCmdPushConstants(detector->preprocess_cmd, ctx->blur_layout,
+                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(blur_params), &blur_params);
+        
+        // Bind descriptor sets for blur input/output
+        VkDescriptorSet blur_desc_set = detector->base_detector->quad_decimate > 1.0f ?
+            detector->decimated_image.descriptor_set : detector->input_image.descriptor_set;
+        vkCmdBindDescriptorSets(detector->preprocess_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               ctx->blur_layout, 0, 1, &blur_desc_set, 0, NULL);
         
         // Horizontal pass
         uint32_t group_count = (image->width + 255) / 256;
@@ -107,8 +123,12 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             0, 1, &barrier, 0, NULL, 0, NULL);
         
+        
         // Vertical pass
         blur_params.direction = 1;
+        vkCmdPushConstants(detector->preprocess_cmd, ctx->blur_layout,
+                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(blur_params), &blur_params);
+        
         group_count = (image->height + 255) / 256;
         vkCmdDispatch(detector->preprocess_cmd, image->width, group_count, 1);
         
@@ -162,8 +182,23 @@ static VkResult execute_threshold_pipeline(vulkan_apriltag_detector_t* detector,
         (uint32_t)detector->base_detector->qtp.min_white_black_diff
     };
     
-    // TODO: Update descriptor sets
-
+    
+    // Update push constants with threshold parameters
+    vkCmdPushConstants(detector->threshold_cmd, ctx->threshold_layout,
+                      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(threshold_params), &threshold_params);
+    
+    // Bind descriptor sets for input image
+    // Use blurred image if blur was applied, otherwise use decimated or original
+    VkDescriptorSet input_desc_set;
+    if (detector->base_detector->quad_sigma > 0.0f) {
+        input_desc_set = detector->blurred_image.descriptor_set;
+    } else if (detector->base_detector->quad_decimate > 1.0f) {
+        input_desc_set = detector->decimated_image.descriptor_set;
+    } else {
+        input_desc_set = detector->input_image.descriptor_set;
+    }
+    vkCmdBindDescriptorSets(detector->threshold_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                           ctx->threshold_layout, 0, 1, &input_desc_set, 0, NULL);
 
     uint32_t group_x = (image->width + 15) / 16;
     uint32_t group_y = (image->height + 15) / 16;
@@ -217,7 +252,15 @@ static VkResult execute_connected_components_pipeline(vulkan_apriltag_detector_t
             iteration, max_iterations
         };
         
-        // TODO: Update descriptor sets with current iteration
+        
+        // Update push constants with connected components parameters
+        vkCmdPushConstants(detector->connected_components_cmd, ctx->connected_components_layout,
+                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cc_params), &cc_params);
+        
+        // Bind descriptor sets for threshold image and components buffer
+        vkCmdBindDescriptorSets(detector->connected_components_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               ctx->connected_components_layout, 0, 1,
+                               &detector->threshold_image.descriptor_set, 0, NULL);
         
         uint32_t group_x = (image->width + 15) / 16;
         uint32_t group_y = (image->height + 15) / 16;
@@ -279,7 +322,22 @@ static VkResult execute_gradient_pipeline(vulkan_apriltag_detector_t* detector, 
         1.0f / 8.0f // Sobel normalization
     };
     
-    // TODO: Update descriptor sets
+    
+    // Update push constants with gradient parameters
+    vkCmdPushConstants(detector->gradient_cmd, ctx->gradient_layout,
+                      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gradient_params), &gradient_params);
+    
+    // Bind descriptor sets for input image (use preprocessed image)
+    VkDescriptorSet input_desc_set;
+    if (detector->base_detector->quad_sigma > 0.0f) {
+        input_desc_set = detector->blurred_image.descriptor_set;
+    } else if (detector->base_detector->quad_decimate > 1.0f) {
+        input_desc_set = detector->decimated_image.descriptor_set;
+    } else {
+        input_desc_set = detector->input_image.descriptor_set;
+    }
+    vkCmdBindDescriptorSets(detector->gradient_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                           ctx->gradient_layout, 0, 1, &input_desc_set, 0, NULL);
     
     uint32_t group_x = (image->width + 15) / 16;
     uint32_t group_y = (image->height + 15) / 16;
