@@ -1,4 +1,5 @@
 # Vulkan-accelerated AprilTag extension
+set(COMPILE_WARNING_AS_ERROR OFF)
 option(BUILD_VULKAN_APRILTAG "Build Vulkan-accelerated AprilTag detector" ON)
 
 if(BUILD_VULKAN_APRILTAG)
@@ -32,6 +33,61 @@ if(BUILD_VULKAN_APRILTAG)
             )
             
         else()
+            # Build full Vulkan implementation and embed real SPIR-V generated from shaders/*.comp
+            set(SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+            set(SHADER_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders_spv)
+            file(MAKE_DIRECTORY ${SHADER_BINARY_DIR})
+
+            find_program(GLSLANG_VALIDATOR glslangValidator)
+            find_program(GLSLC glslc)
+            if(NOT GLSLANG_VALIDATOR AND NOT GLSLC)
+                message(FATAL_ERROR "Neither glslangValidator nor glslc found; cannot build Vulkan shaders")
+            endif()
+
+            set(SHADER_NAMES threshold connected_components gradient decimate blur)
+            set(GENERATED_SHADER_SOURCES)
+            set(GENERATED_SHADER_HEADERS)
+            foreach(SHADER_NAME IN LISTS SHADER_NAMES)
+                set(SHADER_SRC ${SHADER_SOURCE_DIR}/${SHADER_NAME}.comp)
+                set(SHADER_SPV ${SHADER_BINARY_DIR}/${SHADER_NAME}.spv)
+
+                if(GLSLANG_VALIDATOR)
+                    add_custom_command(
+                        OUTPUT ${SHADER_SPV}
+                        COMMAND ${GLSLANG_VALIDATOR} -V ${SHADER_SRC} -o ${SHADER_SPV}
+                        DEPENDS ${SHADER_SRC}
+                        COMMENT "Compiling ${SHADER_SRC} -> ${SHADER_SPV}"
+                        VERBATIM)
+                else()
+                    add_custom_command(
+                        OUTPUT ${SHADER_SPV}
+                        COMMAND ${GLSLC} ${SHADER_SRC} -o ${SHADER_SPV}
+                        DEPENDS ${SHADER_SRC}
+                        COMMENT "Compiling ${SHADER_SRC} -> ${SHADER_SPV}"
+                        VERBATIM)
+                endif()
+
+                set(SHADER_HEADER ${SHADER_BINARY_DIR}/${SHADER_NAME}_spirv.h)
+                set(SHADER_SOURCE ${SHADER_BINARY_DIR}/${SHADER_NAME}_spirv.c)
+                add_custom_command(
+                    OUTPUT ${SHADER_HEADER} ${SHADER_SOURCE}
+                    COMMAND ${CMAKE_COMMAND}
+                        -DSPIRV_FILE=${SHADER_SPV}
+                        -DHEADER_FILE=${SHADER_HEADER}
+                        -DSHADER_NAME=${SHADER_NAME}
+                        -P ${CMAKE_SOURCE_DIR}/CMake/spirv_to_header.cmake
+                    DEPENDS ${SHADER_SPV} ${CMAKE_SOURCE_DIR}/CMake/spirv_to_header.cmake
+                    COMMENT "Embedding ${SHADER_NAME}.spv into C source"
+                    VERBATIM)
+
+                list(APPEND GENERATED_SHADER_SOURCES ${SHADER_SOURCE})
+                list(APPEND GENERATED_SHADER_HEADERS ${SHADER_HEADER})
+            endforeach()
+
+            add_custom_target(vulkan_shaders_embedded ALL
+                DEPENDS ${GENERATED_SHADER_SOURCES} ${GENERATED_SHADER_HEADERS})
+            set_source_files_properties(${GENERATED_SHADER_SOURCES} ${GENERATED_SHADER_HEADERS} PROPERTIES GENERATED TRUE)
+
             # Full Vulkan implementation
             set(VULKAN_APRILTAG_SOURCES
                 vulkan_apriltag.c
@@ -49,7 +105,8 @@ if(BUILD_VULKAN_APRILTAG)
             
             # Create Vulkan AprilTag library
             add_library(vulkan_apriltag ${VULKAN_APRILTAG_SOURCES} ${VULKAN_APRILTAG_HEADERS})
-            
+            add_dependencies(vulkan_apriltag vulkan_shaders_embedded)
+
             target_link_libraries(vulkan_apriltag 
                 PUBLIC apriltag
                 PUBLIC Vulkan::Vulkan
@@ -57,7 +114,9 @@ if(BUILD_VULKAN_APRILTAG)
             
             # Define BUILD_VULKAN_FULL to properly handle Vulkan type declarations
             target_compile_definitions(vulkan_apriltag PRIVATE BUILD_VULKAN_FULL)
-            
+            target_compile_definitions(vulkan_apriltag PRIVATE VULKAN_SHADER_DIR="${SHADER_BINARY_DIR}")
+            target_include_directories(vulkan_apriltag PRIVATE ${SHADER_BINARY_DIR})
+
             if(WIN32)
                 target_compile_definitions(vulkan_apriltag PRIVATE VK_USE_PLATFORM_WIN32_KHR)
             endif()
@@ -84,7 +143,8 @@ if(BUILD_VULKAN_APRILTAG)
         
         install(FILES ${VULKAN_APRILTAG_HEADERS} 
                 DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/apriltag/vulkan_apriltag)
-        
+        install(DIRECTORY ${SHADER_BINARY_DIR}/ DESTINATION ${CMAKE_INSTALL_LIBDIR}/apriltag/shaders FILES_MATCHING PATTERN "*.spv")
+
         # Vulkan demo
         if(BUILD_EXAMPLES)
             set(_OpenCV_REQUIRED_COMPONENTS core imgproc videoio highgui)

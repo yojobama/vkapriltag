@@ -53,7 +53,8 @@ static VkResult execute_preprocessing_pipeline(vulkan_apriltag_detector_t* detec
         // TODO: Update descriptor sets and dispatch
         uint32_t group_x = (decimate_params.output_width + 15) / 16;
         uint32_t group_y = (decimate_params.output_height + 15) / 16;
-        vkCmdDispatch(detector->preprocess_cmd, group_x, group_y, 1);
+        vkCmdDispatch(detector->preproc
+            ess_cmd, group_x, group_y, 1);
         
         // Memory barrier
         VkMemoryBarrier barrier = {
@@ -162,7 +163,8 @@ static VkResult execute_threshold_pipeline(vulkan_apriltag_detector_t* detector,
     };
     
     // TODO: Update descriptor sets
-    
+
+
     uint32_t group_x = (image->width + 15) / 16;
     uint32_t group_y = (image->height + 15) / 16;
     vkCmdDispatch(detector->threshold_cmd, group_x, group_y, 1);
@@ -303,7 +305,7 @@ static VkResult execute_gradient_pipeline(vulkan_apriltag_detector_t* detector, 
 }
 
 // CPU-based final processing of GPU results
-static zarray_t* process_gpu_results(vulkan_apriltag_detector_t* detector, image_u8_t* image) {
+static zarray_t* process_gpu_results(vulkan_apriltag_detector_t* detector/*, image_u8_t* image*/) {
     vulkan_apriltag_context_t* ctx = detector->vulkan_ctx;
     
     // Wait for GPU completion
@@ -337,7 +339,7 @@ zarray_t* vulkan_apriltag_detector_detect(vulkan_apriltag_detector_t* detector, 
     vulkan_apriltag_context_t* ctx = detector->vulkan_ctx;
     
     // Check if image dimensions are within supported limits
-    if (image->width > ctx->max_image_width || image->height > ctx->max_image_height) {
+    if ((uint32_t)image->width > ctx->max_image_width || (uint32_t)image->height > ctx->max_image_height) {
         fprintf(stderr, "Image dimensions exceed GPU limits\n");
         return zarray_create(sizeof(apriltag_detection_t*));
     }
@@ -385,5 +387,5 @@ zarray_t* vulkan_apriltag_detector_detect(vulkan_apriltag_detector_t* detector, 
     }
     
     // Process results on CPU
-    return process_gpu_results(detector, image);
+    return process_gpu_results(detector/*, image*/);
 }

@@ -9,7 +9,37 @@
 // Include embedded shader SPIR-V
 #include "shaders_spirv.h"
 
-static VkResult create_image_buffer(vulkan_apriltag_context_t* ctx, uint32_t width, uint32_t height, 
+static VkResult load_shader_with_fallback(vulkan_apriltag_context_t* ctx,
+                                          const char* shader_name,
+                                          const uint32_t* embedded_data,
+                                          size_t embedded_size,
+                                          VkShaderModule* shader_module) {
+    const char* shader_dir = getenv("APRILTAG_VULKAN_SHADER_DIR");
+#ifdef VULKAN_SHADER_DIR
+    if (!shader_dir || shader_dir[0] == '\0') {
+        shader_dir = VULKAN_SHADER_DIR;
+    }
+#endif
+
+    if (shader_dir && shader_name && shader_name[0] != '\0') {
+        char shader_path[512];
+        int written = snprintf(shader_path, sizeof(shader_path), "%s/%s.spv", shader_dir, shader_name);
+        if (written > 0 && written < (int)sizeof(shader_path)) {
+            FILE* f = fopen(shader_path, "rb");
+            if (f) {
+                fclose(f);
+                VkResult file_result = load_shader_module(ctx->device, shader_path, shader_module);
+                if (file_result == VK_SUCCESS) {
+                    return VK_SUCCESS;
+                }
+            }
+        }
+    }
+
+    return load_shader_from_spirv(ctx->device, embedded_data, embedded_size, shader_module);
+}
+
+static VkResult create_image_buffer(vulkan_apriltag_context_t* ctx, uint32_t width, uint32_t height,
                                    VkFormat format, VkImageUsageFlags usage, vulkan_image_buffer_t* buffer) {
     buffer->width = width;
     buffer->height = height;
@@ -32,23 +62,23 @@ static VkResult setup_pipelines(vulkan_apriltag_context_t* ctx) {
     VkResult result;
     
     // Create shader modules from embedded SPIR-V
-    result = load_shader_from_spirv(ctx->device, threshold_comp_spirv, 
+    result = load_shader_with_fallback(ctx, "threshold_comp", threshold_comp_spirv,
                                    threshold_comp_spirv_size, &ctx->threshold_shader);
     if (result != VK_SUCCESS) return result;
     
-    result = load_shader_from_spirv(ctx->device, connected_components_comp_spirv, 
+    result = load_shader_with_fallback(ctx, "connected_components_comp", connected_components_comp_spirv,
                                    connected_components_comp_spirv_size, &ctx->connected_components_shader);
     if (result != VK_SUCCESS) return result;
     
-    result = load_shader_from_spirv(ctx->device, gradient_comp_spirv, 
+    result = load_shader_with_fallback(ctx, "gradient_comp", gradient_comp_spirv,
                                    gradient_comp_spirv_size, &ctx->gradient_shader);
     if (result != VK_SUCCESS) return result;
     
-    result = load_shader_from_spirv(ctx->device, decimate_comp_spirv, 
+    result = load_shader_with_fallback(ctx, "decimate_comp", decimate_comp_spirv,
                                    decimate_comp_spirv_size, &ctx->decimate_shader);
     if (result != VK_SUCCESS) return result;
     
-    result = load_shader_from_spirv(ctx->device, blur_comp_spirv, 
+    result = load_shader_with_fallback(ctx, "blur_comp", blur_comp_spirv,
                                    blur_comp_spirv_size, &ctx->blur_shader);
     if (result != VK_SUCCESS) return result;
     

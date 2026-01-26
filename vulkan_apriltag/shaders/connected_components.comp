@@ -7,7 +7,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set = 0, binding = 0, r8ui) uniform readonly uimage2D threshold_image;
 layout(set = 0, binding = 1, r32ui) uniform uimage2D labels;
-layout(set = 0, binding = 2) uniform writeonly buffer ComponentBuffer {
+layout(set = 0, binding = 2) writeonly buffer ComponentBuffer {
     uint component_count;
     uint component_sizes[];
 } components;

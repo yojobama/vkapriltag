@@ -18,7 +18,8 @@ static const char* validation_layers[] = {
 
 static const char* device_extensions[1] = { NULL };
 
-static const uint32_t validation_layer_count = sizeof(validation_layers) / sizeof(validation_layers[0]);
+// static const uint32_t validation_layer_count = sizeof(validation_layers) / sizeof(validation_layers[0]);
+static const uint32_t validation_layer_count = 1;
 static const uint32_t device_extension_count = 0; // Empty array
 
 // Debug callback for validation layers
@@ -83,7 +84,7 @@ static VkResult create_buffer(vulkan_apriltag_context_t* ctx, VkDeviceSize size,
     return VK_SUCCESS;
 }
 
-static bool check_validation_layer_support() {
+static bool check_validation_layer_support(void) {
     uint32_t layer_count;
     vkEnumerateInstanceLayerProperties(&layer_count, NULL);
     
@@ -444,7 +445,7 @@ void vulkan_apriltag_context_destroy(vulkan_apriltag_context_t* ctx) {
     free(ctx);
 }
 
-bool vulkan_apriltag_is_supported() {
+bool vulkan_apriltag_is_supported(void) {
     // Check if Vulkan loader is available
     VkInstance test_instance;
     VkApplicationInfo app_info = {

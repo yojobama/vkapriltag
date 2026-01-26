@@ -282,25 +282,25 @@ int main(int argc, char *argv[])
         }
 
         // Display image
-        string window_title = use_camera ? "Vulkan AprilTag Demo (Live)" : "Vulkan AprilTag Demo";
-        imshow(window_title, frame);
-        
-        if (use_camera) {
-            char key = waitKey(1);
-            if (key >= 0) {
-                if (key == 'g' && vulkan_ctx) {
-                    // Toggle between GPU and CPU
-                    use_gpu = !use_gpu;
-                    cout << "Switched to " << (use_gpu ? "GPU" : "CPU") << " implementation" << endl;
-                } else {
-                    break;
-                }
-            }
-        } else {
-            // For static images, wait for key press to exit
-            cout << "Press any key to exit..." << endl;
-            waitKey(0);
-        }
+        // string window_title = use_camera ? "Vulkan AprilTag Demo (Live)" : "Vulkan AprilTag Demo";
+        // imshow(window_title, frame);
+        //
+        // if (use_camera) {
+        //     char key = waitKey(1);
+        //     if (key >= 0) {
+        //         if (key == 'g' && vulkan_ctx) {
+        //             // Toggle between GPU and CPU
+        //             use_gpu = !use_gpu;
+        //             cout << "Switched to " << (use_gpu ? "GPU" : "CPU") << " implementation" << endl;
+        //         } else {
+        //             break;
+        //         }
+        //     }
+        // } else {
+        //     // For static images, wait for key press to exit
+        //     cout << "Press any key to exit..." << endl;
+        //     waitKey(0);
+        // }
     }
 
     // Print final performance comparison

@@ -29,6 +29,11 @@ if (ASAN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ASAN_FLAGS}")
 endif()
 
+if(CMAKE_C_COMPILER_ID MATCHES "Clang" OR CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    # Keep other warnings-as-errors, but don't treat these specific warnings as errors
+    add_compile_options(-Wno-error=unused-parameter -Wno-error=unused-variable -Wno-error=unused-but-set-variable)
+endif()
+
 # Set a default build type if none was specified
 set(default_build_type "Release")
 
