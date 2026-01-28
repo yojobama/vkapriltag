@@ -152,7 +152,11 @@ static VkResult setup_pipelines(vulkan_apriltag_context_t* ctx) {
     result = create_compute_pipeline(ctx->device, ctx->blur_shader, ctx->blur_desc_layout,
                                     &ctx->blur_layout, &ctx->blur_pipeline);
     if (result != VK_SUCCESS) return result;
-    
+
+    result = create_compute_pipeline(ctx->device, ctx->line_fit_shader, ctx->line_fit_desc_layout,
+                                    &ctx->line_fit_layout, &ctx->line_fit_pipeline);
+    if (result != VK_SUCCESS) return result;
+
     return VK_SUCCESS;
 }
 
