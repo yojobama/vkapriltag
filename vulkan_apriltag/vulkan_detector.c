@@ -134,28 +134,29 @@ static VkResult setup_pipelines(vulkan_apriltag_context_t* ctx) {
     
     // Create compute pipelines
     result = create_compute_pipeline(ctx->device, ctx->threshold_shader, ctx->threshold_desc_layout,
-                                    &ctx->threshold_layout, &ctx->threshold_pipeline);
+                                    &ctx->threshold_layout, &ctx->threshold_pipeline, sizeof(threshold_params));
     if (result != VK_SUCCESS) return result;
     
     result = create_compute_pipeline(ctx->device, ctx->connected_components_shader, ctx->connected_components_desc_layout,
-                                    &ctx->connected_components_layout, &ctx->connected_components_pipeline);
+                                    &ctx->connected_components_layout, &ctx->connected_components_pipeline, sizeof(cc_params));
     if (result != VK_SUCCESS) return result;
     
     result = create_compute_pipeline(ctx->device, ctx->gradient_shader, ctx->gradient_desc_layout,
-                                    &ctx->gradient_layout, &ctx->gradient_pipeline);
+                                    &ctx->gradient_layout, &ctx->gradient_pipeline, sizeof(gradient_params));
     if (result != VK_SUCCESS) return result;
     
     result = create_compute_pipeline(ctx->device, ctx->decimate_shader, ctx->decimate_desc_layout,
-                                    &ctx->decimate_layout, &ctx->decimate_pipeline);
+                                    &ctx->decimate_layout, &ctx->decimate_pipeline, sizeof(decimate_params));
     if (result != VK_SUCCESS) return result;
     
     result = create_compute_pipeline(ctx->device, ctx->blur_shader, ctx->blur_desc_layout,
-                                    &ctx->blur_layout, &ctx->blur_pipeline);
+                                    &ctx->blur_layout, &ctx->blur_pipeline, sizeof(blur_params));
     if (result != VK_SUCCESS) return result;
 
-    result = create_compute_pipeline(ctx->device, ctx->line_fit_shader, ctx->line_fit_desc_layout,
-                                    &ctx->line_fit_layout, &ctx->line_fit_pipeline);
-    if (result != VK_SUCCESS) return result;
+    // TODO: set the line fit shader, layout, descriptor layout, etc...
+    // result = create_compute_pipeline(ctx->device, ctx->line_fit_shader, ctx->line_fit_desc_layout,
+    //                                 &ctx->line_fit_layout, &ctx->line_fit_pipeline);
+    // if (result != VK_SUCCESS) return result;
 
     return VK_SUCCESS;
 }

@@ -147,12 +147,25 @@ VkResult allocate_descriptor_set(VkDevice device, VkDescriptorPool descriptor_po
 VkResult create_compute_pipeline(VkDevice device, VkShaderModule shader_module,
                                 VkDescriptorSetLayout descriptor_set_layout,
                                 VkPipelineLayout* pipeline_layout,
-                                VkPipeline* pipeline) {
+                                VkPipeline* pipeline, uint32_t push_constants_size) {
+    // create push constant range if needed
+    uint32_t push_constant_range_count = 0;
+    VkPushConstantRange push_constant_range;
+    if (push_constants_size > 0) {
+        push_constant_range_count = 1;
+        push_constant_range = (VkPushConstantRange){
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0,
+            .size = push_constants_size,
+        };
+    }
     // Create pipeline layout
     VkPipelineLayoutCreateInfo pipeline_layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
         .pSetLayouts = &descriptor_set_layout,
+        .pPushConstantRanges = &push_constant_range,
+        .pushConstantRangeCount = push_constant_range_count,
     };
     VkResult result = vkCreatePipelineLayout(device, &pipeline_layout_info, NULL, pipeline_layout);
     if (result != VK_SUCCESS) return result;

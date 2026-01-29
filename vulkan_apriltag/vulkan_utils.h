@@ -29,7 +29,7 @@ VkResult allocate_descriptor_set(VkDevice device, VkDescriptorPool descriptor_po
 VkResult create_compute_pipeline(VkDevice device, VkShaderModule shader_module,
                                 VkDescriptorSetLayout descriptor_set_layout,
                                 VkPipelineLayout* pipeline_layout,
-                                VkPipeline* pipeline);
+                                VkPipeline* pipeline, uint32_t push_constants_size);
 
 // Command buffer utilities
 VkResult allocate_command_buffer(VkDevice device, VkCommandPool command_pool, VkCommandBuffer* command_buffer);

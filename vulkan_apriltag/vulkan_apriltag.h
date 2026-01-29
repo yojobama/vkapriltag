@@ -107,6 +107,45 @@ typedef struct vulkan_apriltag_context {
     
 } vulkan_apriltag_context_t;
 
+// push constant parameters
+
+typedef struct {
+    uint32_t input_width;
+    uint32_t input_height;
+    uint32_t output_width;
+    uint32_t output_height;
+    float decimate_factor;
+} decimate_params;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t kernel_size;
+    uint32_t direction;
+    float sigma;
+} blur_params;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t tile_size;
+    uint32_t min_white_black_diff;
+} threshold_params;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t iteration;
+    uint32_t max_iterations;
+} cc_params;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    float scale;
+} gradient_params;
+
+
 // GPU buffer for image data
 typedef struct vulkan_image_buffer {
     VkBuffer buffer;
@@ -199,7 +238,7 @@ uint64_t vulkan_apriltag_detector_get_gpu_time_ns(vulkan_apriltag_detector_t* de
 void vulkan_apriltag_detector_print_performance_stats(vulkan_apriltag_detector_t* detector);
 
 // Utility functions
-bool vulkan_apriltag_is_supported();
+bool vulkan_apriltag_is_supported(void);
 void vulkan_apriltag_print_device_info(vulkan_apriltag_context_t* ctx);
 
 #ifdef __cplusplus
