@@ -7,3 +7,6 @@ example/apriltag_demo
 build/
 
 /.vs
+/.idea
+/VKApriltag/.idea
+/VKApriltag/.vs
