@@ -80,11 +80,11 @@ const size_t ${SHADER_NAME}_comp_spirv_size = sizeof(${SHADER_NAME}_comp_spirv);
 ")
 
 # Write header file
-file(WRITE ${HEADER_FILE} ${HEADER_CONTENT})
+file(WRITE "${HEADER_FILE}" "${HEADER_CONTENT}")
 
 # Write source file
 string(REGEX REPLACE "\\.h$" ".c" SOURCE_FILE ${HEADER_FILE})
-file(WRITE ${SOURCE_FILE} ${SOURCE_CONTENT})
+file(WRITE "${SOURCE_FILE}" "${SOURCE_CONTENT}")
 
 message(STATUS "Generated SPIR-V header: ${HEADER_FILE}")
 message(STATUS "Generated SPIR-V source: ${SOURCE_FILE}")
