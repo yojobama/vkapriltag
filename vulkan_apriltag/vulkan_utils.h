@@ -41,6 +41,11 @@ VkResult copy_buffer(VkDevice device, VkQueue queue, VkCommandPool command_pool,
                     VkBuffer src_buffer, VkBuffer dst_buffer, VkDeviceSize size);
 VkResult copy_data_to_buffer(VkDevice device, VkDeviceMemory buffer_memory, 
                            const void* data, VkDeviceSize size, VkDeviceSize offset);
+VkResult copy_buffer_to_image(VkDevice device, VkQueue queue, VkCommandPool command_pool,
+                             VkBuffer src_buffer, VkImage dst_image,
+                             uint32_t width, uint32_t height);
+VkResult transition_image_layout(VkDevice device, VkQueue queue, VkCommandPool command_pool,
+                                VkImage image, VkImageLayout old_layout, VkImageLayout new_layout);
 
 // Timing utilities
 VkResult create_timestamp_query_pool(VkDevice device, uint32_t query_count, VkQueryPool* query_pool);

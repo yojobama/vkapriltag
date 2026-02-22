@@ -10,7 +10,7 @@ layout(set = 0, binding = 1, r16i) uniform writeonly iimage2D gradient_x;
 layout(set = 0, binding = 2, r16i) uniform writeonly iimage2D gradient_y;
 layout(set = 0, binding = 3, r16ui) uniform writeonly uimage2D gradient_magnitude;
 
-layout(set = 0, binding = 4) uniform UniformBufferObject {
+layout(push_constant) uniform UniformBufferObject {
     uint width;
     uint height;
     float scale;

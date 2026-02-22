@@ -43,10 +43,99 @@ static VkResult create_image_buffer(vulkan_apriltag_context_t* ctx, uint32_t wid
                                    VkFormat format, VkImageUsageFlags usage, vulkan_image_buffer_t* buffer) {
     buffer->width = width;
     buffer->height = height;
-    buffer->size = width * height * sizeof(uint8_t); // Assuming 8-bit per channel for now
-    
-    return create_storage_buffer(ctx->device, ctx->memory_properties, buffer->size, 
-                                &buffer->buffer, &buffer->memory);
+    uint32_t format_size = 1;
+    switch (format) {
+        case VK_FORMAT_R8_UINT:
+            format_size = 1;
+            break;
+        case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16_UINT:
+            format_size = 2;
+            break;
+        case VK_FORMAT_R32_UINT:
+            format_size = 4;
+            break;
+        default:
+            format_size = 1;
+            break;
+    }
+    buffer->size = (VkDeviceSize)width * height * format_size;
+
+    VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = { width, height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = usage | VK_IMAGE_USAGE_STORAGE_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+
+    VkResult result = vkCreateImage(ctx->device, &image_info, NULL, &buffer->image);
+    if (result != VK_SUCCESS) return result;
+
+    VkMemoryRequirements mem_requirements;
+    vkGetImageMemoryRequirements(ctx->device, buffer->image, &mem_requirements);
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_requirements.size,
+        .memoryTypeIndex = UINT32_MAX
+    };
+
+    for (uint32_t i = 0; i < ctx->memory_properties.memoryTypeCount; i++) {
+        if ((mem_requirements.memoryTypeBits & (1 << i)) &&
+            (ctx->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            alloc_info.memoryTypeIndex = i;
+            break;
+        }
+    }
+
+    if (alloc_info.memoryTypeIndex == UINT32_MAX) {
+        vkDestroyImage(ctx->device, buffer->image, NULL);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+
+    result = vkAllocateMemory(ctx->device, &alloc_info, NULL, &buffer->memory);
+    if (result != VK_SUCCESS) {
+        vkDestroyImage(ctx->device, buffer->image, NULL);
+        return result;
+    }
+
+    result = vkBindImageMemory(ctx->device, buffer->image, buffer->memory, 0);
+    if (result != VK_SUCCESS) {
+        vkDestroyImage(ctx->device, buffer->image, NULL);
+        vkFreeMemory(ctx->device, buffer->memory, NULL);
+        return result;
+    }
+
+    VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = buffer->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = format,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+
+    result = vkCreateImageView(ctx->device, &view_info, NULL, &buffer->view);
+    if (result != VK_SUCCESS) {
+        vkDestroyImage(ctx->device, buffer->image, NULL);
+        vkFreeMemory(ctx->device, buffer->memory, NULL);
+        return result;
+    }
+
+    return transition_image_layout(ctx->device, ctx->compute_queue, ctx->command_pool,
+                                   buffer->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 }
 
 static VkResult create_compute_buffer(vulkan_apriltag_context_t* ctx, uint32_t element_count, 
@@ -85,51 +174,46 @@ static VkResult setup_pipelines(vulkan_apriltag_context_t* ctx) {
     // Create descriptor set layouts
     VkDescriptorSetLayoutBinding threshold_bindings[] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
     };
     
-    result = create_descriptor_set_layout(ctx->device, 3, threshold_bindings, &ctx->threshold_desc_layout);
+    result = create_descriptor_set_layout(ctx->device, 2, threshold_bindings, &ctx->threshold_desc_layout);
     if (result != VK_SUCCESS) return result;
     
     VkDescriptorSetLayoutBinding connected_components_bindings[] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
     };
     
-    result = create_descriptor_set_layout(ctx->device, 4, connected_components_bindings, &ctx->connected_components_desc_layout);
+    result = create_descriptor_set_layout(ctx->device, 3, connected_components_bindings, &ctx->connected_components_desc_layout);
     if (result != VK_SUCCESS) return result;
     
     VkDescriptorSetLayoutBinding gradient_bindings[] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
     };
     
-    result = create_descriptor_set_layout(ctx->device, 5, gradient_bindings, &ctx->gradient_desc_layout);
+    result = create_descriptor_set_layout(ctx->device, 4, gradient_bindings, &ctx->gradient_desc_layout);
     if (result != VK_SUCCESS) return result;
     
     VkDescriptorSetLayoutBinding decimate_bindings[] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
     };
     
-    result = create_descriptor_set_layout(ctx->device, 3, decimate_bindings, &ctx->decimate_desc_layout);
+    result = create_descriptor_set_layout(ctx->device, 2, decimate_bindings, &ctx->decimate_desc_layout);
     if (result != VK_SUCCESS) return result;
     
     VkDescriptorSetLayoutBinding blur_bindings[] = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
-        { 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
+        { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL }
     };
     
-    result = create_descriptor_set_layout(ctx->device, 4, blur_bindings, &ctx->blur_desc_layout);
+    result = create_descriptor_set_layout(ctx->device, 3, blur_bindings, &ctx->blur_desc_layout);
     if (result != VK_SUCCESS) return result;
     
     // Create compute pipelines
@@ -162,7 +246,8 @@ static VkResult setup_pipelines(vulkan_apriltag_context_t* ctx) {
 }
 
 static void destroy_image_buffer(vulkan_apriltag_context_t* ctx, vulkan_image_buffer_t* buf) {
-    if (buf->buffer) vkDestroyBuffer(ctx->device, buf->buffer, NULL);
+    if (buf->view) vkDestroyImageView(ctx->device, buf->view, NULL);
+    if (buf->image) vkDestroyImage(ctx->device, buf->image, NULL);
     if (buf->memory) vkFreeMemory(ctx->device, buf->memory, NULL);
     memset(buf, 0, sizeof(*buf));
 }
@@ -203,7 +288,7 @@ vulkan_apriltag_detector_t* vulkan_apriltag_detector_create(
     
     // Create GPU buffers
     if (create_image_buffer(ctx, max_width, max_height, VK_FORMAT_R8_UINT, 
-                           VK_IMAGE_USAGE_STORAGE_BIT, &detector->input_image) != VK_SUCCESS) {
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &detector->input_image) != VK_SUCCESS) {
         vulkan_apriltag_detector_destroy(detector);
         return NULL;
     }
@@ -222,6 +307,12 @@ vulkan_apriltag_detector_t* vulkan_apriltag_detector_create(
     
     if (create_image_buffer(ctx, max_width, max_height, VK_FORMAT_R8_UINT,
                            VK_IMAGE_USAGE_STORAGE_BIT, &detector->threshold_image) != VK_SUCCESS) {
+        vulkan_apriltag_detector_destroy(detector);
+        return NULL;
+    }
+
+    if (create_image_buffer(ctx, max_width, max_height, VK_FORMAT_R32_UINT,
+                           VK_IMAGE_USAGE_STORAGE_BIT, &detector->labels_image) != VK_SUCCESS) {
         vulkan_apriltag_detector_destroy(detector);
         return NULL;
     }
@@ -245,7 +336,7 @@ vulkan_apriltag_detector_t* vulkan_apriltag_detector_create(
     }
     
     // Create compute buffers
-    uint32_t max_components = max_width * max_height / 4; // Conservative estimate
+    uint32_t max_components = max_width * max_height + 1;
     if (create_compute_buffer(ctx, max_components, sizeof(uint32_t), &detector->connected_components) != VK_SUCCESS) {
         vulkan_apriltag_detector_destroy(detector);
         return NULL;
@@ -280,6 +371,69 @@ vulkan_apriltag_detector_t* vulkan_apriltag_detector_create(
         vulkan_apriltag_detector_destroy(detector);
         return NULL;
     }
+
+    if (create_uniform_buffer(ctx->device, ctx->memory_properties,
+                              sizeof(float) * 31, &detector->blur_kernel_buffer,
+                              &detector->blur_kernel_memory) != VK_SUCCESS) {
+        vulkan_apriltag_detector_destroy(detector);
+        return NULL;
+    }
+
+    if (allocate_descriptor_set(ctx->device, ctx->descriptor_pool, ctx->threshold_desc_layout, &detector->threshold_desc_set) != VK_SUCCESS ||
+        allocate_descriptor_set(ctx->device, ctx->descriptor_pool, ctx->connected_components_desc_layout, &detector->connected_components_desc_set) != VK_SUCCESS ||
+        allocate_descriptor_set(ctx->device, ctx->descriptor_pool, ctx->gradient_desc_layout, &detector->gradient_desc_set) != VK_SUCCESS ||
+        allocate_descriptor_set(ctx->device, ctx->descriptor_pool, ctx->decimate_desc_layout, &detector->decimate_desc_set) != VK_SUCCESS ||
+        allocate_descriptor_set(ctx->device, ctx->descriptor_pool, ctx->blur_desc_layout, &detector->blur_desc_set) != VK_SUCCESS) {
+        vulkan_apriltag_detector_destroy(detector);
+        return NULL;
+    }
+
+    VkDescriptorImageInfo input_image_info = { .imageView = detector->input_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo decimated_image_info = { .imageView = detector->decimated_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo blurred_image_info = { .imageView = detector->blurred_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo threshold_image_info = { .imageView = detector->threshold_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo labels_image_info = { .imageView = detector->labels_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo gradient_x_info = { .imageView = detector->gradient_x.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo gradient_y_info = { .imageView = detector->gradient_y.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo gradient_mag_info = { .imageView = detector->gradient_mag.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+
+    VkDescriptorBufferInfo components_buffer_info = { .buffer = detector->connected_components.buffer, .offset = 0, .range = detector->connected_components.size };
+    VkDescriptorBufferInfo blur_kernel_info = { .buffer = detector->blur_kernel_buffer, .offset = 0, .range = sizeof(float) * 31 };
+
+    VkWriteDescriptorSet threshold_writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->threshold_desc_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &input_image_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->threshold_desc_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &threshold_image_info }
+    };
+
+    VkWriteDescriptorSet connected_components_writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &threshold_image_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &labels_image_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &components_buffer_info }
+    };
+
+    VkWriteDescriptorSet gradient_writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->gradient_desc_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &input_image_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->gradient_desc_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &gradient_x_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->gradient_desc_set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &gradient_y_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->gradient_desc_set, .dstBinding = 3, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &gradient_mag_info }
+    };
+
+    VkWriteDescriptorSet decimate_writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->decimate_desc_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &input_image_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->decimate_desc_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &decimated_image_info }
+    };
+
+    VkWriteDescriptorSet blur_writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->blur_desc_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &input_image_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->blur_desc_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &blurred_image_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->blur_desc_set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &blur_kernel_info }
+    };
+
+    vkUpdateDescriptorSets(ctx->device, (uint32_t)(sizeof(threshold_writes) / sizeof(threshold_writes[0])), threshold_writes, 0, NULL);
+    vkUpdateDescriptorSets(ctx->device, (uint32_t)(sizeof(connected_components_writes) / sizeof(connected_components_writes[0])), connected_components_writes, 0, NULL);
+    vkUpdateDescriptorSets(ctx->device, (uint32_t)(sizeof(gradient_writes) / sizeof(gradient_writes[0])), gradient_writes, 0, NULL);
+    vkUpdateDescriptorSets(ctx->device, (uint32_t)(sizeof(decimate_writes) / sizeof(decimate_writes[0])), decimate_writes, 0, NULL);
+    vkUpdateDescriptorSets(ctx->device, (uint32_t)(sizeof(blur_writes) / sizeof(blur_writes[0])), blur_writes, 0, NULL);
     
     // Allocate command buffers
     if (allocate_command_buffer(ctx->device, ctx->command_pool, &detector->preprocess_cmd) != VK_SUCCESS ||
@@ -345,6 +499,7 @@ void vulkan_apriltag_detector_destroy(vulkan_apriltag_detector_t* detector) {
         destroy_image_buffer(ctx, &detector->gradient_x);
         destroy_image_buffer(ctx, &detector->gradient_y);
         destroy_image_buffer(ctx, &detector->gradient_mag);
+        destroy_image_buffer(ctx, &detector->labels_image);
         destroy_image_buffer(ctx, &detector->staging_input);
         
         destroy_compute_buffer(ctx, &detector->connected_components);
@@ -352,6 +507,9 @@ void vulkan_apriltag_detector_destroy(vulkan_apriltag_detector_t* detector) {
         destroy_compute_buffer(ctx, &detector->line_segments);
         destroy_compute_buffer(ctx, &detector->quad_candidates);
         destroy_compute_buffer(ctx, &detector->staging_output);
+
+        if (detector->blur_kernel_buffer) vkDestroyBuffer(ctx->device, detector->blur_kernel_buffer, NULL);
+        if (detector->blur_kernel_memory) vkFreeMemory(ctx->device, detector->blur_kernel_memory, NULL);
     }
     
     if (detector->base_detector) {

@@ -8,7 +8,7 @@ layout(local_size_x = 256, local_size_y = 1) in;
 layout(set = 0, binding = 0, r8ui) uniform readonly uimage2D input_image;
 layout(set = 0, binding = 1, r8ui) uniform writeonly uimage2D output_image;
 
-layout(set = 0, binding = 2) uniform UniformBufferObject {
+layout(push_constant) uniform UniformBufferObject {
     uint width;
     uint height;
     uint kernel_size;
@@ -17,7 +17,7 @@ layout(set = 0, binding = 2) uniform UniformBufferObject {
 } ubo;
 
 // Precomputed Gaussian kernel weights (up to radius 15)
-layout(set = 0, binding = 3) uniform KernelWeights {
+layout(set = 0, binding = 2) uniform KernelWeights {
     float weights[31]; // Maximum kernel size: 31 (radius 15)
 } kernel;
 

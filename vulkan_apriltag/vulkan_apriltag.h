@@ -20,6 +20,8 @@ typedef void* VkPipeline;
 typedef void* VkPipelineLayout;
 typedef void* VkDescriptorSetLayout;
 typedef void* VkBuffer;
+typedef void* VkImage;
+typedef void* VkImageView;
 typedef void* VkDeviceMemory;
 typedef void* VkDescriptorSet;
 typedef void* VkCommandBuffer;
@@ -148,9 +150,9 @@ typedef struct {
 
 // GPU buffer for image data
 typedef struct vulkan_image_buffer {
-    VkBuffer buffer;
+    VkImage image;
+    VkImageView view;
     VkDeviceMemory memory;
-    VkDescriptorSet descriptor_set;
     uint32_t width;
     uint32_t height;
     VkDeviceSize size;
@@ -165,8 +167,11 @@ typedef struct vulkan_compute_buffer {
     uint32_t element_count;
 } vulkan_compute_buffer_t;
 
+// Forward declaration of the detector structure
+typedef struct vulkan_apriltag_detector vulkan_apriltag_detector_t;
+
 // Vulkan-accelerated detector
-typedef struct vulkan_apriltag_detector {
+struct vulkan_apriltag_detector {
     apriltag_detector_t* base_detector;
     vulkan_apriltag_context_t* vulkan_ctx;
     
@@ -178,6 +183,7 @@ typedef struct vulkan_apriltag_detector {
     vulkan_image_buffer_t gradient_x;
     vulkan_image_buffer_t gradient_y;
     vulkan_image_buffer_t gradient_mag;
+    vulkan_image_buffer_t labels_image;
     
     vulkan_compute_buffer_t connected_components;
     vulkan_compute_buffer_t edge_points;
@@ -187,6 +193,17 @@ typedef struct vulkan_apriltag_detector {
     // Staging buffers for CPU-GPU transfer
     vulkan_image_buffer_t staging_input;
     vulkan_compute_buffer_t staging_output;
+
+    // Descriptor sets for pipeline stages
+    VkDescriptorSet threshold_desc_set;
+    VkDescriptorSet connected_components_desc_set;
+    VkDescriptorSet gradient_desc_set;
+    VkDescriptorSet decimate_desc_set;
+    VkDescriptorSet blur_desc_set;
+
+    // Blur kernel weights buffer
+    VkBuffer blur_kernel_buffer;
+    VkDeviceMemory blur_kernel_memory;
     
     // Command buffers for different stages
     VkCommandBuffer preprocess_cmd;
@@ -206,7 +223,7 @@ typedef struct vulkan_apriltag_detector {
     // Timing
     VkQueryPool timestamp_pool;
     
-} vulkan_apriltag_detector_t;
+};
 
 // Initialization and cleanup
 vulkan_apriltag_context_t* vulkan_apriltag_context_create(bool enable_debug);

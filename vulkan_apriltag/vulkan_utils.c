@@ -85,6 +85,90 @@ VkResult create_storage_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties
     return VK_SUCCESS;
 }
 
+VkResult transition_image_layout(VkDevice device, VkQueue queue, VkCommandPool command_pool,
+                                VkImage image, VkImageLayout old_layout, VkImageLayout new_layout) {
+    VkCommandBuffer command_buffer;
+    VkResult result = begin_single_time_commands(device, command_pool, &command_buffer);
+    if (result != VK_SUCCESS) return result;
+
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = old_layout,
+        .newLayout = new_layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        }
+    };
+
+    VkPipelineStageFlags source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkPipelineStageFlags destination_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+    if (old_layout == VK_IMAGE_LAYOUT_GENERAL && new_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        source_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        destination_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && new_layout == VK_IMAGE_LAYOUT_GENERAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        source_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destination_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    } else if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED && new_layout == VK_IMAGE_LAYOUT_GENERAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        source_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destination_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
+
+    vkCmdPipelineBarrier(command_buffer,
+                         source_stage, destination_stage,
+                         0, 0, NULL, 0, NULL, 1, &barrier);
+
+    return end_single_time_commands(device, queue, command_pool, command_buffer);
+}
+
+VkResult copy_buffer_to_image(VkDevice device, VkQueue queue, VkCommandPool command_pool,
+                             VkBuffer src_buffer, VkImage dst_image,
+                             uint32_t width, uint32_t height) {
+    VkResult result = transition_image_layout(device, queue, command_pool,
+                                             dst_image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (result != VK_SUCCESS) return result;
+
+    VkCommandBuffer command_buffer;
+    result = begin_single_time_commands(device, command_pool, &command_buffer);
+    if (result != VK_SUCCESS) return result;
+
+    VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { width, height, 1 }
+    };
+
+    vkCmdCopyBufferToImage(command_buffer, src_buffer, dst_image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    result = end_single_time_commands(device, queue, command_pool, command_buffer);
+    if (result != VK_SUCCESS) return result;
+
+    return transition_image_layout(device, queue, command_pool,
+                                  dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+}
+
 VkResult create_uniform_buffer(VkDevice device, VkPhysicalDeviceMemoryProperties memory_properties,
                               VkDeviceSize size, VkBuffer* buffer, VkDeviceMemory* buffer_memory) {
     VkBufferCreateInfo buffer_info = {

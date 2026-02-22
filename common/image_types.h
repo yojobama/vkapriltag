@@ -36,9 +36,9 @@ either expressed or implied, of the Regents of The University of Michigan.
 typedef struct image_u8 image_u8_t;
 struct image_u8
 {
-    const int32_t width;
-    const int32_t height;
-    const int32_t stride;
+    const uint32_t width;
+    const uint32_t height;
+    const uint32_t stride;
 
     uint8_t *buf;
 };
@@ -46,9 +46,9 @@ struct image_u8
 typedef struct image_u8x3 image_u8x3_t;
 struct image_u8x3
 {
-    const int32_t width;
-    const int32_t height;
-    const int32_t stride; // bytes per line
+    const uint32_t width;
+    const uint32_t height;
+    const uint32_t stride; // bytes per line
 
     uint8_t *buf;
 };
@@ -56,9 +56,9 @@ struct image_u8x3
 typedef struct image_u8x4 image_u8x4_t;
 struct image_u8x4
 {
-    const int32_t width;
-    const int32_t height;
-    const int32_t stride; // bytes per line
+    const uint32_t width;
+    const uint32_t height;
+    const uint32_t stride; // bytes per line
 
     uint8_t *buf;
 };
@@ -66,9 +66,9 @@ struct image_u8x4
 typedef struct image_f32 image_f32_t;
 struct image_f32
 {
-    const int32_t width;
-    const int32_t height;
-    const int32_t stride; // floats per line
+    const uint32_t width;
+    const uint32_t height;
+    const uint32_t stride; // floats per line
 
     float *buf; // indexed as buf[y*stride + x]
 };
@@ -76,9 +76,9 @@ struct image_f32
 typedef struct image_u32 image_u32_t;
 struct image_u32
 {
-    const int32_t width;
-    const int32_t height;
-    const int32_t stride; // int32_ts per line
+    const uint32_t width;
+    const uint32_t height;
+    const uint32_t stride; // int32_ts per line
 
     uint32_t *buf; // indexed as buf[y*stride + x]
 };

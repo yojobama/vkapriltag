@@ -288,6 +288,7 @@ static VkResult create_command_pool(vulkan_apriltag_context_t* ctx) {
 
 static VkResult create_descriptor_pool(vulkan_apriltag_context_t* ctx) {
     VkDescriptorPoolSize pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 200 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 100 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 50 }
     };

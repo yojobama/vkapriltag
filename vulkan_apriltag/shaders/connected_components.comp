@@ -12,7 +12,7 @@ layout(set = 0, binding = 2) writeonly buffer ComponentBuffer {
     uint component_sizes[];
 } components;
 
-layout(set = 0, binding = 3) uniform UniformBufferObject {
+layout(push_constant) uniform UniformBufferObject {
     uint width;
     uint height;
     uint iteration;
