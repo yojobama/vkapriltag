@@ -293,6 +293,19 @@ static VkResult execute_connected_components_pipeline(vulkan_apriltag_detector_t
 
     // Run multiple iterations for convergence
     uint32_t max_iterations = 10;
+
+    VkDescriptorImageInfo threshold_info = { .imageView = detector->threshold_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo labels_info = { .imageView = detector->labels_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorBufferInfo components_info = { .buffer = detector->connected_components.buffer, .offset = 0, .range = detector->connected_components.size };
+    VkWriteDescriptorSet cc_writes[] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &threshold_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &labels_info },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &components_info }
+    };
+    vkUpdateDescriptorSets(ctx->device, (uint32_t)(sizeof(cc_writes) / sizeof(cc_writes[0])), cc_writes, 0, NULL);
+    vkCmdBindDescriptorSets(detector->connected_components_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                           ctx->connected_components_layout, 0, 1,
+                           &detector->connected_components_desc_set, 0, NULL);
     
     for (uint32_t iteration = 0; iteration < max_iterations; iteration++) {
         cc_params ccParams = {
@@ -304,19 +317,6 @@ static VkResult execute_connected_components_pipeline(vulkan_apriltag_detector_t
         // Update push constants with connected components parameters
         vkCmdPushConstants(detector->connected_components_cmd, ctx->connected_components_layout,
                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cc_params), &ccParams);
-        
-        VkDescriptorImageInfo threshold_info = { .imageView = detector->threshold_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo labels_info = { .imageView = detector->labels_image.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorBufferInfo components_info = { .buffer = detector->connected_components.buffer, .offset = 0, .range = detector->connected_components.size };
-        VkWriteDescriptorSet cc_writes[] = {
-            { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &threshold_info },
-            { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &labels_info },
-            { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = detector->connected_components_desc_set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &components_info }
-        };
-        vkUpdateDescriptorSets(ctx->device, (uint32_t)(sizeof(cc_writes) / sizeof(cc_writes[0])), cc_writes, 0, NULL);
-        vkCmdBindDescriptorSets(detector->connected_components_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                               ctx->connected_components_layout, 0, 1,
-                               &detector->connected_components_desc_set, 0, NULL);
         
         uint32_t group_x = (process_width + 15) / 16;
         uint32_t group_y = (process_height + 15) / 16;
@@ -470,7 +470,7 @@ zarray_t* vulkan_apriltag_detector_detect(vulkan_apriltag_detector_t* detector, 
     
     // Execute GPU pipeline stages
     VkResult result;
-    
+
     result = execute_preprocessing_pipeline(detector, image);
     if (result != VK_SUCCESS) {
         fprintf(stderr, "Preprocessing pipeline failed: %s\n", vulkan_result_to_string(result));
@@ -506,6 +506,12 @@ zarray_t* vulkan_apriltag_detector_detect(vulkan_apriltag_detector_t* detector, 
     };
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     final_submit.pWaitDstStageMask = &wait_stage;
+
+    result = vkResetFences(ctx->device, 1, &detector->completion_fence);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "Failed to reset completion fence: %s\n", vulkan_result_to_string(result));
+        return zarray_create(sizeof(apriltag_detection_t*));
+    }
     
     result = vkQueueSubmit(ctx->compute_queue, 1, &final_submit, detector->completion_fence);
     if (result != VK_SUCCESS) {
