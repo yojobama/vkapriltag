@@ -1,0 +1,41 @@
+#version 450
+// Generic single-workgroup-block inclusive prefix sum (Hillis-Steele scan
+// in shared memory). Used as the first level of a 2+ level scan: each
+// workgroup produces the inclusive scan of its own 1024 elements plus the
+// total sum of the block, written to `block_sums[group_id]`. A subsequent
+// pass (recursively, if there is more than one block) scans block_sums, and
+// scan_add_offsets.comp adds the resulting per-block base offset back in.
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) readonly buffer InputBuf { uint input_values[]; };
+layout(std430, binding = 1) writeonly buffer OutputBuf { uint output_values[]; };
+layout(std430, binding = 2) writeonly buffer BlockSums { uint block_sums[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+} pc;
+
+shared uint temp[1024];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint gid = gl_GlobalInvocationID.x;
+
+  uint value = (gid < pc.count) ? input_values[gid] : 0u;
+  temp[tid] = value;
+  barrier();
+
+  for (uint offset = 1u; offset < 1024u; offset <<= 1u) {
+    uint addend = (tid >= offset) ? temp[tid - offset] : 0u;
+    barrier();
+    temp[tid] += addend;
+    barrier();
+  }
+
+  if (gid < pc.count) {
+    output_values[gid] = temp[tid];
+  }
+  if (tid == 1023u) {
+    block_sums[gl_WorkGroupID.x] = temp[tid];
+  }
+}

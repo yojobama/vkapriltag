@@ -1,0 +1,22 @@
+#version 450
+// Adds the per-block base offset back into a block-scanned array,
+// completing a multi-level scan. `block_offsets` holds the INCLUSIVE scan
+// of each block's total (as produced by running scan_block.comp again on
+// the block_sums array one level up); workgroup g>0 adds
+// block_offsets[g-1] (the inclusive sum through the previous block, i.e.
+// exactly the exclusive prefix for block g). Workgroup 0 needs no offset.
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) buffer Values { uint values[]; };
+layout(std430, binding = 1) readonly buffer BlockOffsets { uint block_offsets[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+} pc;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= pc.count) return;
+  if (gl_WorkGroupID.x == 0u) return;
+  values[gid] += block_offsets[gl_WorkGroupID.x - 1u];
+}

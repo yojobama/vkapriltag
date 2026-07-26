@@ -1,0 +1,37 @@
+#version 450
+// Final adaptive threshold: writes 127 (ambiguous), 0 (black) or 255 (white)
+// per decimated pixel.  Mirrors InternalThreshold.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer DecimatedImage { uint decimated[]; };
+layout(std430, binding = 1) readonly buffer FilteredMinMax { uint minmax_filtered[]; };
+layout(std430, binding = 2) writeonly buffer Thresholded { uint thresholded[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint decimated_width;
+  uint decimated_height;
+  uint min_white_black_diff;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint total = pc.decimated_width * pc.decimated_height;
+  if (i >= total) return;
+
+  uint x = i % pc.decimated_width;
+  uint y = i / pc.decimated_width;
+  uint block_w = pc.decimated_width / 4u;
+
+  uint packed = minmax_filtered[(x / 4u) + (y / 4u) * block_w];
+  uint mn = packed & 0xffu;
+  uint mx = (packed >> 8u) & 0xffu;
+
+  uint result;
+  if (mx - mn < pc.min_white_black_diff) {
+    result = 127u;
+  } else {
+    uint thresh = mn + (mx - mn) / 2u;
+    result = (decimated[i] > thresh) ? 255u : 0u;
+  }
+  thresholded[i] = result;
+}

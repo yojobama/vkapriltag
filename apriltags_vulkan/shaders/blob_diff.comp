@@ -1,0 +1,146 @@
+#version 450
+// Computes up to 4 QuadBoundaryPoint candidates per interior pixel, one per
+// diamond-shaped neighbor connection (E, SE, S, SW). This is a flat (fully
+// global-memory) re-implementation of frc971::apriltag::BlobDiff: since we
+// don't tile into shared-memory blocks like the CUDA version did (that was
+// purely a bandwidth optimization for its specific block layout), every
+// thread just reads its neighbors directly from the global blob-label and
+// thresholded-image buffers. The output layout (4 separate dense planes of
+// size (width-2)*(height-2), one per connection direction) is preserved so
+// the rest of the pipeline is unaffected.
+//
+// IMPORTANT: QBPoint.x/.y store the *un-decimated* coordinate (matching
+// CUDA's QuadBoundaryPoint::x()/y(): base_x()*2+dx(), base_y()*2+dy()), not
+// the raw decimated pixel index - every downstream consumer (extents
+// min/max + centroid via MinMaxExtentsGpu::cx()/cy()'s 0.05118/-0.028581
+// sub-pixel offsets, line-fit moments, theta) assumes this doubled,
+// half-integer-accurate convention.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Thresholded { uint thresholded[]; };
+layout(std430, binding = 1) readonly buffer Parent { uint parent[]; };
+layout(std430, binding = 2) readonly buffer BlobSize { uint blob_size[]; };
+layout(std430, binding = 3) writeonly buffer Result { QBPoint result[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+  uint min_blob_pixels;
+} pc;
+
+QBPoint emptyPoint() {
+  QBPoint p;
+  p.rep0 = 0u; p.rep1 = 0u; p.x = 0u; p.y = 0u;
+  p.gx = 0; p.gy = 0; p.valid = 0u; p.pad0 = 0u;
+  return p;
+}
+
+void writeOut(uint plane, uint out_index, uint out_stride, QBPoint p) {
+  result[plane * out_stride + out_index] = p;
+}
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint iw = pc.width - 2u;
+  uint ih = pc.height - 2u;
+  uint out_stride = iw * ih;
+  uint total = iw * ih;
+  if (gid >= total) return;
+
+  uint ox = gid % iw;
+  uint oy = gid / iw;
+  uint x = ox + 1u;
+  uint y = oy + 1u;
+
+  uint idx = x + y * pc.width;
+  uint v0 = thresholded[idx];
+  uint rep0 = parent[idx];
+
+  if (v0 == 127u || blob_size[rep0] < pc.min_blob_pixels) {
+    QBPoint e = emptyPoint();
+    writeOut(0u, gid, out_stride, e);
+    writeOut(1u, gid, out_stride, e);
+    writeOut(2u, gid, out_stride, e);
+    writeOut(3u, gid, out_stride, e);
+    return;
+  }
+
+  // Neighbor samples.
+  uint idxE = idx + 1u;
+  uint idxSE = idx + pc.width + 1u;
+  uint idxS = idx + pc.width;
+  uint idxSW = idx + pc.width - 1u;
+  uint idxW = idx - 1u;
+
+  uint vE = thresholded[idxE];
+  uint vSE = thresholded[idxSE];
+  uint vS = thresholded[idxS];
+  uint vSW = thresholded[idxSW];
+  uint vW = thresholded[idxW];
+
+  uint repE = parent[idxE];
+  uint repSE = parent[idxSE];
+  uint repS = parent[idxS];
+  uint repSW = parent[idxSW];
+  uint repW = parent[idxW];
+
+  // Connections 0 (E), 1 (SE), 2 (S): build a QBPoint if the two pixels
+  // straddle a black/white boundary.
+  QBPoint p0 = emptyPoint();
+  if (v0 + vE == 255u && blob_size[repE] >= pc.min_blob_pixels) {
+    p0.rep0 = min(rep0, repE);
+    p0.rep1 = max(rep0, repE);
+    p0.x = x * 2u + 1u; p0.y = y * 2u;
+    p0.gx = (vE > v0) ? 1 : -1;
+    p0.gy = 0;
+    p0.valid = 1u;
+  }
+  writeOut(0u, gid, out_stride, p0);
+
+  QBPoint p1 = emptyPoint();
+  if (v0 + vSE == 255u && blob_size[repSE] >= pc.min_blob_pixels) {
+    p1.rep0 = min(rep0, repSE);
+    p1.rep1 = max(rep0, repSE);
+    p1.x = x * 2u + 1u; p1.y = y * 2u + 1u;
+    p1.gx = (vSE > v0) ? 1 : -1;
+    p1.gy = (vSE > v0) ? 1 : -1;
+    p1.valid = 1u;
+  }
+  writeOut(1u, gid, out_stride, p1);
+
+  QBPoint p2 = emptyPoint();
+  if (v0 + vS == 255u && blob_size[repS] >= pc.min_blob_pixels) {
+    p2.rep0 = min(rep0, repS);
+    p2.rep1 = max(rep0, repS);
+    p2.x = x * 2u; p2.y = y * 2u + 1u;
+    p2.gx = 0;
+    p2.gy = (vS > v0) ? 1 : -1;
+    p2.valid = 1u;
+  }
+  writeOut(2u, gid, out_stride, p2);
+
+  // Dedup check: if the West and South neighbors are both unambiguous and
+  // differ from one another, the SW diagonal connection (3) would duplicate
+  // the topological edge already captured by the West pixel's own SE (=our
+  // South) diagonal connection, so skip emitting it.
+  if (vW != 127u && vS != 127u && vS != vW && x != 1u &&
+      blob_size[repW] >= pc.min_blob_pixels &&
+      blob_size[repS] >= pc.min_blob_pixels) {
+    writeOut(3u, gid, out_stride, emptyPoint());
+    return;
+  }
+
+  QBPoint p3 = emptyPoint();
+  if (v0 + vSW == 255u && blob_size[repSW] >= pc.min_blob_pixels) {
+    p3.rep0 = min(rep0, repSW);
+    p3.rep1 = max(rep0, repSW);
+    p3.x = x * 2u - 1u; p3.y = y * 2u + 1u;
+    p3.gx = (vSW > v0) ? -1 : 1;
+    p3.gy = (vSW > v0) ? 1 : -1;
+    p3.valid = 1u;
+  }
+  writeOut(3u, gid, out_stride, p3);
+}

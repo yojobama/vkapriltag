@@ -1,0 +1,58 @@
+#version 450
+// Computes the raw (non-cumulative) line-fit moment contribution of each
+// point, exactly mirroring TransformLineFitPoint. Mxx/Mxy/Myy are computed
+// as exact 64 bit products using imulExtended (core SPIR-V, no shaderInt64
+// device feature required) and stored as hi/lo 32-bit halves; the CPU side
+// reconstructs the true 64-bit values before doing prefix sums / line
+// fitting (which need genuine 64 bit range for realistic image sizes).
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Points { IPoint points[]; };
+layout(std430, binding = 1) readonly buffer DecimatedImage { uint decimated[]; };
+layout(std430, binding = 2) writeonly buffer Output { RawLineFitPoint output_points[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+  int decimated_width;
+  int decimated_height;
+} pc;
+
+void mul64(int a, int b, out int hi, out int lo) {
+  imulExtended(a, b, hi, lo);
+}
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= pc.count) return;
+
+  IPoint p = points[gid];
+
+  int ix2 = int(p.x) + 1;
+  int iy2 = int(p.y) + 1;
+  int ix = ix2 / 2;
+  int iy = iy2 / 2;
+
+  int W = 1;
+  if (ix > 0 && ix + 1 < pc.decimated_width && iy > 0 && iy + 1 < pc.decimated_height) {
+    int grad_x = int(decimated[iy * pc.decimated_width + ix + 1]) -
+                 int(decimated[iy * pc.decimated_width + ix - 1]);
+    int grad_y = int(decimated[(iy + 1) * pc.decimated_width + ix]) -
+                 int(decimated[(iy - 1) * pc.decimated_width + ix]);
+    W = int(sqrt(float(grad_x * grad_x + grad_y * grad_y))) + 1;
+  }
+
+  RawLineFitPoint out_pt;
+  out_pt.Mx = W * ix2;
+  out_pt.My = W * iy2;
+  mul64(W * ix2, ix2, out_pt.MxxHi, out_pt.MxxLo);
+  mul64(W * ix2, iy2, out_pt.MxyHi, out_pt.MxyLo);
+  mul64(W * iy2, iy2, out_pt.MyyHi, out_pt.MyyLo);
+  out_pt.W = W;
+  out_pt.blob_index = p.blob_index;
+  out_pt.pad0 = 0u;
+  out_pt.pad1 = 0u;
+  output_points[gid] = out_pt;
+}

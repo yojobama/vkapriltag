@@ -1,0 +1,23 @@
+#version 450
+// Resets the (key, payload) sort buffers to a sentinel "maximum" value
+// before compaction writes real entries into the front of them. This
+// guarantees any slots left unused after compaction sort to the very end
+// and are ignored by everything downstream (which only looks at the first
+// `count` sorted entries).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) writeonly buffer KeysHi { uint keys_hi[]; };
+layout(std430, binding = 1) writeonly buffer KeysLo { uint keys_lo[]; };
+layout(std430, binding = 2) writeonly buffer Payload { uint payload[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint capacity;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.capacity) return;
+  keys_hi[i] = 0xFFFFFFFFu;
+  keys_lo[i] = 0xFFFFFFFFu;
+  payload[i] = 0xFFFFFFFFu;
+}

@@ -1,0 +1,33 @@
+#version 450
+// Blurs the per-block min/max using a 3x3 neighborhood min/max.  Mirrors
+// InternalBlockFilter.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
+layout(std430, binding = 1) writeonly buffer FilteredMinMax { uint minmax_filtered[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint block_width;
+  uint block_height;
+} pc;
+
+void main() {
+  uint x = gl_GlobalInvocationID.x;
+  uint y = gl_GlobalInvocationID.y;
+  if (x >= pc.block_width || y >= pc.block_height) return;
+
+  uint mn = 255u;
+  uint mx = 0u;
+  for (int j = -1; j <= 1; ++j) {
+    int ry = int(y) + j;
+    if (ry < 0 || ry >= int(pc.block_height)) continue;
+    for (int i = -1; i <= 1; ++i) {
+      int rx = int(x) + i;
+      if (rx < 0 || rx >= int(pc.block_width)) continue;
+      uint v = minmax_unfiltered[uint(ry) * pc.block_width + uint(rx)];
+      mn = min(mn, v & 0xffu);
+      mx = max(mx, (v >> 8u) & 0xffu);
+    }
+  }
+  minmax_filtered[y * pc.block_width + x] = mn | (mx << 8u);
+}

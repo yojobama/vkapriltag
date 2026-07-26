@@ -1,0 +1,36 @@
+#version 450
+// Computes the min/max pixel value for each 4x4 block of the decimated
+// image.  Mirrors InternalBlockMinMax.  Result is packed as (min | max<<8)
+// in a single uint so we don't need 8-bit storage buffer support.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer DecimatedImage { uint decimated[]; };
+layout(std430, binding = 1) writeonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint decimated_width;
+  uint decimated_height;
+} pc;
+
+uint sampleAt(uint x, uint y) {
+  return decimated[y * pc.decimated_width + x];
+}
+
+void main() {
+  uint bw = pc.decimated_width / 4u;
+  uint bh = pc.decimated_height / 4u;
+  uint bx = gl_GlobalInvocationID.x;
+  uint by = gl_GlobalInvocationID.y;
+  if (bx >= bw || by >= bh) return;
+
+  uint mn = 255u;
+  uint mx = 0u;
+  for (uint j = 0; j < 4u; ++j) {
+    for (uint i = 0; i < 4u; ++i) {
+      uint v = sampleAt(bx * 4u + i, by * 4u + j);
+      mn = min(mn, v);
+      mx = max(mx, v);
+    }
+  }
+  minmax_unfiltered[by * bw + bx] = mn | (mx << 8u);
+}

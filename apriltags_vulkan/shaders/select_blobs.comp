@@ -1,0 +1,61 @@
+#version 450
+// Filters the raw per-(rep0,rep1) blob extents down to plausible tag-quad
+// candidates: big enough, not too big, large enough bounding box, and with
+// the correct black/white border polarity. Mirrors SelectBlobs. Surviving
+// blobs are atomically compacted into `selected[]` (capped to MAX_BLOBS,
+// matching the original's kMaxBlobs, with the atomic counter clamped so a
+// pathological frame can never overflow the output buffer). `remap[]` maps
+// each raw blob index to its compact selected index, or 0xFFFFFFFF if the
+// blob was rejected, so rewrite_index_points.comp can cheaply look up where
+// (or whether) each boundary point belongs in the final point list.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Extents { MinMaxExtentsGpu extents[]; };
+layout(std430, binding = 1) writeonly buffer Selected { MinMaxExtentsGpu selected[]; };
+layout(std430, binding = 2) buffer Counter { uint counter; };
+layout(std430, binding = 3) writeonly buffer Remap { uint remap[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint max_raw_blobs;
+  uint max_blobs;
+  uint tag_width;
+  uint min_cluster_pixels;
+  uint max_cluster_pixels;
+  uint reversed_border; // bool as uint
+  uint normal_border;   // bool as uint
+} pc;
+
+float centerX(MinMaxExtentsGpu e) { return (float(e.min_x) + float(e.max_x)) * 0.5 + 0.05118; }
+float centerY(MinMaxExtentsGpu e) { return (float(e.min_y) + float(e.max_y)) * 0.5 + -0.028581; }
+
+float dotValue(MinMaxExtentsGpu e) {
+  double sum2 = double(e.pxgx_plus_pygy_sum) * 2.0 -
+                double(e.min_x + e.max_x) * double(e.gx_sum) -
+                double(e.min_y + e.max_y) * double(e.gy_sum);
+  return float(sum2 * 0.5 - 0.05118 * double(e.gx_sum) + 0.028581 * double(e.gy_sum));
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.max_raw_blobs) return;
+
+  remap[i] = 0xFFFFFFFFu;
+
+  MinMaxExtentsGpu e = extents[i];
+  if (e.count < pc.min_cluster_pixels) return;
+  if (e.count > pc.max_cluster_pixels) return;
+  if (uint(e.max_x - e.min_x) * uint(e.max_y - e.min_y) < pc.tag_width) return;
+
+  bool quad_reversed_border = dotValue(e) < 0.0;
+  if (pc.reversed_border == 0u && quad_reversed_border) return;
+  if (pc.normal_border == 0u && !quad_reversed_border) return;
+
+  uint pos = atomicAdd(counter, 1u);
+  if (pos >= pc.max_blobs) return;
+
+  selected[pos] = e;
+  remap[i] = pos;
+}

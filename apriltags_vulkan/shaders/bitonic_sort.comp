@@ -1,0 +1,44 @@
+#version 450
+// One bitonic-sort compare-exchange stage over parallel (key_hi, key_lo,
+// payload) arrays, sorting ascending by (key_hi, key_lo) treated as a
+// 64 bit big-endian pair (key_hi is the more significant word). The host
+// issues one dispatch per (k, j) stage of the standard bitonic sort
+// network; `n` must be a power of two (padded with sentinel max keys).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer KeysHi { uint keys_hi[]; };
+layout(std430, binding = 1) buffer KeysLo { uint keys_lo[]; };
+layout(std430, binding = 2) buffer Payload { uint payload[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint n;
+  uint j; // compare distance for this stage
+  uint k; // current sequence length
+} pc;
+
+bool lessThan(uint ahi, uint alo, uint bhi, uint blo) {
+  if (ahi != bhi) return ahi < bhi;
+  return alo < blo;
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.n) return;
+
+  uint ixj = i ^ pc.j;
+  if (ixj <= i || ixj >= pc.n) return;
+
+  bool ascending = ((i & pc.k) == 0u);
+
+  uint ahi = keys_hi[i], alo = keys_lo[i], apay = payload[i];
+  uint bhi = keys_hi[ixj], blo = keys_lo[ixj], bpay = payload[ixj];
+
+  bool shouldSwapAscending = lessThan(bhi, blo, ahi, alo);
+  bool shouldSwapDescending = lessThan(ahi, alo, bhi, blo);
+  bool swap = ascending ? shouldSwapAscending : shouldSwapDescending;
+
+  if (swap) {
+    keys_hi[i] = bhi; keys_lo[i] = blo; payload[i] = bpay;
+    keys_hi[ixj] = ahi; keys_lo[ixj] = alo; payload[ixj] = apay;
+  }
+}

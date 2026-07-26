@@ -1,0 +1,71 @@
+#version 450
+// One hooking pass of parallel union-find over 4-connected same-valued
+// neighbors (right + down, which covers every edge exactly once).  Pixels
+// with value 127 ("ambiguous", neither black nor white) never merge with
+// anything, matching the CUDA implementation's "127 means I'm my own blob"
+// rule.  Call this shader repeatedly, alternating with uf_compress.comp,
+// until PixelsChanged reads back as 0.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Parent { uint parent[]; };
+layout(std430, binding = 1) readonly buffer Thresholded { uint thresholded[]; };
+layout(std430, binding = 2) buffer Changed { uint changed_count; };
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+} pc;
+
+uint find(uint n) {
+  uint p = parent[n];
+  while (p != n) {
+    n = p;
+    p = parent[n];
+  }
+  return n;
+}
+
+void doUnion(uint a, uint b) {
+  bool done = false;
+  while (!done) {
+    a = find(a);
+    b = find(b);
+    if (a < b) {
+      uint old = atomicMin(parent[b], a);
+      done = (old == b);
+      b = old;
+    } else if (b < a) {
+      uint old = atomicMin(parent[a], b);
+      done = (old == a);
+      a = old;
+    } else {
+      done = true;
+    }
+  }
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint total = pc.width * pc.height;
+  if (i >= total) return;
+
+  uint x = i % pc.width;
+  uint y = i / pc.width;
+  uint v = thresholded[i];
+  if (v == 127u) return;
+
+  if (x + 1u < pc.width) {
+    uint right = i + 1u;
+    if (thresholded[right] == v) {
+      atomicAdd(changed_count, 1u);
+      doUnion(i, right);
+    }
+  }
+  if (y + 1u < pc.height) {
+    uint down = i + pc.width;
+    if (thresholded[down] == v) {
+      atomicAdd(changed_count, 1u);
+      doUnion(i, down);
+    }
+  }
+}
