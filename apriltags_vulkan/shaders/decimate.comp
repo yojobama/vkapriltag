@@ -2,9 +2,21 @@
 // Down-samples the full resolution grayscale image by simply keeping every
 // other row/column (matches CudaToGreyscaleAndDecimateHalide's decimation,
 // which copies rather than averages).
-layout(local_size_x = 256) in;
+//
+// The source image arrives PACKED, four 8-bit pixels per uint32 in raster
+// order, and is unpacked here. That keeps the upload at one byte per pixel
+// instead of the four it used to cost (the host previously widened every
+// pixel to a uint32 in a scalar loop, then uploaded 4x the bytes, purely to
+// avoid depending on an optional device feature).
+//
+// Unpacking with a shift rather than relying on 8-bit storage means this
+// needs no VK_KHR_8bit_storage / storageBuffer8BitAccess support, so it works
+// on parts that lack it. The byte order within each word is the natural
+// little-endian one produced by memcpy'ing the source image, which is what
+// every Vulkan-capable platform uses.
+layout(local_size_x_id = 0, local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer GrayImage { uint gray[]; };
+layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };
 layout(std430, binding = 1) writeonly buffer DecimatedImage { uint decimated[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -23,5 +35,8 @@ void main() {
   uint dy = i / decimated_width;
   uint sx = dx * 2u;
   uint sy = dy * 2u;
-  decimated[i] = gray[sy * pc.width + sx];
+
+  uint linear = sy * pc.width + sx;
+  uint word = gray_packed[linear >> 2u];
+  decimated[i] = (word >> ((linear & 3u) * 8u)) & 0xFFu;
 }

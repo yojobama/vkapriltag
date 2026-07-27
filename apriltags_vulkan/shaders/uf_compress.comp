@@ -2,7 +2,7 @@
 // Full path compression: every pixel's parent becomes its ultimate root.
 // Run after each uf_merge.comp pass (and once more at the end) so that
 // downstream shaders can treat `parent[i]` as the final blob label.
-layout(local_size_x = 256) in;
+layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
 

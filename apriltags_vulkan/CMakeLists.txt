@@ -55,7 +55,6 @@ set(SHADER_SOURCES
   shaders/uf_final.comp
   shaders/blob_diff.comp
   shaders/fill_max_key.comp
-  shaders/compact_qbp.comp
   shaders/mark_heads.comp
   shaders/scan_block.comp
   shaders/scan_add_offsets.comp
@@ -64,6 +63,10 @@ set(SHADER_SOURCES
   shaders/select_blobs.comp
   shaders/rewrite_index_points.comp
   shaders/bitonic_sort.comp
+  shaders/bitonic_local.comp
+  shaders/radix_histogram.comp
+  shaders/radix_scan_hist.comp
+  shaders/radix_scatter.comp
   shaders/gather_generic.comp
   shaders/compute_line_fit_points.comp
 )
@@ -87,6 +90,7 @@ add_library(apriltag_vulkan_core STATIC
   src/apriltag_family.cpp
   src/TagDecoder.cpp
   src/common/pgm_io.cpp
+  src/common/WorkerPool.cpp
 )
 
 add_dependencies(apriltag_vulkan_core apriltag_vulkan_shaders)

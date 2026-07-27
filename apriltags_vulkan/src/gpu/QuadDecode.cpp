@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 namespace apriltag_vulkan {
@@ -134,12 +135,17 @@ struct FitQuadResult {
 
 // Ports DoFitLines' per-point windowed-error + 7-tap-gaussian-filter +
 // peak-detection, followed by DoFitQuads' top-10-peaks combinatorial search,
-// for a single blob. `points` are this blob's RawLineFitPoint entries, in
-// perimeter (theta-sorted) order.
+// for a single blob. The blob's RawLineFitPoint entries are `points[begin,
+// end)`, in perimeter (theta-sorted) order.
+//
+// Takes a span rather than a copied vector: the caller used to materialize a
+// fresh std::vector per blob, which is a heap allocation and a copy of the
+// whole run for every one of the several hundred blobs in a frame.
 FitQuadResult FitQuadForBlob(const DetectorConfig &config,
-                            const std::vector<RawLineFitPoint> &points) {
+                            const std::vector<RawLineFitPoint> &points, size_t begin,
+                            size_t end) {
   FitQuadResult result;
-  const size_t total_points = points.size();
+  const size_t total_points = end - begin;
   if (total_points < 4) return result;
 
   // Cumulative (prefix-sum) moments array; cs[k] = sum of points[0..k].
@@ -147,7 +153,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   {
     LineFitMoments running{};
     for (size_t k = 0; k < total_points; ++k) {
-      const RawLineFitPoint &p = points[k];
+      const RawLineFitPoint &p = points[begin + k];
       running.Mx += p.Mx;
       running.My += p.My;
       running.W += p.W;
@@ -283,7 +289,22 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   return result;
 }
 
+// Resolves the CPU tail's degree of parallelism: explicit config wins, then
+// APRILTAG_CPU_THREADS, then hardware_concurrency (WorkerPool's own default).
+unsigned ResolveThreadCount(uint32_t configured) {
+  if (configured > 0) return configured;
+  if (const char *t = std::getenv("APRILTAG_CPU_THREADS")) {
+    const long parsed = std::strtol(t, nullptr, 10);
+    if (parsed > 0) return static_cast<unsigned>(parsed);
+  }
+  return 0;
+}
+
 }  // namespace
+
+QuadDecode::QuadDecode(const DetectorConfig &config)
+    : config_(config),
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads))) {}
 
 std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu> &selected_extents,
                                              const std::vector<RawLineFitPoint> &line_fit_points) const {
@@ -291,21 +312,37 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
 
   // Group line_fit_points into contiguous per-blob spans (the array is
   // sorted by (blob_index, theta) ascending, so each blob's points form one
-  // contiguous run).
-  std::vector<FitQuadResult> fit_quads;
+  // contiguous run). Cheap, and inherently serial.
+  struct Span {
+    size_t begin;
+    size_t end;
+  };
+  std::vector<Span> spans;
   {
     size_t i = 0;
     while (i < line_fit_points.size()) {
       const uint32_t blob_index = line_fit_points[i].blob_index;
       size_t j = i;
       while (j < line_fit_points.size() && line_fit_points[j].blob_index == blob_index) ++j;
-
-      std::vector<RawLineFitPoint> blob_points(line_fit_points.begin() + i,
-                                               line_fit_points.begin() + j);
-      FitQuadResult fq = FitQuadForBlob(config_, blob_points);
-      if (fq.valid) fit_quads.push_back(fq);
+      spans.push_back({i, j});
       i = j;
     }
+  }
+
+  // Fit every blob independently - this is where essentially all of the CPU
+  // tail's time goes. Each entry is written by exactly one task, so no
+  // synchronization is needed beyond the pool's own.
+  std::vector<FitQuadResult> per_span(spans.size());
+  pool_->ParallelFor(spans.size(), [&](size_t s) {
+    per_span[s] = FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end);
+  });
+
+  // Collect survivors in span order, NOT completion order, so the result is
+  // bit-identical to the serial version regardless of thread scheduling.
+  std::vector<FitQuadResult> fit_quads;
+  fit_quads.reserve(per_span.size());
+  for (const FitQuadResult &fq : per_span) {
+    if (fq.valid) fit_quads.push_back(fq);
   }
 
   // UpdateFitQuads: refit lines from the moments, intersect adjacent lines

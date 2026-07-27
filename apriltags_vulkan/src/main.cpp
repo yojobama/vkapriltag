@@ -120,8 +120,10 @@ int main(int argc, char **argv) {
     while (!g_stop) {
       capture.CaptureGrayFrame(gray);
 
-      const auto t0 = std::chrono::steady_clock::now();
       detector.Detect(gray.data());
+      const auto &profile = detector.last_profile();
+
+      const auto t0 = std::chrono::steady_clock::now();
       std::vector<apriltag_vulkan::DetectedQuad> quads =
           quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
       const auto t1 = std::chrono::steady_clock::now();
@@ -130,10 +132,20 @@ int main(int argc, char **argv) {
                                               config.reversed_border);
       const auto t2 = std::chrono::steady_clock::now();
 
+      const double quaddecode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+
       std::cout << "Frame " << frame_index << ": " << quads.size() << " candidate quad(s), "
-               << zarray_size(detections) << " decoded tag(s) in "
-               << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms detect + "
-               << std::chrono::duration<double, std::milli>(t2 - t1).count() << " ms decode"
+           << zarray_size(detections) << " decoded tag(s). "
+           << "GPU(total=" << profile.total_ms << " ms, upload=" << profile.upload_ms
+           << ", label=" << profile.threshold_label_ms << ", boundary=" << profile.boundary_ms
+           << ", sort=" << profile.sort_group_ms << ", linefit=" << profile.linefit_ms
+           << ", readback=" << profile.readback_ms << " ms; uf_iters="
+           << profile.uf_iterations << (profile.uf_converged ? "" : "!")
+           << ", sort_n=" << profile.qbp_sort_n << "/" << profile.ipoint_sort_n
+           << ", submits=" << profile.submits
+           << ", blobs=" << profile.selected_blobs << ", points=" << profile.points
+           << "), CPU(quad_decode=" << quaddecode_ms << " ms, decode=" << decode_ms << " ms)"
                << std::endl;
       print_detections(detections);
 

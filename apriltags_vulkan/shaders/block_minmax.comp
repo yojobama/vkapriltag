@@ -2,7 +2,7 @@
 // Computes the min/max pixel value for each 4x4 block of the decimated
 // image.  Mirrors InternalBlockMinMax.  Result is packed as (min | max<<8)
 // in a single uint so we don't need 8-bit storage buffer support.
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint decimated[]; };
 layout(std430, binding = 1) writeonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };

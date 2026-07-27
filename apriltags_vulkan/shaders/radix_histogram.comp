@@ -1,0 +1,51 @@
+#version 450
+// Pass 1 of 3 of one LSD radix-sort digit pass: per-block digit histograms.
+//
+// Each workgroup covers gl_WorkGroupSize.x consecutive elements, counts how
+// many fall into each of the 16 buckets of the current 4-bit digit, and writes
+// those counts BIN-MAJOR:
+//
+//   hist[bin * num_blocks + block]
+//
+// Bin-major matters: an exclusive scan of the whole array in this layout
+// yields, for every (bin, block) pair, the global output position where that
+// block's elements of that bin begin - all of bin 0 first, then bin 1, and
+// within a bin the blocks in order. That is exactly what a stable scatter
+// needs.
+//
+// Every (bin, block) entry is overwritten unconditionally, so the buffer needs
+// no clearing between passes.
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer KeysHi { uint keys_hi[]; };
+layout(std430, binding = 1) readonly buffer KeysLo { uint keys_lo[]; };
+layout(std430, binding = 2) writeonly buffer Hist { uint hist[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint n;           // elements being sorted
+  uint shift;       // bit offset of this digit within the chosen key word
+  uint use_hi;      // 0 = digit comes from keys_lo, 1 = from keys_hi
+  uint num_blocks;  // ceil(n / gl_WorkGroupSize.x)
+} pc;
+
+shared uint local_hist[16];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+
+  // Loop rather than `if (tid < 16)` so this stays correct even on a device
+  // whose workgroup is smaller than the bucket count.
+  for (uint b = tid; b < 16u; b += gl_WorkGroupSize.x) local_hist[b] = 0u;
+  barrier();
+
+  uint i = gl_GlobalInvocationID.x;
+  if (i < pc.n) {
+    uint word = (pc.use_hi != 0u) ? keys_hi[i] : keys_lo[i];
+    atomicAdd(local_hist[(word >> pc.shift) & 0xFu], 1u);
+  }
+  barrier();
+
+  for (uint b = tid; b < 16u; b += gl_WorkGroupSize.x) {
+    hist[b * pc.num_blocks + gl_WorkGroupID.x] = local_hist[b];
+  }
+}

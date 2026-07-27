@@ -4,17 +4,31 @@
 // with value 127 ("ambiguous", neither black nor white) never merge with
 // anything, matching the CUDA implementation's "127 means I'm my own blob"
 // rule.  Call this shader repeatedly, alternating with uf_compress.comp,
-// until PixelsChanged reads back as 0.
-layout(local_size_x = 256) in;
+// until `changed_flag` reads back as 0.
+//
+// CONVERGENCE FLAG: this used to do `atomicAdd(changed_count, 1u)` for every
+// pixel pair that merely *had* a matching neighbour - up to two atomics per
+// pixel, i.e. ~1M read-modify-writes per pass all targeting a single 4-byte
+// address, which serializes on one cache line and dwarfed the actual union
+// work. Worse, the result was never read: the host looped a fixed 64 times
+// regardless.
+//
+// Now the flag is (a) set only when a union actually joined two distinct
+// components, so it genuinely means "another pass is needed", and (b)
+// aggregated in shared memory first, so at most one global atomic is issued
+// per workgroup rather than one per pixel.
+layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
 layout(std430, binding = 1) readonly buffer Thresholded { uint thresholded[]; };
-layout(std430, binding = 2) buffer Changed { uint changed_count; };
+layout(std430, binding = 2) buffer Changed { uint changed_flag; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
 } pc;
+
+shared uint wg_changed;
 
 uint find(uint n) {
   uint p = parent[n];
@@ -25,7 +39,10 @@ uint find(uint n) {
   return n;
 }
 
-void doUnion(uint a, uint b) {
+// Returns true if the two elements were in distinct components (i.e. this
+// call performed real work and the labelling has not converged yet).
+bool doUnion(uint a, uint b) {
+  bool merged = false;
   bool done = false;
   while (!done) {
     a = find(a);
@@ -33,39 +50,50 @@ void doUnion(uint a, uint b) {
     if (a < b) {
       uint old = atomicMin(parent[b], a);
       done = (old == b);
+      merged = true;
       b = old;
     } else if (b < a) {
       uint old = atomicMin(parent[a], b);
       done = (old == a);
+      merged = true;
       a = old;
     } else {
       done = true;
     }
   }
+  return merged;
 }
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
   uint total = pc.width * pc.height;
-  if (i >= total) return;
 
-  uint x = i % pc.width;
-  uint y = i / pc.width;
-  uint v = thresholded[i];
-  if (v == 127u) return;
+  // NOTE: every invocation must reach both barriers below, so the bounds and
+  // "ambiguous pixel" tests select work rather than returning early.
+  if (gl_LocalInvocationID.x == 0u) wg_changed = 0u;
+  memoryBarrierShared();
+  barrier();
 
-  if (x + 1u < pc.width) {
-    uint right = i + 1u;
-    if (thresholded[right] == v) {
-      atomicAdd(changed_count, 1u);
-      doUnion(i, right);
+  bool merged = false;
+  if (i < total) {
+    uint x = i % pc.width;
+    uint y = i / pc.width;
+    uint v = thresholded[i];
+    if (v != 127u) {
+      if (x + 1u < pc.width && thresholded[i + 1u] == v) {
+        if (doUnion(i, i + 1u)) merged = true;
+      }
+      if (y + 1u < pc.height && thresholded[i + pc.width] == v) {
+        if (doUnion(i, i + pc.width)) merged = true;
+      }
     }
   }
-  if (y + 1u < pc.height) {
-    uint down = i + pc.width;
-    if (thresholded[down] == v) {
-      atomicAdd(changed_count, 1u);
-      doUnion(i, down);
-    }
+
+  if (merged) atomicOr(wg_changed, 1u);
+  memoryBarrierShared();
+  barrier();
+
+  if (gl_LocalInvocationID.x == 0u && wg_changed != 0u) {
+    atomicOr(changed_flag, 1u);
   }
 }

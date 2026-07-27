@@ -1,0 +1,54 @@
+#version 450
+// Pass 2 of 3 of one LSD radix-sort digit pass: turns the bin-major per-block
+// histogram into per-(bin, block) output base offsets by exclusive-scanning it
+// in place.
+//
+// Deliberately a SINGLE workgroup that walks the array in chunks carrying a
+// running total. The array is only 16 * num_blocks entries (a few thousand),
+// so the parallelism lost is irrelevant next to avoiding a second multi-level
+// scan chain with its own buffers and pipelines.
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Hist { uint hist[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint total;  // 16 * num_blocks
+} pc;
+
+shared uint temp[1024];
+shared uint carry;
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint W = gl_WorkGroupSize.x;
+
+  if (tid == 0u) carry = 0u;
+  memoryBarrierShared();
+  barrier();
+
+  // pc.total is uniform, so every invocation runs the same iteration count and
+  // reaches every barrier below.
+  for (uint base = 0u; base < pc.total; base += W) {
+    uint idx = base + tid;
+    uint v = (idx < pc.total) ? hist[idx] : 0u;
+    temp[tid] = v;
+    barrier();
+
+    // Inclusive scan of this chunk (Hillis-Steele).
+    for (uint off = 1u; off < W; off <<= 1u) {
+      uint addend = (tid >= off) ? temp[tid - off] : 0u;
+      barrier();
+      temp[tid] += addend;
+      barrier();
+    }
+
+    // Exclusive value for this element = inclusive - own + everything before
+    // this chunk. `carry` is still this chunk's base; it is advanced below.
+    if (idx < pc.total) hist[idx] = temp[tid] - v + carry;
+    barrier();
+
+    if (tid == W - 1u) carry += temp[W - 1u];
+    memoryBarrierShared();
+    barrier();
+  }
+}

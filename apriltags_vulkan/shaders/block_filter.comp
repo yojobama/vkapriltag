@@ -1,7 +1,7 @@
 #version 450
 // Blurs the per-block min/max using a 3x3 neighborhood min/max.  Mirrors
 // InternalBlockFilter.
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
 layout(std430, binding = 1) writeonly buffer FilteredMinMax { uint minmax_filtered[]; };

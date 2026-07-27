@@ -1,0 +1,117 @@
+#version 450
+// Shared-memory portion of the bitonic sort network.
+//
+// A bitonic compare-exchange stage (k, j) pairs index i with i^j. When
+// j < L (the number of contiguous elements a workgroup holds), both partners
+// are guaranteed to live inside the same L-aligned block, so the stage needs
+// no global synchronization at all - it can run in shared memory. Only stages
+// with j >= L require a separate dispatch and a global barrier.
+//
+// The original port dispatched EVERY stage globally: 171 dispatches for a
+// 2^18 element sort, each a full pass over global memory plus a pipeline
+// barrier. Collapsing the j < L stages moves the large majority of them into
+// shared memory and cuts the number of global passes by ~2.6x.
+//
+// Two roles, selected by the (k_start, k_end) push constants:
+//
+//   1. Initial local sort: k_start=2, k_end=L. Every stage of every k <= L has
+//      j <= k/2 < L, so this single dispatch performs the entire first
+//      log2(L)*(log2(L)+1)/2 stages of the network (36 of them at L=256).
+//
+//   2. Merge tail: k_start=k_end=K for one K > L. The host has already run
+//      that K's stages down to j == L globally; this dispatch finishes the
+//      remaining j = L/2 .. 1 locally.
+//
+// Sort direction always comes from the GLOBAL element index, so the network
+// this produces is bit-for-bit the same network the all-global version ran.
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer KeysHi { uint keys_hi[]; };
+layout(std430, binding = 1) buffer KeysLo { uint keys_lo[]; };
+layout(std430, binding = 2) buffer Payload { uint payload[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint n;        // padded element count actually being sorted
+  uint k_start;  // first k for this dispatch
+  uint k_end;    // last k for this dispatch (inclusive)
+} pc;
+
+// Sized for the largest workgroup this shader is ever specialized to
+// (1024 elements => 12 KiB, within the 16 KiB Vulkan guarantees).
+shared uint s_hi[1024];
+shared uint s_lo[1024];
+shared uint s_pay[1024];
+
+bool lessThan(uint ahi, uint alo, uint bhi, uint blo) {
+  if (ahi != bhi) return ahi < bhi;
+  return alo < blo;
+}
+
+void main() {
+  uint L = gl_WorkGroupSize.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint i = gl_WorkGroupID.x * L + tid;
+
+  // Elements past the sorted range read as the maximum sentinel so they sort
+  // to the end, exactly as the host-side sentinel fill arranges for the
+  // padding inside [count, n).
+  if (i < pc.n) {
+    s_hi[tid] = keys_hi[i];
+    s_lo[tid] = keys_lo[i];
+    s_pay[tid] = payload[i];
+  } else {
+    s_hi[tid] = 0xFFFFFFFFu;
+    s_lo[tid] = 0xFFFFFFFFu;
+    s_pay[tid] = 0xFFFFFFFFu;
+  }
+  barrier();
+
+  for (uint k = pc.k_start; k <= pc.k_end; k <<= 1) {
+    // Only the j < L tail of this k is local. For k <= L that is all of it.
+    for (uint j = min(k >> 1, L >> 1); j > 0u; j >>= 1) {
+      uint partner = tid ^ j;
+
+      uint ph = s_hi[partner], pl = s_lo[partner], pp = s_pay[partner];
+
+      // Direction of the subsequence this element belongs to, taken from its
+      // global index - identical to bitonic_sort.comp's `(i & k) == 0`. Both
+      // partners agree on it: they differ only in bit log2(j), and j <= k/2,
+      // so `i & k` is the same for both.
+      bool ascending = ((i & k) == 0u);
+
+      // Decide the exchange from the PAIR, not from "which value do I want":
+      // both threads must reach the same conclusion, and a tie must produce no
+      // exchange at all. Deciding per-thread with a non-strict test would make
+      // both partners take each other's value on equal keys, duplicating one
+      // payload and dropping the other.
+      bool i_am_lower = tid < partner;
+      uint lo_hi = i_am_lower ? s_hi[tid] : ph;
+      uint lo_lo = i_am_lower ? s_lo[tid] : pl;
+      uint hi_hi = i_am_lower ? ph : s_hi[tid];
+      uint hi_lo = i_am_lower ? pl : s_lo[tid];
+      bool swap = ascending ? lessThan(hi_hi, hi_lo, lo_hi, lo_lo)
+                            : lessThan(lo_hi, lo_lo, hi_hi, hi_lo);
+
+      // Every read above must complete before any write below.
+      memoryBarrierShared();
+      barrier();
+
+      // A genuine exchange: each partner takes the other's element, so no
+      // element is ever duplicated or lost.
+      if (swap) {
+        s_hi[tid] = ph;
+        s_lo[tid] = pl;
+        s_pay[tid] = pp;
+      }
+
+      memoryBarrierShared();
+      barrier();
+    }
+  }
+
+  if (i < pc.n) {
+    keys_hi[i] = s_hi[tid];
+    keys_lo[i] = s_lo[tid];
+    payload[i] = s_pay[tid];
+  }
+}

@@ -11,7 +11,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-layout(local_size_x = 256) in;
+layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Extents { MinMaxExtentsGpu extents[]; };
 layout(std430, binding = 1) writeonly buffer Selected { MinMaxExtentsGpu selected[]; };
@@ -28,14 +28,33 @@ layout(push_constant) uniform PushConstants {
   uint normal_border;   // bool as uint
 } pc;
 
-float centerX(MinMaxExtentsGpu e) { return (float(e.min_x) + float(e.max_x)) * 0.5 + 0.05118; }
-float centerY(MinMaxExtentsGpu e) { return (float(e.min_y) + float(e.max_y)) * 0.5 + -0.028581; }
-
-float dotValue(MinMaxExtentsGpu e) {
-  double sum2 = double(e.pxgx_plus_pygy_sum) * 2.0 -
-                double(e.min_x + e.max_x) * double(e.gx_sum) -
-                double(e.min_y + e.max_y) * double(e.gy_sum);
-  return float(sum2 * 0.5 - 0.05118 * double(e.gx_sum) + 0.028581 * double(e.gy_sum));
+// Border polarity test, replacing MinMaxExtents::dot() < 0.
+//
+// This deliberately uses NO GLSL `double`. float64 is an optional Vulkan
+// feature (VkPhysicalDeviceFeatures::shaderFloat64) that Mali and most other
+// mobile GPUs simply do not expose, and a shader that uses it fails pipeline
+// creation outright on those parts - it is not a slow path, it is a hard
+// portability failure. The CUDA original's dot() returns `float` anyway.
+//
+// Only the SIGN of the dot product is ever consumed, and every term of `sum2`
+// is an exact integer, so `sum2` is accumulated in int32 exactly as the
+// atomics in reduce_extents.comp produced it, and only the fractional
+// sub-pixel correction is done in fp32. Since the sign is unaffected by a
+// positive scale factor we test 2*dot, which clears the 0.5 and keeps the
+// integer term exact:
+//
+//   2*dot = sum2 - 0.10236 * gx_sum + 0.057162 * gy_sum
+//
+// The fp32 rounding of `sum2` (ulp ~64 at the largest realistic magnitudes)
+// is far smaller than the correction terms it is compared against, so this
+// can only disagree with the float64 version for blobs sitting essentially
+// exactly on the polarity boundary.
+bool hasReversedBorder(MinMaxExtentsGpu e) {
+  int sum2 = e.pxgx_plus_pygy_sum * 2 -
+             (e.min_x + e.max_x) * e.gx_sum -
+             (e.min_y + e.max_y) * e.gy_sum;
+  float two_dot = float(sum2) - 0.10236 * float(e.gx_sum) + 0.057162 * float(e.gy_sum);
+  return two_dot < 0.0;
 }
 
 void main() {
@@ -49,7 +68,7 @@ void main() {
   if (e.count > pc.max_cluster_pixels) return;
   if (uint(e.max_x - e.min_x) * uint(e.max_y - e.min_y) < pc.tag_width) return;
 
-  bool quad_reversed_border = dotValue(e) < 0.0;
+  bool quad_reversed_border = hasReversedBorder(e);
   if (pc.reversed_border == 0u && quad_reversed_border) return;
   if (pc.normal_border == 0u && !quad_reversed_border) return;
 

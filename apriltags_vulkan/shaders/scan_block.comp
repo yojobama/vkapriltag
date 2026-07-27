@@ -1,11 +1,18 @@
 #version 450
 // Generic single-workgroup-block inclusive prefix sum (Hillis-Steele scan
 // in shared memory). Used as the first level of a 2+ level scan: each
-// workgroup produces the inclusive scan of its own 1024 elements plus the
-// total sum of the block, written to `block_sums[group_id]`. A subsequent
-// pass (recursively, if there is more than one block) scans block_sums, and
-// scan_add_offsets.comp adds the resulting per-block base offset back in.
-layout(local_size_x = 1024) in;
+// workgroup produces the inclusive scan of its own gl_WorkGroupSize.x
+// elements plus the total sum of the block, written to
+// `block_sums[group_id]`. A subsequent pass (recursively, if there is more
+// than one block) scans block_sums, and scan_add_offsets.comp adds the
+// resulting per-block base offset back in.
+//
+// The block size is a specialization constant, NOT a literal: this shader
+// used to hardcode 1024, which exceeds maxComputeWorkGroupInvocations on
+// Mali-G610 (512) and is not even guaranteed by Vulkan (which promises only
+// 128). The host picks the largest power of two the device allows and must
+// use the SAME value as the scan chain's fan-out divisor.
+layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer InputBuf { uint input_values[]; };
 layout(std430, binding = 1) writeonly buffer OutputBuf { uint output_values[]; };
@@ -15,6 +22,9 @@ layout(push_constant) uniform PushConstants {
   uint count;
 } pc;
 
+// Sized for the largest block this shader will ever be specialized to
+// (1024 entries = 4 KiB, comfortably inside the 16 KiB of shared memory
+// Vulkan guarantees). Only the first gl_WorkGroupSize.x entries are used.
 shared uint temp[1024];
 
 void main() {
@@ -25,7 +35,7 @@ void main() {
   temp[tid] = value;
   barrier();
 
-  for (uint offset = 1u; offset < 1024u; offset <<= 1u) {
+  for (uint offset = 1u; offset < gl_WorkGroupSize.x; offset <<= 1u) {
     uint addend = (tid >= offset) ? temp[tid - offset] : 0u;
     barrier();
     temp[tid] += addend;
@@ -35,7 +45,9 @@ void main() {
   if (gid < pc.count) {
     output_values[gid] = temp[tid];
   }
-  if (tid == 1023u) {
+  // The last lane holds this block's total. Out-of-range lanes contributed 0,
+  // so this stays correct for the final partial block.
+  if (tid == gl_WorkGroupSize.x - 1u) {
     block_sums[gl_WorkGroupID.x] = temp[tid];
   }
 }

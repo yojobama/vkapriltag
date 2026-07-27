@@ -1,15 +1,31 @@
 #include "vk/ComputePipeline.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace apriltag_vulkan::vk {
 
 ComputePipeline::ComputePipeline(const Context &ctx, const std::string &spv_path,
                                  const std::vector<VkBuffer> &buffers,
-                                 uint32_t push_constant_bytes)
+                                 uint32_t push_constant_bytes, WorkgroupSize workgroup_size)
     : device_(ctx.device()),
       shader_(ctx.device(), spv_path),
-      push_constant_bytes_(push_constant_bytes) {
+      push_constant_bytes_(push_constant_bytes),
+      workgroup_size_(workgroup_size) {
+  for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = ctx.caps().max_workgroup_count[i];
+
+  // Fail loudly at build time rather than with an obscure driver error later.
+  if (workgroup_size_.invocations() > ctx.caps().max_workgroup_invocations ||
+      workgroup_size_.x > ctx.caps().max_workgroup_size[0] ||
+      workgroup_size_.y > ctx.caps().max_workgroup_size[1] ||
+      workgroup_size_.z > ctx.caps().max_workgroup_size[2]) {
+    throw std::runtime_error(spv_path + ": requested workgroup size " +
+                             std::to_string(workgroup_size_.x) + "x" +
+                             std::to_string(workgroup_size_.y) + "x" +
+                             std::to_string(workgroup_size_.z) +
+                             " exceeds this device's compute limits");
+  }
+
   // Descriptor set layout: one storage buffer binding per entry in `buffers`.
   std::vector<VkDescriptorSetLayoutBinding> bindings(buffers.size());
   for (size_t i = 0; i < buffers.size(); ++i) {
@@ -43,11 +59,27 @@ ComputePipeline::ComputePipeline(const Context &ctx, const std::string &spv_path
   CheckVk(vkCreatePipelineLayout(device_, &pipeline_layout_info, nullptr, &pipeline_layout_),
           "vkCreatePipelineLayout");
 
+  // Feed the workgroup dimensions in as specialization constants 0/1/2, which
+  // the shaders declare via layout(local_size_{x,y,z}_id = ...).
+  const uint32_t spec_data[3] = {workgroup_size_.x, workgroup_size_.y, workgroup_size_.z};
+  VkSpecializationMapEntry spec_entries[3];
+  for (uint32_t i = 0; i < 3; ++i) {
+    spec_entries[i].constantID = i;
+    spec_entries[i].offset = i * sizeof(uint32_t);
+    spec_entries[i].size = sizeof(uint32_t);
+  }
+  VkSpecializationInfo spec_info{};
+  spec_info.mapEntryCount = 3;
+  spec_info.pMapEntries = spec_entries;
+  spec_info.dataSize = sizeof(spec_data);
+  spec_info.pData = spec_data;
+
   VkPipelineShaderStageCreateInfo stage_info{};
   stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   stage_info.module = shader_.module();
   stage_info.pName = "main";
+  stage_info.pSpecializationInfo = &spec_info;
 
   VkComputePipelineCreateInfo pipeline_info{};
   pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -117,7 +149,9 @@ ComputePipeline::ComputePipeline(ComputePipeline &&other) noexcept
       pipeline_(other.pipeline_),
       descriptor_pool_(other.descriptor_pool_),
       descriptor_set_(other.descriptor_set_),
-      push_constant_bytes_(other.push_constant_bytes_) {
+      push_constant_bytes_(other.push_constant_bytes_),
+      workgroup_size_(other.workgroup_size_) {
+  for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = other.max_workgroup_count_[i];
   other.set_layout_ = VK_NULL_HANDLE;
   other.pipeline_layout_ = VK_NULL_HANDLE;
   other.pipeline_ = VK_NULL_HANDLE;
@@ -136,6 +170,8 @@ ComputePipeline &ComputePipeline::operator=(ComputePipeline &&other) noexcept {
     descriptor_pool_ = other.descriptor_pool_;
     descriptor_set_ = other.descriptor_set_;
     push_constant_bytes_ = other.push_constant_bytes_;
+    workgroup_size_ = other.workgroup_size_;
+    for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = other.max_workgroup_count_[i];
     other.set_layout_ = VK_NULL_HANDLE;
     other.pipeline_layout_ = VK_NULL_HANDLE;
     other.pipeline_ = VK_NULL_HANDLE;
@@ -146,7 +182,13 @@ ComputePipeline &ComputePipeline::operator=(ComputePipeline &&other) noexcept {
 }
 
 void ComputePipeline::DispatchRaw(VkCommandBuffer cmd, uint32_t gx, uint32_t gy, uint32_t gz,
-                                  const void *push_constants) const {
+                                  const void *push_constants, BarrierKind barrier) const {
+  if (gx == 0 || gy == 0 || gz == 0) return;
+  if (gx > max_workgroup_count_[0] || gy > max_workgroup_count_[1] ||
+      gz > max_workgroup_count_[2]) {
+    throw std::runtime_error("Compute dispatch exceeds maxComputeWorkGroupCount");
+  }
+
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
   if (descriptor_set_ != VK_NULL_HANDLE) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1,
@@ -157,33 +199,51 @@ void ComputePipeline::DispatchRaw(VkCommandBuffer cmd, uint32_t gx, uint32_t gy,
                        push_constant_bytes_, push_constants);
   }
   vkCmdDispatch(cmd, gx, gy, gz);
-  Barrier(cmd);
+  Barrier(cmd, barrier);
 }
 
-void ComputePipeline::Dispatch1D(VkCommandBuffer cmd, uint32_t elements, uint32_t local_size_x,
-                                 const void *push_constants) const {
-  uint32_t groups = (elements + local_size_x - 1) / local_size_x;
-  DispatchRaw(cmd, std::max(groups, 1u), 1, 1, push_constants);
+void ComputePipeline::Dispatch1D(VkCommandBuffer cmd, uint32_t elements,
+                                 const void *push_constants, BarrierKind barrier) const {
+  if (elements == 0) return;
+  const uint32_t groups = (elements + workgroup_size_.x - 1) / workgroup_size_.x;
+  DispatchRaw(cmd, groups, 1, 1, push_constants, barrier);
 }
 
 void ComputePipeline::Dispatch2D(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                                 uint32_t local_size_x, uint32_t local_size_y,
-                                 const void *push_constants) const {
-  uint32_t gx = (width + local_size_x - 1) / local_size_x;
-  uint32_t gy = (height + local_size_y - 1) / local_size_y;
-  DispatchRaw(cmd, std::max(gx, 1u), std::max(gy, 1u), 1, push_constants);
+                                 const void *push_constants, BarrierKind barrier) const {
+  if (width == 0 || height == 0) return;
+  const uint32_t gx = (width + workgroup_size_.x - 1) / workgroup_size_.x;
+  const uint32_t gy = (height + workgroup_size_.y - 1) / workgroup_size_.y;
+  DispatchRaw(cmd, gx, gy, 1, push_constants, barrier);
 }
 
-void ComputePipeline::Barrier(VkCommandBuffer cmd) {
+void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
+  if (kind == BarrierKind::None) return;
+
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
-                          VK_ACCESS_TRANSFER_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
-                          VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
-                      &barrier, 0, nullptr, 0, nullptr);
+
+  VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  if (kind == BarrierKind::ComputeAndTransfer) {
+    stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  } else {
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  }
+
+  vkCmdPipelineBarrier(cmd, stages, stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+void ComputePipeline::HostReadBarrier(VkCommandBuffer cmd) {
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                       &barrier, 0, nullptr, 0, nullptr);
 }
 
 }  // namespace apriltag_vulkan::vk

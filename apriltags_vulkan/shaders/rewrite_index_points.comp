@@ -11,7 +11,7 @@
 
 #define PI 3.14159265358979323846
 
-layout(local_size_x = 256) in;
+layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Sorted { QBPoint sorted[]; };
 layout(std430, binding = 1) readonly buffer RawBlobIndex { uint raw_blob_index[]; };

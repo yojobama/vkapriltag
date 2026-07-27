@@ -1,7 +1,9 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 
+#include "common/WorkerPool.h"
 #include "gpu/GpuDetector.h"
 #include "gpu/Types.h"
 
@@ -17,9 +19,17 @@ namespace apriltag_vulkan {
 // plain C++ than as GPU compute shaders. See line_fit_filter.cu's
 // DoFitLines / DoFitQuads / apriltag_detect.cu's UpdateFitQuads for the
 // original CUDA algorithms this ports.
+//
+// PERFORMANCE: this becomes the single most expensive stage once the GPU
+// pipeline is properly sized - ~10 ms single-threaded at 1080p with 440
+// blobs, against a few milliseconds for all the GPU work on a discrete card.
+// The per-blob fits are completely independent, so they run across a
+// persistent worker pool. Results are collected in blob order, so the output
+// is identical to the serial version regardless of thread scheduling.
 class QuadDecode {
  public:
-  explicit QuadDecode(const DetectorConfig &config) : config_(config) {}
+  // Honours APRILTAG_CPU_THREADS when config.cpu_threads is left at 0.
+  explicit QuadDecode(const DetectorConfig &config);
 
   // Runs the full CPU tail (peak finding, combinatorial quad fit, corner
   // intersection, geometric sanity checks, decimation-scale correction) and
@@ -29,8 +39,12 @@ class QuadDecode {
   std::vector<DetectedQuad> Decode(const std::vector<MinMaxExtentsGpu> &selected_extents,
                                    const std::vector<RawLineFitPoint> &line_fit_points) const;
 
+  unsigned threads() const { return pool_->threads(); }
+
  private:
   DetectorConfig config_;
+  // unique_ptr so a const Decode() can still hand work to the (stateful) pool.
+  std::unique_ptr<WorkerPool> pool_;
 };
 
 }  // namespace apriltag_vulkan

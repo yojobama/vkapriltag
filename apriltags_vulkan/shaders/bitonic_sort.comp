@@ -4,7 +4,7 @@
 // 64 bit big-endian pair (key_hi is the more significant word). The host
 // issues one dispatch per (k, j) stage of the standard bitonic sort
 // network; `n` must be a power of two (padded with sentinel max keys).
-layout(local_size_x = 256) in;
+layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer KeysHi { uint keys_hi[]; };
 layout(std430, binding = 1) buffer KeysLo { uint keys_lo[]; };

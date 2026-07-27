@@ -1,8 +1,13 @@
 # Compiles a list of GLSL compute shaders to SPIR-V using glslangValidator,
-# targeting the Vulkan 1.2 environment.  We deliberately avoid any
-# vendor-specific extensions in the shaders themselves so the resulting
-# SPIR-V runs unmodified on any Vulkan 1.2 conformant driver (AMD/RADV,
-# NVIDIA, Intel, etc).
+# targeting the Vulkan 1.1 environment.
+#
+# 1.1 rather than 1.2 on purpose: nothing in these shaders needs a 1.2
+# feature, and targeting 1.1 keeps older mobile drivers (Mali/Adreno, older
+# Panfrost) eligible. The shaders also avoid every optional device feature -
+# no shaderFloat64, no shaderInt64, no 8-bit storage - so the resulting
+# SPIR-V loads unmodified on desktop NVIDIA/AMD/Intel and on mobile parts
+# alike. Workgroup sizes are specialization constants, chosen at runtime from
+# the device's reported limits.
 find_program(GLSLANG_VALIDATOR_EXECUTABLE
   NAMES glslangValidator
   HINTS Vulkan::glslangValidator
@@ -23,7 +28,7 @@ function(compile_shaders TARGET_NAME SHADER_LIST OUT_DIR_VAR)
     add_custom_command(
       OUTPUT ${SPIRV_OUTPUT}
       COMMAND ${GLSLANG_VALIDATOR_EXECUTABLE}
-              --target-env vulkan1.2
+              --target-env vulkan1.1
               -I${CMAKE_CURRENT_SOURCE_DIR}/shaders
               -o ${SPIRV_OUTPUT}
               ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}

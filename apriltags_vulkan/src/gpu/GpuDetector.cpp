@@ -1,8 +1,11 @@
 #include "gpu/GpuDetector.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 
 #ifndef SHADER_DIR
@@ -12,6 +15,12 @@
 namespace apriltag_vulkan {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double MsSince(Clock::time_point a, Clock::time_point b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
 
 std::string ShaderPath(const char *name) {
   return std::string(SHADER_DIR) + "/" + name + ".comp.spv";
@@ -24,14 +33,35 @@ uint32_t NextPow2(uint32_t v) {
   return v + 1;
 }
 
-VkBufferUsageFlags kSsboUsage =
+// Number of bits needed to represent every value in [0, max_value].
+uint32_t BitsFor(uint32_t max_value) {
+  uint32_t bits = 0;
+  while (max_value > 0) {
+    ++bits;
+    max_value >>= 1;
+  }
+  return std::max(bits, 1u);
+}
+
+// 4-bit digits needed to cover `bits` bits.
+uint32_t DigitsFor(uint32_t bits) { return (bits + 3u) / 4u; }
+
+// rewrite_index_points.comp computes theta_key = round((atan(dy, dx) + PI) *
+// 8e6). atan2 is bounded by [-PI, PI], so the key cannot exceed
+// round(2*PI*8e6) = 50265482. This bound is what makes 7 digits (28 bits)
+// provably sufficient for the index-point sort's low word.
+constexpr uint32_t kMaxThetaKey = 50265483u;
+
+const VkBufferUsageFlags kSsboUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-vk::Buffer MakeSsbo(vk::Context &ctx, VkDeviceSize bytes) {
-  return vk::Buffer(ctx, std::max<VkDeviceSize>(bytes, 4), kSsboUsage,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-}
+// Offsets (in 4-byte slots) into the shared counter readback staging buffer.
+constexpr uint32_t kSlotUfChanged = 0;
+constexpr uint32_t kSlotQbpCount = 1;
+constexpr uint32_t kSlotSelectedCount = 2;
+constexpr uint32_t kSlotPointCount = 3;
+constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 }  // namespace
 
@@ -41,6 +71,41 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     throw std::runtime_error("width and height must both be multiples of 8");
   }
 
+  // --- Environment overrides. These must all be applied before any capacity
+  // or launch geometry is derived from the config. ---
+
+  // The boundary-point cap is the main device-memory lever on unified-memory
+  // parts, where the dense worst-case sizing is expensive.
+  if (const char *cap = std::getenv("APRILTAG_VK_MAX_POINTS")) {
+    const long parsed = std::strtol(cap, nullptr, 10);
+    if (parsed > 0) config_.max_boundary_points = static_cast<uint32_t>(parsed);
+  }
+  // A/B the sort strategy per device without a rebuild.
+  if (const char *sort_mode = std::getenv("APRILTAG_VK_SORT")) {
+    if (std::strcmp(sort_mode, "global") == 0) {
+      config_.sort_algorithm = DetectorConfig::SortAlgorithm::GlobalBitonic;
+    } else if (std::strcmp(sort_mode, "hybrid") == 0) {
+      config_.sort_algorithm = DetectorConfig::SortAlgorithm::SharedMemoryBitonic;
+    } else if (std::strcmp(sort_mode, "radix") == 0) {
+      config_.sort_algorithm = DetectorConfig::SortAlgorithm::Radix;
+    }
+  }
+  // Labelling chunk size. Smaller chunks detect convergence more precisely at
+  // the cost of an extra round trip when they guess low.
+  if (const char *chunk = std::getenv("APRILTAG_VK_UF_CHUNK")) {
+    const long parsed = std::strtol(chunk, nullptr, 10);
+    if (parsed > 0) config_.uf_iterations_per_chunk = static_cast<uint32_t>(parsed);
+  }
+  if (config_.uf_iterations_per_chunk == 0) config_.uf_iterations_per_chunk = 1;
+
+  // Launch geometry comes from the device, never from a literal.
+  const vk::DeviceCaps &caps = ctx_.caps();
+  wg1d_ = vk::WorkgroupSize{caps.wg1d, 1, 1};
+  wg2d_ = vk::WorkgroupSize{caps.wg2d_x, caps.wg2d_y, 1};
+  scan_wg_ = caps.scan_wg;
+  // Hard cap of 128: see radix_scatter.comp's byte-packed rank counters.
+  radix_wg_ = vk::WorkgroupSize{std::min(caps.wg1d, 128u), 1, 1};
+
   decimated_width_ = config_.width / 2;
   decimated_height_ = config_.height / 2;
   block_width_ = decimated_width_ / 4;
@@ -48,62 +113,125 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   interior_width_ = decimated_width_ - 2;
   interior_height_ = decimated_height_ - 2;
   dense_qbp_count_ = 4u * interior_width_ * interior_height_;
+
   qbp_capacity_ = dense_qbp_count_;
+  if (config_.max_boundary_points > 0) {
+    qbp_capacity_ = std::min(qbp_capacity_, config_.max_boundary_points);
+  }
   qbp_padded_n_ = NextPow2(std::max(qbp_capacity_, 1u));
   ipoint_capacity_ = qbp_capacity_;
   ipoint_padded_n_ = NextPow2(std::max(ipoint_capacity_, 1u));
+
+  // The grayscale frame is uploaded packed, four 8-bit pixels per uint32.
+  // width % 8 == 0 guarantees the pixel count divides evenly by four.
+  gray_words_ = (config_.width * config_.height) / 4u;
 
   CreateBuffers();
   CreatePipelines();
 }
 
 void GpuDetector::CreateBuffers() {
-  gray_buf_ = MakeSsbo(ctx_, VkDeviceSize(config_.width) * config_.height * 4);
-  decimated_buf_ = MakeSsbo(ctx_, VkDeviceSize(decimated_width_) * decimated_height_ * 4);
-  minmax_unfiltered_buf_ = MakeSsbo(ctx_, VkDeviceSize(block_width_) * block_height_ * 4);
-  minmax_filtered_buf_ = MakeSsbo(ctx_, VkDeviceSize(block_width_) * block_height_ * 4);
-  thresholded_buf_ = MakeSsbo(ctx_, VkDeviceSize(decimated_width_) * decimated_height_ * 4);
+  auto ssbo = [this](VkDeviceSize bytes) {
+    vk::Buffer b(ctx_, std::max<VkDeviceSize>(bytes, 4), kSsboUsage, vk::MemoryKind::DeviceLocal);
+    device_bytes_ += b.size();
+    return b;
+  };
 
-  parent_buf_ = MakeSsbo(ctx_, VkDeviceSize(decimated_width_) * decimated_height_ * 4);
-  blob_size_buf_ = MakeSsbo(ctx_, VkDeviceSize(decimated_width_) * decimated_height_ * 4);
-  uf_changed_buf_ = MakeSsbo(ctx_, 4);
+  // On unified-memory parts (Mali and other integrated GPUs) the grayscale
+  // buffer is host-visible device memory written directly by the CPU, which
+  // removes the staging copy entirely. On discrete cards there is no such
+  // memory type (absent resizable BAR), so Buffer falls back to device-local
+  // and we DMA through a persistently mapped staging buffer instead.
+  gray_buf_ = vk::Buffer(
+      ctx_, VkDeviceSize(gray_words_) * 4,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      ctx_.caps().unified_memory ? vk::MemoryKind::DeviceLocalMapped
+                                 : vk::MemoryKind::DeviceLocal);
+  device_bytes_ += gray_buf_.size();
+  gray_direct_write_ = gray_buf_.host_visible();
 
-  qbp_dense_buf_ = MakeSsbo(ctx_, VkDeviceSize(dense_qbp_count_) * sizeof(QBPoint));
-  qbp_compacted_buf_ = MakeSsbo(ctx_, VkDeviceSize(qbp_capacity_) * sizeof(QBPoint));
-  qbp_counter_buf_ = MakeSsbo(ctx_, 4);
-  qbp_keys_hi_buf_ = MakeSsbo(ctx_, VkDeviceSize(qbp_padded_n_) * 4);
-  qbp_keys_lo_buf_ = MakeSsbo(ctx_, VkDeviceSize(qbp_padded_n_) * 4);
-  qbp_payload_buf_ = MakeSsbo(ctx_, VkDeviceSize(qbp_padded_n_) * 4);
-  qbp_sorted_buf_ = MakeSsbo(ctx_, VkDeviceSize(qbp_capacity_) * sizeof(QBPoint));
+  if (!gray_direct_write_) {
+    upload_staging_ = vk::Buffer(ctx_, VkDeviceSize(gray_words_) * 4,
+                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk::MemoryKind::HostVisible);
+  }
+  counter_staging_ = vk::Buffer(ctx_, kCounterStagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                vk::MemoryKind::HostVisible);
 
-  heads_buf_ = MakeSsbo(ctx_, VkDeviceSize(qbp_capacity_) * 4);
-  raw_blob_index_buf_ = MakeSsbo(ctx_, VkDeviceSize(qbp_capacity_) * 4);
+  decimated_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
+  minmax_unfiltered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
+  minmax_filtered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
+  thresholded_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
 
-  extents_buf_ = MakeSsbo(ctx_, VkDeviceSize(config_.max_raw_blobs) * sizeof(MinMaxExtentsGpu));
-  selected_extents_buf_ =
-      MakeSsbo(ctx_, VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu));
-  selected_counter_buf_ = MakeSsbo(ctx_, 4);
-  remap_buf_ = MakeSsbo(ctx_, VkDeviceSize(config_.max_raw_blobs) * 4);
+  parent_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
+  blob_size_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
+  uf_changed_buf_ = ssbo(4);
 
-  index_points_buf_ = MakeSsbo(ctx_, VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
-  index_points_counter_buf_ = MakeSsbo(ctx_, 4);
-  ipoint_keys_hi_buf_ = MakeSsbo(ctx_, VkDeviceSize(ipoint_padded_n_) * 4);
-  ipoint_keys_lo_buf_ = MakeSsbo(ctx_, VkDeviceSize(ipoint_padded_n_) * 4);
-  ipoint_payload_buf_ = MakeSsbo(ctx_, VkDeviceSize(ipoint_padded_n_) * 4);
-  index_points_sorted_buf_ = MakeSsbo(ctx_, VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
+  qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(QBPoint));
+  qbp_counter_buf_ = ssbo(4);
+  qbp_keys_hi_buf_ = ssbo(VkDeviceSize(qbp_padded_n_) * 4);
+  qbp_keys_lo_buf_ = ssbo(VkDeviceSize(qbp_padded_n_) * 4);
+  qbp_payload_buf_ = ssbo(VkDeviceSize(qbp_padded_n_) * 4);
+  qbp_sorted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(QBPoint));
 
-  line_fit_points_buf_ = MakeSsbo(ctx_, VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
+  heads_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
+  raw_blob_index_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
+
+  extents_buf_ = ssbo(VkDeviceSize(config_.max_raw_blobs) * sizeof(MinMaxExtentsGpu));
+  selected_extents_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu));
+  selected_counter_buf_ = ssbo(4);
+  remap_buf_ = ssbo(VkDeviceSize(config_.max_raw_blobs) * 4);
+
+  index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
+  index_points_counter_buf_ = ssbo(4);
+  ipoint_keys_hi_buf_ = ssbo(VkDeviceSize(ipoint_padded_n_) * 4);
+  ipoint_keys_lo_buf_ = ssbo(VkDeviceSize(ipoint_padded_n_) * 4);
+  ipoint_payload_buf_ = ssbo(VkDeviceSize(ipoint_padded_n_) * 4);
+  index_points_sorted_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
+
+  line_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
+
+  // Radix sort ping-pong scratch and histogram. One shared set: the two sorts
+  // are recorded in different submissions, so they never alias in time.
+  const uint32_t sort_capacity = std::max(qbp_capacity_, ipoint_capacity_);
+  radix_scratch_hi_ = ssbo(VkDeviceSize(sort_capacity) * 4);
+  radix_scratch_lo_ = ssbo(VkDeviceSize(sort_capacity) * 4);
+  radix_scratch_pay_ = ssbo(VkDeviceSize(sort_capacity) * 4);
+  radix_max_blocks_ = (sort_capacity + radix_wg_.x - 1) / radix_wg_.x;
+  radix_hist_ = ssbo(VkDeviceSize(16) * std::max(radix_max_blocks_, 1u) * 4);
 
   qbp_scan_chain_ = BuildScanChain(qbp_capacity_);
+
+  // Readback staging starts at a size that covers the extents plus a healthy
+  // number of line-fit points, and grows on demand. Steady state therefore
+  // performs no allocation at all.
+  const VkDeviceSize initial_readback =
+      VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu) + 16 +
+      VkDeviceSize(std::min<uint32_t>(ipoint_capacity_, 1u << 16)) * sizeof(RawLineFitPoint);
+  EnsureReadbackCapacity(std::max<VkDeviceSize>(initial_readback, 4096));
+}
+
+void GpuDetector::EnsureReadbackCapacity(VkDeviceSize bytes) {
+  if (bytes <= readback_capacity_) return;
+  // Grow geometrically so a slowly rising point count cannot cause a
+  // reallocation every frame.
+  VkDeviceSize new_capacity = std::max<VkDeviceSize>(readback_capacity_ * 2, bytes);
+  readback_staging_ = vk::Buffer(ctx_, new_capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                 vk::MemoryKind::HostVisible);
+  readback_capacity_ = readback_staging_.size();
 }
 
 GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
   ScanChain chain;
   uint32_t size = capacity;
-  while (size > 1024) {
-    uint32_t next = (size + 1023) / 1024;
+  // Fan-out per level is the scan block size, which is device dependent - it
+  // must match scan_block.comp's specialized local_size_x exactly.
+  while (size > scan_wg_) {
+    uint32_t next = (size + scan_wg_ - 1) / scan_wg_;
     chain.level_capacities.push_back(next);
-    chain.level_buffers.push_back(MakeSsbo(ctx_, VkDeviceSize(std::max(next, 1u)) * 4));
+    vk::Buffer b(ctx_, VkDeviceSize(std::max(next, 1u)) * 4, kSsboUsage,
+                 vk::MemoryKind::DeviceLocal);
+    device_bytes_ += b.size();
+    chain.level_buffers.push_back(std::move(b));
     size = next;
   }
   return chain;
@@ -111,62 +239,67 @@ GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
 
 void GpuDetector::CreatePipelines() {
   decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath("decimate"),
-                                     {gray_buf_.get(), decimated_buf_.get()}, 8);
+                                     {gray_buf_.get(), decimated_buf_.get()}, 8, wg1d_);
   block_minmax_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("block_minmax"), {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 8);
+      ctx_, ShaderPath("block_minmax"), {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 8,
+      wg2d_);
   block_filter_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
-      8);
+      8, wg2d_);
   threshold_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("threshold"),
-      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 12);
+      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 12, wg1d_);
 
-  uf_init_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_init"), {parent_buf_.get()}, 8);
+  uf_init_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_init"), {parent_buf_.get()}, 8, wg1d_);
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_merge"),
-      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8);
-  uf_compress_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_compress"), {parent_buf_.get()}, 8);
+      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8, wg1d_);
+  uf_compress_pl_ =
+      vk::ComputePipeline(ctx_, ShaderPath("uf_compress"), {parent_buf_.get()}, 8, wg1d_);
   uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_final"),
-                                     {parent_buf_.get(), blob_size_buf_.get()}, 8);
+                                     {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
 
   blob_diff_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("blob_diff"),
-      {thresholded_buf_.get(), parent_buf_.get(), blob_size_buf_.get(), qbp_dense_buf_.get()}, 12);
+      {thresholded_buf_.get(), parent_buf_.get(), blob_size_buf_.get(), qbp_compacted_buf_.get(),
+       qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(),
+       qbp_payload_buf_.get()},
+      16, wg1d_);
 
   fill_max_key_qbp_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("fill_max_key"),
-      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get()}, 4);
-  compact_qbp_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("compact_qbp"),
-      {qbp_dense_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
-       qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get()},
-      8);
+      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get()}, 8, wg1d_);
   qbp_bitonic_sort_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("bitonic_sort"),
-      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get()}, 12);
+      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get()}, 12, wg1d_);
+  qbp_bitonic_local_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("bitonic_local"),
+      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get()}, 12, wg1d_);
   qbp_gather_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("gather_generic"),
-      {qbp_compacted_buf_.get(), qbp_sorted_buf_.get(), qbp_payload_buf_.get()}, 12);
+      {qbp_compacted_buf_.get(), qbp_sorted_buf_.get(), qbp_payload_buf_.get()}, 12, wg1d_);
 
-  mark_heads_pl_ =
-      vk::ComputePipeline(ctx_, ShaderPath("mark_heads"), {qbp_sorted_buf_.get(), heads_buf_.get()}, 4);
+  mark_heads_pl_ = vk::ComputePipeline(ctx_, ShaderPath("mark_heads"),
+                                       {qbp_sorted_buf_.get(), heads_buf_.get()}, 4, wg1d_);
 
-  // Multi-level scan pipeline chain for heads -> raw_blob_index.
+  // Multi-level scan pipeline chain for heads -> raw_blob_index. These must
+  // use the same workgroup size as the scan chain's fan-out divisor, since
+  // scan_add_offsets.comp indexes block_offsets by gl_WorkGroupID.
   {
+    const vk::WorkgroupSize scan_wg{scan_wg_, 1, 1};
     VkBuffer prev_values = heads_buf_.get();
     VkBuffer prev_output = raw_blob_index_buf_.get();
     for (size_t i = 0; i < qbp_scan_chain_.level_buffers.size(); ++i) {
       VkBuffer block_sums = qbp_scan_chain_.level_buffers[i].get();
       qbp_scan_block_pls_.push_back(vk::ComputePipeline(
-          ctx_, ShaderPath("scan_block"), {prev_values, prev_output, block_sums}, 4));
+          ctx_, ShaderPath("scan_block"), {prev_values, prev_output, block_sums}, 4, scan_wg));
       prev_values = block_sums;
       prev_output = block_sums;
     }
-    // Final (top) level: scan in place with no further block_sums consumer
-    // needed downstream, but scan_block still requires a block_sums binding;
-    // reuse the same buffer as a scratch dump (unused beyond this point).
-    qbp_scan_block_pls_.push_back(
-        vk::ComputePipeline(ctx_, ShaderPath("scan_block"), {prev_values, prev_output, prev_output}, 4));
+    // Final (top) level: scan in place. scan_block still requires a block_sums
+    // binding, so reuse the same buffer as a scratch dump (unused downstream).
+    qbp_scan_block_pls_.push_back(vk::ComputePipeline(
+        ctx_, ShaderPath("scan_block"), {prev_values, prev_output, prev_output}, 4, scan_wg));
 
     // scan_add_offsets pipelines, one per level from the top back down to
     // level 0 (raw_blob_index_buf_ is level 0's output).
@@ -174,216 +307,523 @@ void GpuDetector::CreatePipelines() {
     for (auto &buf : qbp_scan_chain_.level_buffers) level_values.push_back(buf.get());
     for (size_t i = 0; i + 1 < level_values.size(); ++i) {
       qbp_scan_add_offsets_pls_.push_back(vk::ComputePipeline(
-          ctx_, ShaderPath("scan_add_offsets"), {level_values[i], level_values[i + 1]}, 4));
+          ctx_, ShaderPath("scan_add_offsets"), {level_values[i], level_values[i + 1]}, 4,
+          scan_wg));
     }
   }
 
   init_extents_pl_ =
-      vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4);
+      vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4, wg1d_);
   reduce_extents_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("reduce_extents"),
-      {qbp_sorted_buf_.get(), heads_buf_.get(), raw_blob_index_buf_.get(), extents_buf_.get()}, 8);
+      {qbp_sorted_buf_.get(), heads_buf_.get(), raw_blob_index_buf_.get(), extents_buf_.get()}, 8,
+      wg1d_);
 
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
       {extents_buf_.get(), selected_extents_buf_.get(), selected_counter_buf_.get(),
        remap_buf_.get()},
-      28);
+      28, wg1d_);
 
   fill_max_key_ipoint_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("fill_max_key"),
-      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 4);
+      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 8,
+      wg1d_);
   rewrite_index_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("rewrite_index_points"),
       {qbp_sorted_buf_.get(), raw_blob_index_buf_.get(), remap_buf_.get(),
        selected_extents_buf_.get(), index_points_buf_.get(), index_points_counter_buf_.get(),
        ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()},
-      12);
+      12, wg1d_);
   ipoint_bitonic_sort_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("bitonic_sort"),
-      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 12);
+      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 12,
+      wg1d_);
+  ipoint_bitonic_local_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("bitonic_local"),
+      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 12,
+      wg1d_);
   ipoint_gather_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("gather_generic"),
-      {index_points_buf_.get(), index_points_sorted_buf_.get(), ipoint_payload_buf_.get()}, 12);
+      {index_points_buf_.get(), index_points_sorted_buf_.get(), ipoint_payload_buf_.get()}, 12,
+      wg1d_);
 
   compute_line_fit_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("compute_line_fit_points"),
-      {index_points_sorted_buf_.get(), decimated_buf_.get(), line_fit_points_buf_.get()}, 12);
+      {index_points_sorted_buf_.get(), decimated_buf_.get(), line_fit_points_buf_.get()}, 12,
+      wg1d_);
+
+  // ---------------- Radix sort ----------------
+  // Gather variants that read the payload out of the scratch set, for when an
+  // odd number of digit passes leaves the result there.
+  qbp_gather_scratch_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("gather_generic"),
+      {qbp_compacted_buf_.get(), qbp_sorted_buf_.get(), radix_scratch_pay_.get()}, 12, wg1d_);
+  ipoint_gather_scratch_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("gather_generic"),
+      {index_points_buf_.get(), index_points_sorted_buf_.get(), radix_scratch_pay_.get()}, 12,
+      wg1d_);
+
+  radix_scan_hist_pl_ = vk::ComputePipeline(ctx_, ShaderPath("radix_scan_hist"),
+                                            {radix_hist_.get()}, 4, wg1d_);
+
+  const uint32_t kRadixPush = 16;  // n, shift, use_hi, num_blocks
+  qbp_radix_hist_a_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_histogram"),
+      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), radix_hist_.get()}, kRadixPush, radix_wg_);
+  qbp_radix_hist_b_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_histogram"),
+      {radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_hist_.get()}, kRadixPush, radix_wg_);
+  qbp_radix_scatter_ab_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_scatter"),
+      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get(),
+       radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_scratch_pay_.get(),
+       radix_hist_.get()},
+      kRadixPush, radix_wg_);
+  qbp_radix_scatter_ba_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_scatter"),
+      {radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_scratch_pay_.get(),
+       qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), qbp_payload_buf_.get(),
+       radix_hist_.get()},
+      kRadixPush, radix_wg_);
+
+  ipoint_radix_hist_a_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_histogram"),
+      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), radix_hist_.get()}, kRadixPush,
+      radix_wg_);
+  ipoint_radix_hist_b_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_histogram"),
+      {radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_hist_.get()}, kRadixPush, radix_wg_);
+  ipoint_radix_scatter_ab_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_scatter"),
+      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get(),
+       radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_scratch_pay_.get(),
+       radix_hist_.get()},
+      kRadixPush, radix_wg_);
+  ipoint_radix_scatter_ba_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("radix_scatter"),
+      {radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_scratch_pay_.get(),
+       ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get(),
+       radix_hist_.get()},
+      kRadixPush, radix_wg_);
+
+  // Digit counts, derived from provable bounds on each key word so no pass is
+  // spent on bits that are always zero.
+  //
+  //   boundary points: keys are (rep0, rep1), both union-find roots, i.e.
+  //                    decimated pixel indices in [0, pixels).
+  //   index points:    keys are (selected blob index, theta_key).
+  const uint32_t pixels = decimated_width_ * decimated_height_;
+  const uint32_t rep_digits = DigitsFor(BitsFor(pixels > 0 ? pixels - 1 : 0));
+  qbp_radix_.hist_from_a = &qbp_radix_hist_a_pl_;
+  qbp_radix_.hist_from_b = &qbp_radix_hist_b_pl_;
+  qbp_radix_.scatter_a_to_b = &qbp_radix_scatter_ab_pl_;
+  qbp_radix_.scatter_b_to_a = &qbp_radix_scatter_ba_pl_;
+  qbp_radix_.lo_digits = rep_digits;
+  qbp_radix_.hi_digits = rep_digits;
+
+  ipoint_radix_.hist_from_a = &ipoint_radix_hist_a_pl_;
+  ipoint_radix_.hist_from_b = &ipoint_radix_hist_b_pl_;
+  ipoint_radix_.scatter_a_to_b = &ipoint_radix_scatter_ab_pl_;
+  ipoint_radix_.scatter_b_to_a = &ipoint_radix_scatter_ba_pl_;
+  ipoint_radix_.lo_digits = DigitsFor(BitsFor(kMaxThetaKey));
+  ipoint_radix_.hi_digits =
+      DigitsFor(BitsFor(config_.max_blobs > 0 ? config_.max_blobs - 1 : 0));
 }
 
-void GpuDetector::RunBitonicSort(VkCommandBuffer cmd, const vk::ComputePipeline &sort_pipeline,
+bool GpuDetector::RunRadixSort(VkCommandBuffer cmd, const RadixPipelines &pipelines,
+                               uint32_t count) {
+  if (count == 0) return false;
+
+  // Must match the histogram/scatter pipelines' own workgroup size, since
+  // Dispatch1D derives its group count from that.
+  const uint32_t num_blocks = (count + radix_wg_.x - 1) / radix_wg_.x;
+  const uint32_t hist_len = 16u * num_blocks;
+
+  // Least-significant digit first, low key word before high: that is exactly
+  // ascending order on the 64-bit (hi, lo) composite, and every pass is stable
+  // so the ordering established by earlier digits survives.
+  bool in_scratch = false;
+  const uint32_t passes = pipelines.passes();
+  for (uint32_t pass = 0; pass < passes; ++pass) {
+    const bool use_hi = pass >= pipelines.lo_digits;
+    const uint32_t shift = (use_hi ? (pass - pipelines.lo_digits) : pass) * 4u;
+
+    struct {
+      uint32_t n, shift, use_hi, num_blocks;
+    } pc{count, shift, use_hi ? 1u : 0u, num_blocks};
+
+    // Histogram: every (bin, block) slot is overwritten, so no clear needed.
+    (in_scratch ? *pipelines.hist_from_b : *pipelines.hist_from_a).Dispatch1D(cmd, count, &pc);
+
+    struct {
+      uint32_t total;
+    } scan_pc{hist_len};
+    radix_scan_hist_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
+
+    (in_scratch ? *pipelines.scatter_b_to_a : *pipelines.scatter_a_to_b)
+        .Dispatch1D(cmd, count, &pc);
+    in_scratch = !in_scratch;
+  }
+  return in_scratch;
+}
+
+void GpuDetector::RunBitonicSort(VkCommandBuffer cmd,
+                                 const vk::ComputePipeline &local_pipeline,
+                                 const vk::ComputePipeline &global_pipeline,
                                  uint32_t padded_n) {
-  for (uint32_t k = 2; k <= padded_n; k <<= 1) {
-    for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+  // A stage (k, j) pairs index i with i^j, so it stays inside one workgroup's
+  // L contiguous elements whenever j < L and can run in shared memory.
+  // L == 1 disables the shared-memory path entirely, degenerating to one
+  // global dispatch per stage (the original scheme).
+  const uint32_t L =
+      (config_.sort_algorithm == DetectorConfig::SortAlgorithm::SharedMemoryBitonic)
+          ? local_pipeline.workgroup_size().x
+          : 1u;
+  struct LocalPc { uint32_t n, k_start, k_end; };
+
+  // Phase 1: every k <= L has all of its stages local (j <= k/2 < L), so this
+  // single dispatch covers log2(L)*(log2(L)+1)/2 stages - 36 of them at L=256.
+  if (L > 1) {
+    LocalPc initial{padded_n, 2u, L};
+    local_pipeline.Dispatch1D(cmd, padded_n, &initial);
+  }
+
+  // Phase 2: wider k. Stages down to j == L need global barriers; the
+  // remaining j < L tail collapses into one more local dispatch.
+  for (uint32_t k = (L > 1 ? L : 1u) << 1; k != 0 && k <= padded_n; k <<= 1) {
+    for (uint32_t j = k >> 1; j >= L && j > 0; j >>= 1) {
       struct { uint32_t n, j, k; } pc{padded_n, j, k};
-      sort_pipeline.Dispatch1D(cmd, padded_n, 256, &pc);
+      global_pipeline.Dispatch1D(cmd, padded_n, &pc);
+    }
+    if (L > 1) {
+      LocalPc tail{padded_n, k, k};
+      local_pipeline.Dispatch1D(cmd, padded_n, &tail);
     }
   }
 }
 
-void GpuDetector::RunInclusiveScan(VkCommandBuffer cmd, VkBuffer /*values*/, VkBuffer /*output*/,
-                                   uint32_t count, const ScanChain &chain,
-                                   const std::vector<vk::ComputePipeline> &scan_block_pipelines,
-                                   const std::vector<vk::ComputePipeline> &scan_add_offsets_pipelines) {
-  // Down pass: scan level 0 (the real values), then each block-sums level.
-  std::vector<uint32_t> counts = {count};
-  for (uint32_t cap : chain.level_capacities) {
-    counts.push_back((counts.back() + 1023) / 1024);
-    (void)cap;
+void GpuDetector::RunSizedSort(VkCommandBuffer cmd, const vk::ComputePipeline &fill_pipeline,
+                               const vk::ComputePipeline &local_pipeline,
+                               const vk::ComputePipeline &global_pipeline, uint32_t count,
+                               uint32_t padded_n) {
+  // Only the [count, padded_n) tail needs sentinel keys; blob_diff /
+  // rewrite_index_points wrote real keys into [0, count).
+  if (padded_n > count) {
+    struct { uint32_t begin, end; } pc{count, padded_n};
+    fill_pipeline.Dispatch1D(cmd, padded_n - count, &pc);
   }
+  RunBitonicSort(cmd, local_pipeline, global_pipeline, padded_n);
+}
 
-  for (size_t i = 0; i < scan_block_pipelines.size(); ++i) {
-    uint32_t c = (i < counts.size()) ? counts[i] : 1;
-    struct { uint32_t count; } pc{c};
-    scan_block_pipelines[i].Dispatch1D(cmd, std::max(c, 1u), 1024, &pc);
+void GpuDetector::RunInclusiveScan(
+    VkCommandBuffer cmd, uint32_t count, const ScanChain &chain,
+    const std::vector<vk::ComputePipeline> &scan_block_pipelines,
+    const std::vector<vk::ComputePipeline> &scan_add_offsets_pipelines) {
+  if (count == 0) return;
+  (void)chain;
+
+  // Element count at each level; stop once a level fits in a single block.
+  std::vector<uint32_t> ns;
+  ns.push_back(count);
+  while (ns.back() > scan_wg_) {
+    ns.push_back((ns.back() + scan_wg_ - 1) / scan_wg_);
   }
+  // The chain was built for the worst-case capacity, so a smaller count can
+  // only need fewer levels than there are pipelines.
+  const size_t levels = std::min(ns.size(), scan_block_pipelines.size());
 
-  // Up pass: propagate offsets from the topmost level back down to level 0.
-  for (size_t i = scan_add_offsets_pipelines.size(); i-- > 0;) {
-    uint32_t c = counts[i];
-    struct { uint32_t count; } pc{c};
-    scan_add_offsets_pipelines[i].Dispatch1D(cmd, std::max(c, 1u), 1024, &pc);
+  // Down pass: scan each level.
+  for (size_t i = 0; i < levels; ++i) {
+    struct { uint32_t count; } pc{ns[i]};
+    scan_block_pipelines[i].Dispatch1D(cmd, ns[i], &pc);
+  }
+  // Up pass: fold each level's block offsets back into the level below.
+  for (size_t i = levels - 1; i-- > 0;) {
+    if (i >= scan_add_offsets_pipelines.size()) continue;
+    struct { uint32_t count; } pc{ns[i]};
+    scan_add_offsets_pipelines[i].Dispatch1D(cmd, ns[i], &pc);
   }
 }
 
+void GpuDetector::RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &counter,
+                                    uint32_t slot) {
+  counter.RecordCopyTo(cmd, counter_staging_, 4, 0, VkDeviceSize(slot) * 4);
+}
+
+uint32_t GpuDetector::ReadCounterSlot(uint32_t slot) const {
+  uint32_t value = 0;
+  counter_staging_.Read(&value, 4, VkDeviceSize(slot) * 4);
+  return value;
+}
+
 void GpuDetector::Detect(const uint8_t *gray_frame) {
-  // Upload the grayscale frame, expanding to uint32 per pixel (avoids
-  // needing the optional 8-bit-storage-buffer device feature).
-  {
-    std::vector<uint32_t> expanded(VkDeviceSize(config_.width) * config_.height);
-    for (size_t i = 0; i < expanded.size(); ++i) expanded[i] = gray_frame[i];
-    gray_buf_.Upload(ctx_, expanded.data(), expanded.size() * 4);
+  using vk::BarrierKind;
+  const auto t_begin = Clock::now();
+  last_profile_ = DetectProfile{};
+  const uint64_t submits_at_start = ctx_.submit_count;
+
+  const uint32_t pixels = decimated_width_ * decimated_height_;
+  const VkDeviceSize gray_bytes = VkDeviceSize(config_.width) * config_.height;
+  const bool use_radix = config_.sort_algorithm == DetectorConfig::SortAlgorithm::Radix;
+
+  // ------------------------------------------------------------------
+  // Upload. One memcpy of the raw 8-bit frame - no widening loop, and a
+  // quarter of the bytes the uint32-per-pixel layout used to move.
+  // ------------------------------------------------------------------
+  const auto t_upload0 = Clock::now();
+  if (gray_direct_write_) {
+    gray_buf_.Write(gray_frame, gray_bytes);
+  } else {
+    upload_staging_.Write(gray_frame, gray_bytes);
   }
+  const auto t_upload1 = Clock::now();
 
-  VkCommandBuffer cmd = ctx_.BeginOneShotCommands();
+  // Push constants shared across several stages.
+  struct { uint32_t w, h; } dims_pc{config_.width, config_.height};
+  struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
+  struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
 
-  // Zero the small atomic counters and per-frame accumulators.
+  // ------------------------------------------------------------------
+  // Submit 1: decimate, adaptive threshold, and the first chunk of
+  // connected-component labelling.
+  // ------------------------------------------------------------------
+  VkCommandBuffer cmd = ctx_.BeginCommands();
+  if (!gray_direct_write_) {
+    gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
+  }
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   index_points_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
   blob_size_buf_.FillZero(cmd);
-  vk::ComputePipeline::Barrier(cmd);
+  vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
-  // 1. Grayscale decimation + adaptive threshold.
-  struct { uint32_t w, h; } dims_pc{config_.width, config_.height};
-  decimate_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, 256, &dims_pc);
-
-  struct { uint32_t dw, dh; } bwbh_pc{decimated_width_, decimated_height_};
-  block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, 16, 16, &bwbh_pc);
-
-  struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
-  block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, 16, 16, &blockdims_pc);
+  decimate_pl_.Dispatch1D(cmd, pixels, &dims_pc);
+  block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &dwdh_pc);
+  block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 
   struct { uint32_t dw, dh, min_diff; } thresh_pc{decimated_width_, decimated_height_,
                                                   config_.min_white_black_diff};
-  threshold_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, 256, &thresh_pc);
+  threshold_pl_.Dispatch1D(cmd, pixels, &thresh_pc);
 
-  // 2. Connected component labeling (union-find), iterated to convergence.
-  uf_init_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, 256, &bwbh_pc);
-  for (int iter = 0; iter < 64; ++iter) {
-    uf_changed_buf_.FillZero(cmd);
-    vk::ComputePipeline::Barrier(cmd);
-    uf_merge_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, 256, &bwbh_pc);
-    uf_compress_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, 256, &bwbh_pc);
+  uf_init_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
+
+  // Records `iterations` labelling passes. The convergence flag is cleared
+  // immediately before the LAST merge of the chunk, so a zero readback means
+  // "the final pass changed nothing", i.e. genuinely converged - clearing it
+  // once at the start of the chunk instead would conflate "converged" with
+  // "changed something earlier in this chunk" and never terminate tightly.
+  auto record_uf_chunk = [&](VkCommandBuffer c, uint32_t iterations) {
+    for (uint32_t iter = 0; iter < iterations; ++iter) {
+      if (iter + 1 == iterations) {
+        vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
+        uf_changed_buf_.FillZero(c);
+        vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
+      }
+      uf_merge_pl_.Dispatch1D(c, pixels, &dwdh_pc);
+      uf_compress_pl_.Dispatch1D(c, pixels, &dwdh_pc);
+    }
+  };
+
+  // Seed the first chunk with however many iterations converged last frame, so
+  // steady-state video settles in one chunk plus its verification rather than
+  // rediscovering the count in 8-iteration steps every frame.
+  uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
+  chunk = std::min(chunk, config_.max_uf_iterations);
+  record_uf_chunk(cmd, chunk);
+  RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  ctx_.SubmitAndWait(cmd);
+
+  uint32_t uf_iterations = chunk;
+  bool converged = ReadCounterSlot(kSlotUfChanged) == 0;
+  while (!converged && uf_iterations < config_.max_uf_iterations) {
+    const uint32_t next =
+        std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
+    cmd = ctx_.BeginCommands();
+    record_uf_chunk(cmd, next);
+    RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
+    vk::ComputePipeline::HostReadBarrier(cmd);
+    ctx_.SubmitAndWait(cmd);
+    uf_iterations += next;
+    converged = ReadCounterSlot(kSlotUfChanged) == 0;
   }
-  uf_final_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, 256, &bwbh_pc);
+  last_uf_iterations_ = uf_iterations;
+  const auto t_label = Clock::now();
 
-  // 3. Boundary point extraction.
-  struct { uint32_t w, h, min_blob; } blobdiff_pc{decimated_width_, decimated_height_,
-                                                  config_.min_cluster_pixels};
-  blob_diff_pl_.Dispatch1D(cmd, interior_width_ * interior_height_, 256, &blobdiff_pc);
+  // ------------------------------------------------------------------
+  // Submit 2: blob sizes, boundary point extraction, and compaction. The
+  // compacted count is the number every later stage is sized by.
+  // ------------------------------------------------------------------
+  cmd = ctx_.BeginCommands();
+  uf_final_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
 
-  // 4. Compact valid boundary points + sort by (rep0, rep1).
-  struct { uint32_t capacity; } fillcap_pc{qbp_padded_n_};
-  fill_max_key_qbp_pl_.Dispatch1D(cmd, qbp_padded_n_, 256, &fillcap_pc);
+  // blob_diff appends valid boundary points (with their sort keys) directly
+  // into the compacted buffer, so there is no dense intermediate array and no
+  // separate full-capacity compaction pass.
+  struct { uint32_t w, h, min_blob, capacity; } blobdiff_pc{
+      decimated_width_, decimated_height_, config_.min_cluster_pixels, qbp_capacity_};
+  blob_diff_pl_.Dispatch1D(cmd, interior_width_ * interior_height_, &blobdiff_pc,
+                           BarrierKind::ComputeAndTransfer);
 
-  struct { uint32_t total, capacity; } compact_pc{dense_qbp_count_, qbp_capacity_};
-  compact_qbp_pl_.Dispatch1D(cmd, dense_qbp_count_, 256, &compact_pc);
+  RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  ctx_.SubmitAndWait(cmd);
 
-  RunBitonicSort(cmd, qbp_bitonic_sort_pl_, qbp_padded_n_);
+  const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
+  const uint32_t qbp_padded = NextPow2(std::max(qbp_count, 1u));
+  const auto t_boundary = Clock::now();
 
-  // Zero the destination first: gather_generic.comp intentionally skips
-  // writing for sorted positions beyond the real compacted point count
-  // (they hold sentinel payload values), so without this the tail would
-  // otherwise retain a *previous frame's* stale QBPoint data, which could
-  // corrupt blob extents downstream. A zeroed QBPoint has valid == 0, which
-  // mark_heads.comp / reduce_extents.comp explicitly skip.
-  qbp_sorted_buf_.FillZero(cmd);
-  vk::ComputePipeline::Barrier(cmd);
+  // ------------------------------------------------------------------
+  // Submit 3: sort the boundary points by (rep0, rep1), group them into raw
+  // blobs, select plausible tag quads, and rewrite the survivors.
+  //
+  // Everything here is dispatched over qbp_count, not qbp_capacity_. At 1080p
+  // that is the difference between a ~2M-element bitonic network (231 stages)
+  // and one sized to the few hundred thousand points a real frame produces.
+  // ------------------------------------------------------------------
+  cmd = ctx_.BeginCommands();
+  if (qbp_count > 0) {
+    bool result_in_scratch = false;
+    if (use_radix) {
+      result_in_scratch = RunRadixSort(cmd, qbp_radix_, qbp_count);
+    } else {
+      RunSizedSort(cmd, fill_max_key_qbp_pl_, qbp_bitonic_local_pl_, qbp_bitonic_sort_pl_,
+                   qbp_count, qbp_padded);
+    }
 
-  struct { uint32_t count, stride, src_count; } gather_pc{qbp_capacity_, sizeof(QBPoint) / 4,
-                                                          qbp_capacity_};
-  qbp_gather_pl_.Dispatch1D(cmd, qbp_capacity_, 256, &gather_pc);
+    // No pre-clear of qbp_sorted_buf_ is needed any more: the gather covers
+    // exactly [0, qbp_count), every payload there is a real index, and nothing
+    // downstream reads past that point. This used to be a 66 MB fill per frame.
+    struct { uint32_t count, stride, src_count; } gather_pc{qbp_count, sizeof(QBPoint) / 4,
+                                                            qbp_count};
+    (result_in_scratch ? qbp_gather_scratch_pl_ : qbp_gather_pl_)
+        .Dispatch1D(cmd, qbp_count, &gather_pc);
 
-  // 5. Mark blob boundaries + scan to assign compact raw blob indices.
-  struct { uint32_t count; } count_pc{qbp_capacity_};
-  mark_heads_pl_.Dispatch1D(cmd, qbp_capacity_, 256, &count_pc);
-  RunInclusiveScan(cmd, heads_buf_.get(), raw_blob_index_buf_.get(), qbp_capacity_,
-                   qbp_scan_chain_, qbp_scan_block_pls_, qbp_scan_add_offsets_pls_);
+    struct { uint32_t count; } count_pc{qbp_count};
+    mark_heads_pl_.Dispatch1D(cmd, qbp_count, &count_pc);
+    RunInclusiveScan(cmd, qbp_count, qbp_scan_chain_, qbp_scan_block_pls_,
+                     qbp_scan_add_offsets_pls_);
 
-  // 6. Reduce into per-raw-blob extents, then select plausible tag quads.
-  struct { uint32_t capacity; } extentscap_pc{config_.max_raw_blobs};
-  init_extents_pl_.Dispatch1D(cmd, config_.max_raw_blobs, 256, &extentscap_pc);
+    struct { uint32_t capacity; } extentscap_pc{config_.max_raw_blobs};
+    init_extents_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &extentscap_pc);
 
-  struct { uint32_t count, max_raw_blobs; } reduce_pc{qbp_capacity_, config_.max_raw_blobs};
-  reduce_extents_pl_.Dispatch1D(cmd, qbp_capacity_, 256, &reduce_pc);
+    struct { uint32_t count, max_raw_blobs; } reduce_pc{qbp_count, config_.max_raw_blobs};
+    reduce_extents_pl_.Dispatch1D(cmd, qbp_count, &reduce_pc);
 
-  struct {
-    uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal;
-  } select_pc{config_.max_raw_blobs,      config_.max_blobs,
-             config_.tag_width,          config_.min_cluster_pixels,
-             config_.max_cluster_pixels, config_.reversed_border ? 1u : 0u,
-             config_.normal_border ? 1u : 0u};
-  select_blobs_pl_.Dispatch1D(cmd, config_.max_raw_blobs, 256, &select_pc);
+    struct {
+      uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal;
+    } select_pc{config_.max_raw_blobs,      config_.max_blobs,
+                config_.tag_width,          config_.min_cluster_pixels,
+                config_.max_cluster_pixels, config_.reversed_border ? 1u : 0u,
+                config_.normal_border ? 1u : 0u};
+    select_blobs_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &select_pc);
 
-  // 7. Rewrite surviving points to (compact blob index, angle) form, sort by
-  // (blob_index, angle) so each blob's points are ordered around its
-  // perimeter (needed for windowed line fitting on the CPU side).
-  fill_max_key_ipoint_pl_.Dispatch1D(cmd, ipoint_padded_n_, 256, &fillcap_pc);
-
-  struct { uint32_t count, capacity, max_raw_blobs; } rewrite_pc{qbp_capacity_, ipoint_capacity_,
-                                                                 config_.max_raw_blobs};
-  rewrite_index_points_pl_.Dispatch1D(cmd, qbp_capacity_, 256, &rewrite_pc);
-
-  RunBitonicSort(cmd, ipoint_bitonic_sort_pl_, ipoint_padded_n_);
-
-  struct { uint32_t count, stride, src_count; } igather_pc{ipoint_capacity_, sizeof(IPoint) / 4,
-                                                           ipoint_capacity_};
-  ipoint_gather_pl_.Dispatch1D(cmd, ipoint_capacity_, 256, &igather_pc);
-
-  // 8. Per-point raw line-fit moments (cumulative summation happens on the
-  // CPU after readback - see QuadDecode).
-  struct { uint32_t count; int dw, dh; } linefit_pc{
-      ipoint_capacity_, static_cast<int>(decimated_width_), static_cast<int>(decimated_height_)};
-  compute_line_fit_points_pl_.Dispatch1D(cmd, ipoint_capacity_, 256, &linefit_pc);
-
-  ctx_.EndOneShotCommands(cmd);
-
-  // --- Read back the small, CPU-tail-relevant results. ---
-  uint32_t num_selected_blobs = 0;
-  selected_counter_buf_.Download(ctx_, &num_selected_blobs, 4);
-  num_selected_blobs = std::min(num_selected_blobs, config_.max_blobs);
-
-  last_selected_extents.assign(num_selected_blobs, MinMaxExtentsGpu{});
-  if (num_selected_blobs > 0) {
-    selected_extents_buf_.Download(ctx_, last_selected_extents.data(),
-                                   VkDeviceSize(num_selected_blobs) * sizeof(MinMaxExtentsGpu));
+    struct { uint32_t count, capacity, max_raw_blobs; } rewrite_pc{qbp_count, ipoint_capacity_,
+                                                                   config_.max_raw_blobs};
+    rewrite_index_points_pl_.Dispatch1D(cmd, qbp_count, &rewrite_pc);
   }
+  RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
+  RecordCounterCopy(cmd, index_points_counter_buf_, kSlotPointCount);
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  ctx_.SubmitAndWait(cmd);
 
-  uint32_t num_points = 0;
-  index_points_counter_buf_.Download(ctx_, &num_points, 4);
-  num_points = std::min(num_points, ipoint_capacity_);
+  const uint32_t num_selected_blobs =
+      std::min(ReadCounterSlot(kSlotSelectedCount), config_.max_blobs);
+  const uint32_t num_points = std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_);
+  const uint32_t ipoint_padded = NextPow2(std::max(num_points, 1u));
+  const auto t_sort_group = Clock::now();
 
-  last_line_fit_points.assign(num_points, RawLineFitPoint{});
+  // ------------------------------------------------------------------
+  // Submit 4: sort the surviving points around each blob's perimeter, compute
+  // per-point line-fit moments, and stage both payloads for readback.
+  // ------------------------------------------------------------------
+  const VkDeviceSize extents_bytes = VkDeviceSize(num_selected_blobs) * sizeof(MinMaxExtentsGpu);
+  const VkDeviceSize linefit_offset = (extents_bytes + 15) & ~VkDeviceSize(15);
+  const VkDeviceSize linefit_bytes = VkDeviceSize(num_points) * sizeof(RawLineFitPoint);
+  EnsureReadbackCapacity(linefit_offset + linefit_bytes);
+
+  cmd = ctx_.BeginCommands();
   if (num_points > 0) {
-    line_fit_points_buf_.Download(ctx_, last_line_fit_points.data(),
-                                  VkDeviceSize(num_points) * sizeof(RawLineFitPoint));
+    bool result_in_scratch = false;
+    if (use_radix) {
+      result_in_scratch = RunRadixSort(cmd, ipoint_radix_, num_points);
+    } else {
+      RunSizedSort(cmd, fill_max_key_ipoint_pl_, ipoint_bitonic_local_pl_,
+                   ipoint_bitonic_sort_pl_, num_points, ipoint_padded);
+    }
+
+    struct { uint32_t count, stride, src_count; } igather_pc{num_points, sizeof(IPoint) / 4,
+                                                             num_points};
+    (result_in_scratch ? ipoint_gather_scratch_pl_ : ipoint_gather_pl_)
+        .Dispatch1D(cmd, num_points, &igather_pc);
+
+    struct { uint32_t count; int dw, dh; } linefit_pc{
+        num_points, static_cast<int>(decimated_width_), static_cast<int>(decimated_height_)};
+    compute_line_fit_points_pl_.Dispatch1D(cmd, num_points, &linefit_pc,
+                                           BarrierKind::ComputeAndTransfer);
   }
+  if (extents_bytes > 0) {
+    selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);
+  }
+  if (linefit_bytes > 0) {
+    line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
+  }
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  ctx_.SubmitAndWait(cmd);
+  const auto t_linefit = Clock::now();
+
+  // ------------------------------------------------------------------
+  // Host-side copies out of the persistently mapped readback buffer.
+  // ------------------------------------------------------------------
+  last_selected_extents.resize(num_selected_blobs);
+  last_line_fit_points.resize(num_points);
+  if (extents_bytes > 0) {
+    readback_staging_.Read(last_selected_extents.data(), extents_bytes, 0);
+  }
+  if (linefit_bytes > 0) {
+    readback_staging_.Read(last_line_fit_points.data(), linefit_bytes, linefit_offset);
+  }
+  const auto t_end = Clock::now();
+
+  last_profile_.upload_ms = MsSince(t_upload0, t_upload1);
+  last_profile_.threshold_label_ms = MsSince(t_upload1, t_label);
+  last_profile_.boundary_ms = MsSince(t_label, t_boundary);
+  last_profile_.sort_group_ms = MsSince(t_boundary, t_sort_group);
+  last_profile_.linefit_ms = MsSince(t_sort_group, t_linefit);
+  last_profile_.readback_ms = MsSince(t_linefit, t_end);
+  last_profile_.gpu_ms = last_profile_.threshold_label_ms + last_profile_.boundary_ms +
+                         last_profile_.sort_group_ms + last_profile_.linefit_ms;
+  last_profile_.total_ms = MsSince(t_begin, t_end);
+  last_profile_.upload_bytes = gray_bytes;
+  last_profile_.readback_bytes = extents_bytes + linefit_bytes + 16;
+  last_profile_.selected_blobs = num_selected_blobs;
+  last_profile_.points = num_points;
+  last_profile_.boundary_points = qbp_count;
+  last_profile_.qbp_sort_n = (qbp_count > 0) ? (use_radix ? qbp_count : qbp_padded) : 0;
+  last_profile_.ipoint_sort_n = (num_points > 0) ? (use_radix ? num_points : ipoint_padded) : 0;
+  last_profile_.sort_passes = use_radix ? qbp_radix_.passes() : 0;
+  last_profile_.uf_iterations = uf_iterations;
+  last_profile_.uf_converged = converged;
+  last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);
 
   // Quad fitting itself happens in QuadDecode (CPU tail); Detect() only runs
   // the GPU pipeline and exposes its outputs via last_selected_extents /
   // last_line_fit_points.
+}
+
+std::string GpuDetector::DescribeSizing() const {
+  std::ostringstream os;
+  os << "apriltag_vulkan: " << config_.width << "x" << config_.height << " -> decimated "
+     << decimated_width_ << "x" << decimated_height_ << ", boundary point capacity "
+     << qbp_capacity_;
+  if (config_.max_boundary_points > 0 && qbp_capacity_ < dense_qbp_count_) {
+    os << " (capped from dense " << dense_qbp_count_ << ")";
+  }
+  os << ", device memory " << (device_bytes_ / (1024 * 1024)) << " MiB";
+  os << ", gray upload " << (gray_direct_write_ ? "direct (unified memory)" : "staged");
+  return os.str();
 }
 
 }  // namespace apriltag_vulkan
