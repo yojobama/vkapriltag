@@ -342,3 +342,11 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+/apriltags_vulkan/.idea/.gitignore
+/apriltags_vulkan/.idea/.name
+/apriltags_vulkan/.idea/apriltags_vulkan.iml
+/apriltags_vulkan/.idea/editor.xml
+/apriltags_vulkan/.idea/misc.xml
+/apriltags_vulkan/.idea/modules.xml
+/apriltags_vulkan/.idea/vcs.xml
+/.idea/workspace.xml
