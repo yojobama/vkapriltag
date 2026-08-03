@@ -1,11 +1,12 @@
-#include "TagDecoder.h"
+#include "vkapriltag/TagDecoder.h"
 
 extern "C" {
 #include "common/g2d.h"
 
-// Declared non-static in the fetched apriltag library's apriltag.c but not
-// exposed via any header - forward-declared here exactly as the original
-// CUDA apriltag_detect.cu does.
+// Exposed as non-static entry points by cmake/patches/apriltag-expose-decode-steps.patch,
+// applied to the fetched (unmodified upstream) apriltag library - not exposed via
+// any header, forward-declared here exactly as the original CUDA
+// apriltag_detect.cu does.
 void quad_decode_index(apriltag_detector_t *td, struct quad *quad_original, image_u8_t *im,
                        image_u8_t *im_samples, zarray_t *detections);
 void reconcile_detections(zarray_t *detections, zarray_t *poly0, zarray_t *poly1);

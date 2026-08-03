@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "gpu/GpuDetector.h"
+#include "vkapriltag/gpu/GpuDetector.h"
 
 extern "C" {
 #include "apriltag.h"
@@ -14,7 +14,9 @@ namespace apriltag_vulkan {
 // Wires the CPU-computed quad corner candidates (DetectedQuad, produced by
 // QuadDecode from the GPU pipeline's output) through the fetched `apriltag`
 // C library's per-family bit-sampling/hamming decode (quad_decode_index) and
-// cross-family duplicate reconciliation (reconcile_detections), producing
+// cross-family duplicate reconciliation (reconcile_detections) - both exposed
+// as non-static entry points via cmake/patches/apriltag-expose-decode-steps.patch -
+// producing
 // final decoded tags: id, hamming distance, decision margin, center, and a
 // homography-refined set of corners (not just the raw geometric quad
 // corners QuadDecode computed). This exactly mirrors what

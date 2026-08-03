@@ -10,12 +10,12 @@
 #include <string>
 #include <vector>
 
-#include "TagDecoder.h"
-#include "apriltag_family.h"
-#include "common/pgm_io.h"
-#include "gpu/GpuDetector.h"
-#include "gpu/QuadDecode.h"
-#include "vk/Context.h"
+#include "vkapriltag/TagDecoder.h"
+#include "vkapriltag/apriltag_family.h"
+#include "vkapriltag/common/pgm_io.h"
+#include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/QuadDecode.h"
+#include "vkapriltag/vk/Context.h"
 #include <chrono>
 
 extern "C" {

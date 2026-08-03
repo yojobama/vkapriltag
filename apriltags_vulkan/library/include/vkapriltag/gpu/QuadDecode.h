@@ -3,9 +3,9 @@
 #include <memory>
 #include <vector>
 
-#include "common/WorkerPool.h"
-#include "gpu/GpuDetector.h"
-#include "gpu/Types.h"
+#include "vkapriltag/common/WorkerPool.h"
+#include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/Types.h"
 
 namespace apriltag_vulkan {
 

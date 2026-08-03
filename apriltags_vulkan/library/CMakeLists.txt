@@ -1,0 +1,152 @@
+# ---------------------------------------------------------------------------
+# vkapriltag: the Vulkan-compute GPU detection pipeline + CPU QuadDecode/
+# TagDecoder tail, packaged as a standalone, installable library. Consumers
+# link against the `vkapriltag::vkapriltag` target (or plain `vkapriltag` when
+# add_subdirectory()'d in-tree).
+# ---------------------------------------------------------------------------
+
+find_package(Vulkan REQUIRED)
+find_package(Threads REQUIRED)
+
+# ---------------------------------------------------------------------------
+# The AprilTag CPU decode library.  This is a pure-C library (no CUDA/OpenCV
+# dependency) that performs the final quad -> tag id/pose decode step, exactly
+# like the original CUDA implementation does (it also ran this part on the
+# CPU). We fetch the official upstream AprilRobotics library and apply a small
+# patch that extracts two blocks apriltag_detector_detect() already contains
+# (the per-quad family decode, and the cross-family duplicate-reconciliation
+# pass) into non-static entry points - quad_decode_index()/
+# reconcile_detections() - so the GPU pipeline can drive them directly with
+# its own externally-detected quads instead of apriltag_detector_detect()'s
+# own (CPU-only) quad-detection step. The patch changes no behavior of
+# apriltag_detector_detect() itself.
+# ---------------------------------------------------------------------------
+include(FetchContent)
+set(APRILTAG_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-decode-steps.patch)
+FetchContent_Declare(
+  apriltag
+  GIT_REPOSITORY https://github.com/AprilRobotics/apriltag.git
+  GIT_TAG v3.4.5
+  # Idempotent: skips re-applying if the patch is already present (needed
+  # since FetchContent may re-run the patch step across reconfigures).
+  PATCH_COMMAND git apply --reverse --check ${APRILTAG_PATCH_FILE} || git apply ${APRILTAG_PATCH_FILE}
+)
+FetchContent_MakeAvailable(apriltag)
+
+# Newer GCC (15+) defaults to a C standard where implicit/incompatible
+# pointer-type function calls (used throughout this older C library, e.g.
+# common/getopt.c's zarray_vmap(..., free)) are hard errors instead of
+# warnings. Pin it to gnu17 so it builds unmodified.
+if(TARGET apriltag)
+  target_compile_options(apriltag PRIVATE -std=gnu17)
+endif()
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
+
+set(SHADER_SOURCES
+  shaders/decimate.comp
+  shaders/block_minmax.comp
+  shaders/block_filter.comp
+  shaders/threshold.comp
+  shaders/uf_init.comp
+  shaders/uf_merge.comp
+  shaders/uf_compress.comp
+  shaders/uf_final.comp
+  shaders/blob_diff.comp
+  shaders/fill_max_key.comp
+  shaders/mark_heads.comp
+  shaders/scan_block.comp
+  shaders/scan_add_offsets.comp
+  shaders/init_extents.comp
+  shaders/reduce_extents.comp
+  shaders/select_blobs.comp
+  shaders/rewrite_index_points.comp
+  shaders/bitonic_sort.comp
+  shaders/bitonic_local.comp
+  shaders/radix_histogram.comp
+  shaders/radix_scan_hist.comp
+  shaders/radix_scatter.comp
+  shaders/gather_generic.comp
+  shaders/compute_line_fit_points.comp
+)
+
+compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)
+
+add_library(vkapriltag SHARED
+  src/vk/Context.cpp
+  src/vk/Buffer.cpp
+  src/vk/Shader.cpp
+  src/vk/ComputePipeline.cpp
+  src/gpu/GpuDetector.cpp
+  src/gpu/QuadDecode.cpp
+  src/apriltag_family.cpp
+  src/TagDecoder.cpp
+  src/common/pgm_io.cpp
+  src/common/WorkerPool.cpp
+)
+add_library(vkapriltag::vkapriltag ALIAS vkapriltag)
+
+add_dependencies(vkapriltag vkapriltag_shaders)
+
+target_include_directories(vkapriltag PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+# The shader SPIR-V lives next to the build tree during development, and next
+# to the installed library (under share/vkapriltag/shaders) once installed.
+target_compile_definitions(vkapriltag PUBLIC
+  "SHADER_DIR=\"$<BUILD_INTERFACE:${SHADER_OUTPUT_DIR}>$<INSTALL_INTERFACE:${CMAKE_INSTALL_FULL_DATADIR}/vkapriltag/shaders>\""
+)
+
+target_link_libraries(vkapriltag PUBLIC
+  Vulkan::Vulkan
+  Threads::Threads
+  apriltag
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(vkapriltag PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
+set_target_properties(vkapriltag PROPERTIES OUTPUT_NAME vkapriltag)
+
+# ---------------------------------------------------------------------------
+# Install rules: library, public headers, compiled shaders, and a CMake
+# package config so downstream projects can find_package(vkapriltag).
+# ---------------------------------------------------------------------------
+install(TARGETS vkapriltag
+  EXPORT vkapriltagTargets
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(DIRECTORY include/vkapriltag DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(FILES ${SHADER_SPIRV_BINARIES}
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/vkapriltag/shaders
+)
+
+install(EXPORT vkapriltagTargets
+  FILE vkapriltagTargets.cmake
+  NAMESPACE vkapriltag::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vkapriltag
+)
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vkapriltagConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/vkapriltagConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vkapriltag
+)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/vkapriltagConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion
+)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/vkapriltagConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/vkapriltagConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vkapriltag
+)

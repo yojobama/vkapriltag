@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Vulkan)
+find_dependency(Threads)
+find_dependency(apriltag)
+
+include("${CMAKE_CURRENT_LIST_DIR}/vkapriltagTargets.cmake")
+
+check_required_components(vkapriltag)

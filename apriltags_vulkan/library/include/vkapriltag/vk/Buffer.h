@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "vk/Context.h"
+#include "vkapriltag/vk/Context.h"
 
 namespace apriltag_vulkan::vk {
 

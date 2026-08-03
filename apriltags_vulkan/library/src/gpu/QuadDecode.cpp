@@ -1,4 +1,4 @@
-#include "gpu/QuadDecode.h"
+#include "vkapriltag/gpu/QuadDecode.h"
 
 #include <algorithm>
 #include <array>

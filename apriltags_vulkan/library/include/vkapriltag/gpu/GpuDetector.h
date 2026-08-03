@@ -7,10 +7,10 @@
 #include <string>
 #include <vector>
 
-#include "gpu/Types.h"
-#include "vk/Buffer.h"
-#include "vk/ComputePipeline.h"
-#include "vk/Context.h"
+#include "vkapriltag/gpu/Types.h"
+#include "vkapriltag/vk/Buffer.h"
+#include "vkapriltag/vk/ComputePipeline.h"
+#include "vkapriltag/vk/Context.h"
 
 namespace apriltag_vulkan {
 

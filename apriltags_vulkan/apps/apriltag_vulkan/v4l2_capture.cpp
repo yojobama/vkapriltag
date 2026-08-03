@@ -1,4 +1,4 @@
-#include "common/v4l2_capture.h"
+#include "v4l2_capture.h"
 
 #include <fcntl.h>
 #include <linux/videodev2.h>

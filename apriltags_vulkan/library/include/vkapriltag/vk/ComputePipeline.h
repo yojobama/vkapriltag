@@ -6,9 +6,9 @@
 #include <string>
 #include <vector>
 
-#include "vk/Buffer.h"
-#include "vk/Context.h"
-#include "vk/Shader.h"
+#include "vkapriltag/vk/Buffer.h"
+#include "vkapriltag/vk/Context.h"
+#include "vkapriltag/vk/Shader.h"
 
 namespace apriltag_vulkan::vk {
 

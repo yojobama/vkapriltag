@@ -18,6 +18,10 @@ if(NOT GLSLANG_VALIDATOR_EXECUTABLE)
 endif()
 
 function(compile_shaders TARGET_NAME SHADER_LIST OUT_DIR_VAR)
+  # Optional 4th argument: name of a variable (set in the caller's scope) to
+  # receive the full list of compiled .spv paths, e.g. for install(FILES ...).
+  set(OUT_BINARIES_VAR "${ARGV3}")
+
   set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
   file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 
@@ -41,4 +45,7 @@ function(compile_shaders TARGET_NAME SHADER_LIST OUT_DIR_VAR)
 
   add_custom_target(${TARGET_NAME} DEPENDS ${SPIRV_BINARIES})
   set(${OUT_DIR_VAR} "${SHADER_OUT_DIR}" PARENT_SCOPE)
+  if(OUT_BINARIES_VAR)
+    set(${OUT_BINARIES_VAR} "${SPIRV_BINARIES}" PARENT_SCOPE)
+  endif()
 endfunction()

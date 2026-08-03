@@ -7,12 +7,12 @@
 #include <string>
 #include <vector>
 
-#include "TagDecoder.h"
-#include "apriltag_family.h"
-#include "common/v4l2_capture.h"
-#include "gpu/GpuDetector.h"
-#include "gpu/QuadDecode.h"
-#include "vk/Context.h"
+#include "vkapriltag/TagDecoder.h"
+#include "vkapriltag/apriltag_family.h"
+#include "v4l2_capture.h"
+#include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/QuadDecode.h"
+#include "vkapriltag/vk/Context.h"
 
 extern "C" {
 #include "apriltag.h"

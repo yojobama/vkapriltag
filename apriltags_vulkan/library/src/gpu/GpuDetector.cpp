@@ -1,4 +1,4 @@
-#include "gpu/GpuDetector.h"
+#include "vkapriltag/gpu/GpuDetector.h"
 
 #include <algorithm>
 #include <chrono>
