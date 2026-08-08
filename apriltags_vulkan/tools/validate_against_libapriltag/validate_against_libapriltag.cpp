@@ -5,6 +5,7 @@
 // (apriltag_detector_detect()) run on the exact same image. This is the
 // "verify against the official libapriltag outputs" check - not a manual/
 // eyeballed comparison.
+#define NOMINMAX
 #include <algorithm>
 #include <iostream>
 #include <string>

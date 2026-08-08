@@ -23,7 +23,7 @@ option(VKAPRILTAG_BUILD_TOOLS "Build the libapriltag cross-validation tool" ON)
 # find_package(vkapriltag) / the vkapriltag::vkapriltag target.
 add_subdirectory(library)
 
-if(VKAPRILTAG_BUILD_APPS)
+if(VKAPRILTAG_BUILD_APPS AND UNIX)
   add_subdirectory(apps)
 endif()
 

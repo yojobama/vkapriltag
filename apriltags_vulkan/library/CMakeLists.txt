@@ -75,7 +75,7 @@ set(SHADER_SOURCES
 
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)
 
-add_library(vkapriltag SHARED
+add_library(vkapriltag STATIC
   src/vk/Context.cpp
   src/vk/Buffer.cpp
   src/vk/Shader.cpp
