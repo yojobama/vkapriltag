@@ -33,6 +33,12 @@ uint32_t NextPow2(uint32_t v) {
   return v + 1;
 }
 
+// Largest power of two <= v (v must be >= 1).
+uint32_t PrevPow2(uint32_t v) {
+  v = std::max(v, 1u);
+  return NextPow2(v / 2 + 1);
+}
+
 // Number of bits needed to represent every value in [0, max_value].
 uint32_t BitsFor(uint32_t max_value) {
   uint32_t bits = 0;
@@ -46,12 +52,6 @@ uint32_t BitsFor(uint32_t max_value) {
 // 4-bit digits needed to cover `bits` bits.
 uint32_t DigitsFor(uint32_t bits) { return (bits + 3u) / 4u; }
 
-// rewrite_index_points.comp computes theta_key = round((atan(dy, dx) + PI) *
-// 8e6). atan2 is bounded by [-PI, PI], so the key cannot exceed
-// round(2*PI*8e6) = 50265482. This bound is what makes 7 digits (28 bits)
-// provably sufficient for the index-point sort's low word.
-constexpr uint32_t kMaxThetaKey = 50265483u;
-
 const VkBufferUsageFlags kSsboUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -61,6 +61,7 @@ constexpr uint32_t kSlotUfChanged = 0;
 constexpr uint32_t kSlotQbpCount = 1;
 constexpr uint32_t kSlotSelectedCount = 2;
 constexpr uint32_t kSlotPointCount = 3;
+constexpr uint32_t kSlotNumRoots = 4;
 constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 }  // namespace
@@ -120,11 +121,36 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   }
   qbp_padded_n_ = NextPow2(std::max(qbp_capacity_, 1u));
   ipoint_capacity_ = qbp_capacity_;
-  ipoint_padded_n_ = NextPow2(std::max(ipoint_capacity_, 1u));
 
   // The grayscale frame is uploaded packed, four 8-bit pixels per uint32.
   // width % 8 == 0 guarantees the pixel count divides evenly by four.
   gray_words_ = (config_.width * config_.height) / 4u;
+
+  // sort_points_local.comp handles one selected blob per workgroup, sorting
+  // its points entirely in shared memory (2 words/point: key + local index).
+  // local_sort_cap_ is the workgroup's thread count, bounded by the device's
+  // max workgroup invocation count (a real dispatch limit); it no longer
+  // needs to also bound the shared array size (see local_sort_virtual_cap_
+  // below), but 1024 remains a sane ceiling matching radix_wg_/wg1d_'s
+  // derivation from caps below.
+  local_sort_cap_ = PrevPow2(std::max(caps.max_workgroup_invocations, 1u));
+  local_sort_cap_ = std::min(local_sort_cap_, 1024u);
+
+  // The shader's virtual per-blob capacity is decoupled from the workgroup's
+  // thread count (each thread handles multiple elements in a strided
+  // pattern), so it only needs to fit the shared-memory budget - not the
+  // device's max workgroup invocation count. This lets blobs bigger than the
+  // device can run as a single workgroup (e.g. a large tag's own border)
+  // still get properly angle-sorted instead of falling back to an unsorted
+  // identity copy. Capped at 4096 (32 KiB on an 8-byte/element budget) rather
+  // than using the full shared-memory budget: every workgroup allocates this
+  // much shared memory regardless of the blob it draws, so sizing it to the
+  // device's absolute max here would collapse occupancy for the vast
+  // majority of (much smaller) blobs. 4096 comfortably covers real tag
+  // borders (a 1920x1080 frame's largest observed tag border is ~1200
+  // points) while leaving most of the shared-memory budget free.
+  local_sort_virtual_cap_ =
+      std::min(PrevPow2(std::max(caps.max_shared_memory_bytes / 8u, 1u)), 2048u);
 
   CreateBuffers();
   CreatePipelines();
@@ -165,6 +191,7 @@ void GpuDetector::CreateBuffers() {
   parent_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   blob_size_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   uf_changed_buf_ = ssbo(4);
+  root_dense_id_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
 
   qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(QBPoint));
   qbp_counter_buf_ = ssbo(4);
@@ -183,16 +210,15 @@ void GpuDetector::CreateBuffers() {
 
   index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
   index_points_counter_buf_ = ssbo(4);
-  ipoint_keys_hi_buf_ = ssbo(VkDeviceSize(ipoint_padded_n_) * 4);
-  ipoint_keys_lo_buf_ = ssbo(VkDeviceSize(ipoint_padded_n_) * 4);
-  ipoint_payload_buf_ = ssbo(VkDeviceSize(ipoint_padded_n_) * 4);
   index_points_sorted_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
+  blob_point_offsets_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 4);
 
   line_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
 
-  // Radix sort ping-pong scratch and histogram. One shared set: the two sorts
-  // are recorded in different submissions, so they never alias in time.
-  const uint32_t sort_capacity = std::max(qbp_capacity_, ipoint_capacity_);
+  // Radix sort ping-pong scratch and histogram. Only the boundary-point sort
+  // uses this any more (index points are sorted per-blob in shared memory by
+  // sort_points_local.comp), so it is sized to qbp_capacity_ alone.
+  const uint32_t sort_capacity = qbp_capacity_;
   radix_scratch_hi_ = ssbo(VkDeviceSize(sort_capacity) * 4);
   radix_scratch_lo_ = ssbo(VkDeviceSize(sort_capacity) * 4);
   radix_scratch_pay_ = ssbo(VkDeviceSize(sort_capacity) * 4);
@@ -200,6 +226,8 @@ void GpuDetector::CreateBuffers() {
   radix_hist_ = ssbo(VkDeviceSize(16) * std::max(radix_max_blocks_, 1u) * 4);
 
   qbp_scan_chain_ = BuildScanChain(qbp_capacity_);
+  root_scan_chain_ = BuildScanChain(decimated_width_ * decimated_height_);
+  blob_scan_chain_ = BuildScanChain(std::max(config_.max_blobs, 1u));
 
   // Readback staging starts at a size that covers the extents plus a healthy
   // number of line-fit points, and grows on demand. Steady state therefore
@@ -263,7 +291,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("blob_diff"),
       {thresholded_buf_.get(), parent_buf_.get(), blob_size_buf_.get(), qbp_compacted_buf_.get(),
        qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(),
-       qbp_payload_buf_.get()},
+       qbp_payload_buf_.get(), root_dense_id_buf_.get()},
       16, wg1d_);
 
   fill_max_key_qbp_pl_ = vk::ComputePipeline(
@@ -325,28 +353,78 @@ void GpuDetector::CreatePipelines() {
        remap_buf_.get()},
       28, wg1d_);
 
-  fill_max_key_ipoint_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("fill_max_key"),
-      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 8,
+  // Dense blob id assignment: mark_roots.comp flags each union-find root,
+  // then an inclusive scan (same chain machinery as qbp_scan_chain_ above,
+  // just over `pixels` elements) turns the flags into a 1-based rank used by
+  // blob_diff.comp to build a narrow boundary-point sort key.
+  mark_roots_pl_ = vk::ComputePipeline(ctx_, ShaderPath("mark_roots"),
+                                       {parent_buf_.get(), root_dense_id_buf_.get()}, 8, wg1d_);
+  {
+    const vk::WorkgroupSize scan_wg{scan_wg_, 1, 1};
+    VkBuffer prev_values = root_dense_id_buf_.get();
+    VkBuffer prev_output = root_dense_id_buf_.get();
+    for (size_t i = 0; i < root_scan_chain_.level_buffers.size(); ++i) {
+      VkBuffer block_sums = root_scan_chain_.level_buffers[i].get();
+      root_scan_block_pls_.push_back(vk::ComputePipeline(
+          ctx_, ShaderPath("scan_block"), {prev_values, prev_output, block_sums}, 4, scan_wg));
+      prev_values = block_sums;
+      prev_output = block_sums;
+    }
+    root_scan_block_pls_.push_back(vk::ComputePipeline(
+        ctx_, ShaderPath("scan_block"), {prev_values, prev_output, prev_output}, 4, scan_wg));
+
+    std::vector<VkBuffer> level_values = {root_dense_id_buf_.get()};
+    for (auto &buf : root_scan_chain_.level_buffers) level_values.push_back(buf.get());
+    for (size_t i = 0; i + 1 < level_values.size(); ++i) {
+      root_scan_add_offsets_pls_.push_back(vk::ComputePipeline(
+          ctx_, ShaderPath("scan_add_offsets"), {level_values[i], level_values[i + 1]}, 4,
+          scan_wg));
+    }
+  }
+
+  // Per-blob point base-offset assignment: extract_blob_counts.comp copies
+  // each selected blob's point count into blob_point_offsets_buf_, then the
+  // same chain-scan pattern turns it into an inclusive prefix sum so
+  // rewrite_index_points.comp / sort_points_local.comp can place/find each
+  // blob's points at a deterministic, contiguous range.
+  extract_blob_counts_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("extract_blob_counts"),
+      {selected_extents_buf_.get(), selected_counter_buf_.get(), blob_point_offsets_buf_.get()}, 4,
       wg1d_);
+  {
+    const vk::WorkgroupSize scan_wg{scan_wg_, 1, 1};
+    VkBuffer prev_values = blob_point_offsets_buf_.get();
+    VkBuffer prev_output = blob_point_offsets_buf_.get();
+    for (size_t i = 0; i < blob_scan_chain_.level_buffers.size(); ++i) {
+      VkBuffer block_sums = blob_scan_chain_.level_buffers[i].get();
+      blob_scan_block_pls_.push_back(vk::ComputePipeline(
+          ctx_, ShaderPath("scan_block"), {prev_values, prev_output, block_sums}, 4, scan_wg));
+      prev_values = block_sums;
+      prev_output = block_sums;
+    }
+    blob_scan_block_pls_.push_back(vk::ComputePipeline(
+        ctx_, ShaderPath("scan_block"), {prev_values, prev_output, prev_output}, 4, scan_wg));
+
+    std::vector<VkBuffer> level_values = {blob_point_offsets_buf_.get()};
+    for (auto &buf : blob_scan_chain_.level_buffers) level_values.push_back(buf.get());
+    for (size_t i = 0; i + 1 < level_values.size(); ++i) {
+      blob_scan_add_offsets_pls_.push_back(vk::ComputePipeline(
+          ctx_, ShaderPath("scan_add_offsets"), {level_values[i], level_values[i + 1]}, 4,
+          scan_wg));
+    }
+  }
+
   rewrite_index_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("rewrite_index_points"),
       {qbp_sorted_buf_.get(), raw_blob_index_buf_.get(), remap_buf_.get(),
        selected_extents_buf_.get(), index_points_buf_.get(), index_points_counter_buf_.get(),
-       ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()},
+       blob_point_offsets_buf_.get()},
       12, wg1d_);
-  ipoint_bitonic_sort_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("bitonic_sort"),
-      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 12,
-      wg1d_);
-  ipoint_bitonic_local_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("bitonic_local"),
-      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get()}, 12,
-      wg1d_);
-  ipoint_gather_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("gather_generic"),
-      {index_points_buf_.get(), index_points_sorted_buf_.get(), ipoint_payload_buf_.get()}, 12,
-      wg1d_);
+  sort_points_local_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("sort_points_local"),
+      {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
+       index_points_sorted_buf_.get()},
+      4, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
 
   compute_line_fit_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("compute_line_fit_points"),
@@ -359,10 +437,6 @@ void GpuDetector::CreatePipelines() {
   qbp_gather_scratch_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("gather_generic"),
       {qbp_compacted_buf_.get(), qbp_sorted_buf_.get(), radix_scratch_pay_.get()}, 12, wg1d_);
-  ipoint_gather_scratch_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("gather_generic"),
-      {index_points_buf_.get(), index_points_sorted_buf_.get(), radix_scratch_pay_.get()}, 12,
-      wg1d_);
 
   radix_scan_hist_pl_ = vk::ComputePipeline(ctx_, ShaderPath("radix_scan_hist"),
                                             {radix_hist_.get()}, 4, wg1d_);
@@ -387,32 +461,14 @@ void GpuDetector::CreatePipelines() {
        radix_hist_.get()},
       kRadixPush, radix_wg_);
 
-  ipoint_radix_hist_a_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("radix_histogram"),
-      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), radix_hist_.get()}, kRadixPush,
-      radix_wg_);
-  ipoint_radix_hist_b_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("radix_histogram"),
-      {radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_hist_.get()}, kRadixPush, radix_wg_);
-  ipoint_radix_scatter_ab_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("radix_scatter"),
-      {ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get(),
-       radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_scratch_pay_.get(),
-       radix_hist_.get()},
-      kRadixPush, radix_wg_);
-  ipoint_radix_scatter_ba_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("radix_scatter"),
-      {radix_scratch_hi_.get(), radix_scratch_lo_.get(), radix_scratch_pay_.get(),
-       ipoint_keys_hi_buf_.get(), ipoint_keys_lo_buf_.get(), ipoint_payload_buf_.get(),
-       radix_hist_.get()},
-      kRadixPush, radix_wg_);
-
-  // Digit counts, derived from provable bounds on each key word so no pass is
-  // spent on bits that are always zero.
+  // Digit counts, derived from a provable bound on each key word so no pass
+  // is spent on bits that are always zero.
   //
-  //   boundary points: keys are (rep0, rep1), both union-find roots, i.e.
-  //                    decimated pixel indices in [0, pixels).
-  //   index points:    keys are (selected blob index, theta_key).
+  //   boundary points: keys are (rep0, rep1), both DENSE blob ids in
+  //                    [0, num_roots) - see mark_roots.comp. num_roots is
+  //                    data-dependent, so these are placeholders here;
+  //                    Detect() overwrites both every frame once num_roots
+  //                    for that frame is known.
   const uint32_t pixels = decimated_width_ * decimated_height_;
   const uint32_t rep_digits = DigitsFor(BitsFor(pixels > 0 ? pixels - 1 : 0));
   qbp_radix_.hist_from_a = &qbp_radix_hist_a_pl_;
@@ -421,14 +477,6 @@ void GpuDetector::CreatePipelines() {
   qbp_radix_.scatter_b_to_a = &qbp_radix_scatter_ba_pl_;
   qbp_radix_.lo_digits = rep_digits;
   qbp_radix_.hi_digits = rep_digits;
-
-  ipoint_radix_.hist_from_a = &ipoint_radix_hist_a_pl_;
-  ipoint_radix_.hist_from_b = &ipoint_radix_hist_b_pl_;
-  ipoint_radix_.scatter_a_to_b = &ipoint_radix_scatter_ab_pl_;
-  ipoint_radix_.scatter_b_to_a = &ipoint_radix_scatter_ba_pl_;
-  ipoint_radix_.lo_digits = DigitsFor(BitsFor(kMaxThetaKey));
-  ipoint_radix_.hi_digits =
-      DigitsFor(BitsFor(config_.max_blobs > 0 ? config_.max_blobs - 1 : 0));
 }
 
 bool GpuDetector::RunRadixSort(VkCommandBuffer cmd, const RadixPipelines &pipelines,
@@ -659,6 +707,15 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   cmd = ctx_.BeginCommands();
   uf_final_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
 
+  // Dense blob id assignment: mark_roots.comp flags each union-find root,
+  // then an inclusive scan turns the 0/1 flags into a 1-based rank among all
+  // roots in ascending pixel-index order. blob_diff.comp uses this to key the
+  // boundary-point sort on the actual number of raw blobs instead of a full
+  // pixel index.
+  mark_roots_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
+  RunInclusiveScan(cmd, pixels, root_scan_chain_, root_scan_block_pls_,
+                   root_scan_add_offsets_pls_);
+
   // blob_diff appends valid boundary points (with their sort keys) directly
   // into the compacted buffer, so there is no dense intermediate array and no
   // separate full-capacity compaction pass.
@@ -668,11 +725,20 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                            BarrierKind::ComputeAndTransfer);
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
+  // The scan's last element is the total number of union-find roots this
+  // frame - read back alongside qbp_count so the sort's key width can be
+  // sized to the actual root count rather than a pixels-wide worst case.
+  root_dense_id_buf_.RecordCopyTo(cmd, counter_staging_, 4,
+                                  VkDeviceSize(pixels - 1) * 4, VkDeviceSize(kSlotNumRoots) * 4);
   vk::ComputePipeline::HostReadBarrier(cmd);
   ctx_.SubmitAndWait(cmd);
 
   const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
   const uint32_t qbp_padded = NextPow2(std::max(qbp_count, 1u));
+  const uint32_t num_roots = ReadCounterSlot(kSlotNumRoots);
+  const uint32_t rep_digits = DigitsFor(BitsFor(num_roots > 0 ? num_roots - 1 : 0));
+  qbp_radix_.lo_digits = rep_digits;
+  qbp_radix_.hi_digits = rep_digits;
   const auto t_boundary = Clock::now();
 
   // ------------------------------------------------------------------
@@ -720,6 +786,16 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                 config_.normal_border ? 1u : 0u};
     select_blobs_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &select_pc);
 
+    // Per-blob point base offsets: copy each selected blob's count into
+    // blob_point_offsets_buf_ (reading num_selected straight off
+    // selected_counter_buf_, since the host hasn't read it back yet this
+    // submission) and inclusive-scan it, so rewrite_index_points.comp can
+    // place every blob's points at a deterministic, contiguous offset.
+    struct { uint32_t capacity; } extract_pc{config_.max_blobs};
+    extract_blob_counts_pl_.Dispatch1D(cmd, config_.max_blobs, &extract_pc);
+    RunInclusiveScan(cmd, config_.max_blobs, blob_scan_chain_, blob_scan_block_pls_,
+                     blob_scan_add_offsets_pls_);
+
     struct { uint32_t count, capacity, max_raw_blobs; } rewrite_pc{qbp_count, ipoint_capacity_,
                                                                    config_.max_raw_blobs};
     rewrite_index_points_pl_.Dispatch1D(cmd, qbp_count, &rewrite_pc);
@@ -732,7 +808,6 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const uint32_t num_selected_blobs =
       std::min(ReadCounterSlot(kSlotSelectedCount), config_.max_blobs);
   const uint32_t num_points = std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_);
-  const uint32_t ipoint_padded = NextPow2(std::max(num_points, 1u));
   const auto t_sort_group = Clock::now();
 
   // ------------------------------------------------------------------
@@ -746,18 +821,12 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
   cmd = ctx_.BeginCommands();
   if (num_points > 0) {
-    bool result_in_scratch = false;
-    if (use_radix) {
-      result_in_scratch = RunRadixSort(cmd, ipoint_radix_, num_points);
-    } else {
-      RunSizedSort(cmd, fill_max_key_ipoint_pl_, ipoint_bitonic_local_pl_,
-                   ipoint_bitonic_sort_pl_, num_points, ipoint_padded);
-    }
-
-    struct { uint32_t count, stride, src_count; } igather_pc{num_points, sizeof(IPoint) / 4,
-                                                             num_points};
-    (result_in_scratch ? ipoint_gather_scratch_pl_ : ipoint_gather_pl_)
-        .Dispatch1D(cmd, num_points, &igather_pc);
+    // rewrite_index_points.comp already packed every selected blob's points
+    // into one contiguous range, so sorting each blob's own points into
+    // angular order is a one-workgroup-per-blob shared-memory sort - no
+    // composite (blob_index, theta) key, no separate gather pass.
+    struct { uint32_t num_selected_blobs; } sort_pc{num_selected_blobs};
+    sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &sort_pc);
 
     struct { uint32_t count; int dw, dh; } linefit_pc{
         num_points, static_cast<int>(decimated_width_), static_cast<int>(decimated_height_)};
@@ -802,7 +871,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.points = num_points;
   last_profile_.boundary_points = qbp_count;
   last_profile_.qbp_sort_n = (qbp_count > 0) ? (use_radix ? qbp_count : qbp_padded) : 0;
-  last_profile_.ipoint_sort_n = (num_points > 0) ? (use_radix ? num_points : ipoint_padded) : 0;
+  last_profile_.ipoint_sort_n = num_points;
   last_profile_.sort_passes = use_radix ? qbp_radix_.passes() : 0;
   last_profile_.uf_iterations = uf_iterations;
   last_profile_.uf_converged = converged;

@@ -7,7 +7,8 @@ namespace apriltag_vulkan::vk {
 
 ComputePipeline::ComputePipeline(const Context &ctx, const std::string &spv_path,
                                  const std::vector<VkBuffer> &buffers,
-                                 uint32_t push_constant_bytes, WorkgroupSize workgroup_size)
+                                 uint32_t push_constant_bytes, WorkgroupSize workgroup_size,
+                                 std::vector<uint32_t> extra_specialization_constants)
     : device_(ctx.device()),
       shader_(ctx.device(), spv_path),
       push_constant_bytes_(push_constant_bytes),
@@ -60,19 +61,22 @@ ComputePipeline::ComputePipeline(const Context &ctx, const std::string &spv_path
           "vkCreatePipelineLayout");
 
   // Feed the workgroup dimensions in as specialization constants 0/1/2, which
-  // the shaders declare via layout(local_size_{x,y,z}_id = ...).
-  const uint32_t spec_data[3] = {workgroup_size_.x, workgroup_size_.y, workgroup_size_.z};
-  VkSpecializationMapEntry spec_entries[3];
-  for (uint32_t i = 0; i < 3; ++i) {
+  // the shaders declare via layout(local_size_{x,y,z}_id = ...). Any extra
+  // caller-supplied constants follow at IDs 3, 4, ...
+  std::vector<uint32_t> spec_data = {workgroup_size_.x, workgroup_size_.y, workgroup_size_.z};
+  spec_data.insert(spec_data.end(), extra_specialization_constants.begin(),
+                   extra_specialization_constants.end());
+  std::vector<VkSpecializationMapEntry> spec_entries(spec_data.size());
+  for (uint32_t i = 0; i < spec_data.size(); ++i) {
     spec_entries[i].constantID = i;
     spec_entries[i].offset = i * sizeof(uint32_t);
     spec_entries[i].size = sizeof(uint32_t);
   }
   VkSpecializationInfo spec_info{};
-  spec_info.mapEntryCount = 3;
-  spec_info.pMapEntries = spec_entries;
-  spec_info.dataSize = sizeof(spec_data);
-  spec_info.pData = spec_data;
+  spec_info.mapEntryCount = static_cast<uint32_t>(spec_entries.size());
+  spec_info.pMapEntries = spec_entries.data();
+  spec_info.dataSize = spec_data.size() * sizeof(uint32_t);
+  spec_info.pData = spec_data.data();
 
   VkPipelineShaderStageCreateInfo stage_info{};
   stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

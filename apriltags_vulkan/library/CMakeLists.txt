@@ -52,6 +52,7 @@ set(SHADER_SOURCES
   shaders/uf_merge.comp
   shaders/uf_compress.comp
   shaders/uf_final.comp
+  shaders/mark_roots.comp
   shaders/blob_diff.comp
   shaders/fill_max_key.comp
   shaders/mark_heads.comp
@@ -60,7 +61,9 @@ set(SHADER_SOURCES
   shaders/init_extents.comp
   shaders/reduce_extents.comp
   shaders/select_blobs.comp
+  shaders/extract_blob_counts.comp
   shaders/rewrite_index_points.comp
+  shaders/sort_points_local.comp
   shaders/bitonic_sort.comp
   shaders/bitonic_local.comp
   shaders/radix_histogram.comp

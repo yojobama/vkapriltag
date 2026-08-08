@@ -1,0 +1,28 @@
+#version 450
+// Copies each selected blob's point count into a buffer sized to max_blobs,
+// zero-padding beyond num_selected_blobs, so it can be inclusive-scanned
+// (scan_block.comp / scan_add_offsets.comp) into per-blob base offsets for
+// rewrite_index_points.comp and sort_points_local.comp.
+//
+// This runs in the same submission as select_blobs.comp, before the host has
+// read back num_selected_blobs, so it reads the count straight off the GPU
+// counter buffer instead of taking it as a push constant.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
+layout(std430, binding = 1) readonly buffer SelectedCounter { uint num_selected; };
+layout(std430, binding = 2) writeonly buffer Counts { uint counts[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint capacity;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.capacity) return;
+  uint n = min(num_selected, pc.capacity);
+  counts[i] = (i < n) ? selected[i].count : 0u;
+}

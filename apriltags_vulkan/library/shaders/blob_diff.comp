@@ -36,6 +36,7 @@ layout(std430, binding = 4) buffer Counter { uint counter; };
 layout(std430, binding = 5) writeonly buffer KeysHi { uint keys_hi[]; };
 layout(std430, binding = 6) writeonly buffer KeysLo { uint keys_lo[]; };
 layout(std430, binding = 7) writeonly buffer Payload { uint payload[]; };
+layout(std430, binding = 8) readonly buffer RootDenseId { uint root_dense_id[]; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -46,13 +47,22 @@ layout(push_constant) uniform PushConstants {
 
 // Appends one boundary point, together with its (rep0, rep1) sort key and the
 // identity payload index the gather pass needs.
+//
+// rep_a/rep_b are raw union-find roots (decimated pixel indices). They are
+// translated to dense blob ids (see mark_roots.comp) before building the sort
+// key, so the key only needs enough bits for the actual number of raw blobs
+// instead of a full pixel index - this does not change grouping/ordering
+// behavior since the translation is monotonic in the raw root index.
 void append(uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
+  uint dense_a = root_dense_id[rep_a] - 1u;
+  uint dense_b = root_dense_id[rep_b] - 1u;
+
   uint pos = atomicAdd(counter, 1u);
   if (pos >= pc.capacity) return;
 
   QBPoint p;
-  p.rep0 = min(rep_a, rep_b);
-  p.rep1 = max(rep_a, rep_b);
+  p.rep0 = min(dense_a, dense_b);
+  p.rep1 = max(dense_a, dense_b);
   p.x = px;
   p.y = py;
   p.gx = gx;

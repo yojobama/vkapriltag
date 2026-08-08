@@ -236,7 +236,6 @@ class GpuDetector {
   uint32_t qbp_capacity_ = 0;     // upper bound after compaction
   uint32_t qbp_padded_n_ = 0;     // next pow2 >= qbp_capacity_ (buffer sizing only)
   uint32_t ipoint_capacity_ = 0;  // upper bound on selected points
-  uint32_t ipoint_padded_n_ = 0;
 
   uint32_t gray_words_ = 0;  // packed 4 pixels per uint32
 
@@ -251,9 +250,17 @@ class GpuDetector {
   vk::Buffer heads_buf_, raw_blob_index_buf_;
   vk::Buffer extents_buf_;
   vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
+  // Dense blob id lookup: root_dense_id_buf_[raw_root] is a 1-based rank
+  // among all union-find roots in ascending pixel-index order (see
+  // mark_roots.comp). Sized to `pixels`.
+  vk::Buffer root_dense_id_buf_;
   vk::Buffer index_points_buf_, index_points_counter_buf_;
-  vk::Buffer ipoint_keys_hi_buf_, ipoint_keys_lo_buf_, ipoint_payload_buf_;
   vk::Buffer index_points_sorted_buf_;
+  // Inclusive scan of each selected blob's point count (see
+  // extract_blob_counts.comp), sized to config_.max_blobs. Gives
+  // rewrite_index_points.comp / sort_points_local.comp each blob's base
+  // offset into index_points_buf_/index_points_sorted_buf_.
+  vk::Buffer blob_point_offsets_buf_;
   vk::Buffer line_fit_points_buf_;
 
   // Radix sort scratch. One set, shared by both sorts: they never overlap in
@@ -273,6 +280,19 @@ class GpuDetector {
   bool gray_direct_write_ = false;
 
   ScanChain qbp_scan_chain_;
+  // Scan chains for the root-dense-id assignment (sized to `pixels`) and the
+  // per-blob point-offset assignment (sized to config_.max_blobs).
+  ScanChain root_scan_chain_;
+  ScanChain blob_scan_chain_;
+  // Largest point count sort_points_local.comp can sort in shared memory for
+  // one blob (a power of two, derived from device limits at construction).
+  // The workgroup itself still only has local_sort_cap_ threads (bounded by
+  // the device's max workgroup invocations); local_sort_virtual_cap_ can
+  // exceed that because each thread handles multiple elements in a strided
+  // pattern, so it's bounded only by the shared-memory budget (2 words per
+  // element: theta key + local index).
+  uint32_t local_sort_cap_ = 0;
+  uint32_t local_sort_virtual_cap_ = 0;
 
   // --- Pipelines ---
   vk::ComputePipeline decimate_pl_;
@@ -293,15 +313,25 @@ class GpuDetector {
   std::vector<vk::ComputePipeline> qbp_scan_add_offsets_pls_;
   vk::ComputePipeline init_extents_pl_, reduce_extents_pl_;
   vk::ComputePipeline select_blobs_pl_;
-  vk::ComputePipeline fill_max_key_ipoint_pl_, rewrite_index_points_pl_;
-  vk::ComputePipeline ipoint_bitonic_sort_pl_, ipoint_bitonic_local_pl_;
-  vk::ComputePipeline ipoint_gather_pl_, ipoint_gather_scratch_pl_;
-  vk::ComputePipeline ipoint_radix_hist_a_pl_, ipoint_radix_hist_b_pl_;
-  vk::ComputePipeline ipoint_radix_scatter_ab_pl_, ipoint_radix_scatter_ba_pl_;
+  vk::ComputePipeline rewrite_index_points_pl_;
   vk::ComputePipeline radix_scan_hist_pl_;  // shared: binds only the histogram
 
-  RadixPipelines qbp_radix_, ipoint_radix_;
+  RadixPipelines qbp_radix_;
   vk::ComputePipeline compute_line_fit_points_pl_;
+
+  // Dense blob id assignment (mark_roots.comp + an inclusive scan), recorded
+  // once per frame right after union-find converges.
+  vk::ComputePipeline mark_roots_pl_;
+  std::vector<vk::ComputePipeline> root_scan_block_pls_;
+  std::vector<vk::ComputePipeline> root_scan_add_offsets_pls_;
+
+  // Per-blob point base-offset assignment (extract_blob_counts.comp + an
+  // inclusive scan) and the segmented local sort that replaces a flat
+  // radix/bitonic sort of index points.
+  vk::ComputePipeline extract_blob_counts_pl_;
+  std::vector<vk::ComputePipeline> blob_scan_block_pls_;
+  std::vector<vk::ComputePipeline> blob_scan_add_offsets_pls_;
+  vk::ComputePipeline sort_points_local_pl_;
 
   DetectProfile last_profile_;
   uint64_t device_bytes_ = 0;

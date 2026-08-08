@@ -2,10 +2,13 @@
 // Consumes the sorted, per-raw-blob QBPoint array and the raw->selected
 // blob remap produced by select_blobs.comp. For every point belonging to a
 // selected blob, computes its angle around the blob centroid (matching
-// AddThetaToIndexPoint) and atomically appends an IPoint into the output
-// array, together with a (blob_index, theta) sort key for the next
-// bitonic_sort.comp pass (which orders each blob's points around its
-// perimeter, required for windowed line fitting).
+// AddThetaToIndexPoint) and writes an IPoint into the output array at a
+// DETERMINISTIC position: base_offset[sel_bi] + (its rank within this raw
+// blob's contiguous run in sorted[]). This packs every selected blob's
+// points into one contiguous range of the output array with no atomic-
+// derived scatter, which is what lets sort_points_local.comp sort each
+// blob's points with a single workgroup instead of one flat global sort
+// keyed on (blob_index, theta).
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
@@ -19,9 +22,7 @@ layout(std430, binding = 2) readonly buffer Remap { uint remap[]; };
 layout(std430, binding = 3) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
 layout(std430, binding = 4) writeonly buffer Output { IPoint output_points[]; };
 layout(std430, binding = 5) buffer Counter { uint counter; };
-layout(std430, binding = 6) writeonly buffer KeysHi { uint keys_hi[]; };
-layout(std430, binding = 7) writeonly buffer KeysLo { uint keys_lo[]; };
-layout(std430, binding = 8) writeonly buffer Payload { uint payload[]; };
+layout(std430, binding = 6) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -48,8 +49,17 @@ void main() {
   int theta_int = int(round(theta));
   uint theta_key = uint(max(theta_int, 0));
 
-  uint pos = atomicAdd(counter, 1u);
+  // blob_point_offsets[sel_bi] is the INCLUSIVE scan of selected[].count (see
+  // extract_blob_counts.comp), so subtracting this blob's own count gives its
+  // exclusive base offset. i - e.starting_offset is this point's 0-based rank
+  // within the blob's contiguous run in sorted[] (starting_offset was copied
+  // from the raw blob's extents by select_blobs.comp), so the sum is a
+  // stable, collision-free position with no atomic needed for placement.
+  uint base = blob_point_offsets[sel_bi] - e.count;
+  uint pos = base + (i - e.starting_offset);
   if (pos >= pc.capacity) return;
+
+  atomicAdd(counter, 1u);  // total point count only; no longer used to place
 
   IPoint out_pt;
   out_pt.blob_index = sel_bi;
@@ -61,8 +71,4 @@ void main() {
   out_pt.pad0 = 0u;
   out_pt.pad1 = 0u;
   output_points[pos] = out_pt;
-
-  keys_hi[pos] = sel_bi;
-  keys_lo[pos] = theta_key;
-  payload[pos] = pos;
 }
