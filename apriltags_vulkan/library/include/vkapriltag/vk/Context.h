@@ -102,8 +102,9 @@ struct DeviceCaps {
 // so it runs unmodified on desktop NVIDIA/AMD/Intel, on Mali/Adreno mobile
 // drivers, and on Mesa's software implementations.
 class Context {
- public:
+public:
   explicit Context(const ContextOptions &options = ContextOptions{});
+  explicit Context(const std::string& deviceName, const ContextOptions& options = ContextOptions{});
   ~Context();
 
   Context(const Context &) = delete;
@@ -144,6 +145,7 @@ class Context {
  private:
   void CreateInstance(const ContextOptions &options);
   void SelectPhysicalDevice(const ContextOptions &options);
+  void SelectPhysicalDevice(const std::string& deviceName, const ContextOptions& options);
   void CreateLogicalDevice();
   void QueryCaps(const ContextOptions &options);
   void CreateCommandResources();

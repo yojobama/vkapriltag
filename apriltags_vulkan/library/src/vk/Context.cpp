@@ -118,6 +118,31 @@ Context::Context(const ContextOptions &options_in) {
   }
 }
 
+Context::Context(const std::string& deviceName, const ContextOptions& options_in) {
+    ContextOptions options = options_in;
+    // Environment overrides, so the same binary can be retargeted at runtime.
+    if (EnvFlag("APRILTAG_VK_ALLOW_CPU")) options.allow_cpu_device = true;
+    if (EnvFlag("APRILTAG_VK_VALIDATION")) options.enable_validation = true;
+    int env_int = 0;
+    if (EnvInt("APRILTAG_VK_DEVICE", &env_int)) options.device_index = env_int;
+    if (EnvInt("APRILTAG_VK_WG", &env_int) && env_int > 0) {
+        options.workgroup_size_override = static_cast<uint32_t>(env_int);
+    }
+    if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
+        options.max_invocations_override = static_cast<uint32_t>(env_int);
+    }
+
+    CreateInstance(options);
+    SelectPhysicalDevice(deviceName, options);
+    CreateLogicalDevice();
+    QueryCaps(options);
+    CreateCommandResources();
+
+    if (options.verbose) {
+        std::cerr << DescribeDevice() << std::endl;
+    }
+}
+
 Context::~Context() {
   if (device_) {
     // Nothing may still be in flight when we start destroying pools.
@@ -250,6 +275,62 @@ void Context::SelectPhysicalDevice(const ContextOptions &options) {
     throw std::runtime_error("No Vulkan 1.1+ device with a compute queue found. Devices seen:" +
                              describe_all());
   }
+}
+
+void Context::SelectPhysicalDevice(const std::string& deviceName, const ContextOptions& options) {
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance_, &count, nullptr);
+    if (count == 0) {
+        throw std::runtime_error(
+            "No Vulkan physical devices found. No usable Vulkan driver (ICD) is installed - "
+            "check that a *_icd.json for your GPU exists under /usr/share/vulkan/icd.d and that "
+            "vulkaninfo --summary lists your device.");
+    }
+    std::vector<VkPhysicalDevice> devices(count);
+    vkEnumeratePhysicalDevices(instance_, &count, devices.data());
+
+    // Gather properties once, for both selection and the diagnostic message.
+    std::vector<VkPhysicalDeviceProperties> props(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        vkGetPhysicalDeviceProperties(devices[i], &props[i]);
+    }
+
+    auto describe_all = [&]() {
+        std::ostringstream os;
+        for (uint32_t i = 0; i < count; ++i) {
+            os << "\n  [" << i << "] " << props[i].deviceName << " ("
+                << DeviceTypeName(props[i].deviceType) << ", Vulkan "
+                << VK_API_VERSION_MAJOR(props[i].apiVersion) << "."
+                << VK_API_VERSION_MINOR(props[i].apiVersion) << ")";
+        }
+        return os.str();
+        };
+
+    // Explicit index wins, but still has to be usable.
+    if (options.device_index >= 0) {
+        if (static_cast<uint32_t>(options.device_index) >= count) {
+            throw std::runtime_error("APRILTAG_VK_DEVICE=" + std::to_string(options.device_index) +
+                " is out of range; devices are:" + describe_all());
+        }
+        uint32_t i = static_cast<uint32_t>(options.device_index);
+        if (!HasComputeQueue(devices[i])) {
+            throw std::runtime_error(std::string("Requested device '") + props[i].deviceName +
+                "' has no compute queue family.");
+        }
+        physical_device_ = devices[i];
+        return;
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        if (props[i].deviceName == deviceName) {
+            if (!HasComputeQueue(devices[i])) {
+                throw std::runtime_error(std::string("Requested device '") + props[i].deviceName +
+                    "' has no compute queue family.");
+            }
+            physical_device_ = devices[i];
+            return;
+        }
+    }
 }
 
 void Context::CreateLogicalDevice() {
