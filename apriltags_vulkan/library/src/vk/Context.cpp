@@ -378,8 +378,42 @@ void Context::QueryCaps(const ContextOptions &options) {
 }
 
 std::vector<DeviceCaps> Context::EnumerateDevices() {
+    VkApplicationInfo app_info{};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "apriltag_vulkan";
+    // Nothing in this pipeline uses a 1.2 core entry point, so asking for 1.1
+    // keeps older mobile drivers (and older Panfrost) eligible.
+    app_info.apiVersion = VK_API_VERSION_1_1;
+    
+	// for this wee session to enumerate devices there is no need not to have the validation layer enabled, so we will enable it if it is available
+    std::vector<const char*> layers;
+    uint32_t layer_count = 0;
+    vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
+    std::vector<VkLayerProperties> available(layer_count);
+    vkEnumerateInstanceLayerProperties(&layer_count, available.data());
+    const char* kValidation = "VK_LAYER_KHRONOS_validation";
+    for (const auto& l : available) {
+        if (std::strcmp(l.layerName, kValidation) == 0) {
+            layers.push_back(kValidation);
+            break;
+        }
+    }
+    if (layers.empty()) {
+        std::cerr << "apriltag_vulkan: VK_LAYER_KHRONOS_validation is not installed; continuing without it." << std::endl;
+    }
+
+    VkInstanceCreateInfo create_info{};
+    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    create_info.pApplicationInfo = &app_info;
+    create_info.enabledLayerCount = static_cast<uint32_t>(layers.size());
+    create_info.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+
+    VkInstance instance;
+    CheckVk(vkCreateInstance(&create_info, nullptr, &instance), "vkCreateInstance");
+
+    
     uint32_t count = 0;
-    vkEnumeratePhysicalDevices(instance_, &count, nullptr);
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
     if (count == 0) {
         throw std::runtime_error(
             "No Vulkan physical devices found. No usable Vulkan driver (ICD) is installed - "
@@ -387,7 +421,7 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
             "vulkaninfo --summary lists your device.");
     }
     std::vector<VkPhysicalDevice> devices(count);
-    vkEnumeratePhysicalDevices(instance_, &count, devices.data());
+    vkEnumeratePhysicalDevices(instance, &count, devices.data());
 
     // Gather properties once, for both selection and the diagnostic message.
     std::vector<VkPhysicalDeviceProperties> props(count);
@@ -404,10 +438,11 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
         vkGetPhysicalDeviceProperties(device, &device_props);
     
         VkPhysicalDeviceProperties props{};
-        vkGetPhysicalDeviceProperties(physical_device_, &props);
+        vkGetPhysicalDeviceProperties(device, &props);
         VkPhysicalDeviceFeatures features{};
-        vkGetPhysicalDeviceFeatures(physical_device_, &features);
-        vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);
+        vkGetPhysicalDeviceFeatures(device, &features);
+        VkPhysicalDeviceMemoryProperties mem_props{};
+        vkGetPhysicalDeviceMemoryProperties(device, &mem_props);
 
         caps.name = props.deviceName;
         caps.type = props.deviceType;
@@ -437,11 +472,24 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
         // Timestamp support: needs a non-zero period and a queue family that can
         // actually write timestamps.
         uint32_t qf_count = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qf_count, nullptr);
+        vkGetPhysicalDeviceQueueFamilyProperties(device, &qf_count, nullptr);
         std::vector<VkQueueFamilyProperties> qfs(qf_count);
-        vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qf_count, qfs.data());
+        vkGetPhysicalDeviceQueueFamilyProperties(device, &qf_count, qfs.data());
+
+        int queue_family = UINT32_MAX;
+        for (uint32_t i = 0; i < qf_count; ++i) {
+            if (qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                queue_family = i;
+                break;
+            }
+        }
+        if (queue_family == UINT32_MAX) {
+			std::cerr << "Device " << props.deviceName << " has no compute queue family; skipping." << std::endl;
+            continue;
+        }
+
         const uint32_t valid_bits =
-            (queue_family_ < qf_count) ? qfs[queue_family_].timestampValidBits : 0;
+            (queue_family < qf_count) ? qfs[queue_family].timestampValidBits : 0;
         caps.timestamp_period_ns = l.timestampPeriod;
         caps.timestamps_supported = valid_bits > 0 && l.timestampPeriod > 0.0f;
 
@@ -449,8 +497,8 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
         caps.unified_memory = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
             props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
         caps.has_host_cached = false;
-        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; ++i) {
-            const VkMemoryPropertyFlags f = mem_props_.memoryTypes[i].propertyFlags;
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags f = mem_props.memoryTypes[i].propertyFlags;
             if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
                 caps.has_host_cached = true;
             }
@@ -599,7 +647,7 @@ std::string Context::DescribeDevice() const {
   return os.str();
 }
 
-std::string Context::DescribeDevice(const DeviceCaps &caps) const {
+std::string Context::DescribeDevice(const DeviceCaps &caps) {
     std::ostringstream os;
     os << "apriltag_vulkan: using " << caps.name << " (" << DeviceTypeName(caps.type)
         << ", Vulkan " << VK_API_VERSION_MAJOR(caps.api_version) << "."
