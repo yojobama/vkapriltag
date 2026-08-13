@@ -117,6 +117,8 @@ class Context {
   VkCommandPool command_pool() const { return command_pool_; }
   const DeviceCaps &caps() const { return caps_; }
 
+  std::vector<DeviceCaps> EnumerateDevices();
+
   // Finds a memory type satisfying `required`, preferring one that also has
   // every bit of `preferred`. Returns UINT32_MAX when nothing satisfies
   // `required`, so callers with a fallback can test rather than catch.
@@ -138,7 +140,7 @@ class Context {
   // A human readable summary of the selected device and the launch geometry
   // derived from it.
   std::string DescribeDevice() const;
-
+  std::string DescribeDevice(const DeviceCaps &caps) const;
  private:
   void CreateInstance(const ContextOptions &options);
   void SelectPhysicalDevice(const ContextOptions &options);

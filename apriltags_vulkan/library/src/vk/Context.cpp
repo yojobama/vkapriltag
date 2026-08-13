@@ -377,6 +377,122 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.scan_wg = std::max(FloorPow2(want_scan), 1u);
 }
 
+std::vector<DeviceCaps> Context::EnumerateDevices() {
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(instance_, &count, nullptr);
+    if (count == 0) {
+        throw std::runtime_error(
+            "No Vulkan physical devices found. No usable Vulkan driver (ICD) is installed - "
+            "check that a *_icd.json for your GPU exists under /usr/share/vulkan/icd.d and that "
+            "vulkaninfo --summary lists your device.");
+    }
+    std::vector<VkPhysicalDevice> devices(count);
+    vkEnumeratePhysicalDevices(instance_, &count, devices.data());
+
+    // Gather properties once, for both selection and the diagnostic message.
+    std::vector<VkPhysicalDeviceProperties> props(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        vkGetPhysicalDeviceProperties(devices[i], &props[i]);
+    }
+
+	std::vector<DeviceCaps> caps_list;
+    caps_list.reserve(count);
+
+    for (const VkPhysicalDevice& device : devices) {
+		DeviceCaps caps;
+		VkPhysicalDeviceProperties device_props;
+        vkGetPhysicalDeviceProperties(device, &device_props);
+    
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physical_device_, &props);
+        VkPhysicalDeviceFeatures features{};
+        vkGetPhysicalDeviceFeatures(physical_device_, &features);
+        vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_props_);
+
+        caps.name = props.deviceName;
+        caps.type = props.deviceType;
+        caps.api_version = props.apiVersion;
+        caps.vendor_id = props.vendorID;
+
+        const VkPhysicalDeviceLimits& l = props.limits;
+        caps.max_workgroup_invocations = l.maxComputeWorkGroupInvocations;
+        for (int i = 0; i < 3; ++i) {
+            caps.max_workgroup_size[i] = l.maxComputeWorkGroupSize[i];
+            caps.max_workgroup_count[i] = l.maxComputeWorkGroupCount[i];
+        }
+        caps.max_shared_memory_bytes = l.maxComputeSharedMemorySize;
+
+        // Testing aid: simulate a more constrained device so the launch geometry a
+        // Mali-class part would receive can be exercised on desktop hardware.
+        //if (options.max_invocations_override > 0) {
+        //    caps.max_workgroup_invocations =
+        //        std::min(caps.max_workgroup_invocations, options.max_invocations_override);
+        //    caps.max_workgroup_size[0] =
+        //        std::min(caps.max_workgroup_size[0], options.max_invocations_override);
+        //}
+
+        caps.has_shader_float64 = features.shaderFloat64 == VK_TRUE;
+        caps.has_shader_int64 = features.shaderInt64 == VK_TRUE;
+
+        // Timestamp support: needs a non-zero period and a queue family that can
+        // actually write timestamps.
+        uint32_t qf_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qf_count, nullptr);
+        std::vector<VkQueueFamilyProperties> qfs(qf_count);
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qf_count, qfs.data());
+        const uint32_t valid_bits =
+            (queue_family_ < qf_count) ? qfs[queue_family_].timestampValidBits : 0;
+        caps.timestamp_period_ns = l.timestampPeriod;
+        caps.timestamps_supported = valid_bits > 0 && l.timestampPeriod > 0.0f;
+
+        // Memory topology.
+        caps.unified_memory = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+            props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+        caps.has_host_cached = false;
+        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags f = mem_props_.memoryTypes[i].propertyFlags;
+            if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+                caps.has_host_cached = true;
+            }
+        }
+
+        // --- Derived launch geometry ---
+        // 1D: 256 is a good default on desktop; Mali-class parts do better with
+        // 128, and the hard ceiling is whatever the device reports.
+        uint32_t want_1d = (caps.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 128u : 256u;
+        //if (options.workgroup_size_override > 0) want_1d = options.workgroup_size_override;
+        want_1d = std::min(want_1d, caps.max_workgroup_invocations);
+        want_1d = std::min(want_1d, caps.max_workgroup_size[0]);
+        // bitonic_local.comp stages three uint32 arrays of one element per
+        // invocation in shared memory, so the workgroup must also fit that budget.
+        want_1d = std::min(want_1d, std::max<uint32_t>(caps.max_shared_memory_bytes / 12u, 1u));
+        caps.wg1d = std::max(FloorPow2(want_1d), 1u);
+
+        // 2D: prefer 16x16, fall back to 8x8 on parts that cannot host 256
+        // invocations per group.
+        if (caps.max_workgroup_invocations >= 256 && caps.max_workgroup_size[0] >= 16 &&
+            caps.max_workgroup_size[1] >= 16) {
+            caps.wg2d_x = 16;
+            caps.wg2d_y = 16;
+        }
+        else {
+            caps.wg2d_x = 8;
+            caps.wg2d_y = 8;
+        }
+
+        // Scan: a bigger block means fewer scan levels, but it must fit both the
+        // invocation limit and the shared-memory budget (4 bytes per element).
+        uint32_t want_scan = std::min<uint32_t>(1024, caps.max_workgroup_invocations);
+        want_scan = std::min(want_scan, caps.max_workgroup_size[0]);
+        want_scan = std::min(want_scan, std::max<uint32_t>(caps.max_shared_memory_bytes / 4u, 1u));
+        caps.scan_wg = std::max(FloorPow2(want_scan), 1u);
+    
+		caps_list.push_back(caps);
+    }
+
+    return caps_list;
+}
+
 void Context::CreateCommandResources() {
   VkCommandPoolCreateInfo pool_info{};
   pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -481,6 +597,29 @@ std::string Context::DescribeDevice() const {
      << ", host_cached=" << (caps_.has_host_cached ? "yes" : "no")
      << ", timestamps=" << (caps_.timestamps_supported ? "yes" : "no");
   return os.str();
+}
+
+std::string Context::DescribeDevice(const DeviceCaps &caps) const {
+    std::ostringstream os;
+    os << "apriltag_vulkan: using " << caps.name << " (" << DeviceTypeName(caps.type)
+        << ", Vulkan " << VK_API_VERSION_MAJOR(caps.api_version) << "."
+        << VK_API_VERSION_MINOR(caps.api_version) << "."
+        << VK_API_VERSION_PATCH(caps.api_version) << ")";
+    if (caps.is_cpu_device()) {
+        os << "\n  WARNING: this is a SOFTWARE Vulkan implementation running on the CPU. "
+            "Timings here say nothing about GPU performance.";
+    }
+    os << "\n  limits: maxComputeWorkGroupInvocations=" << caps.max_workgroup_invocations
+        << ", maxComputeWorkGroupSize.x=" << caps.max_workgroup_size[0]
+        << ", maxComputeSharedMemorySize=" << caps.max_shared_memory_bytes
+        << ", float64=" << (caps.has_shader_float64 ? "yes" : "no")
+        << ", int64=" << (caps.has_shader_int64 ? "yes" : "no");
+    os << "\n  chosen geometry: wg1d=" << caps.wg1d << ", wg2d=" << caps.wg2d_x << "x"
+        << caps.wg2d_y << ", scan_wg=" << caps.scan_wg
+        << ", unified_memory=" << (caps.unified_memory ? "yes" : "no")
+        << ", host_cached=" << (caps.has_host_cached ? "yes" : "no")
+        << ", timestamps=" << (caps.timestamps_supported ? "yes" : "no");
+    return os.str();
 }
 
 }  // namespace apriltag_vulkan::vk
