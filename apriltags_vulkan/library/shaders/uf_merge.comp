@@ -1,6 +1,9 @@
 #version 450
 // One hooking pass of parallel union-find over 4-connected same-valued
-// neighbors (right + down, which covers every edge exactly once).  Pixels
+// neighbors.  Only the DOWN edge is considered: uf_init.comp already joined
+// every horizontal run of equal pixels, so the right-hand edges are unioned
+// before this shader ever runs.  Between them the two still cover every edge
+// exactly once.  Pixels
 // with value 127 ("ambiguous", neither black nor white) never merge with
 // anything, matching the CUDA implementation's "127 means I'm my own blob"
 // rule.  Call this shader repeatedly, alternating with uf_compress.comp,
@@ -76,13 +79,9 @@ void main() {
 
   bool merged = false;
   if (i < total) {
-    uint x = i % pc.width;
     uint y = i / pc.width;
     uint v = thresholded[i];
     if (v != 127u) {
-      if (x + 1u < pc.width && thresholded[i + 1u] == v) {
-        if (doUnion(i, i + 1u)) merged = true;
-      }
       if (y + 1u < pc.height && thresholded[i + pc.width] == v) {
         if (doUnion(i, i + pc.width)) merged = true;
       }

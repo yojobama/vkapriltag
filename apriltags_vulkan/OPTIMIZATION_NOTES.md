@@ -21,21 +21,22 @@ throughout.
 | 4 | hash grouping replaces the (rep0, rep1) sort | 15.34 ms |
 | 5 | 256-thread local sort + CPU tail cleanup | 14.31 ms |
 | 6 | delete the now-unreachable sort machinery | 14.09 ms |
-| 7 | per-pixel labels remove `blob_diff`'s random gathers | **12.51 ms** |
+| 7 | per-pixel labels remove `blob_diff`'s random gathers | 12.51 ms |
+| 8 | horizontal runs pre-joined in `uf_init` | **11.53 ms** |
 
 Per-stage, baseline versus now:
 
 | Stage | Before | After |
 | --- | --- | --- |
 | upload | 0.22 | 0.22 |
-| threshold + label | 3.58 | 3.55 |
-| **boundary** | **3.24** | **1.71** |
-| **sort + group** | **15.83** | **2.98** |
-| **linefit** | **13.41** | **3.07** |
+| **threshold + label** | **3.58** | **2.59** |
+| **boundary** | **3.24** | **1.73** |
+| **sort + group** | **15.83** | **3.01** |
+| **linefit** | **13.41** | **3.05** |
 | readback | 3.25 | 1.09 |
-| GPU total | 39.48 | 12.51 |
-| CPU `quad_decode` | 4.15 | 3.56 |
-| **pipeline total** | **44.3** | **16.8** |
+| GPU total | 39.48 | 11.53 |
+| CPU `quad_decode` | 4.15 | 3.7 |
+| **pipeline total** | **44.3** | **16.1** |
 
 Device memory also drops, since the sort's scratch is gone: 55 -> 41 MiB at
 `APRILTAG_VK_MAX_POINTS=200000`, and 261 MiB at the default dense sizing.
@@ -207,6 +208,42 @@ much smaller chain.
 
 > boundary 3.25 -> 1.71 ms
 
+## 8. Pre-join horizontal runs in the init pass
+
+The labelling stage is not arithmetic-bound, it is bound on dependent global
+loads. Two ablations pin that down. Splitting the stage shows `uf_merge` is
+essentially all of it — and running `uf_merge` *without* the compression
+passes is **worse**, 5.24 ms against 3.60, which is the signature of chain
+walking rather than of pass count:
+
+| labelling passes run | threshold + label |
+| --- | --- |
+| none | 0.86 ms |
+| compress only | 1.04 ms |
+| merge + compress (was) | 3.60 ms |
+| merge only | 5.24 ms |
+
+`uf_init.comp` now points each pixel at its left neighbour when the two are
+the same non-ambiguous value, so every horizontal run is already one component
+before any merge pass runs. That is exactly the structure the first `uf_merge`
+pass used to build for the right-hand edges — with all-singleton input,
+unioning (i, i+1) hooks `parent[i+1] = i`, because hooking is by `atomicMin`
+and i < i+1. Building it directly is a pure streaming write: no atomics, no
+`find()` walks, no contention, where the merge pass paid two `find()`s, an
+`atomicMin` and a retry loop per horizontal edge. `uf_merge.comp` is then
+responsible only for the down edges, halving its union work; between them the
+two still cover every edge exactly once, and the "a component's root is its
+minimum index" invariant is preserved, because a run's leftmost pixel is its
+minimum index.
+
+One detail is load-bearing, and was worth 1.0 ms on its own: **a compression
+pass has to run between the init and the first merge.** Without it the
+vertical unions walk the run chains the init just built, paying an
+O(run length) `find()` each, and the whole change measures as an exact wash
+(3.577 ms against a 3.575 ms baseline). With it, 2.57 ms.
+
+> threshold+label 3.58 -> 2.59 ms
+
 ---
 
 ## Measured and rejected
@@ -229,6 +266,45 @@ round trip and its command recording cost about what the traffic does. The
 0.25 ms is still there for the taking via `vkCmdDispatchIndirect`, which
 avoids the round trip; it just needs the count passed to the shaders through a
 binding rather than a push constant, since push constants are host-side.
+
+**Tile-local union-find in shared memory.** The obvious answer to a stage
+bound on dependent global loads is to move the pointer chasing into shared
+memory: one workgroup per tile, resolve every component that fits inside the
+tile locally, leave only the cross-tile seams to the global passes. For a
+16x16 tile that is ~94% of all union operations. It is **much slower**, and
+gets worse the bigger the tile:
+
+| tile | threshold + label | tile pass alone |
+| --- | --- | --- |
+| none (flat, per pixel) | 3.58 ms | — |
+| 4x4 | 4.02 ms | 1.29 ms |
+| 8x8 | 4.62 ms | 2.09 ms |
+| 16x16 | 5.32 ms | 3.00 ms |
+| 32x32 | 6.63 ms | 4.36 ms |
+
+The tiling did work as intended — at 16x16 it cut the global merge/compress
+work from 2.70 ms to 1.46 ms — but the tile pass itself cost 3.00 ms to save
+1.24 ms. The reason is architectural: Mali (Valhall) has no dedicated
+shared-memory scratchpad the way NVIDIA and AMD parts do, it backs GLSL
+`shared` with L2. A dependent load in shared memory is therefore not
+meaningfully cheaper than one in global memory, and all that remains is the
+extra pass and its barriers. **This is a Mali-specific result** — the same
+change would plausibly win on a discrete GPU, so do not port it blind.
+
+**Computing run starts directly instead of chaining then compressing.** Since
+step 8 needs a compression pass anyway, `uf_init.comp` could scan backwards
+through `thresholded` to find each run's first pixel and write a flat parent
+in a single pass, saving a 2 MB read and a 2 MB write. The backward scan reads
+known addresses, so unlike path compression it is not a dependent chain.
+Measured 2.91 ms against 2.57 ms for chain-then-compress: the O(run length)
+per-thread scan costs more than the pointer chase plus a separate flat pass.
+Rejected.
+
+**An equal-root early-out before `doUnion` in `uf_merge`.** `parent[]` is flat
+on entry, so testing `parent[i] != parent[i + width]` costs the two loads
+`find()` would have issued anyway and skips every union on the
+convergence-check pass. Measured 2.550 ms against 2.569 ms — inside the noise,
+and it encodes a fragile ordering invariant in the shader. Rejected.
 
 **`sqrtf(a*a+b*b)` instead of `hypotf` in `FitLine`/`FitLineError`.** Worth
 3.67 -> 3.38 ms on the CPU tail with identical output, but `hypotf` is
@@ -276,26 +352,31 @@ echo performance > /sys/class/devfreq/dmc/governor
 
 ## Remaining opportunities, largest first
 
-Where the 16.8 ms now goes: threshold+label 3.55, CPU `quad_decode` 3.56,
-linefit 3.07, sort+group 2.98, boundary 1.71, readback 1.09, tag_decode 0.66,
+Where the 16.1 ms now goes: CPU `quad_decode` 3.7, sort+group 3.01, linefit
+3.05, threshold+label 2.59, boundary 1.73, readback 1.09, tag_decode 0.66,
 upload 0.22.
 
 1. **Overlap the CPU tail with the next frame's GPU work.** `quad_decode` +
-   `tag_decode` is 4.2 ms of the 16.8, and it runs strictly after the GPU
-   finishes. Double-buffering the detector so frame N's CPU tail runs during
+   `tag_decode` is 4.4 ms of the 16.1 — now the single largest item — and it
+   runs strictly after the GPU finishes. Double-buffering the detector so frame N's CPU tail runs during
    frame N+1's GPU pipeline hides essentially all of it — about 25% of
    end-to-end latency for no algorithmic change. This is an application-level
    change (`main.cpp` and the detector's buffer set), not a shader one, and is
-   almost certainly the best remaining ratio of win to risk.
+   almost certainly the best remaining ratio of win to risk. (Deferred by
+   request; not attempted here.)
 
-2. **Block-based connected-component labelling.** Ablation (`chunk=0` versus
-   `chunk=2`) puts decimate + threshold at 0.86 ms and the union-find itself
-   at 2.7 ms, i.e. ~1.35 ms per merge/compress iteration over 518400 pixels.
-   Both passes are random-access bound on the 2 MB `parent` array. A
-   block-based scheme (BUF / Playne-Equivalence, union-find over 2x2 blocks)
-   has 4x fewer nodes and is the standard 3-4x win here — call it 2 ms. It is
-   also the riskiest change on this list: it is a rewrite of the one stage
-   whose correctness everything downstream depends on.
+2. **Further work on labelling — but not the obvious kinds.** The stage is
+   now 2.59 ms, of which 0.86 ms is decimate + threshold and ~1.7 ms is the
+   union-find. Two approaches are already measured and rejected above
+   (shared-memory tiling, direct run-start scanning). Note also that the
+   classic block-based schemes (BUF, Playne-Equivalence) do **not** apply
+   here: they rely on all foreground pixels of a 2x2 block being connected,
+   which holds for binary 8-connected labelling. This image is 4-connected and
+   three-valued (0 / 255, with 127 merging with nothing), so a 2x2 block is
+   not guaranteed to be a single component and the 4x node-count reduction is
+   simply not available. What is left is reducing pass count: the second merge
+   exists only to observe convergence, so a cheaper convergence proof would
+   save most of a pass.
 
 3. **`vkCmdDispatchIndirect` for `init_extents` / `select_blobs`** — 0.25 ms,
    measured. See "Measured and rejected" for why the readback version of this

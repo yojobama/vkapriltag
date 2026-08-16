@@ -1,12 +1,31 @@
 #version 450
-// Initializes the union-find parent array: every pixel starts as its own
-// root.  This replaces the CUDA implementation's block-based BKE init; we
-// use a simple flat per-pixel Shiloach-Vishkin style union-find instead,
-// which is algorithmically equivalent (produces the same connected
-// components) and much easier to make portable across GPU vendors.
+// Initializes the union-find parent array. Rather than starting every pixel
+// as its own root, each pixel is pointed at its left neighbour whenever the
+// two are the same (non-ambiguous) value - so every horizontal run of equal
+// pixels is already a single component before the first merge pass runs.
+//
+// This is exactly the structure the first uf_merge.comp pass used to build
+// for the right-hand edges: with all-singleton input, unioning (i, i+1) hooks
+// parent[i+1] = i, because the pass hooks with atomicMin and i < i+1. Building
+// it directly instead is strictly cheaper. It is a pure streaming write with
+// no atomics, no find() walks, and no contention, where the merge pass had to
+// do two find()s, an atomicMin and a retry loop per horizontal edge - and
+// horizontal edges are the majority of same-component neighbour pairs in a
+// thresholded image, since runs are long and rows are wide.
+//
+// uf_merge.comp is then only responsible for the vertical (down) edges, which
+// halves its union work. See the note there.
+//
+// The root convention is preserved: a horizontal run's root is its leftmost
+// pixel, which is its minimum index, which is what atomicMin hooking expects.
+//
+// Ambiguous pixels (value 127) never merge with anything, matching the CUDA
+// implementation's "127 means I'm my own blob" rule, so they always stay
+// their own root here.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer Parent { uint parent[]; };
+layout(std430, binding = 0) writeonly buffer Parent { uint parent[]; };
+layout(std430, binding = 1) readonly buffer Thresholded { uint thresholded[]; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -17,5 +36,9 @@ void main() {
   uint i = gl_GlobalInvocationID.x;
   uint total = pc.width * pc.height;
   if (i >= total) return;
-  parent[i] = i;
+
+  uint v = thresholded[i];
+  uint x = i % pc.width;
+  bool join_left = (v != 127u) && (x > 0u) && (thresholded[i - 1u] == v);
+  parent[i] = join_left ? (i - 1u) : i;
 }

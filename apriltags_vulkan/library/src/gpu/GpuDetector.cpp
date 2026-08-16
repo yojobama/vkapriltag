@@ -254,7 +254,8 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("threshold"),
       {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 12, wg1d_);
 
-  uf_init_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_init"), {parent_buf_.get()}, 8, wg1d_);
+  uf_init_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("uf_init"), {parent_buf_.get(), thresholded_buf_.get()}, 8, wg1d_);
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_merge"),
       {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8, wg1d_);
@@ -463,6 +464,10 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   threshold_pl_.Dispatch1D(cmd, pixels, &thresh_pc);
 
   uf_init_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
+  // Flatten the run chains uf_init.comp just built before the first merge
+  // pass walks them. Without this the vertical unions pay an O(run length)
+  // find() each, which cancels out exactly what the run-based init saved.
+  uf_compress_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
 
   // Records `iterations` labelling passes. The convergence flag is cleared
   // immediately before the LAST merge of the chunk, so a zero readback means
