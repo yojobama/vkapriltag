@@ -1,0 +1,36 @@
+#version 450
+// Folds "which blob does this pixel belong to" and "is that blob big enough to
+// matter" into a single spatially-local per-pixel value, so blob_diff.comp can
+// read it with the same locality it already reads `thresholded` with.
+//
+// pixel_label[i] is 0 when the pixel's blob is below min_blob_pixels (or the
+// pixel is otherwise uninteresting), and 1 + the union-find root index
+// otherwise.
+//
+// Why this exists: blob_diff.comp looked up blob_size[parent[n]] for the pixel
+// and each of its five neighbours - six RANDOM gathers into a 2 MB array per
+// interior pixel, over a million of them per frame - plus two more per emitted
+// point to translate roots into dense ids. This pass does exactly ONE random
+// gather per pixel, and every read in blob_diff.comp afterwards is a
+// neighbouring address.
+//
+// The "+1" biasing is what lets 0 mean "no usable blob", which collapses
+// blob_diff.comp's two separate tests (ambiguous pixel, blob too small) into a
+// single comparison.
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
+layout(std430, binding = 1) readonly buffer BlobSize { uint blob_size[]; };
+layout(std430, binding = 2) writeonly buffer PixelLabel { uint pixel_label[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+  uint min_blob_pixels;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) return;
+  uint r = parent[i];
+  pixel_label[i] = (blob_size[r] >= pc.min_blob_pixels) ? (r + 1u) : 0u;
+}

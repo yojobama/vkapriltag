@@ -144,8 +144,7 @@ int main(int argc, char **argv) {
               << ", linefit=" << profile.linefit_ms << ", readback=" << profile.readback_ms
               << " ms)" << std::endl;
     std::cout << "  work: boundary_points=" << profile.boundary_points
-              << ", qbp_sort_n=" << profile.qbp_sort_n
-              << ", ipoint_sort_n=" << profile.ipoint_sort_n
+              << ", raw_blobs=" << profile.raw_blobs
               << ", uf_iterations=" << profile.uf_iterations
               << (profile.uf_converged ? "" : " (HIT LIMIT)")
               << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs

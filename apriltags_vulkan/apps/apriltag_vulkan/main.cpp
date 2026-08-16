@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
            << ", sort=" << profile.sort_group_ms << ", linefit=" << profile.linefit_ms
            << ", readback=" << profile.readback_ms << " ms; uf_iters="
            << profile.uf_iterations << (profile.uf_converged ? "" : "!")
-           << ", sort_n=" << profile.qbp_sort_n << "/" << profile.ipoint_sort_n
+           << ", raw_blobs=" << profile.raw_blobs
            << ", submits=" << profile.submits
            << ", blobs=" << profile.selected_blobs << ", points=" << profile.points
            << "), CPU(quad_decode=" << quaddecode_ms << " ms, decode=" << decode_ms << " ms)"

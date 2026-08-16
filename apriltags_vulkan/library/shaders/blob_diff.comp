@@ -11,11 +11,15 @@
 // with the same atomic counter compaction already used removes the dense
 // array, its traffic, and that whole second pass.
 //
+// Every read here is now spatially local. The blob identity and the
+// "big enough to matter" test both come from pixel_label[] (see
+// label_pixels.comp), which replaced six random gathers into blob_size[] per
+// interior pixel plus two more per emitted point into root_dense_id[].
+//
 // Ordering: the append order is nondeterministic (it depends on atomic
-// arrival order), exactly as it already was when compact_qbp.comp did the
-// appending. Nothing depends on it - the points are immediately sorted by
-// (rep0, rep1), and MinMaxExtentsGpu::starting_offset is not consumed by the
-// CPU tail.
+// arrival order). Nothing depends on it - the points are immediately grouped
+// by (rep0, rep1) with a hash table, and MinMaxExtentsGpu::starting_offset is
+// not consumed by the CPU tail.
 //
 // IMPORTANT: QBPoint.x/.y store the *un-decimated* coordinate (matching
 // CUDA's QuadBoundaryPoint::x()/y(): base_x()*2+dx(), base_y()*2+dy()), not
@@ -29,40 +33,30 @@
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Thresholded { uint thresholded[]; };
-layout(std430, binding = 1) readonly buffer Parent { uint parent[]; };
-layout(std430, binding = 2) readonly buffer BlobSize { uint blob_size[]; };
-layout(std430, binding = 3) writeonly buffer Compacted { QBPoint compacted[]; };
-layout(std430, binding = 4) buffer Counter { uint counter; };
-layout(std430, binding = 5) writeonly buffer KeysHi { uint keys_hi[]; };
-layout(std430, binding = 6) writeonly buffer KeysLo { uint keys_lo[]; };
-layout(std430, binding = 7) writeonly buffer Payload { uint payload[]; };
-layout(std430, binding = 8) readonly buffer RootDenseId { uint root_dense_id[]; };
+layout(std430, binding = 1) readonly buffer PixelLabel { uint pixel_label[]; };
+layout(std430, binding = 2) writeonly buffer Compacted { QBPoint compacted[]; };
+layout(std430, binding = 3) buffer Counter { uint counter; };
+layout(std430, binding = 4) writeonly buffer KeysHi { uint keys_hi[]; };
+layout(std430, binding = 5) writeonly buffer KeysLo { uint keys_lo[]; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
-  uint min_blob_pixels;
   uint capacity;
 } pc;
 
-// Appends one boundary point, together with its (rep0, rep1) sort key and the
-// identity payload index the gather pass needs.
+// Appends one boundary point together with its (rep0, rep1) grouping key.
 //
-// rep_a/rep_b are raw union-find roots (decimated pixel indices). They are
-// translated to dense blob ids (see mark_roots.comp) before building the sort
-// key, so the key only needs enough bits for the actual number of raw blobs
-// instead of a full pixel index - this does not change grouping/ordering
-// behavior since the translation is monotonic in the raw root index.
+// rep_a/rep_b are raw union-find roots (decimated pixel indices). They are no
+// longer translated to dense ids: the grouping is a hash table now, so the key
+// only has to be distinct per blob, not narrow.
 void append(uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
-  uint dense_a = root_dense_id[rep_a] - 1u;
-  uint dense_b = root_dense_id[rep_b] - 1u;
-
   uint pos = atomicAdd(counter, 1u);
   if (pos >= pc.capacity) return;
 
   QBPoint p;
-  p.rep0 = min(dense_a, dense_b);
-  p.rep1 = max(dense_a, dense_b);
+  p.rep0 = min(rep_a, rep_b);
+  p.rep1 = max(rep_a, rep_b);
   p.x = px;
   p.y = py;
   p.gx = gx;
@@ -71,9 +65,11 @@ void append(uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
   p.pad0 = 0u;
   compacted[pos] = p;
 
+  // The key is re-read by hash_group.comp when it compares a probed slot's
+  // claimant against this point, which is why it lives in its own tight
+  // arrays rather than being read out of the 32-byte QBPoint.
   keys_hi[pos] = p.rep0;
   keys_lo[pos] = p.rep1;
-  payload[pos] = pos;
 }
 
 void main() {
@@ -89,10 +85,10 @@ void main() {
 
   uint idx = x + y * pc.width;
   uint v0 = thresholded[idx];
-  uint rep0 = parent[idx];
+  uint l0 = pixel_label[idx];
 
   // Ambiguous pixel, or a blob too small to matter: contributes nothing.
-  if (v0 == 127u || blob_size[rep0] < pc.min_blob_pixels) return;
+  if (v0 == 127u || l0 == 0u) return;
 
   // Neighbor samples. The dispatch covers interior pixels only
   // (x in [1, width-1), y in [1, height-1)), so all five are in range.
@@ -108,23 +104,25 @@ void main() {
   uint vSW = thresholded[idxSW];
   uint vW = thresholded[idxW];
 
-  uint repE = parent[idxE];
-  uint repSE = parent[idxSE];
-  uint repS = parent[idxS];
-  uint repSW = parent[idxSW];
-  uint repW = parent[idxW];
+  uint lE = pixel_label[idxE];
+  uint lSE = pixel_label[idxSE];
+  uint lS = pixel_label[idxS];
+  uint lSW = pixel_label[idxSW];
+  uint lW = pixel_label[idxW];
+
+  uint rep0 = l0 - 1u;
 
   // Connections 0 (E), 1 (SE), 2 (S): emit a point if the two pixels straddle
   // a black/white boundary.
-  if (v0 + vE == 255u && blob_size[repE] >= pc.min_blob_pixels) {
-    append(rep0, repE, x * 2u + 1u, y * 2u, (vE > v0) ? 1 : -1, 0);
+  if (v0 + vE == 255u && lE != 0u) {
+    append(rep0, lE - 1u, x * 2u + 1u, y * 2u, (vE > v0) ? 1 : -1, 0);
   }
-  if (v0 + vSE == 255u && blob_size[repSE] >= pc.min_blob_pixels) {
+  if (v0 + vSE == 255u && lSE != 0u) {
     int g = (vSE > v0) ? 1 : -1;
-    append(rep0, repSE, x * 2u + 1u, y * 2u + 1u, g, g);
+    append(rep0, lSE - 1u, x * 2u + 1u, y * 2u + 1u, g, g);
   }
-  if (v0 + vS == 255u && blob_size[repS] >= pc.min_blob_pixels) {
-    append(rep0, repS, x * 2u, y * 2u + 1u, 0, (vS > v0) ? 1 : -1);
+  if (v0 + vS == 255u && lS != 0u) {
+    append(rep0, lS - 1u, x * 2u, y * 2u + 1u, 0, (vS > v0) ? 1 : -1);
   }
 
   // Dedup check: if the West and South neighbors are both unambiguous and
@@ -132,11 +130,10 @@ void main() {
   // the topological edge already captured by the West pixel's own SE (=our
   // South) diagonal connection, so skip emitting it.
   bool sw_is_duplicate = vW != 127u && vS != 127u && vS != vW && x != 1u &&
-                         blob_size[repW] >= pc.min_blob_pixels &&
-                         blob_size[repS] >= pc.min_blob_pixels;
+                         lW != 0u && lS != 0u;
   if (sw_is_duplicate) return;
 
-  if (v0 + vSW == 255u && blob_size[repSW] >= pc.min_blob_pixels) {
-    append(rep0, repSW, x * 2u - 1u, y * 2u + 1u, (vSW > v0) ? -1 : 1, (vSW > v0) ? 1 : -1);
+  if (v0 + vSW == 255u && lSW != 0u) {
+    append(rep0, lSW - 1u, x * 2u - 1u, y * 2u + 1u, (vSW > v0) ? -1 : 1, (vSW > v0) ? 1 : -1);
   }
 }
