@@ -15,14 +15,22 @@ layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 1) writeonly buffer Flags { uint flags[]; };
+layout(std430, binding = 2) readonly buffer BlobSize { uint blob_size[]; };
 
 layout(push_constant) uniform PushConstants {
   uint dw;
   uint dh;
+  uint min_blob_pixels;
 } pc;
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= pc.dw * pc.dh) return;
-  flags[i] = (parent[i] == i) ? 1u : 0u;
+  // Rank ONLY the roots a boundary point can ever name. blob_diff.comp
+  // refuses to emit a point whose blob is smaller than min_blob_pixels, so
+  // roots below that threshold are unreachable from the sort key - yet they
+  // dominate the root count (a 1080p frame has ~154k roots but only a few
+  // thousand blobs of >= 24 pixels), and it is the root COUNT that sets the
+  // key width and hence the radix pass count.
+  flags[i] = (parent[i] == i && blob_size[i] >= pc.min_blob_pixels) ? 1u : 0u;
 }

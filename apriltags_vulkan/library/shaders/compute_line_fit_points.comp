@@ -20,10 +20,6 @@ layout(push_constant) uniform PushConstants {
   int decimated_height;
 } pc;
 
-void mul64(int a, int b, out int hi, out int lo) {
-  imulExtended(a, b, hi, lo);
-}
-
 void main() {
   uint gid = gl_GlobalInvocationID.x;
   if (gid >= pc.count) return;
@@ -44,15 +40,15 @@ void main() {
     W = int(sqrt(float(grad_x * grad_x + grad_y * grad_y))) + 1;
   }
 
+  // Emit only the three independent quantities. Mx/My/Mxx/Mxy/Myy are all
+  // exact functions of (x2, y2, W), so shipping them as well was 32 of every
+  // 48 bytes of readback carrying no information. The CPU reconstructs them
+  // in native int64 during the prefix sum, which also retires the
+  // imulExtended hi/lo split this shader needed to fake 64-bit products.
   RawLineFitPoint out_pt;
-  out_pt.Mx = W * ix2;
-  out_pt.My = W * iy2;
-  mul64(W * ix2, ix2, out_pt.MxxHi, out_pt.MxxLo);
-  mul64(W * ix2, iy2, out_pt.MxyHi, out_pt.MxyLo);
-  mul64(W * iy2, iy2, out_pt.MyyHi, out_pt.MyyLo);
+  out_pt.x2 = ix2;
+  out_pt.y2 = iy2;
   out_pt.W = W;
   out_pt.blob_index = p.blob_index;
-  out_pt.pad0 = 0u;
-  out_pt.pad1 = 0u;
   output_points[gid] = out_pt;
 }

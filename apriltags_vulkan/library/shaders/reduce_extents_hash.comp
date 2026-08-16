@@ -1,0 +1,53 @@
+#version 450
+// reduce_extents.comp, keyed off the hash slot instead of off a run in a
+// sorted array. Identical arithmetic; the only differences are where the raw
+// blob index comes from, and that `starting_offset` is no longer meaningful
+// (there is no sorted array to offset into - scatter_index_points.comp places
+// each point with a per-blob cursor instead).
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Compacted { QBPoint compacted[]; };
+layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
+layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
+layout(std430, binding = 3) readonly buffer HashOwner { uint hash_owner[]; };
+layout(std430, binding = 4) buffer Extents { MinMaxExtentsGpu extents[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+  uint max_raw_blobs;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) return;
+
+  uint slot = point_slot[i];
+  if (slot == 0xFFFFFFFFu) return;
+
+  uint bi = slot_dense[slot];
+  if (bi == 0u || bi > pc.max_raw_blobs) return;
+  bi -= 1u;
+
+  QBPoint p = compacted[i];
+  if (p.valid == 0u) return;
+
+  if (hash_owner[slot] == i + 1u) {
+    extents[bi].starting_offset = 0u;
+    extents[bi].rep0 = p.rep0;
+    extents[bi].rep1 = p.rep1;
+  }
+
+  int x = int(p.x);
+  int y = int(p.y);
+  atomicMin(extents[bi].min_x, x);
+  atomicMin(extents[bi].min_y, y);
+  atomicMax(extents[bi].max_x, x);
+  atomicMax(extents[bi].max_y, y);
+  atomicAdd(extents[bi].count, 1u);
+  atomicAdd(extents[bi].gx_sum, p.gx);
+  atomicAdd(extents[bi].gy_sum, p.gy);
+  atomicAdd(extents[bi].pxgx_plus_pygy_sum, x * p.gx + y * p.gy);
+}

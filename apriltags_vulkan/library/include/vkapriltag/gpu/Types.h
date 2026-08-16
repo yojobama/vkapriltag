@@ -58,27 +58,18 @@ struct IPoint {
 static_assert(sizeof(IPoint) == 32, "IPoint must match std430 layout");
 
 struct RawLineFitPoint {
-  int32_t Mx = 0;
-  int32_t My = 0;
-  int32_t MxxHi = 0;
-  int32_t MxxLo = 0;
-  int32_t MxyHi = 0;
-  int32_t MxyLo = 0;
-  int32_t MyyHi = 0;
-  int32_t MyyLo = 0;
+  int32_t x2 = 0;
+  int32_t y2 = 0;
   int32_t W = 0;
   uint32_t blob_index = 0;
-  uint32_t pad0 = 0;
-  uint32_t pad1 = 0;
 
-  static int64_t Recombine(int32_t hi, int32_t lo) {
-    return (static_cast<int64_t>(hi) << 32) | static_cast<uint32_t>(lo);
-  }
-  int64_t Mxx() const { return Recombine(MxxHi, MxxLo); }
-  int64_t Mxy() const { return Recombine(MxyHi, MxyLo); }
-  int64_t Myy() const { return Recombine(MyyHi, MyyLo); }
+  int32_t Mx() const { return W * x2; }
+  int32_t My() const { return W * y2; }
+  int64_t Mxx() const { return static_cast<int64_t>(W) * x2 * x2; }
+  int64_t Mxy() const { return static_cast<int64_t>(W) * x2 * y2; }
+  int64_t Myy() const { return static_cast<int64_t>(W) * y2 * y2; }
 };
-static_assert(sizeof(RawLineFitPoint) == 48, "RawLineFitPoint must match std430 layout");
+static_assert(sizeof(RawLineFitPoint) == 16, "RawLineFitPoint must match std430 layout");
 
 // CPU-side cumulative line fit moments for a range of points (mirrors
 // frc971::apriltag::LineFitMoments). Built by prefix-summing RawLineFitPoint

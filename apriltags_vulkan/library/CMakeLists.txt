@@ -71,6 +71,10 @@ set(SHADER_SOURCES
   shaders/radix_scatter.comp
   shaders/gather_generic.comp
   shaders/compute_line_fit_points.comp
+  shaders/hash_group.comp
+  shaders/mark_slots.comp
+  shaders/reduce_extents_hash.comp
+  shaders/scatter_index_points.comp
 )
 
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)

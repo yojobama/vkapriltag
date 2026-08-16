@@ -148,40 +148,58 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   const size_t total_points = end - begin;
   if (total_points < 4) return result;
 
-  // Cumulative (prefix-sum) moments array; cs[k] = sum of points[0..k].
-  std::vector<LineFitMoments> cs(total_points);
+  // Scratch reused across every blob this thread fits. FitQuadForBlob is
+  // called once per blob (several hundred per frame) and used to heap-allocate
+  // four vectors each time; the buffers only ever grow.
+  thread_local std::vector<LineFitMoments> cs;
+  thread_local std::vector<double> error;
+  thread_local std::vector<double> filtered;
+  thread_local std::vector<std::pair<double, uint32_t>> peaks;
+  cs.resize(total_points);
+  error.resize(total_points);
+  filtered.resize(total_points);
+  peaks.clear();
+
   {
     LineFitMoments running{};
     for (size_t k = 0; k < total_points; ++k) {
       const RawLineFitPoint &p = points[begin + k];
-      running.Mx += p.Mx;
-      running.My += p.My;
+      const int64_t wx = static_cast<int64_t>(p.W) * p.x2;
+      const int64_t wy = static_cast<int64_t>(p.W) * p.y2;
+      running.Mx += static_cast<int32_t>(wx);
+      running.My += static_cast<int32_t>(wy);
       running.W += p.W;
-      running.Mxx += p.Mxx();
-      running.Mxy += p.Mxy();
-      running.Myy += p.Myy();
+      running.Mxx += wx * p.x2;
+      running.Mxy += wx * p.y2;
+      running.Myy += wy * p.y2;
       cs[k] = running;
     }
   }
 
   const int ksz = std::min<int>(20, static_cast<int>(total_points / 12));
 
-  // Windowed error per point (DoFitLines).
-  std::vector<double> error(total_points);
-  for (size_t i = 0; i < total_points; ++i) {
-    size_t i0 = (i + 2 * total_points - ksz) % total_points;
-    size_t i1 = (i + total_points + ksz) % total_points;
-    LineFitMoments m = ReadMomentsWindow(cs, total_points, i0, i1);
+  // Windowed error per point (DoFitLines). The circular index arithmetic is
+  // done with conditional subtraction rather than `%`: the offsets are always
+  // within one period, so a compare-and-subtract is exact, and this loop nest
+  // was issuing roughly a dozen integer divisions per boundary point.
+  const size_t n = total_points;
+  const size_t k_off = static_cast<size_t>(ksz);
+  for (size_t i = 0; i < n; ++i) {
+    const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+    size_t i1 = i + k_off;
+    if (i1 >= n) i1 -= n;
+    LineFitMoments m = ReadMomentsWindow(cs, n, i0, i1);
     error[i] = FitLineError(m.N, m.Mx, m.My, m.Mxx, m.Myy, m.Mxy, m.W);
   }
 
   // 7-tap Gaussian filter, applied circularly.
-  std::vector<double> filtered(total_points);
-  for (size_t i = 0; i < total_points; ++i) {
+  constexpr size_t kHalf = kFilterCoefficients.size() / 2;  // 3
+  for (size_t i = 0; i < n; ++i) {
     double accumulated = 0.0;
+    size_t idx = (i >= kHalf) ? (i - kHalf) : (i + n - kHalf);
     for (size_t j = 0; j < kFilterCoefficients.size(); ++j) {
-      size_t idx = (i + total_points + j - kFilterCoefficients.size() / 2) % total_points;
       accumulated += error[idx] * kFilterCoefficients[j];
+      if (++idx == n) idx = 0;
     }
     filtered[i] = accumulated;
   }
@@ -189,12 +207,16 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   // Peak detection: is_peak = my_error > before_error && my_error > after_error;
   // peak.error = -my_error (so ascending sort by error puts the strongest
   // peaks first).
-  std::vector<std::pair<double, uint32_t>> peaks;  // (error, point index)
-  for (size_t i = 0; i < total_points; ++i) {
-    double before = filtered[(i + total_points - 1) % total_points];
-    double after = filtered[(i + 1) % total_points];
-    if (filtered[i] > before && filtered[i] > after) {
-      peaks.emplace_back(-filtered[i], static_cast<uint32_t>(i));
+  {
+    double before = filtered[n - 1];
+    double cur = filtered[0];
+    for (size_t i = 0; i < n; ++i) {
+      const double after = filtered[(i + 1 == n) ? 0 : (i + 1)];
+      if (cur > before && cur > after) {
+        peaks.emplace_back(-cur, static_cast<uint32_t>(i));
+      }
+      before = cur;
+      cur = after;
     }
   }
 
@@ -203,10 +225,9 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
 
   std::stable_sort(peaks.begin(), peaks.end(),
                    [](const auto &a, const auto &b) { return a.first < b.first; });
-  std::vector<uint32_t> point_indices;
-  point_indices.reserve(K);
-  for (size_t k = 0; k < K; ++k) point_indices.push_back(peaks[k].second);
-  std::sort(point_indices.begin(), point_indices.end());
+  std::array<uint32_t, kNMaxima> point_indices{};
+  for (size_t k = 0; k < K; ++k) point_indices[k] = peaks[k].second;
+  std::sort(point_indices.begin(), point_indices.begin() + K);
 
   // ComputeM0M1Fit: cache line fits for segment (m0, m1) pairs that can ever
   // appear as the "first segment" of a valid 4-combination (m0 < 7, m1 < 8).

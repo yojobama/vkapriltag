@@ -138,6 +138,7 @@ class GpuDetector {
     uint32_t uf_iterations = 0;       // labelling passes until convergence
     uint32_t submits = 0;             // queue submissions this frame
     bool uf_converged = true;         // false if max_uf_iterations was hit
+    uint32_t rep_digits_dbg = 0;
   };
 
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
@@ -263,6 +264,15 @@ class GpuDetector {
   vk::Buffer blob_point_offsets_buf_;
   vk::Buffer line_fit_points_buf_;
 
+  // --- Hash grouping (replaces the global (rep0, rep1) sort) ---
+  // hash_owner_buf_[slot] is 0 when free, else 1 + the index of the boundary
+  // point that claimed the slot. point_slot_buf_[i] is point i's slot.
+  // slot_dense_buf_ is mark_slots.comp's 0/1 flags, scanned in place into a
+  // 1-based raw blob id. blob_cursor_buf_ is one output cursor per selected
+  // blob for scatter_index_points.comp.
+  vk::Buffer hash_owner_buf_, point_slot_buf_, slot_dense_buf_, blob_cursor_buf_;
+  uint32_t hash_table_size_ = 0;
+
   // Radix sort scratch. One set, shared by both sorts: they never overlap in
   // time (the boundary-point sort finishes a whole submission before the index
   // point sort is recorded), and both have the same element capacity.
@@ -318,6 +328,10 @@ class GpuDetector {
 
   RadixPipelines qbp_radix_;
   vk::ComputePipeline compute_line_fit_points_pl_;
+  vk::ComputePipeline hash_group_pl_, mark_slots_pl_, reduce_extents_hash_pl_,
+      scatter_index_points_pl_;
+  std::vector<vk::ComputePipeline> slot_scan_block_pls_;
+  std::vector<vk::ComputePipeline> slot_scan_add_offsets_pls_;
 
   // Dense blob id assignment (mark_roots.comp + an inclusive scan), recorded
   // once per frame right after union-find converges.

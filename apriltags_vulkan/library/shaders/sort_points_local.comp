@@ -61,16 +61,22 @@ void main() {
     return;
   }
 
-  for (uint idx = tid; idx < kLocalCap; idx += threads) {
+  // Size the network to THIS blob, not to kLocalCap. `count` is uniform across
+  // the workgroup, so `cap` is too, and every barrier below is still reached
+  // by every invocation.
+  uint cap = 1u;
+  while (cap < count) cap <<= 1u;
+
+  for (uint idx = tid; idx < cap; idx += threads) {
     s_key[idx] = (idx < count) ? src[base + idx].theta_key : 0xFFFFFFFFu;
     s_idx[idx] = idx;
   }
   memoryBarrierShared();
   barrier();
 
-  for (uint k = 2u; k <= kLocalCap; k <<= 1u) {
+  for (uint k = 2u; k <= cap; k <<= 1u) {
     for (uint j = k >> 1u; j > 0u; j >>= 1u) {
-      for (uint idx = tid; idx < kLocalCap; idx += threads) {
+      for (uint idx = tid; idx < cap; idx += threads) {
         uint partner = idx ^ j;
         if (partner > idx) {
           bool ascending = ((idx & k) == 0u);

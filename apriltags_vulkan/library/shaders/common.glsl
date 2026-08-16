@@ -56,18 +56,10 @@ struct IPoint {
 // halves because GLSL core has no int64 type.  Mirrors
 // frc971::apriltag::LineFitPoint.
 struct RawLineFitPoint {
-  int Mx;
-  int My;
-  int MxxHi;
-  int MxxLo;
-  int MxyHi;
-  int MxyLo;
-  int MyyHi;
-  int MyyLo;
-  int W;
+  int x2;           // doubled x coordinate (was implicit in Mx = W * x2)
+  int y2;           // doubled y coordinate
+  int W;            // gradient-magnitude weight
   uint blob_index;
-  uint pad0;
-  uint pad1;
 };
 
 #endif // APRILTAG_COMMON_GLSL

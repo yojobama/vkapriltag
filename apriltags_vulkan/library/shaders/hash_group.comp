@@ -1,0 +1,65 @@
+#version 450
+// Assigns every boundary point a hash-table slot for its (rep0, rep1) pair,
+// replacing the global (rep0, rep1) SORT that used to exist purely to make
+// equal pairs adjacent.
+//
+// The sort was doing far more than the pipeline needs. Nothing downstream
+// consumes the ORDER of the boundary points - only their GROUPING - because
+// each selected blob's points are re-sorted by angle around its centroid
+// immediately afterwards (sort_points_local.comp). Grouping by an unordered
+// key is a hash-table problem, not a sort problem: one pass over the points
+// instead of 2 * ceil(bits/4) stable radix passes, each of which read and
+// rewrote three words per element.
+//
+// The insert is lock-free AND spin-free. A slot's value is `owner + 1` where
+// `owner` is the index of the point that claimed it (0 means empty, so a
+// plain FillZero resets the table). Whoever loses the CAS gets the winner's
+// index back and can immediately compare keys, because the claimant's key was
+// written by blob_diff.comp in an earlier, barriered dispatch and is therefore
+// already visible. No thread ever waits on another thread's later write, which
+// matters: Vulkan does not guarantee independent forward progress between
+// workgroups, so a spin here could deadlock on a conformant implementation.
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer KeysHi { uint keys_hi[]; };
+layout(std430, binding = 1) readonly buffer KeysLo { uint keys_lo[]; };
+layout(std430, binding = 2) buffer HashOwner { uint hash_owner[]; };
+layout(std430, binding = 3) writeonly buffer PointSlot { uint point_slot[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+  uint table_mask;   // table size - 1; table size is a power of two
+  uint max_probes;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) return;
+
+  uint k0 = keys_hi[i];
+  uint k1 = keys_lo[i];
+
+  // 64 -> 32 bit mix (murmur-style finalizer). The keys are dense small ids,
+  // so a plain xor/shift would cluster badly under linear probing.
+  uint h = k0 * 0x9E3779B1u + k1 * 0x85EBCA6Bu;
+  h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
+  h &= pc.table_mask;
+
+  for (uint probe = 0u; probe < pc.max_probes; ++probe) {
+    uint owner = hash_owner[h];
+    if (owner == 0u) {
+      uint prev = atomicCompSwap(hash_owner[h], 0u, i + 1u);
+      owner = (prev == 0u) ? (i + 1u) : prev;
+    }
+    uint o = owner - 1u;
+    if (keys_hi[o] == k0 && keys_lo[o] == k1) {
+      point_slot[i] = h;
+      return;
+    }
+    h = (h + 1u) & pc.table_mask;
+  }
+  // Table effectively full along this probe chain. Dropping the point is the
+  // same defensive behaviour the capacity clamps elsewhere use; at the sizing
+  // below (table = 4x max_raw_blobs) it cannot happen for a real frame.
+  point_slot[i] = 0xFFFFFFFFu;
+}

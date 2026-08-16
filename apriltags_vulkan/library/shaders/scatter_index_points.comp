@@ -1,0 +1,76 @@
+#version 450
+// rewrite_index_points.comp without the sorted array. Each surviving point
+// takes the next free slot in its blob's contiguous output range via a
+// per-blob cursor, so the blob's points are still packed contiguously (which
+// is all sort_points_local.comp requires) without any global ordering having
+// been established first.
+//
+// Order within a blob is atomic-arrival dependent, exactly as the boundary
+// point append order in blob_diff.comp already was - and it is immediately
+// overwritten by the angular sort in sort_points_local.comp.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+#define PI 3.14159265358979323846
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Compacted { QBPoint compacted[]; };
+layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
+layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
+layout(std430, binding = 3) readonly buffer Remap { uint remap[]; };
+layout(std430, binding = 4) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
+layout(std430, binding = 5) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
+layout(std430, binding = 6) buffer BlobCursor { uint blob_cursor[]; };
+layout(std430, binding = 7) writeonly buffer Output { IPoint output_points[]; };
+layout(std430, binding = 8) buffer Counter { uint counter; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+  uint capacity;
+  uint max_raw_blobs;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) return;
+
+  uint slot = point_slot[i];
+  if (slot == 0xFFFFFFFFu) return;
+
+  uint bi = slot_dense[slot];
+  if (bi == 0u || bi > pc.max_raw_blobs) return;
+  bi -= 1u;
+
+  uint sel = remap[bi];
+  if (sel == 0xFFFFFFFFu) return;
+
+  QBPoint p = compacted[i];
+  if (p.valid == 0u) return;
+
+  MinMaxExtentsGpu e = selected[sel];
+  float cx = (float(e.min_x) + float(e.max_x)) * 0.5 + 0.05118;
+  float cy = (float(e.min_y) + float(e.max_y)) * 0.5 + -0.028581;
+
+  float theta = (atan(float(p.y) - cy, float(p.x) - cx) + float(PI)) * 8e6;
+  int theta_int = int(round(theta));
+  uint theta_key = uint(max(theta_int, 0));
+
+  uint rank = atomicAdd(blob_cursor[sel], 1u);
+  if (rank >= e.count) return;
+  uint pos = blob_point_offsets[sel] - e.count + rank;
+  if (pos >= pc.capacity) return;
+
+  atomicAdd(counter, 1u);
+
+  IPoint out_pt;
+  out_pt.blob_index = sel;
+  out_pt.x = p.x;
+  out_pt.y = p.y;
+  out_pt.gx = p.gx;
+  out_pt.gy = p.gy;
+  out_pt.theta_key = theta_key;
+  out_pt.pad0 = 0u;
+  out_pt.pad1 = 0u;
+  output_points[pos] = out_pt;
+}
