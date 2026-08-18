@@ -8,10 +8,12 @@
 #define NOMINMAX
 #include <algorithm>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 #include <filesystem>
 
+#include "vkapriltag/PipelinedDetector.h"
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/apriltag_family.h"
 #include "vkapriltag/gpu/GpuDetector.h"
@@ -49,6 +51,11 @@ int main(int argc, char **argv) {
   std::string load_path;
   std::string family_name = "tag36h11";
   std::string csv_path;
+  // When set, runs frame N+1's GPU stage concurrently with frame N's CPU
+  // tail via PipelinedDetector instead of the strictly serial
+  // Detect->Decode->Decode sequence. Raises throughput, not per-frame
+  // latency: see PipelinedDetector.h.
+  bool pipelined = false;
   // A single Detect() call is dominated by cold-start costs (first-touch page
   // faults across every buffer, pipeline warm-up), which say nothing about
   // per-frame throughput. Repeat and report the best/median to measure the
@@ -71,6 +78,8 @@ int main(int argc, char **argv) {
       iterations = std::max(1, std::stoi(next("--iterations")));
     } else if (arg == "--csv") {
       csv_path = next("--csv");
+    } else if (arg == "--pipelined") {
+      pipelined = true;
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -79,7 +88,7 @@ int main(int argc, char **argv) {
 
   if (load_path.empty()) {
     std::cerr << "Usage: apriltag_vulkan_validate --data <FileName> [--family tag36h11] "
-                 "[--iterations N] [--csv path.csv]"
+                 "[--iterations N] [--csv path.csv] [--pipelined]"
              << std::endl;
     return 1;
   }
@@ -140,81 +149,156 @@ int main(int argc, char **argv) {
       config.reversed_border = tf->reversed_border;
       config.normal_border = !tf->reversed_border;
 
-      apriltag_vulkan::GpuDetector detector(ctx, config);
-      apriltag_vulkan::QuadDecode quad_decode(config);
-      apriltag_vulkan::TagDecoder tag_decoder(td_ours);
-
       ImageMetrics metrics;
       metrics.file = file;
       metrics.width = width;
       metrics.height = height;
       metrics.iterations = iterations;
 
-      std::vector<double> gpu_totals, quad_decode_totals, tag_decode_totals, pipeline_totals;
-      gpu_totals.reserve(static_cast<size_t>(iterations));
-      quad_decode_totals.reserve(static_cast<size_t>(iterations));
-      tag_decode_totals.reserve(static_cast<size_t>(iterations));
-      pipeline_totals.reserve(static_cast<size_t>(iterations));
-
       zarray_t* ours = nullptr;
       apriltag_vulkan::GpuDetector::DetectProfile profile;
       std::vector<apriltag_vulkan::DetectedQuad> quads;
 
-      for (int it = 0; it < iterations; ++it) {
+      // `ours` (returned by TagDecoder/PipelinedDetector::Decode()) is owned
+      // by whichever of these holds the underlying TagDecoder, and is only
+      // valid while that object is alive - so it must outlive the
+      // print/compare code below, which runs after this if/else. A plain
+      // TagDecoder/PipelinedDetector local declared inside just one branch
+      // would be destroyed at that branch's closing brace, leaving `ours`
+      // dangling by the time it's read.
+      std::unique_ptr<apriltag_vulkan::TagDecoder> owned_tag_decoder;
+      std::unique_ptr<apriltag_vulkan::PipelinedDetector> owned_pdetector;
+
+      if (pipelined) {
+        // Frame N+1's GPU stage runs concurrently with frame N's CPU tail.
+        // Detect() returns the PREVIOUS frame's completed result, so a
+        // call's own wall time reflects roughly this frame's GPU stage (plus
+        // a join-wait for the previous tail, ~0 once the tail is fully
+        // hidden). What matters for the pipelining claim is THROUGHPUT - the
+        // total wall time to process `iterations` frames divided by
+        // iterations - not any individual stage, since the whole point is
+        // that quad_decode/tag_decode no longer show up as separate serial
+        // time. See PipelinedDetector.h: this raises throughput, not
+        // per-frame latency.
+        owned_pdetector = std::make_unique<apriltag_vulkan::PipelinedDetector>(ctx, config, td_ours);
+        apriltag_vulkan::PipelinedDetector &pdetector = *owned_pdetector;
+        std::vector<double> submit_totals;
+        submit_totals.reserve(static_cast<size_t>(iterations));
+
+        const auto throughput_t0 = std::chrono::steady_clock::now();
+        for (int it = 0; it < iterations; ++it) {
           const auto t0 = std::chrono::steady_clock::now();
-          detector.Detect(image.data);
-          profile = detector.last_profile();
-          gpu_totals.push_back(profile.total_ms);
+          apriltag_vulkan::PipelinedDetector::Result result = pdetector.Detect(image.data);
+          const auto t1 = std::chrono::steady_clock::now();
+          submit_totals.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+          if (result.valid) {
+            ours = result.detections;
+            quads = result.quads;
+            profile = result.profile;
+          }
+        }
+        apriltag_vulkan::PipelinedDetector::Result final_result = pdetector.Flush();
+        if (final_result.valid) {
+          ours = final_result.detections;
+          quads = final_result.quads;
+          profile = final_result.profile;
+        }
+        const auto throughput_t1 = std::chrono::steady_clock::now();
+        const double throughput_per_frame_ms =
+            std::chrono::duration<double, std::milli>(throughput_t1 - throughput_t0).count() /
+            iterations;
 
-          const auto t_quad0 = std::chrono::steady_clock::now();
-          quads = quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
-          const auto t_quad1 = std::chrono::steady_clock::now();
-          quad_decode_totals.push_back(
-              std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());
+        metrics.gpu_total_ms = ComputeStats(submit_totals);
+        metrics.quad_decode_ms = Stats{};  // hidden behind the next frame's GPU stage
+        metrics.tag_decode_ms = Stats{};
+        metrics.pipeline_ms = Stats{throughput_per_frame_ms, throughput_per_frame_ms,
+                                    throughput_per_frame_ms};
+        metrics.candidate_quads = static_cast<uint32_t>(quads.size());
+        metrics.boundary_points = profile.boundary_points;
+        metrics.raw_blobs = profile.raw_blobs;
+        metrics.selected_blobs = profile.selected_blobs;
+        metrics.points = profile.points;
+        metrics.uf_iterations = profile.uf_iterations;
+        metrics.uf_converged = profile.uf_converged;
 
-          const auto t_dec0 = std::chrono::steady_clock::now();
-          ours = tag_decoder.Decode(quads, image.data, width, height, config.reversed_border);
-          const auto t_dec1 = std::chrono::steady_clock::now();
-          tag_decode_totals.push_back(
-              std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count());
+        std::cout << quads.size() << " candidate quad(s) from the Vulkan pipeline (pipelined)."
+                  << std::endl;
+        std::cout << "  work: boundary_points=" << profile.boundary_points
+            << ", raw_blobs=" << profile.raw_blobs
+            << ", blobs=" << profile.selected_blobs << ", points=" << profile.points << std::endl;
+        std::cout << "Pipelined throughput over " << iterations
+                  << " frame(s): " << throughput_per_frame_ms << " ms/frame ("
+                  << (1000.0 / throughput_per_frame_ms) << " fps)" << std::endl;
+        PrintStats("Detect() call (GPU stage + prev-tail join-wait)", metrics.gpu_total_ms,
+                   iterations);
+      } else {
+        apriltag_vulkan::GpuDetector detector(ctx, config);
+        apriltag_vulkan::QuadDecode quad_decode(config);
+        owned_tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(td_ours);
+        apriltag_vulkan::TagDecoder &tag_decoder = *owned_tag_decoder;
 
-          pipeline_totals.push_back(
-              std::chrono::duration<double, std::milli>(t_dec1 - t0).count());
+        std::vector<double> gpu_totals, quad_decode_totals, tag_decode_totals, pipeline_totals;
+        gpu_totals.reserve(static_cast<size_t>(iterations));
+        quad_decode_totals.reserve(static_cast<size_t>(iterations));
+        tag_decode_totals.reserve(static_cast<size_t>(iterations));
+        pipeline_totals.reserve(static_cast<size_t>(iterations));
+
+        for (int it = 0; it < iterations; ++it) {
+            const auto t0 = std::chrono::steady_clock::now();
+            detector.Detect(image.data);
+            profile = detector.last_profile();
+            gpu_totals.push_back(profile.total_ms);
+
+            const auto t_quad0 = std::chrono::steady_clock::now();
+            quads = quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+            const auto t_quad1 = std::chrono::steady_clock::now();
+            quad_decode_totals.push_back(
+                std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());
+
+            const auto t_dec0 = std::chrono::steady_clock::now();
+            ours = tag_decoder.Decode(quads, image.data, width, height, config.reversed_border);
+            const auto t_dec1 = std::chrono::steady_clock::now();
+            tag_decode_totals.push_back(
+                std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count());
+
+            pipeline_totals.push_back(
+                std::chrono::duration<double, std::milli>(t_dec1 - t0).count());
+        }
+
+        metrics.gpu_total_ms = ComputeStats(gpu_totals);
+        metrics.quad_decode_ms = ComputeStats(quad_decode_totals);
+        metrics.tag_decode_ms = ComputeStats(tag_decode_totals);
+        metrics.pipeline_ms = ComputeStats(pipeline_totals);
+        metrics.candidate_quads = static_cast<uint32_t>(quads.size());
+        metrics.boundary_points = profile.boundary_points;
+        metrics.raw_blobs = profile.raw_blobs;
+        metrics.selected_blobs = profile.selected_blobs;
+        metrics.points = profile.points;
+        metrics.uf_iterations = profile.uf_iterations;
+        metrics.uf_converged = profile.uf_converged;
+
+        std::cout << quads.size() << " candidate quad(s) from the Vulkan pipeline." << std::endl;
+        std::cout << detector.DescribeSizing() << std::endl;
+        std::cout << "GPU profile (last iteration): total=" << profile.total_ms
+            << " ms (upload=" << profile.upload_ms
+            << ", threshold+label=" << profile.threshold_label_ms
+            << ", boundary=" << profile.boundary_ms << ", sort+group=" << profile.sort_group_ms
+            << ", linefit=" << profile.linefit_ms << ", readback=" << profile.readback_ms
+            << " ms)" << std::endl;
+        std::cout << "  work: boundary_points=" << profile.boundary_points
+            << ", raw_blobs=" << profile.raw_blobs
+            << ", uf_iterations=" << profile.uf_iterations
+            << (profile.uf_converged ? "" : " (HIT LIMIT)")
+            << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs
+            << ", points=" << profile.points << std::endl;
+        std::cout << "  bytes: upload=" << profile.upload_bytes
+            << ", readback=" << profile.readback_bytes << std::endl;
+        std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
+        PrintStats("GPU total", metrics.gpu_total_ms, iterations);
+        PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
+        PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
+        PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
       }
-
-      metrics.gpu_total_ms = ComputeStats(gpu_totals);
-      metrics.quad_decode_ms = ComputeStats(quad_decode_totals);
-      metrics.tag_decode_ms = ComputeStats(tag_decode_totals);
-      metrics.pipeline_ms = ComputeStats(pipeline_totals);
-      metrics.candidate_quads = static_cast<uint32_t>(quads.size());
-      metrics.boundary_points = profile.boundary_points;
-      metrics.raw_blobs = profile.raw_blobs;
-      metrics.selected_blobs = profile.selected_blobs;
-      metrics.points = profile.points;
-      metrics.uf_iterations = profile.uf_iterations;
-      metrics.uf_converged = profile.uf_converged;
-
-      std::cout << quads.size() << " candidate quad(s) from the Vulkan pipeline." << std::endl;
-      std::cout << detector.DescribeSizing() << std::endl;
-      std::cout << "GPU profile (last iteration): total=" << profile.total_ms
-          << " ms (upload=" << profile.upload_ms
-          << ", threshold+label=" << profile.threshold_label_ms
-          << ", boundary=" << profile.boundary_ms << ", sort+group=" << profile.sort_group_ms
-          << ", linefit=" << profile.linefit_ms << ", readback=" << profile.readback_ms
-          << " ms)" << std::endl;
-      std::cout << "  work: boundary_points=" << profile.boundary_points
-          << ", raw_blobs=" << profile.raw_blobs
-          << ", uf_iterations=" << profile.uf_iterations
-          << (profile.uf_converged ? "" : " (HIT LIMIT)")
-          << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs
-          << ", points=" << profile.points << std::endl;
-      std::cout << "  bytes: upload=" << profile.upload_bytes
-          << ", readback=" << profile.readback_bytes << std::endl;
-      std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
-      PrintStats("GPU total", metrics.gpu_total_ms, iterations);
-      PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
-      PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
-      PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
 
       std::cout << "--- Our detections ---" << std::endl;
       print_detections(ours);
