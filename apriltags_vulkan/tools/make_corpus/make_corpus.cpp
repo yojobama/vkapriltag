@@ -37,7 +37,13 @@ int RoundToMultipleOf8(double value) {
 int main(int argc, char **argv) {
   std::string input_path;
   std::string out_dir;
-  std::vector<double> scales = {0.25, 0.375, 0.5, 0.75, 1.0, 1.5};
+  // Downscale only (<= 1.0). Upscaling synthesizes pixels the source image
+  // never had - it manufactures a smoother/differently-interpolated edge
+  // profile rather than the resolution loss a real distant/small tag would
+  // actually show, so it is not a valid stand-in for "the tag is farther
+  // away" and must not be used for validating the resolution-relative
+  // thresholds (item 2) or corner-fit changes (item 3).
+  std::vector<double> scales = {0.25, 0.375, 0.5, 0.75, 1.0};
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -63,7 +69,7 @@ int main(int argc, char **argv) {
 
   if (input_path.empty() || out_dir.empty()) {
     std::cerr << "Usage: make_corpus --input <image> --out-dir <dir> "
-                 "[--scales 0.25,0.375,0.5,0.75,1.0,1.5]"
+                 "[--scales 0.25,0.375,0.5,0.75,1.0]"
              << std::endl;
     return 1;
   }
