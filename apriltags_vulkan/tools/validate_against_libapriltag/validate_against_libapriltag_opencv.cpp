@@ -1,10 +1,10 @@
 // Standalone validation tool: runs this project's full Vulkan+CPU detection
 // pipeline (GpuDetector -> QuadDecode -> TagDecoder) on a static grayscale
-// PGM image and compares the resulting decoded tag IDs against the fetched
-// `apriltag` C library's own, unmodified, reference CPU detector
-// (apriltag_detector_detect()) run on the exact same image. This is the
-// "verify against the official libapriltag outputs" check - not a manual/
-// eyeballed comparison.
+// image and compares the resulting decoded tag IDs AND corner positions
+// against the fetched `apriltag` C library's own, unmodified, reference CPU
+// detector (apriltag_detector_detect()) run on the exact same image. This is
+// the "verify against the official libapriltag outputs" check - not a
+// manual/eyeballed comparison.
 #define NOMINMAX
 #include <algorithm>
 #include <iostream>
@@ -14,10 +14,10 @@
 
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/apriltag_family.h"
-#include "vkapriltag/common/pgm_io.h"
 #include "vkapriltag/gpu/GpuDetector.h"
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
+#include "validate_common.h"
 #include <chrono>
 
 #include <opencv2/opencv.hpp>
@@ -26,26 +26,21 @@ extern "C" {
 #include "apriltag.h"
 }
 
+using apriltag_vulkan::validate::AppendCsvRow;
+using apriltag_vulkan::validate::CompareCorners;
+using apriltag_vulkan::validate::ComputeStats;
+using apriltag_vulkan::validate::ExtractDetections;
+using apriltag_vulkan::validate::ImageMetrics;
+using apriltag_vulkan::validate::PrintIds;
+using apriltag_vulkan::validate::SortedIds;
+using apriltag_vulkan::validate::Stats;
+
 namespace {
 
-std::vector<int> SortedIds(const zarray_t *detections) {
-  std::vector<int> ids;
-  for (int i = 0; i < zarray_size(detections); ++i) {
-    apriltag_detection_t *det;
-    zarray_get(const_cast<zarray_t *>(detections), i, &det);
-    ids.push_back(det->id);
-  }
-  std::sort(ids.begin(), ids.end());
-  return ids;
-}
-
-void PrintIds(const char *label, const std::vector<int> &ids) {
-  std::cout << label << ": [";
-  for (size_t i = 0; i < ids.size(); ++i) {
-    if (i) std::cout << ", ";
-    std::cout << ids[i];
-  }
-  std::cout << "]" << std::endl;
+void PrintStats(const char *label, const Stats &s, int iterations) {
+  std::cout << "  " << label << ": best=" << s.best << " ms";
+  if (iterations > 1) std::cout << ", median=" << s.median << " ms, worst=" << s.worst << " ms";
+  std::cout << std::endl;
 }
 
 }  // namespace
@@ -53,10 +48,13 @@ void PrintIds(const char *label, const std::vector<int> &ids) {
 int main(int argc, char **argv) {
   std::string load_path;
   std::string family_name = "tag36h11";
+  std::string csv_path;
   // A single Detect() call is dominated by cold-start costs (first-touch page
   // faults across every buffer, pipeline warm-up), which say nothing about
   // per-frame throughput. Repeat and report the best/median to measure the
-  // steady state a live camera feed would actually see.
+  // steady state a live camera feed would actually see. The WHOLE pipeline
+  // (GPU + quad_decode + tag_decode) is timed per iteration, not just
+  // Detect(), since CPU-tail changes are invisible to a GPU-only timer.
   int iterations = 1;
 
   for (int i = 1; i < argc; ++i) {
@@ -71,6 +69,8 @@ int main(int argc, char **argv) {
       family_name = next("--family");
     } else if (arg == "--iterations") {
       iterations = std::max(1, std::stoi(next("--iterations")));
+    } else if (arg == "--csv") {
+      csv_path = next("--csv");
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -79,7 +79,7 @@ int main(int argc, char **argv) {
 
   if (load_path.empty()) {
     std::cerr << "Usage: apriltag_vulkan_validate --data <FileName> [--family tag36h11] "
-                 "[--iterations N]"
+                 "[--iterations N] [--csv path.csv]"
              << std::endl;
     return 1;
   }
@@ -91,11 +91,11 @@ int main(int argc, char **argv) {
 
   if (std::filesystem::is_directory(path, errorCode)) {
     std::cout << "Testing all images in directory: " << load_path << std::endl;
-  
+
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
       // Skips subdirectories if you only want regular files
       if (std::filesystem::is_regular_file(entry.path())) {
-		cv::Mat img = cv::imread(entry.path().string(), cv::IMREAD_GRAYSCALE);
+	cv::Mat img = cv::imread(entry.path().string(), cv::IMREAD_GRAYSCALE);
         if (img.empty()) {
             std::cerr << "Failed to load Image: " << entry.path().string() << std::endl;
             continue;
@@ -144,30 +144,60 @@ int main(int argc, char **argv) {
       apriltag_vulkan::QuadDecode quad_decode(config);
       apriltag_vulkan::TagDecoder tag_decoder(td_ours);
 
-      std::vector<double> gpu_totals;
+      ImageMetrics metrics;
+      metrics.file = file;
+      metrics.width = width;
+      metrics.height = height;
+      metrics.iterations = iterations;
+
+      std::vector<double> gpu_totals, quad_decode_totals, tag_decode_totals, pipeline_totals;
       gpu_totals.reserve(static_cast<size_t>(iterations));
+      quad_decode_totals.reserve(static_cast<size_t>(iterations));
+      tag_decode_totals.reserve(static_cast<size_t>(iterations));
+      pipeline_totals.reserve(static_cast<size_t>(iterations));
+
+      zarray_t* ours = nullptr;
+      apriltag_vulkan::GpuDetector::DetectProfile profile;
+      std::vector<apriltag_vulkan::DetectedQuad> quads;
+
       for (int it = 0; it < iterations; ++it) {
+          const auto t0 = std::chrono::steady_clock::now();
           detector.Detect(image.data);
-          gpu_totals.push_back(detector.last_profile().total_ms);
+          profile = detector.last_profile();
+          gpu_totals.push_back(profile.total_ms);
+
+          const auto t_quad0 = std::chrono::steady_clock::now();
+          quads = quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+          const auto t_quad1 = std::chrono::steady_clock::now();
+          quad_decode_totals.push_back(
+              std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());
+
+          const auto t_dec0 = std::chrono::steady_clock::now();
+          ours = tag_decoder.Decode(quads, image.data, width, height, config.reversed_border);
+          const auto t_dec1 = std::chrono::steady_clock::now();
+          tag_decode_totals.push_back(
+              std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count());
+
+          pipeline_totals.push_back(
+              std::chrono::duration<double, std::milli>(t_dec1 - t0).count());
       }
 
-      const auto t0 = std::chrono::steady_clock::now();
-      detector.Detect(image.data);
-      const auto& profile = detector.last_profile();
+      metrics.gpu_total_ms = ComputeStats(gpu_totals);
+      metrics.quad_decode_ms = ComputeStats(quad_decode_totals);
+      metrics.tag_decode_ms = ComputeStats(tag_decode_totals);
+      metrics.pipeline_ms = ComputeStats(pipeline_totals);
+      metrics.candidate_quads = static_cast<uint32_t>(quads.size());
+      metrics.boundary_points = profile.boundary_points;
+      metrics.raw_blobs = profile.raw_blobs;
+      metrics.selected_blobs = profile.selected_blobs;
+      metrics.points = profile.points;
+      metrics.uf_iterations = profile.uf_iterations;
+      metrics.uf_converged = profile.uf_converged;
 
-      const auto t_quad0 = std::chrono::steady_clock::now();
-      std::vector<apriltag_vulkan::DetectedQuad> quads =
-          quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
-      const auto t_quad1 = std::chrono::steady_clock::now();
-
-      const auto t_dec0 = std::chrono::steady_clock::now();
-      zarray_t* ours = tag_decoder.Decode(quads, image.data, width, height, config.reversed_border);
-      const auto t_dec1 = std::chrono::steady_clock::now();
-
-      const auto t1 = std::chrono::steady_clock::now();
       std::cout << quads.size() << " candidate quad(s) from the Vulkan pipeline." << std::endl;
       std::cout << detector.DescribeSizing() << std::endl;
-      std::cout << "GPU profile: total=" << profile.total_ms << " ms (upload=" << profile.upload_ms
+      std::cout << "GPU profile (last iteration): total=" << profile.total_ms
+          << " ms (upload=" << profile.upload_ms
           << ", threshold+label=" << profile.threshold_label_ms
           << ", boundary=" << profile.boundary_ms << ", sort+group=" << profile.sort_group_ms
           << ", linefit=" << profile.linefit_ms << ", readback=" << profile.readback_ms
@@ -180,23 +210,16 @@ int main(int argc, char **argv) {
           << ", points=" << profile.points << std::endl;
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
-      if (gpu_totals.size() > 1) {
-          std::vector<double> sorted = gpu_totals;
-          std::sort(sorted.begin(), sorted.end());
-          std::cout << "  over " << sorted.size() << " iterations: first=" << gpu_totals.front()
-              << " ms, best=" << sorted.front() << " ms, median="
-              << sorted[sorted.size() / 2] << " ms, worst=" << sorted.back() << " ms"
-              << std::endl;
-      }
-      std::cout << "CPU profile: quad_decode="
-          << std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count()
-          << " ms, tag_decode="
-          << std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count()
-          << " ms, pipeline_total="
-          << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms" << std::endl;
+      std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
+      PrintStats("GPU total", metrics.gpu_total_ms, iterations);
+      PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
+      PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
+      PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
+
       std::cout << "--- Our detections ---" << std::endl;
       print_detections(ours);
-      std::vector<int> our_ids = SortedIds(ours);
+      std::vector<apriltag_vulkan::validate::DetectionInfo> our_dets = ExtractDetections(ours);
+      std::vector<int> our_ids = SortedIds(our_dets);
 
       apriltag_detector_t* td_ref = apriltag_detector_create();
       apriltag_detector_add_family(td_ref, tf);
@@ -217,12 +240,21 @@ int main(int argc, char **argv) {
           << " ms" << std::endl;
       std::cout << "--- Reference (official libapriltag) detections ---" << std::endl;
       print_detections(ref);
-      std::vector<int> ref_ids = SortedIds(ref);
+      std::vector<apriltag_vulkan::validate::DetectionInfo> ref_dets = ExtractDetections(ref);
+      std::vector<int> ref_ids = SortedIds(ref_dets);
 
       PrintIds("Our tag IDs", our_ids);
       PrintIds("Reference tag IDs", ref_ids);
 
-      if (our_ids == ref_ids) {
+      metrics.corners = CompareCorners(our_dets, ref_dets);
+      if (metrics.corners.compared_tags > 0) {
+        std::cout << "Corner RMS over " << metrics.corners.compared_tags
+            << " tag(s) present in both: mean=" << metrics.corners.mean_rms
+            << " px, max=" << metrics.corners.max_rms << " px" << std::endl;
+      }
+
+      metrics.ids_match = (our_ids == ref_ids);
+      if (metrics.ids_match) {
           std::cout << "MATCH: decoded tag ID set agrees with the official libapriltag detector."
               << std::endl;
           match++;
@@ -232,6 +264,8 @@ int main(int argc, char **argv) {
               << std::endl;
           mismatch++;
       }
+
+      if (!csv_path.empty()) AppendCsvRow(csv_path, metrics);
     }
 
     std::cout << "Final Results: " << match << " matches, " << mismatch << " mismatches." << std::endl;

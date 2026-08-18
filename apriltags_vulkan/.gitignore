@@ -1,0 +1,6 @@
+# Phase 0 corpus/baseline artifacts: locally generated and machine-specific
+# (resolution sweep of a tracked source image; CSV timing baselines differ
+# per host). Regenerate with tools/make_corpus and apriltag_vulkan_validate
+# --csv rather than committing them.
+/corpus/
+*.csv
