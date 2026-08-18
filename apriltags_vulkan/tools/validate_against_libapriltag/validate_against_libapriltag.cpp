@@ -167,6 +167,11 @@ int main(int argc, char **argv) {
     metrics.points = profile.points;
     metrics.uf_iterations = profile.uf_iterations;
     metrics.uf_converged = profile.uf_converged;
+    {
+      const apriltag_vulkan::QuadDecode::DpStats dp_stats = quad_decode.last_dp_stats();
+      metrics.dp_attempts = dp_stats.attempts;
+      metrics.dp_fallbacks = dp_stats.fallbacks;
+    }
 
     std::cout << quads.size() << " candidate quad(s) from the Vulkan pipeline." << std::endl;
     std::cout << detector.DescribeSizing() << std::endl;
@@ -189,6 +194,11 @@ int main(int argc, char **argv) {
     PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
     PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
     PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
+    if (metrics.dp_attempts > 0) {
+      std::cout << "DP corner seeding: " << metrics.dp_fallbacks << "/" << metrics.dp_attempts
+                << " blobs fell back to the combinatorial search ("
+                << (100.0 * metrics.dp_fallbacks / metrics.dp_attempts) << "%)" << std::endl;
+    }
 
     std::cout << "--- Our detections ---" << std::endl;
     print_detections(ours);

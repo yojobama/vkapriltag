@@ -150,6 +150,14 @@ struct ImageMetrics {
 
   bool ids_match = false;
   CornerComparison corners;
+
+  // Item 3 (DP corner seeding) instrumentation. Both 0 when
+  // config.quad_fit_method is the default kPeaks. dp_fallbacks/dp_attempts
+  // is the fraction of blobs where DP couldn't produce a valid quad and the
+  // combinatorial search ran anyway - a high rate means DP is adding cost
+  // without saving the search's.
+  uint32_t dp_attempts = 0;
+  uint32_t dp_fallbacks = 0;
 };
 
 // Appends one CSV row, writing the header first if `path` doesn't exist yet.
@@ -170,7 +178,8 @@ inline void AppendCsvRow(const std::string &path, const ImageMetrics &m) {
         "pipeline_ms_best,pipeline_ms_median,"
         "candidate_quads,boundary_points,raw_blobs,selected_blobs,points,"
         "uf_iterations,uf_converged,ids_match,"
-        "corner_compared_tags,corner_rms_mean,corner_rms_max\n";
+        "corner_compared_tags,corner_rms_mean,corner_rms_max,"
+        "dp_attempts,dp_fallbacks\n";
   }
   f << m.file << ',' << m.width << ',' << m.height << ',' << m.iterations << ','
     << m.gpu_total_ms.best << ',' << m.gpu_total_ms.median << ',' << m.gpu_total_ms.worst << ','
@@ -180,7 +189,8 @@ inline void AppendCsvRow(const std::string &path, const ImageMetrics &m) {
     << m.candidate_quads << ',' << m.boundary_points << ',' << m.raw_blobs << ','
     << m.selected_blobs << ',' << m.points << ','
     << m.uf_iterations << ',' << (m.uf_converged ? 1 : 0) << ',' << (m.ids_match ? 1 : 0) << ','
-    << m.corners.compared_tags << ',' << m.corners.mean_rms << ',' << m.corners.max_rms << '\n';
+    << m.corners.compared_tags << ',' << m.corners.mean_rms << ',' << m.corners.max_rms << ','
+    << m.dp_attempts << ',' << m.dp_fallbacks << '\n';
 }
 
 }  // namespace validate
