@@ -267,6 +267,64 @@ round trip and its command recording cost about what the traffic does. The
 avoids the round trip; it just needs the count passed to the shaders through a
 binding rather than a push constant, since push constants are host-side.
 
+**Pipelining the CPU tail behind the next frame's GPU stage.** Implemented as
+`PipelinedDetector`: a 1-deep double-buffered handoff so frame N+1's GPU stage
+(`GpuDetector::Detect`) runs on a background thread's tail work for frame N
+(`QuadDecode` + `TagDecoder`) concurrently, instead of the strictly serial
+`Detect -> Decode -> Decode` every caller used before. `GpuDetector::Detect()`
+is already fully synchronous (four `SubmitAndWait`s, host copies complete
+before it returns), so no device buffer needed double-buffering — only two
+host-side things did: `last_selected_extents`/`last_line_fit_points` (copied
+out before the tail runs, since the next `Detect()` overwrites them) and the
+raw grayscale frame `TagDecoder` samples from (double-buffered, since the
+caller may start capturing the next frame into the same buffer while the tail
+is still reading it). Verified race-free — a ThreadSanitizer build ran 300
+pipelined frames across the full corpus with zero reported races, and every
+frame decoded identically to the serial path in both a normal and a TSan
+build (5/5 corpus matches, corner RMS bit-identical).
+
+It is nonetheless a **clear throughput regression on the Mali-G610/RK3588**,
+at every corpus scale, confirmed after ruling out two obvious confounds:
+
+| image | serial `pipeline_total` (median) | pipelined throughput/frame |
+| --- | --- | --- |
+| 320x200 | 2.30 ms | 2.31 ms |
+| 480x304 | 4.46 ms | 4.32 ms |
+| 640x400 | 3.14 ms | 3.55 ms |
+| 960x600 | 7.21 ms | 6.38 ms |
+| 1280x800 | 6.77 ms | 8.18 ms |
+
+Two of five scales look flat-to-slightly-better; the largest (1280x800, the
+most representative of real deployment) is **21% worse**. The GPU stage
+*itself* measured slower when run concurrently with the previous frame's tail
+(`gpu_ms_median` 5.70 -> 7.84 ms at 1280x800) — the regression is not
+overhead from spawning a thread per frame (measured separately at 0.087 ms
+average spawn+join on this device, negligible against multi-millisecond
+frames).
+
+Ruled out:
+- **DRAM controller governor.** `dmc_ondemand` was still active at 528 MHz of
+  a 2112 MHz maximum (see the deployment note above) — pinning it to
+  `performance` and re-measuring changed nothing material (serial 6.71 ms vs.
+  pipelined 8.05 ms at 1280x800, essentially the same gap).
+- **`QuadDecode`'s WorkerPool oversubscribing the 4xA76+4xA55 cores** while
+  the main thread also needs CPU time to service the GPU driver's fence wait.
+  Sweeping `APRILTAG_CPU_THREADS` from 1 to 8 found a shallow minimum at 6
+  threads (8.03 ms) — still worse than serial's 6.77 ms at every thread
+  count tested.
+
+Working theory (not independently confirmed): this SoC has unified CPU/GPU
+memory over a shared LPDDR bus, and/or a Vulkan driver whose
+`vkWaitForFences` does not yield the CPU cheaply while blocked. Either way,
+running CPU-heavy work concurrently with a GPU submission is not free the way
+it would be on a discrete card with its own VRAM and an otherwise-idle CPU
+during the wait — the same class of platform-specific result as the
+tile-local union-find rejection below. `PipelinedDetector` and its
+`--pipelined` validate-tool flag are kept in the tree (branch
+`PipelineCpuTail`, not merged) since the mechanism itself is correct and
+might pay off on different hardware or once the tail is small enough that
+contention no longer dominates; do not enable it by default on this target.
+
 **Tile-local union-find in shared memory.** The obvious answer to a stage
 bound on dependent global loads is to move the pointer chasing into shared
 memory: one workgroup per tile, resolve every component that fits inside the
@@ -356,14 +414,13 @@ Where the 16.1 ms now goes: CPU `quad_decode` 3.7, sort+group 3.01, linefit
 3.05, threshold+label 2.59, boundary 1.73, readback 1.09, tag_decode 0.66,
 upload 0.22.
 
-1. **Overlap the CPU tail with the next frame's GPU work.** `quad_decode` +
-   `tag_decode` is 4.4 ms of the 16.1 — now the single largest item — and it
-   runs strictly after the GPU finishes. Double-buffering the detector so frame N's CPU tail runs during
-   frame N+1's GPU pipeline hides essentially all of it — about 25% of
-   end-to-end latency for no algorithmic change. This is an application-level
-   change (`main.cpp` and the detector's buffer set), not a shader one, and is
-   almost certainly the best remaining ratio of win to risk. (Deferred by
-   request; not attempted here.)
+1. ~~**Overlap the CPU tail with the next frame's GPU work.**~~ **Attempted and
+   rejected — see "Measured and rejected" below.** It regresses throughput
+   ~20-25% on this hardware. The claim below that this "hides essentially all
+   of it — about 25% of end-to-end latency" was also wrong on its own terms
+   even setting the regression aside: pipelining raises *throughput*, not
+   per-frame *latency* (frame N's result is returned one frame later); the
+   two are easy to conflate but are not the same claim.
 
 2. **Further work on labelling — but not the obvious kinds.** The stage is
    now 2.59 ms, of which 0.86 ms is decimate + threshold and ~1.7 ms is the
