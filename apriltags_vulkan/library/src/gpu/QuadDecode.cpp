@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace apriltag_vulkan {
 namespace {
@@ -125,13 +126,168 @@ void FitLine(const LineFitMoments &moments, double *lineparam01, double *linepar
   *mse = eig_small;
 }
 
-// Per-blob result of the combinatorial quad search (mirrors FitQuad in
-// line_fit_filter.h).
+// Per-blob result of the quad fit, from either the combinatorial search
+// (mirrors FitQuad in line_fit_filter.h) or the item-3 DP corner-seeding
+// path.
 struct FitQuadResult {
   bool valid = false;
+  // Set (regardless of `valid`) whenever quad_fit_method == kDp and this
+  // blob was eligible (>= 4 points) - i.e. DP was tried at all. dp_used is
+  // set only when it actually produced the accepted result; attempted-but-
+  // not-used means DP fell back to the combinatorial search. Purely for
+  // QuadDecode::last_dp_stats() instrumentation.
+  bool dp_attempted = false;
+  bool dp_used = false;
   uint32_t indices[4] = {};
   LineFitMoments moments[4];
 };
+
+// Coordinates for DP corner seeding: RawLineFitPoint's (x2, y2), the same
+// "doubled" decimated-pixel grid the line fit itself uses. Approximate
+// (integer boundary-tracing coordinates, not sub-pixel), which is fine here
+// since these only SEED which 4 indices to fit lines through - the actual
+// corner accuracy comes from the exact same ReadMomentsWindow + FitLine +
+// intersection code the peaks path already uses on whichever 4 indices are
+// chosen.
+struct Point2 {
+  double x, y;
+};
+
+Point2 PointAt(const std::vector<RawLineFitPoint> &points, size_t begin, size_t idx) {
+  const RawLineFitPoint &p = points[begin + idx];
+  return {static_cast<double>(p.x2), static_cast<double>(p.y2)};
+}
+
+double SqDist(Point2 a, Point2 b) {
+  const double dx = a.x - b.x, dy = a.y - b.y;
+  return dx * dx + dy * dy;
+}
+
+// Squared perpendicular distance of p from the (infinite) line through a, b,
+// scaled by |ab|^2 (i.e. actual_dist^2 * |ab|^2) - avoids a sqrt/division
+// per point; callers only ever compare these against each other or against
+// a threshold likewise scaled by diameter_sq.
+double ScaledPerpDistSq(Point2 a, Point2 b, Point2 p) {
+  const double abx = b.x - a.x, aby = b.y - a.y;
+  const double apx = p.x - a.x, apy = p.y - a.y;
+  const double cross = abx * apy - aby * apx;
+  return cross * cross;
+}
+
+// Seeds 4 corner indices geometrically: the two mutually-farthest boundary
+// points (a 2-pass O(n) approximation of the polygon's diameter - exact
+// all-pairs would be O(n^2)), then the point of maximum perpendicular
+// deviation from that diameter on each of the two resulting arcs. Returns
+// false (leaving out_indices untouched) whenever the blob doesn't look like
+// a clean quad this way: too few points, a degenerate (near-zero) diameter,
+// an empty arc, or a "corner" that doesn't meaningfully deviate from the
+// diameter line (a triangle or a rounded blob would still produce SOME
+// max-distance point on each arc, just an unconvincing one). The caller
+// falls back to the peaks-based combinatorial search in every failure case.
+bool FindDpCornerIndices(const std::vector<RawLineFitPoint> &points, size_t begin, size_t n,
+                         uint32_t out_indices[4]) {
+  if (n < 8) return false;
+
+  const Point2 p0 = PointAt(points, begin, 0);
+  size_t a_idx = 0;
+  double best_d = -1.0;
+  for (size_t i = 1; i < n; ++i) {
+    const double d = SqDist(p0, PointAt(points, begin, i));
+    if (d > best_d) {
+      best_d = d;
+      a_idx = i;
+    }
+  }
+  const Point2 pa = PointAt(points, begin, a_idx);
+  size_t b_idx = 0;
+  best_d = -1.0;
+  for (size_t i = 0; i < n; ++i) {
+    const double d = SqDist(pa, PointAt(points, begin, i));
+    if (d > best_d) {
+      best_d = d;
+      b_idx = i;
+    }
+  }
+  if (a_idx == b_idx) return false;
+  const Point2 pb = PointAt(points, begin, b_idx);
+  const double diameter_sq = SqDist(pa, pb);
+  if (diameter_sq < 1e-6) return false;
+
+  const size_t lo = std::min(a_idx, b_idx), hi = std::max(a_idx, b_idx);
+
+  size_t c1_idx = n, c2_idx = n;  // n is not a valid index; doubles as "not found"
+  double best_perp1 = -1.0, best_perp2 = -1.0;
+  for (size_t i = lo + 1; i < hi; ++i) {
+    const double d = ScaledPerpDistSq(pa, pb, PointAt(points, begin, i));
+    if (d > best_perp1) {
+      best_perp1 = d;
+      c1_idx = i;
+    }
+  }
+  for (size_t i = 0; i < lo; ++i) {
+    const double d = ScaledPerpDistSq(pa, pb, PointAt(points, begin, i));
+    if (d > best_perp2) {
+      best_perp2 = d;
+      c2_idx = i;
+    }
+  }
+  for (size_t i = hi + 1; i < n; ++i) {
+    const double d = ScaledPerpDistSq(pa, pb, PointAt(points, begin, i));
+    if (d > best_perp2) {
+      best_perp2 = d;
+      c2_idx = i;
+    }
+  }
+  if (c1_idx == n || c2_idx == n) return false;
+
+  // Require both corner candidates to meaningfully deviate from the
+  // diameter line. 1% of (diameter * diameter) is a low bar - a real tag
+  // corner deviates by roughly half the diameter - it exists only to reject
+  // genuinely degenerate shapes (near-triangles, rounded blobs).
+  const double min_perp = 0.0001 * diameter_sq * diameter_sq;
+  if (best_perp1 < min_perp || best_perp2 < min_perp) return false;
+
+  // Circular order around the perimeter: lo -> c1 -> hi -> c2 -> (back to
+  // lo). c1 lies strictly between lo and hi by construction; c2 lies
+  // strictly outside [lo, hi], i.e. on the arc that wraps from hi through
+  // n-1/0 back to lo. Absolute numeric order doesn't matter beyond that -
+  // ReadMomentsWindow's wrap-around branch handles any consecutive pair
+  // regardless - only that consecutive entries trace consecutive arcs.
+  out_indices[0] = static_cast<uint32_t>(lo);
+  out_indices[1] = static_cast<uint32_t>(c1_idx);
+  out_indices[2] = static_cast<uint32_t>(hi);
+  out_indices[3] = static_cast<uint32_t>(c2_idx);
+  return true;
+}
+
+// Attempts the DP corner-seeding path for one blob. `cs` is the same
+// prefix-sum array FitQuadForBlob already computes for the peaks path.
+// Returns an invalid (default) result whenever DP's geometric seeding fails
+// outright, or the resulting 4 segments don't pass the same
+// max_line_fit_mse gate the combinatorial search applies to every candidate
+// segment - both cases mean "fall back to peaks", handled by the caller.
+FitQuadResult TryDpQuad(const DetectorConfig &config, const std::vector<RawLineFitPoint> &points,
+                        size_t begin, size_t total_points,
+                        const std::vector<LineFitMoments> &cs) {
+  FitQuadResult result;
+  uint32_t idx[4];
+  if (!FindDpCornerIndices(points, begin, total_points, idx)) return result;
+
+  LineFitMoments seg_moments[4];
+  for (int k = 0; k < 4; ++k) {
+    seg_moments[k] = ReadMomentsWindow(cs, total_points, idx[k], idx[(k + 1) % 4]);
+    double err, mse;
+    FitLine(seg_moments[k], nullptr, nullptr, &err, &mse);
+    if (mse > config.max_line_fit_mse) return result;
+  }
+
+  result.valid = true;
+  for (int k = 0; k < 4; ++k) {
+    result.indices[k] = idx[k];
+    result.moments[k] = seg_moments[k];
+  }
+  return result;
+}
 
 // Ports DoFitLines' per-point windowed-error + 7-tap-gaussian-filter +
 // peak-detection, followed by DoFitQuads' top-10-peaks combinatorial search,
@@ -174,6 +330,17 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
       running.Myy += wy * p.y2;
       cs[k] = running;
     }
+  }
+
+  if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
+    result.dp_attempted = true;  // sticks even if we fall through to peaks below
+    FitQuadResult dp_result = TryDpQuad(config, points, begin, total_points, cs);
+    if (dp_result.valid) {
+      dp_result.dp_attempted = true;
+      dp_result.dp_used = true;
+      return dp_result;
+    }
+    // Falls through to the peaks-based combinatorial search below.
   }
 
   const int ksz = std::min<int>(20, static_cast<int>(total_points / 12));
@@ -321,11 +488,23 @@ unsigned ResolveThreadCount(uint32_t configured) {
   return 0;
 }
 
+// Resolves quad_fit_method: explicit config wins, then APRILTAG_VK_QUADFIT.
+DetectorConfig::QuadFitMethod ResolveQuadFitMethod(DetectorConfig::QuadFitMethod configured) {
+  if (const char *m = std::getenv("APRILTAG_VK_QUADFIT")) {
+    const std::string method = m;
+    if (method == "dp") return DetectorConfig::QuadFitMethod::kDp;
+    if (method == "peaks") return DetectorConfig::QuadFitMethod::kPeaks;
+  }
+  return configured;
+}
+
 }  // namespace
 
 QuadDecode::QuadDecode(const DetectorConfig &config)
     : config_(config),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads))) {}
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads))) {
+  config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
+}
 
 std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu> &selected_extents,
                                              const std::vector<RawLineFitPoint> &line_fit_points) const {
@@ -357,6 +536,14 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
   pool_->ParallelFor(spans.size(), [&](size_t s) {
     per_span[s] = FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end);
   });
+
+  last_dp_stats_ = DpStats{};
+  for (const FitQuadResult &fq : per_span) {
+    if (fq.dp_attempted) {
+      ++last_dp_stats_.attempts;
+      if (!fq.dp_used) ++last_dp_stats_.fallbacks;
+    }
+  }
 
   // Collect survivors in span order, NOT completion order, so the result is
   // bit-identical to the serial version regardless of thread scheduling.

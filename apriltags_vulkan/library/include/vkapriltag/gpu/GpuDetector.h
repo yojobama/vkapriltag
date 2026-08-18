@@ -65,6 +65,19 @@ struct DetectorConfig {
   float max_line_fit_mse = 10.0f;
   double cos_critical_rad = 0.98;  // ~cos(11 degrees), matches typical apriltag default
 
+  // Corner-seeding algorithm for QuadDecode's per-blob quad fit (CPU tail).
+  // kPeaks (default) is the exact port of the original windowed-error +
+  // 7-tap-filter + peak-detection + C(10,4) combinatorial search. kDp seeds
+  // 4 corners geometrically instead - the two mutually-farthest boundary
+  // points, plus the point of maximum perpendicular deviation on each
+  // resulting arc - skipping the combinatorial search entirely, and falls
+  // back to kPeaks per-blob whenever DP doesn't cleanly yield 4 points whose
+  // segments pass the same max_line_fit_mse gate the combinatorial search
+  // uses. See QuadDecode.cpp's FitQuadForBlob/TryDpQuad.
+  // Env override: APRILTAG_VK_QUADFIT=peaks|dp
+  enum class QuadFitMethod { kPeaks, kDp };
+  QuadFitMethod quad_fit_method = QuadFitMethod::kPeaks;
+
   // Defensive caps (deliberately smaller than the CUDA implementation's
   // dense worst-case sizing, which would otherwise waste tens of MB with no
   // real-world benefit; both are generous for realistic scenes).
