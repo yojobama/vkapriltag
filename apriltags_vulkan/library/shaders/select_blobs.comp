@@ -26,6 +26,12 @@ layout(push_constant) uniform PushConstants {
   uint max_cluster_pixels;
   uint reversed_border; // bool as uint
   uint normal_border;   // bool as uint
+  // Geometric prefilters (item 2): 0 disables the corresponding test, so the
+  // default config is a no-op here. See DetectorConfig::aspect_max/fill_min/
+  // fill_max for the derivation and the corpus measurements behind them.
+  float aspect_max;
+  float fill_min;
+  float fill_max;
 } pc;
 
 // Border polarity test, replacing MinMaxExtents::dot() < 0.
@@ -66,7 +72,30 @@ void main() {
   MinMaxExtentsGpu e = extents[i];
   if (e.count < pc.min_cluster_pixels) return;
   if (e.count > pc.max_cluster_pixels) return;
-  if (uint(e.max_x - e.min_x) * uint(e.max_y - e.min_y) < pc.tag_width) return;
+
+  // Bounding-box sanity + geometric prefilters (item 2). The previous test
+  // here (`bbox area < tag_width`) compared a pixel-area against tag_width,
+  // which is in "bit squares" (8 for tag36h11) - a unit mismatch that made it
+  // reject essentially nothing. bbox_w/bbox_h == 0 is kept as a hard
+  // rejection (a zero-width or zero-height blob is degenerate and would
+  // divide by zero below); aspect/fill are additional, independently
+  // toggleable filters (0 disables each).
+  uint bbox_w = uint(e.max_x - e.min_x);
+  uint bbox_h = uint(e.max_y - e.min_y);
+  if (bbox_w == 0u || bbox_h == 0u) return;
+
+  if (pc.aspect_max > 0.0) {
+    float long_side = float(max(bbox_w, bbox_h));
+    float short_side = float(min(bbox_w, bbox_h));
+    if (long_side > short_side * pc.aspect_max) return;
+  }
+
+  if (pc.fill_min > 0.0 || pc.fill_max > 0.0) {
+    float perimeter = 2.0 * float(bbox_w + bbox_h);
+    float fill = float(e.count) / perimeter;
+    if (pc.fill_min > 0.0 && fill < pc.fill_min) return;
+    if (pc.fill_max > 0.0 && fill > pc.fill_max) return;
+  }
 
   bool quad_reversed_border = hasReversedBorder(e);
   if (pc.reversed_border == 0u && quad_reversed_border) return;

@@ -76,6 +76,22 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   }
   if (config_.uf_iterations_per_chunk == 0) config_.uf_iterations_per_chunk = 1;
 
+  // Scale-relative minimum cluster size: derives a floor for
+  // min_cluster_pixels from the smallest tag side (full-resolution pixels)
+  // the caller declares, then raises min_cluster_pixels to that floor (never
+  // lowers it, so an explicit min_cluster_pixels always still applies).
+  if (const char *min_tag_px = std::getenv("APRILTAG_VK_MIN_TAG_PX")) {
+    const long parsed = std::strtol(min_tag_px, nullptr, 10);
+    if (parsed > 0) config_.min_tag_pixels = static_cast<uint32_t>(parsed);
+  }
+  if (config_.min_tag_pixels > 0) {
+    // Perimeter, in decimated-grid boundary points, of a square tag whose
+    // full-resolution side is min_tag_pixels, at this pipeline's fixed 2x
+    // decimation: 4 sides x (min_tag_pixels / 2) decimated pixels each.
+    const uint32_t derived_min_cluster = 2u * config_.min_tag_pixels;
+    config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, derived_min_cluster);
+  }
+
   // Launch geometry comes from the device, never from a literal.
   const vk::DeviceCaps &caps = ctx_.caps();
   wg1d_ = vk::WorkgroupSize{caps.wg1d, 1, 1};
@@ -281,7 +297,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("select_blobs"),
       {extents_buf_.get(), selected_extents_buf_.get(), selected_counter_buf_.get(),
        remap_buf_.get()},
-      28, wg1d_);
+      40, wg1d_);
 
   // Per-blob point base-offset assignment: extract_blob_counts.comp copies
   // each selected blob's point count into blob_point_offsets_buf_, then the
@@ -576,10 +592,13 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
     struct {
       uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal;
+      float aspect_max, fill_min, fill_max;
     } select_pc{config_.max_raw_blobs,      config_.max_blobs,
                 config_.tag_width,          config_.min_cluster_pixels,
                 config_.max_cluster_pixels, config_.reversed_border ? 1u : 0u,
-                config_.normal_border ? 1u : 0u};
+                config_.normal_border ? 1u : 0u,
+                config_.aspect_max,         config_.fill_min,
+                config_.fill_max};
     select_blobs_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &select_pc);
 
     struct { uint32_t capacity; } extract_pc{config_.max_blobs};

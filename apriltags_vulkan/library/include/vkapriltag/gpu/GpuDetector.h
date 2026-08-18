@@ -29,6 +29,39 @@ struct DetectorConfig {
   bool reversed_border = false;
   bool normal_border = true;
 
+  // Smallest tag side the caller cares about, in FULL-RESOLUTION pixels. 0
+  // (default) disables this and leaves min_cluster_pixels as the only floor.
+  // When set, GpuDetector raises min_cluster_pixels to whatever a
+  // min_tag_pixels-wide square tag's boundary-point count would be at this
+  // pipeline's fixed 2x decimation (4 sides x min_tag_pixels/2 decimated
+  // pixels each), so undersized noise/text/foliage blobs never reach the
+  // expensive per-blob CPU quad fit. Declaring this is strictly a recall/
+  // throughput trade: tags smaller than it are guaranteed to be dropped.
+  // Env override: APRILTAG_VK_MIN_TAG_PX=<n>
+  uint32_t min_tag_pixels = 0;
+
+  // Bounding-box aspect ratio cap (max(w,h)/min(w,h)) applied in
+  // select_blobs.comp. 0 disables the test. 8 clears views up to ~82 degrees
+  // off-normal - beyond what libapriltag can reliably decode anyway - while
+  // rejecting stringy non-quad blobs (text edges, foliage) that pass the raw
+  // point-count test. Measured against the validation corpus: the real tag's
+  // aspect ratio stayed within 1.0-1.02 at every scale tested, comfortably
+  // inside this bound; background blobs from the same scene ranged 1-28.
+  float aspect_max = 8.0f;
+
+  // Fill-ratio bounds: a selected blob's boundary-point count divided by its
+  // bounding box's own perimeter (2*(w+h)). A clean quadrilateral traces out
+  // close to one boundary point per perimeter pixel, so this ratio sits near
+  // 1.0; 0/0 disables the test. Measured against the validation corpus, the
+  // real tag's fill ratio was 1.00-1.01 at every scale tested; background
+  // blobs from the same scene spanned roughly 0.5-1.7 (1st-99th percentile).
+  // The bounds here are deliberately wider than that observed spread - the
+  // corpus is a single photographed scene, not a stress test for this
+  // filter, so they're set to comfortably clear the real tag rather than to
+  // aggressively trim this specific background.
+  float fill_min = 0.5f;
+  float fill_max = 2.5f;
+
   float max_line_fit_mse = 10.0f;
   double cos_critical_rad = 0.98;  // ~cos(11 degrees), matches typical apriltag default
 
