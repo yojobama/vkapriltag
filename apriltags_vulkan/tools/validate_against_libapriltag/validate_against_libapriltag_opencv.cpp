@@ -276,6 +276,7 @@ int main(int argc, char **argv) {
       }
 
       if (!csv_path.empty()) AppendCsvRow(csv_path, metrics);
+	  std::cout << "------------------------------------------------------------" << std::endl;
     }
 
     std::cout << "Final Results: " << match << " matches, " << mismatch << " mismatches." << std::endl;
