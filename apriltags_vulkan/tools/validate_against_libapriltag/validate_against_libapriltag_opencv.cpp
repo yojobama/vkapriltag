@@ -114,6 +114,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::cout << "------------------------------------------------------------" << std::endl;
   for (const std::string& file : files) {
       cv::Mat image = cv::imread(file, cv::IMREAD_GRAYSCALE);
       if (image.empty()) {
