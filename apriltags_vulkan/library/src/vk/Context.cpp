@@ -7,6 +7,10 @@
 #include <sstream>
 #include <vector>
 
+#ifndef SHADER_DIR
+#define SHADER_DIR "shaders"
+#endif
+
 namespace apriltag_vulkan::vk {
 
 namespace {
@@ -106,11 +110,17 @@ Context::Context(const ContextOptions &options_in) {
   if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
     options.max_invocations_override = static_cast<uint32_t>(env_int);
   }
+  if (std::getenv("APRILTAG_VK_PIPELINE_CACHE") != nullptr &&
+      !EnvFlag("APRILTAG_VK_PIPELINE_CACHE")) {
+    options.use_pipeline_cache = false;
+  }
 
   CreateInstance(options);
   SelectPhysicalDevice(options);
   CreateLogicalDevice();
   QueryCaps(options);
+  pipeline_cache_ = PipelineCache(device_, physical_device_, SHADER_DIR,
+                                  options.use_pipeline_cache, options.verbose);
   CreateCommandResources();
 
   if (options.verbose) {
@@ -131,11 +141,17 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
     if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
         options.max_invocations_override = static_cast<uint32_t>(env_int);
     }
+    if (std::getenv("APRILTAG_VK_PIPELINE_CACHE") != nullptr &&
+        !EnvFlag("APRILTAG_VK_PIPELINE_CACHE")) {
+        options.use_pipeline_cache = false;
+    }
 
     CreateInstance(options);
     SelectPhysicalDevice(deviceName, options);
     CreateLogicalDevice();
     QueryCaps(options);
+    pipeline_cache_ = PipelineCache(device_, physical_device_, SHADER_DIR,
+                                    options.use_pipeline_cache, options.verbose);
     CreateCommandResources();
 
     if (options.verbose) {
@@ -147,6 +163,10 @@ Context::~Context() {
   if (device_) {
     // Nothing may still be in flight when we start destroying pools.
     vkDeviceWaitIdle(device_);
+    // Must happen before vkDestroyDevice: pipeline_cache_'s own destructor
+    // runs after this function body (member destruction order), which would
+    // otherwise call vkDestroyPipelineCache on an already-destroyed device.
+    pipeline_cache_.ReleaseBeforeDeviceDestruction();
     for (size_t i = 0; i < kCommandRing; ++i) {
       if (fence_ring_[i]) vkDestroyFence(device_, fence_ring_[i], nullptr);
     }

@@ -3,9 +3,12 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "vkapriltag/vk/PipelineCache.h"
 
 namespace apriltag_vulkan::vk {
 
@@ -46,6 +49,15 @@ struct ContextOptions {
   // the hardware in hand. 0 = use the real limit.
   // Env override: APRILTAG_VK_MAX_INVOCATIONS=<n>
   uint32_t max_invocations_override = 0;
+
+  // Persist compiled pipelines to disk (see vk::PipelineCache) so the ~30
+  // vkCreateComputePipelines calls GpuDetector makes only pay their full
+  // SPIR-V -> ISA compile cost once per device per shader build, not on
+  // every process startup. The cache file is keyed to the physical device
+  // and the compiled shader corpus, so it never serves stale data after a
+  // driver update or shader rebuild.
+  // Env override: APRILTAG_VK_PIPELINE_CACHE=0
+  bool use_pipeline_cache = true;
 
   // Print the selected device and derived launch geometry to stderr.
   bool verbose = true;
@@ -118,6 +130,18 @@ public:
   VkCommandPool command_pool() const { return command_pool_; }
   const DeviceCaps &caps() const { return caps_; }
 
+  // VK_NULL_HANDLE when pipeline caching is disabled (ContextOptions::
+  // use_pipeline_cache = false or APRILTAG_VK_PIPELINE_CACHE=0), which every
+  // pipeline-creation call already treats as "no cache".
+  VkPipelineCache pipeline_cache() const { return pipeline_cache_.handle(); }
+
+  // Writes the current pipeline cache to disk now, skipping the write if it
+  // is unchanged since it was last loaded/saved. Also called automatically
+  // from the destructor, but GpuDetector calls this explicitly right after
+  // building its pipelines so a process that is killed rather than shut
+  // down cleanly still keeps the cache.
+  void FlushPipelineCache() const { pipeline_cache_.Save(); }
+
   // Finds a memory type satisfying `required`, preferring one that also has
   // every bit of `preferred`. Returns UINT32_MAX when nothing satisfies
   // `required`, so callers with a fallback can test rather than catch.
@@ -161,6 +185,7 @@ public:
 
   VkPhysicalDeviceMemoryProperties mem_props_{};
   DeviceCaps caps_;
+  PipelineCache pipeline_cache_;
 
   // Reusable command buffers plus the fence tracking each one's submission.
   mutable VkCommandBuffer cmd_ring_[kCommandRing] = {};

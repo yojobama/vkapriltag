@@ -89,7 +89,7 @@ ComputePipeline::ComputePipeline(const Context &ctx, const std::string &spv_path
   pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pipeline_info.stage = stage_info;
   pipeline_info.layout = pipeline_layout_;
-  CheckVk(vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
+  CheckVk(vkCreateComputePipelines(device_, ctx.pipeline_cache(), 1, &pipeline_info, nullptr,
                                    &pipeline_),
           "vkCreateComputePipelines");
 

@@ -452,6 +452,64 @@ upload 0.22.
    predicate is ever consumed, so a saturating or hierarchical count would do.
    Part of the 1.71 ms boundary stage; not separately measured.
 
+## Pipeline caching (startup latency, not per-frame)
+
+Everything above is steady-state per-frame time. Separately,
+`GpuDetector::CreatePipelines()` builds ~30 `VkPipeline`s (plus a
+capacity-dependent number of scan-chain stages) once at construction, and
+until now every one of those was a full SPIR-V -> ISA compile with
+`vkCreatePipelineCache`'s cache argument hardcoded to `VK_NULL_HANDLE` - i.e.
+no caching at all, on every process start.
+
+`vk::Context` now owns a `vk::PipelineCache` (`library/src/vk/PipelineCache.
+cpp`) that persists a `VkPipelineCache` to disk across runs and hands it to
+every `vk::ComputePipeline`'s `vkCreateComputePipelines` call. The on-disk
+file is keyed to `vendorID`/`deviceID`/`pipelineCacheUUID` (so a driver
+update or a different GPU never gets fed stale data - the spec defines
+`pipelineCacheUUID` to change exactly when compiled pipeline data would stop
+being valid) plus an FNV-1a hash of the compiled `.spv` corpus (so a shader
+rebuild during development doesn't feed the driver last week's binaries
+either). `GpuDetector` flushes it right after `CreatePipelines()` rather than
+relying solely on `~Context()`, since a camera-loop binary is more often
+killed than shut down cleanly. Disable with `APRILTAG_VK_PIPELINE_CACHE=0`;
+override the cache directory with `APRILTAG_VK_CACHE_DIR=<path>` (default:
+`%LOCALAPPDATA%\vkapriltag` / `$XDG_CACHE_HOME/vkapriltag`).
+
+Measured on the Windows desktop dev box (AMD Radeon RX 9060 XT, Vulkan
+1.4.349) with a throwaway harness that just constructs `Context` +
+`GpuDetector` and exits, timing `CreatePipelines()`:
+
+| run                                             | `CreatePipelines()` |
+|--------------------------------------------------|---------------------:|
+| truly cold (no app cache, no prior driver cache)  |            240.7 ms |
+| warm (app cache hit)                              |             16.6 ms |
+
+A ~14x reduction on this GPU. Two things worth knowing before generalizing
+that number:
+
+* AMD's own driver keeps a persistent shader cache underneath ours. Once
+  *anything* had compiled these shaders on this machine, even runs with
+  `APRILTAG_VK_PIPELINE_CACHE=0` came back at ~18 ms - the driver-level cache
+  alone was already doing most of the work here. The 240 ms number is only
+  visible on the very first compile a machine ever does. This doesn't make
+  the app-level cache redundant: it's the layer that's actually there on
+  drivers with no such cache of their own (Mesa/Panfrost on the Orange Pi
+  target above is the case that matters), and it's unaffected by whatever a
+  given driver does or doesn't do underneath it.
+* This targets pipeline *creation*, not first-dispatch latency. Some drivers
+  defer final codegen to first use, so a residual first-frame cost can
+  survive a warm pipeline cache. Not measured here; a follow-up would be a
+  throwaway warm-up dispatch during construction, only if profiling on the
+  actual Mali target shows it's still worth shaving.
+* A warm run makes zero writes to the cache file (checked via mtime): saving
+  is skipped whenever the retrieved cache data hashes the same as what was
+  loaded, so steady-state use touches the filesystem only on the first run
+  after a shader rebuild or driver update.
+* Feeding the driver a corrupted or hand-edited cache file falls back
+  cleanly to an empty cache and a fresh compile (verified by truncating a
+  cache file to garbage bytes) - a bad cache can slow a run back down to
+  the cold-path cost, but never breaks detection.
+
 ## Reproducing
 
 ```

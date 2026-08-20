@@ -150,6 +150,12 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
 
   CreateBuffers();
   CreatePipelines();
+
+  // Persist any newly-compiled pipelines now rather than relying solely on
+  // ~Context(): a process that gets killed (common for a camera-loop
+  // binary) rather than shut down cleanly would otherwise lose the cache
+  // every time. Cheap when nothing changed - see PipelineCache::Save().
+  ctx_.FlushPipelineCache();
 }
 
 void GpuDetector::CreateBuffers() {
