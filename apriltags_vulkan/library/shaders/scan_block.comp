@@ -47,7 +47,15 @@ void main() {
   }
   // The last lane holds this block's total. Out-of-range lanes contributed 0,
   // so this stays correct for the final partial block.
-  if (tid == gl_WorkGroupSize.x - 1u) {
+  //
+  // Only emit it when there's more than one workgroup: the single-workgroup
+  // case is the top ("collapse") level of a multi-level scan, where the
+  // caller binds `block_sums` to the SAME buffer as `output_values` (there is
+  // no further level to fold into). With gl_NumWorkGroups.x == 1,
+  // gl_WorkGroupID.x is always 0, so this write would alias and clobber
+  // output_values[0] - which already holds the correct scanned value for
+  // element 0 - with this workgroup's total instead.
+  if (gl_NumWorkGroups.x > 1u && tid == gl_WorkGroupSize.x - 1u) {
     block_sums[gl_WorkGroupID.x] = temp[tid];
   }
 }
