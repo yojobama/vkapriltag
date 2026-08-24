@@ -5,12 +5,12 @@
 
 namespace apriltag_vulkan::vk {
 
-ComputePipeline::ComputePipeline(const Context &ctx, const std::string &spv_path,
+ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_source,
                                  const std::vector<VkBuffer> &buffers,
                                  uint32_t push_constant_bytes, WorkgroupSize workgroup_size,
                                  std::vector<uint32_t> extra_specialization_constants)
     : device_(ctx.device()),
-      shader_(ctx.device(), spv_path),
+      shader_(ctx.device(), shader_source),
       push_constant_bytes_(push_constant_bytes),
       workgroup_size_(workgroup_size) {
   for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = ctx.caps().max_workgroup_count[i];
@@ -20,7 +20,7 @@ ComputePipeline::ComputePipeline(const Context &ctx, const std::string &spv_path
       workgroup_size_.x > ctx.caps().max_workgroup_size[0] ||
       workgroup_size_.y > ctx.caps().max_workgroup_size[1] ||
       workgroup_size_.z > ctx.caps().max_workgroup_size[2]) {
-    throw std::runtime_error(spv_path + ": requested workgroup size " +
+    throw std::runtime_error(shader_source.label + ": requested workgroup size " +
                              std::to_string(workgroup_size_.x) + "x" +
                              std::to_string(workgroup_size_.y) + "x" +
                              std::to_string(workgroup_size_.z) +

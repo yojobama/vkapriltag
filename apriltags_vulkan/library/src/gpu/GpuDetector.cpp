@@ -1,5 +1,7 @@
 #include "vkapriltag/gpu/GpuDetector.h"
 
+#include "vkapriltag/vk/EmbeddedShaders.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -22,8 +24,14 @@ double MsSince(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
-std::string ShaderPath(const char *name) {
-  return std::string(SHADER_DIR) + "/" + name + ".comp.spv";
+// Prefers SPIR-V compiled into the binary, falling back to SHADER_DIR when
+// this build has none (VKAPRILTAG_EMBED_SHADERS=OFF). Embedding is what lets
+// the library run somewhere with no install prefix - see EmbeddedShaders.h.
+vk::ShaderSource ShaderPath(const char *name) {
+  if (const vk::EmbeddedShader *embedded = vk::FindEmbeddedShader(name)) {
+    return vk::ShaderSource(embedded->code, embedded->bytes, name);
+  }
+  return vk::ShaderSource(std::string(SHADER_DIR) + "/" + name + ".comp.spv");
 }
 
 uint32_t NextPow2(uint32_t v) {

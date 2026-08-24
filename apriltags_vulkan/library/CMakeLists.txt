@@ -69,7 +69,39 @@ set(SHADER_SOURCES
 
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)
 
+# ---------------------------------------------------------------------------
+# Compile the SPIR-V corpus into the library, so a deployed binary needs
+# nothing on disk beside it. This is what makes the library usable from a
+# context with no install prefix at all - most concretely a JNI shared object
+# extracted from a jar, which is how PhotonVision consumes native code. Turn
+# it off to fall back to loading .spv files from SHADER_DIR at runtime; the
+# selection happens at runtime via vk::HasEmbeddedShaders(), so both paths
+# stay compiled and exercised.
+# ---------------------------------------------------------------------------
+option(VKAPRILTAG_EMBED_SHADERS "Compile the SPIR-V corpus into the library" ON)
+
+set(EMBEDDED_SHADERS_CPP ${CMAKE_CURRENT_BINARY_DIR}/embedded_shaders.cpp)
+set(GENERATE_EMBEDDED_SHADERS_SCRIPT
+  ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/GenerateEmbeddedShaders.cmake)
+
+# '|'-joined: a ';'-separated list would be split into separate arguments on
+# the way through -D.
+string(REPLACE ";" "|" SHADER_SPIRV_BINARIES_ARG "${SHADER_SPIRV_BINARIES}")
+
+add_custom_command(
+  OUTPUT ${EMBEDDED_SHADERS_CPP}
+  COMMAND ${CMAKE_COMMAND}
+          "-DSPV_FILES=${SHADER_SPIRV_BINARIES_ARG}"
+          "-DOUTPUT=${EMBEDDED_SHADERS_CPP}"
+          "-DEMBED=${VKAPRILTAG_EMBED_SHADERS}"
+          -P ${GENERATE_EMBEDDED_SHADERS_SCRIPT}
+  DEPENDS ${SHADER_SPIRV_BINARIES} ${GENERATE_EMBEDDED_SHADERS_SCRIPT}
+  COMMENT "Embedding SPIR-V corpus into libvkapriltag"
+  VERBATIM
+)
+
 add_library(vkapriltag STATIC
+  ${EMBEDDED_SHADERS_CPP}
   src/vk/Context.cpp
   src/vk/Buffer.cpp
   src/vk/Shader.cpp

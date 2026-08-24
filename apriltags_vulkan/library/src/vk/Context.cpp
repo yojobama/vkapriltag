@@ -1,5 +1,7 @@
 #include "vkapriltag/vk/Context.h"
 
+#include "vkapriltag/vk/EmbeddedShaders.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +99,21 @@ void CheckVk(VkResult result, const char *what) {
   }
 }
 
+namespace {
+
+// Shaders compiled into the binary have no directory for PipelineCache to
+// hash, so hand it the build-time corpus digest instead. Builds with
+// VKAPRILTAG_EMBED_SHADERS=OFF still key off SHADER_DIR's contents.
+PipelineCache MakePipelineCache(VkDevice device, VkPhysicalDevice physical_device, bool enabled,
+                                bool verbose) {
+  if (HasEmbeddedShaders()) {
+    return PipelineCache(device, physical_device, EmbeddedShaderCorpusHash(), enabled, verbose);
+  }
+  return PipelineCache(device, physical_device, std::string(SHADER_DIR), enabled, verbose);
+}
+
+}  // namespace
+
 Context::Context(const ContextOptions &options_in) {
   ContextOptions options = options_in;
   // Environment overrides, so the same binary can be retargeted at runtime.
@@ -119,8 +136,8 @@ Context::Context(const ContextOptions &options_in) {
   SelectPhysicalDevice(options);
   CreateLogicalDevice();
   QueryCaps(options);
-  pipeline_cache_ = PipelineCache(device_, physical_device_, SHADER_DIR,
-                                  options.use_pipeline_cache, options.verbose);
+  pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
+                                     options.verbose);
   CreateCommandResources();
 
   if (options.verbose) {
@@ -150,8 +167,8 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
     SelectPhysicalDevice(deviceName, options);
     CreateLogicalDevice();
     QueryCaps(options);
-    pipeline_cache_ = PipelineCache(device_, physical_device_, SHADER_DIR,
-                                    options.use_pipeline_cache, options.verbose);
+    pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
+                                       options.verbose);
     CreateCommandResources();
 
     if (options.verbose) {
