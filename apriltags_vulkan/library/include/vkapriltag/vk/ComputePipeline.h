@@ -53,7 +53,7 @@ class ComputePipeline {
   // starting at 3 (right after the workgroup size's 0/1/2), for shaders that
   // need an additional device-derived compile-time constant (e.g. a shared
   // memory array length decoupled from the workgroup's thread count).
-  ComputePipeline(const Context &ctx, const std::string &spv_path,
+  ComputePipeline(const Context &ctx, const ShaderSource &shader_source,
                   const std::vector<VkBuffer> &buffers, uint32_t push_constant_bytes,
                   WorkgroupSize workgroup_size,
                   std::vector<uint32_t> extra_specialization_constants = {});
