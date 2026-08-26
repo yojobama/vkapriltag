@@ -11,6 +11,7 @@ layout(push_constant) uniform PushConstants {
   uint decimated_width;
   uint decimated_height;
   uint min_white_black_diff;
+  uint block_width;
 } pc;
 
 void main() {
@@ -20,9 +21,13 @@ void main() {
 
   uint x = i % pc.decimated_width;
   uint y = i / pc.decimated_width;
-  uint block_w = pc.decimated_width / 4u;
 
-  uint packed = minmax_filtered[(x / 4u) + (y / 4u) * block_w];
+  // block_width is passed explicitly rather than recomputed as
+  // decimated_width/4u: decimated_width need not be a multiple of 4 (only
+  // the source image's width/height are guaranteed even), so the host's
+  // ceil-rounded block grid (GpuDetector::block_width_) is the only correct
+  // stride into minmax_filtered[].
+  uint packed = minmax_filtered[(x / 4u) + (y / 4u) * pc.block_width];
   uint mn = packed & 0xffu;
   uint mx = (packed >> 8u) & 0xffu;
 

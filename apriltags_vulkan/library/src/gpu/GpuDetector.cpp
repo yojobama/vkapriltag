@@ -55,8 +55,8 @@ constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     : ctx_(ctx), config_(config) {
-  if (config_.width % 8 != 0 || config_.height % 8 != 0) {
-    throw std::runtime_error("width and height must both be multiples of 8");
+  if (config_.width % 2 != 0 || config_.height % 2 != 0) {
+    throw std::runtime_error("width and height must both be even");
   }
 
   // --- Environment overrides. These must all be applied before any capacity
@@ -100,8 +100,13 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
 
   decimated_width_ = config_.width / 2;
   decimated_height_ = config_.height / 2;
-  block_width_ = decimated_width_ / 4;
-  block_height_ = decimated_height_ / 4;
+  // Rounded up rather than floored: the input is only guaranteed even, not a
+  // multiple of 8, so decimated_width_/height_ need not be a multiple of 4.
+  // block_minmax.comp/threshold.comp handle the resulting ragged trailing
+  // block explicitly (edge-clamped sampling / an explicit block_width push
+  // constant) rather than assuming block_width_ * 4 == decimated_width_.
+  block_width_ = (decimated_width_ + 3) / 4;
+  block_height_ = (decimated_height_ + 3) / 4;
   interior_width_ = decimated_width_ - 2;
   interior_height_ = decimated_height_ - 2;
   dense_qbp_count_ = 4u * interior_width_ * interior_height_;
@@ -113,7 +118,8 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   ipoint_capacity_ = qbp_capacity_;
 
   // The grayscale frame is uploaded packed, four 8-bit pixels per uint32.
-  // width % 8 == 0 guarantees the pixel count divides evenly by four.
+  // width and height are each guaranteed even (checked above), so their
+  // product is guaranteed divisible by four.
   gray_words_ = (config_.width * config_.height) / 4u;
 
   // sort_points_local.comp handles one selected blob per workgroup, sorting
@@ -267,14 +273,14 @@ void GpuDetector::CreatePipelines() {
   decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath("decimate"),
                                      {gray_buf_.get(), decimated_buf_.get()}, 8, wg1d_);
   block_minmax_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("block_minmax"), {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 8,
+      ctx_, ShaderPath("block_minmax"), {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16,
       wg2d_);
   block_filter_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
       8, wg2d_);
   threshold_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("threshold"),
-      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 12, wg1d_);
+      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg1d_);
 
   uf_init_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_init"), {parent_buf_.get(), thresholded_buf_.get()}, 8, wg1d_);
@@ -477,12 +483,14 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   blob_cursor_buf_.FillZero(cmd);
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
+  struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
+                                                block_height_};
   decimate_pl_.Dispatch1D(cmd, pixels, &dims_pc);
-  block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &dwdh_pc);
+  block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 
-  struct { uint32_t dw, dh, min_diff; } thresh_pc{decimated_width_, decimated_height_,
-                                                  config_.min_white_black_diff};
+  struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
+      decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
   threshold_pl_.Dispatch1D(cmd, pixels, &thresh_pc);
 
   uf_init_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);

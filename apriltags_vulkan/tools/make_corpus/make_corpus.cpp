@@ -24,12 +24,11 @@
 namespace {
 
 // The directory-mode loader in validate_against_libapriltag_opencv.cpp skips
-// images whose dimensions aren't a multiple of 8 (the GPU pipeline's
-// decimate/block stages assume it), so every generated image must round to
-// that.
-int RoundToMultipleOf8(double value) {
-  int rounded = static_cast<int>(std::lround(value / 8.0)) * 8;
-  return std::max(8, rounded);
+// images whose dimensions aren't even (the GPU pipeline's decimation halves
+// each dimension), so every generated image must round to that.
+int RoundToEven(double value) {
+  int rounded = static_cast<int>(std::lround(value / 2.0)) * 2;
+  return std::max(2, rounded);
 }
 
 }  // namespace
@@ -85,8 +84,8 @@ int main(int argc, char **argv) {
   std::filesystem::create_directories(out_dir, ec);
 
   for (double scale : scales) {
-    int w = RoundToMultipleOf8(src.cols * scale);
-    int h = RoundToMultipleOf8(src.rows * scale);
+    int w = RoundToEven(src.cols * scale);
+    int h = RoundToEven(src.rows * scale);
 
     cv::Mat resized;
     // INTER_AREA is the right choice when shrinking (proper decimation,

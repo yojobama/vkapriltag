@@ -100,8 +100,8 @@ int main(int argc, char **argv) {
             std::cerr << "Failed to load Image: " << entry.path().string() << std::endl;
             continue;
         }
-        else if (img.cols % 8 != 0 || img.rows % 8 != 0) {
-            std::cerr << "Skipping Image (dimensions not multiple of 8): " << entry.path().string() << std::endl;
+        else if (img.cols % 2 != 0 || img.rows % 2 != 0) {
+            std::cerr << "Skipping Image (dimensions not even): " << entry.path().string() << std::endl;
             continue;
         }
         files.push_back(entry.path().string());
