@@ -160,7 +160,7 @@ std::vector<uint8_t> LoadValidated(const std::string &file_path, VkPhysicalDevic
 }  // namespace
 
 std::string PipelineCache::CacheFilePath(VkPhysicalDevice physical_device,
-                                         const std::string &shader_dir, bool verbose) const {
+                                         uint64_t shader_corpus_hash, bool verbose) const {
   const std::string dir = CacheDirectory();
   if (dir.empty()) {
     if (verbose) {
@@ -182,11 +182,10 @@ std::string PipelineCache::CacheFilePath(VkPhysicalDevice physical_device,
 
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(physical_device, &props);
-  const uint64_t shader_hash = HashShaderDir(shader_dir);
 
   std::ostringstream name;
   name << "vkapriltag-" << HexU32(props.vendorID) << "-" << HexU32(props.deviceID) << "-"
-       << HexBytes(props.pipelineCacheUUID, VK_UUID_SIZE) << "-" << std::hex << shader_hash
+       << HexBytes(props.pipelineCacheUUID, VK_UUID_SIZE) << "-" << std::hex << shader_corpus_hash
        << ".vkpc";
 
   return (fs::path(dir) / name.str()).string();
@@ -194,10 +193,17 @@ std::string PipelineCache::CacheFilePath(VkPhysicalDevice physical_device,
 
 PipelineCache::PipelineCache(VkDevice device, VkPhysicalDevice physical_device,
                              const std::string &shader_dir, bool enabled, bool verbose)
+    // Skip the directory scan entirely when caching is off - the hash is only
+    // ever used to name the cache file, which this build will not write.
+    : PipelineCache(device, physical_device, enabled ? HashShaderDir(shader_dir) : 0, enabled,
+                    verbose) {}
+
+PipelineCache::PipelineCache(VkDevice device, VkPhysicalDevice physical_device,
+                             uint64_t shader_corpus_hash, bool enabled, bool verbose)
     : device_(device), verbose_(verbose) {
   if (!enabled) return;
 
-  file_path_ = CacheFilePath(physical_device, shader_dir, verbose);
+  file_path_ = CacheFilePath(physical_device, shader_corpus_hash, verbose);
 
   std::vector<uint8_t> initial_data;
   if (!file_path_.empty()) {

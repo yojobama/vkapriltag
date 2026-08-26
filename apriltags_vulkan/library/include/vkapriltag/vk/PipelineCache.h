@@ -34,6 +34,12 @@ class PipelineCache {
   // VK_NULL_HANDLE.
   PipelineCache(VkDevice device, VkPhysicalDevice physical_device,
                 const std::string &shader_dir, bool enabled, bool verbose);
+
+  // Same, for builds whose shaders are compiled into the binary and so have
+  // no directory to hash - the caller supplies the corpus digest directly
+  // (see vk::EmbeddedShaderCorpusHash()).
+  PipelineCache(VkDevice device, VkPhysicalDevice physical_device, uint64_t shader_corpus_hash,
+                bool enabled, bool verbose);
   ~PipelineCache();
 
   PipelineCache(const PipelineCache &) = delete;
@@ -63,7 +69,7 @@ class PipelineCache {
 
  private:
   void Destroy();
-  std::string CacheFilePath(VkPhysicalDevice physical_device, const std::string &shader_dir,
+  std::string CacheFilePath(VkPhysicalDevice physical_device, uint64_t shader_corpus_hash,
                             bool verbose) const;
 
   VkDevice device_ = VK_NULL_HANDLE;
