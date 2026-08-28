@@ -60,6 +60,23 @@ bool EnvInt(const char *name, int *out) {
   return true;
 }
 
+// Parses "WxH" (e.g. "32x8"). Returns false (leaving *w/*h untouched) if the
+// variable is unset or malformed, so a bad value falls back to automatic
+// selection rather than silently picking 0x0.
+bool EnvWxH(const char *name, uint32_t *w, uint32_t *h) {
+  const char *v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return false;
+  char *end = nullptr;
+  long parsed_w = std::strtol(v, &end, 10);
+  if (end == v || *end != 'x' || parsed_w <= 0) return false;
+  const char *h_start = end + 1;
+  long parsed_h = std::strtol(h_start, &end, 10);
+  if (end == h_start || *end != '\0' || parsed_h <= 0) return false;
+  *w = static_cast<uint32_t>(parsed_w);
+  *h = static_cast<uint32_t>(parsed_h);
+  return true;
+}
+
 // Largest power of two <= v (v >= 1).
 uint32_t FloorPow2(uint32_t v) {
   uint32_t r = 1;
@@ -124,6 +141,7 @@ Context::Context(const ContextOptions &options_in) {
   if (EnvInt("APRILTAG_VK_WG", &env_int) && env_int > 0) {
     options.workgroup_size_override = static_cast<uint32_t>(env_int);
   }
+  EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
   if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
     options.max_invocations_override = static_cast<uint32_t>(env_int);
   }
@@ -155,6 +173,7 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
     if (EnvInt("APRILTAG_VK_WG", &env_int) && env_int > 0) {
         options.workgroup_size_override = static_cast<uint32_t>(env_int);
     }
+    EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
     if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
         options.max_invocations_override = static_cast<uint32_t>(env_int);
     }
@@ -478,8 +497,15 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.wg1d = std::max(FloorPow2(want_1d), 1u);
 
   // 2D: prefer 16x16, fall back to 8x8 on parts that cannot host 256
-  // invocations per group.
-  if (caps_.max_workgroup_invocations >= 256 && caps_.max_workgroup_size[0] >= 16 &&
+  // invocations per group. options.workgroup_size_2d_x/y (APRILTAG_VK_WG2D)
+  // overrides this outright for sweeping launch geometry on a specific
+  // device; ComputePipeline's own construction-time check throws loudly if
+  // the override exceeds the device's real limits, so no extra validation
+  // is needed here.
+  if (options.workgroup_size_2d_x > 0 && options.workgroup_size_2d_y > 0) {
+    caps_.wg2d_x = options.workgroup_size_2d_x;
+    caps_.wg2d_y = options.workgroup_size_2d_y;
+  } else if (caps_.max_workgroup_invocations >= 256 && caps_.max_workgroup_size[0] >= 16 &&
       caps_.max_workgroup_size[1] >= 16) {
     caps_.wg2d_x = 16;
     caps_.wg2d_y = 16;

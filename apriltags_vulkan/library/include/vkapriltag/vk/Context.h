@@ -42,6 +42,15 @@ struct ContextOptions {
   // Env override: APRILTAG_VK_WG=<n>
   uint32_t workgroup_size_override = 0;
 
+  // Override the 2D compute workgroup size (used by decimate/threshold/
+  // uf_init/blob_diff/block_minmax/block_filter). 0 = pick automatically
+  // (16x16 where the device supports 256 invocations per group, 8x8
+  // otherwise). A testing aid for sweeping launch geometry on a specific
+  // device - see OPTIMIZATION_NOTES.md's workgroup-size item.
+  // Env override: APRILTAG_VK_WG2D=<w>x<h>
+  uint32_t workgroup_size_2d_x = 0;
+  uint32_t workgroup_size_2d_y = 0;
+
   // Pretend the device reports at most this many invocations per workgroup.
   // Purely a testing aid: it lets a desktop GPU exercise the exact launch
   // geometry a constrained part would get (Mali-G610 reports 512, and Vulkan
