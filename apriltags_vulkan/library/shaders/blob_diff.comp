@@ -30,7 +30,11 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-layout(local_size_x_id = 0, local_size_x = 256) in;
+// Dispatched 2D so the interior (ox, oy) coordinate comes straight from
+// gl_GlobalInvocationID.xy instead of a runtime `%`/`/` by the interior
+// width (see decimate.comp's comment) - the hottest of the four converted
+// shaders, at up to 4 appends per interior pixel.
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer Thresholded { uint thresholded[]; };
 layout(std430, binding = 1) readonly buffer PixelLabel { uint pixel_label[]; };
@@ -73,13 +77,12 @@ void append(uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
 }
 
 void main() {
-  uint gid = gl_GlobalInvocationID.x;
   uint iw = pc.width - 2u;
   uint ih = pc.height - 2u;
-  if (gid >= iw * ih) return;
+  uint ox = gl_GlobalInvocationID.x;
+  uint oy = gl_GlobalInvocationID.y;
+  if (ox >= iw || oy >= ih) return;
 
-  uint ox = gid % iw;
-  uint oy = gid / iw;
   uint x = ox + 1u;
   uint y = oy + 1u;
 

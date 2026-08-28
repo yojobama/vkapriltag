@@ -1,7 +1,10 @@
 #version 450
 // Final adaptive threshold: writes 127 (ambiguous), 0 (black) or 255 (white)
 // per decimated pixel.  Mirrors InternalThreshold.
-layout(local_size_x_id = 0, local_size_x = 256) in;
+//
+// Dispatched 2D so x/y come straight from gl_GlobalInvocationID.xy instead
+// of a runtime `%`/`/` by decimated_width (see decimate.comp's comment).
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint decimated[]; };
 layout(std430, binding = 1) readonly buffer FilteredMinMax { uint minmax_filtered[]; };
@@ -15,12 +18,10 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 void main() {
-  uint i = gl_GlobalInvocationID.x;
-  uint total = pc.decimated_width * pc.decimated_height;
-  if (i >= total) return;
-
-  uint x = i % pc.decimated_width;
-  uint y = i / pc.decimated_width;
+  uint x = gl_GlobalInvocationID.x;
+  uint y = gl_GlobalInvocationID.y;
+  if (x >= pc.decimated_width || y >= pc.decimated_height) return;
+  uint i = y * pc.decimated_width + x;
 
   // block_width is passed explicitly rather than recomputed as
   // decimated_width/4u: decimated_width need not be a multiple of 4 (only

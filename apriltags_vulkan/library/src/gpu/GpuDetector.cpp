@@ -298,8 +298,11 @@ GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
 }
 
 void GpuDetector::CreatePipelines() {
+  // 2D so the shader recovers its (x, y) from gl_GlobalInvocationID.xy rather
+  // than a runtime `%`/`/` by a push-constant width - see each shader's own
+  // comment. Mali (Valhall) has no integer divide instruction.
   decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath("decimate"),
-                                     {gray_buf_.get(), decimated_buf_.get()}, 8, wg1d_);
+                                     {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_);
   block_minmax_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_minmax"), {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16,
       wg2d_);
@@ -308,10 +311,10 @@ void GpuDetector::CreatePipelines() {
       8, wg2d_);
   threshold_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("threshold"),
-      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg1d_);
+      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_);
 
   uf_init_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("uf_init"), {parent_buf_.get(), thresholded_buf_.get()}, 8, wg1d_);
+      ctx_, ShaderPath("uf_init"), {parent_buf_.get(), thresholded_buf_.get()}, 8, wg2d_);
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_merge"),
       {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8, wg1d_);
@@ -324,7 +327,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("blob_diff"),
       {thresholded_buf_.get(), pixel_label_buf_.get(), qbp_compacted_buf_.get(),
        qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get()},
-      12, wg1d_);
+      12, wg2d_);
 
   label_pixels_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("label_pixels"),
@@ -496,17 +499,17 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  decimate_pl_.Dispatch1D(cmd, pixels, &dims_pc);
+  decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
   block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 
   struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
       decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch1D(cmd, pixels, &thresh_pc);
+  threshold_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &thresh_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
-  uf_init_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
+  uf_init_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
   // Flatten the run chains uf_init.comp just built before the first merge
   // pass walks them. Without this the vertical unions pay an O(run length)
   // find() each, which cancels out exactly what the run-based init saved.
@@ -583,7 +586,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   struct { uint32_t w, h, capacity; } blobdiff_pc{decimated_width_, decimated_height_,
                                                    qbp_capacity_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
-  blob_diff_pl_.Dispatch1D(cmd, interior_width_ * interior_height_, &blobdiff_pc,
+  blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
                            BarrierKind::ComputeAndTransfer);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
 

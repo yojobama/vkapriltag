@@ -14,7 +14,12 @@
 // on parts that lack it. The byte order within each word is the natural
 // little-endian one produced by memcpy'ing the source image, which is what
 // every Vulkan-capable platform uses.
-layout(local_size_x_id = 0, local_size_x = 256) in;
+//
+// Dispatched 2D so dx/dy come straight from gl_GlobalInvocationID.xy instead
+// of a runtime `%`/`/` by decimated_width - Mali (Valhall) has no integer
+// divide instruction, so that recovery used to cost a software divide
+// sequence per invocation, once per pixel.
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };
 layout(std430, binding = 1) writeonly buffer DecimatedImage { uint decimated[]; };
@@ -27,16 +32,14 @@ layout(push_constant) uniform PushConstants {
 void main() {
   uint decimated_width = pc.width / 2u;
   uint decimated_height = pc.height / 2u;
-  uint total = decimated_width * decimated_height;
-  uint i = gl_GlobalInvocationID.x;
-  if (i >= total) return;
+  uint dx = gl_GlobalInvocationID.x;
+  uint dy = gl_GlobalInvocationID.y;
+  if (dx >= decimated_width || dy >= decimated_height) return;
 
-  uint dx = i % decimated_width;
-  uint dy = i / decimated_width;
   uint sx = dx * 2u;
   uint sy = dy * 2u;
 
   uint linear = sy * pc.width + sx;
   uint word = gray_packed[linear >> 2u];
-  decimated[i] = (word >> ((linear & 3u) * 8u)) & 0xFFu;
+  decimated[dy * decimated_width + dx] = (word >> ((linear & 3u) * 8u)) & 0xFFu;
 }
