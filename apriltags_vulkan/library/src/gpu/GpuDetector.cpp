@@ -351,8 +351,25 @@ void GpuDetector::CreatePipelines() {
   // constant - a real SPIR-V restriction - so a dynamic lane index needs
   // subgroupShuffle instead); reduce_extents_hash's needs ARITHMETIC too, to
   // reduce per-point values, not just counts.
+  //
+  // Excludes integrated GPUs outright, regardless of what they report
+  // supporting: measured on the Orange Pi 5's Mali-G610 (which reports all
+  // three capabilities and produces bit-correct results with them), this is
+  // a catastrophic regression, not a wash - pipeline_total went from
+  // 11.5 ms to 18.1 ms, with reduce_extents_hash_subgroup.comp's "extents"
+  // span alone going from 0.91 ms to 6.04 ms, reproduced consistently
+  // across repeated runs. The same class of result OPTIMIZATION_NOTES.md
+  // already recorded for tile-local shared-memory union-find: Mali
+  // (Valhall) has no dedicated hardware for these GPU-compute patterns the
+  // way discrete parts do, so software-costly ballot/shuffle/arithmetic
+  // sequences can cost far more than the plain atomics they replace. On the
+  // Windows/RX 9060 XT test machine (a discrete GPU, subgroupSize=64) the
+  // same code measures a small but real and repeatable win instead
+  // (pipeline_total best 1.40 -> 1.33 ms), so this is excluded specifically
+  // for integrated GPUs, not disabled outright.
   const bool subgroup = ctx_.caps().has_subgroup_ballot && ctx_.caps().has_subgroup_arithmetic &&
-                        ctx_.caps().has_subgroup_shuffle;
+                        ctx_.caps().has_subgroup_shuffle &&
+                        ctx_.caps().type != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
   auto pick_sg = [subgroup](const char *base_name, const char *subgroup_name) {
     return subgroup ? subgroup_name : base_name;
   };
