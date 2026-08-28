@@ -60,7 +60,6 @@ set(SHADER_SOURCES
   shaders/select_blobs.comp
   shaders/extract_blob_counts.comp
   shaders/sort_points_local.comp
-  shaders/compute_line_fit_points.comp
   shaders/hash_group.comp
   shaders/reduce_extents_hash.comp
   shaders/scatter_index_points.comp

@@ -246,7 +246,6 @@ void GpuDetector::CreateBuffers() {
   remap_buf_ = ssbo(VkDeviceSize(config_.max_raw_blobs) * 4);
 
   index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
-  index_points_sorted_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
   blob_point_offsets_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 4);
 
   line_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
@@ -387,8 +386,8 @@ void GpuDetector::CreatePipelines() {
   sort_points_local_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("sort_points_local"),
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
-       index_points_sorted_buf_.get()},
-      4, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
+       decimated_buf_.get(), line_fit_points_buf_.get()},
+      12, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
 
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
@@ -407,12 +406,6 @@ void GpuDetector::CreatePipelines() {
        selected_extents_buf_.get(), blob_point_offsets_buf_.get(), blob_cursor_buf_.get(),
        index_points_buf_.get()},
       12, wg1d_);
-
-  compute_line_fit_points_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("compute_line_fit_points"),
-      {index_points_sorted_buf_.get(), decimated_buf_.get(), line_fit_points_buf_.get()}, 12,
-      wg1d_);
-
 }
 
 void GpuDetector::RunInclusiveScan(
@@ -710,18 +703,19 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     // rewrite_index_points.comp already packed every selected blob's points
     // into one contiguous range, so sorting each blob's own points into
     // angular order is a one-workgroup-per-blob shared-memory sort - no
-    // composite (blob_index, theta) key, no separate gather pass.
-    struct { uint32_t num_selected_blobs; } sort_pc{num_selected_blobs};
+    // composite (blob_index, theta) key, no separate gather pass. Fused with
+    // the line-fit moment computation (see sort_points_local.comp's own
+    // comment): once a blob's points are in final order each thread already
+    // knows which source point lands at its output position, so it samples
+    // the decimated image and writes the RawLineFitPoint directly instead of
+    // a separate dispatch re-reading a sorted intermediate.
+    struct { uint32_t num_selected_blobs; int dw, dh; } sort_pc{
+        num_selected_blobs, static_cast<int>(decimated_width_),
+        static_cast<int>(decimated_height_)};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
-    sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &sort_pc);
+    sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &sort_pc,
+                                      BarrierKind::ComputeAndTransfer);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
-
-    struct { uint32_t count; int dw, dh; } linefit_pc{
-        num_points, static_cast<int>(decimated_width_), static_cast<int>(decimated_height_)};
-    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLinefitCompute));
-    compute_line_fit_points_pl_.Dispatch1D(cmd, num_points, &linefit_pc,
-                                           BarrierKind::ComputeAndTransfer);
-    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLinefitCompute));
   }
   if (extents_bytes > 0) {
     selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);

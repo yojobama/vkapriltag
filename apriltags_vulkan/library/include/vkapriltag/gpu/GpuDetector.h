@@ -185,24 +185,24 @@ class GpuDetector {
     // APRILTAG_VK_TIMESTAMPS=1 - and costs nothing when timestamps aren't
     // supported or the pool wasn't constructed.
     bool has_gpu_stage_breakdown = false;
-    std::array<double, 11> gpu_stage_ms = {};
+    std::array<double, 10> gpu_stage_ms = {};
   };
 
   // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
   // vkCmdWriteTimestamp pair (start, end) recorded around the named group of
   // dispatches - see the kSpan* constants and their use in Detect().
-  static constexpr std::array<const char *, 11> kGpuStageNames = {
-      "threshold",       // decimate + block_minmax + block_filter + threshold
-      "labelling",       // uf_init + uf_compress + the uf_merge/uf_compress loop
-      "label_finalize",  // uf_final + label_pixels
-      "boundary",        // blob_diff (append + compaction)
-      "hash_group",      // hash_group.comp (also assigns dense raw blob ids)
-      "extents",         // init_extents.comp + reduce_extents_hash.comp
-      "select",          // select_blobs.comp
-      "blob_scan",       // extract_blob_counts.comp + its scan chain
-      "scatter",         // scatter_index_points.comp
-      "sort",            // sort_points_local.comp
-      "linefit_compute", // compute_line_fit_points.comp
+  static constexpr std::array<const char *, 10> kGpuStageNames = {
+      "threshold",      // decimate + block_minmax + block_filter + threshold
+      "labelling",      // uf_init + uf_compress + the uf_merge/uf_compress loop
+      "label_finalize", // uf_final + label_pixels
+      "boundary",       // blob_diff (append + compaction)
+      "hash_group",     // hash_group.comp (also assigns dense raw blob ids)
+      "extents",        // init_extents.comp + reduce_extents_hash.comp
+      "select",         // select_blobs.comp
+      "blob_scan",      // extract_blob_counts.comp + its scan chain
+      "scatter",        // scatter_index_points.comp
+      "sort",           // sort_points_local.comp - fused with the line-fit
+                        // moment computation, see its own comment
   };
 
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
@@ -282,12 +282,13 @@ class GpuDetector {
   vk::Buffer extents_buf_;
   vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
   vk::Buffer index_points_buf_;
-  vk::Buffer index_points_sorted_buf_;
   // Inclusive scan of each selected blob's point count (see
   // extract_blob_counts.comp), sized to config_.max_blobs. Gives
   // rewrite_index_points.comp / sort_points_local.comp each blob's base
-  // offset into index_points_buf_/index_points_sorted_buf_.
+  // offset into index_points_buf_.
   vk::Buffer blob_point_offsets_buf_;
+  // Written directly by sort_points_local.comp, fused with the angular
+  // sort - see that shader's comment. No intermediate sorted-IPoint buffer.
   vk::Buffer line_fit_points_buf_;
 
   // --- Hash grouping (replaces the global (rep0, rep1) sort) ---
@@ -342,7 +343,6 @@ class GpuDetector {
   vk::ComputePipeline label_pixels_pl_;
   vk::ComputePipeline select_blobs_pl_;
 
-  vk::ComputePipeline compute_line_fit_points_pl_;
   vk::ComputePipeline hash_group_pl_, reduce_extents_hash_pl_, scatter_index_points_pl_;
 
 
@@ -380,7 +380,6 @@ class GpuDetector {
     kSpanBlobScan,
     kSpanScatter,
     kSpanSort,
-    kSpanLinefitCompute,
     kNumGpuStageSpans,
   };
   // WriteTimestamp() index for a span's start/end - 2 slots per span.
