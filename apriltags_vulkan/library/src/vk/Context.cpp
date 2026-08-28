@@ -497,14 +497,29 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.wg1d = std::max(FloorPow2(want_1d), 1u);
 
   // 2D: prefer 16x16, fall back to 8x8 on parts that cannot host 256
-  // invocations per group. options.workgroup_size_2d_x/y (APRILTAG_VK_WG2D)
-  // overrides this outright for sweeping launch geometry on a specific
-  // device; ComputePipeline's own construction-time check throws loudly if
-  // the override exceeds the device's real limits, so no extra validation
-  // is needed here.
+  // invocations per group - except integrated GPUs, which get 8x8
+  // unconditionally. Measured on Mali-G610 (Orange Pi 5) across the four
+  // shaders wg2d_ actually drives (decimate/threshold/uf_init/blob_diff,
+  // since A6's move to 2D dispatch): 8x8 beat 16x16 by ~1-2% on
+  // pipeline_total, consistently across three repeated A/B runs (e.g.
+  // 11.616/11.772/11.618 ms median for 8x8 vs. 11.772/11.808/11.778 ms for
+  // 16x16). A parallel sweep of wg1d_ (64/128/256/512, via
+  // APRILTAG_VK_WG - the remaining 1D shaders: uf_merge/uf_compress/
+  // uf_final/hash_group/reduce_extents_hash/select_blobs/
+  // extract_blob_counts/scatter_index_points/label_pixels) showed no signal
+  // at all - every value landed within the ~0.2 ms run-to-run noise band -
+  // so wg1d_'s existing 128-for-integrated-GPU default is left as is.
+  // options.workgroup_size_2d_x/y (APRILTAG_VK_WG2D) overrides this
+  // outright for sweeping launch geometry on a specific device;
+  // ComputePipeline's own construction-time check throws loudly if the
+  // override exceeds the device's real limits, so no extra validation is
+  // needed here.
   if (options.workgroup_size_2d_x > 0 && options.workgroup_size_2d_y > 0) {
     caps_.wg2d_x = options.workgroup_size_2d_x;
     caps_.wg2d_y = options.workgroup_size_2d_y;
+  } else if (caps_.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+    caps_.wg2d_x = 8;
+    caps_.wg2d_y = 8;
   } else if (caps_.max_workgroup_invocations >= 256 && caps_.max_workgroup_size[0] >= 16 &&
       caps_.max_workgroup_size[1] >= 16) {
     caps_.wg2d_x = 16;
