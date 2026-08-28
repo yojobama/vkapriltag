@@ -463,6 +463,7 @@ void Context::QueryCaps(const ContextOptions &options) {
       caps_.has_host_cached = true;
     }
   }
+  caps_.non_coherent_atom_size = std::max<VkDeviceSize>(l.nonCoherentAtomSize, 1);
 
   // --- Derived launch geometry ---
   // 1D: 256 is a good default on desktop; Mali-class parts do better with
@@ -621,6 +622,7 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
                 caps.has_host_cached = true;
             }
         }
+        caps.non_coherent_atom_size = std::max<VkDeviceSize>(l.nonCoherentAtomSize, 1);
 
         // --- Derived launch geometry ---
         // 1D: 256 is a good default on desktop; Mali-class parts do better with

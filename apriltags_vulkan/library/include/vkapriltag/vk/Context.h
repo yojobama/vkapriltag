@@ -89,6 +89,10 @@ struct DeviceCaps {
   // parts such as Mali). Lets us skip staging copies entirely.
   bool unified_memory = false;
   bool has_host_cached = false;
+  // VkPhysicalDeviceLimits::nonCoherentAtomSize. Non-coherent host-visible
+  // reads/writes (see MemoryKind::HostVisibleCached) must be invalidated/
+  // flushed on a range aligned to this size.
+  VkDeviceSize non_coherent_atom_size = 1;
 
   // --- Timestamp queries (for honest GPU-side timings) ---
   bool timestamps_supported = false;
@@ -151,6 +155,13 @@ public:
   // Same, but throws when no memory type satisfies `required`.
   uint32_t FindMemoryTypeOrThrow(uint32_t type_bits, VkMemoryPropertyFlags required,
                                  VkMemoryPropertyFlags preferred = 0) const;
+
+  // The property flags of a memory type index returned by FindMemoryType, so
+  // a caller (Buffer) can tell which optional bits (e.g. HOST_COHERENT)
+  // actually landed on the type it was handed.
+  VkMemoryPropertyFlags MemoryTypeFlags(uint32_t type_index) const {
+    return mem_props_.memoryTypes[type_index].propertyFlags;
+  }
 
   // Begins recording into a pooled, reused command buffer, first waiting for
   // that slot's previous submission to retire. No per-frame allocation.

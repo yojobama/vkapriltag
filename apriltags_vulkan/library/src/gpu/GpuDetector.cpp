@@ -208,7 +208,7 @@ void GpuDetector::CreateBuffers() {
                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk::MemoryKind::HostVisible);
   }
   counter_staging_ = vk::Buffer(ctx_, kCounterStagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                vk::MemoryKind::HostVisible);
+                                vk::MemoryKind::HostVisibleCached);
 
   decimated_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   minmax_unfiltered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
@@ -267,7 +267,7 @@ void GpuDetector::EnsureReadbackCapacity(VkDeviceSize bytes) {
   // reallocation every frame.
   VkDeviceSize new_capacity = std::max<VkDeviceSize>(readback_capacity_ * 2, bytes);
   readback_staging_ = vk::Buffer(ctx_, new_capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                 vk::MemoryKind::HostVisible);
+                                 vk::MemoryKind::HostVisibleCached);
   readback_capacity_ = readback_staging_.size();
 }
 
