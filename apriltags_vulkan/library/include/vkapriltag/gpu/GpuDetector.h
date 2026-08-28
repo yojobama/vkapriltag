@@ -272,15 +272,16 @@ class GpuDetector {
   vk::Buffer gray_buf_, decimated_buf_;
   vk::Buffer minmax_unfiltered_buf_, minmax_filtered_buf_;
   vk::Buffer thresholded_buf_;
+  // parent_buf_ is repurposed after labelling converges: label_pixels.comp
+  // overwrites each entry in place with "1 + union-find root, or 0 if the
+  // blob is too small" (see that shader's comment), so blob_diff.comp reads
+  // it as a per-pixel label rather than a raw union-find parent.
   vk::Buffer parent_buf_, blob_size_buf_, uf_changed_buf_;
   vk::Buffer qbp_compacted_buf_, qbp_counter_buf_;
   vk::Buffer qbp_keys_hi_buf_, qbp_keys_lo_buf_;
   vk::Buffer extents_buf_;
   vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
-  // Per-pixel "1 + union-find root, or 0 if the blob is too small" (see
-  // label_pixels.comp). Sized to `pixels`.
-  vk::Buffer pixel_label_buf_;
-  vk::Buffer index_points_buf_, index_points_counter_buf_;
+  vk::Buffer index_points_buf_;
   vk::Buffer index_points_sorted_buf_;
   // Inclusive scan of each selected blob's point count (see
   // extract_blob_counts.comp), sized to config_.max_blobs. Gives

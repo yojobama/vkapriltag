@@ -8,6 +8,14 @@
 // Order within a blob is atomic-arrival dependent, exactly as the boundary
 // point append order in blob_diff.comp already was - and it is immediately
 // overwritten by the angular sort in sort_points_local.comp.
+//
+// No separate output counter: every point that reaches the `atomicAdd(
+// blob_cursor[sel], ...)` below is, by construction, one of exactly
+// e.count points sharing that blob's (rep0, rep1) key (reduce_extents_hash.
+// comp counted them the same way), so the total written across every
+// selected blob is exactly blob_point_offsets_buf_'s last (inclusive-scanned)
+// entry - already computed by extract_blob_counts.comp's scan chain, with no
+// separate atomic needed here.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
@@ -23,7 +31,6 @@ layout(std430, binding = 4) readonly buffer Selected { MinMaxExtentsGpu selected
 layout(std430, binding = 5) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 6) buffer BlobCursor { uint blob_cursor[]; };
 layout(std430, binding = 7) writeonly buffer Output { IPoint output_points[]; };
-layout(std430, binding = 8) buffer Counter { uint counter; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -60,8 +67,6 @@ void main() {
   if (rank >= e.count) return;
   uint pos = blob_point_offsets[sel] - e.count + rank;
   if (pos >= pc.capacity) return;
-
-  atomicAdd(counter, 1u);
 
   IPoint out_pt;
   out_pt.blob_index = sel;

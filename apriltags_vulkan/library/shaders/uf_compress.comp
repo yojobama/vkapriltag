@@ -2,6 +2,13 @@
 // Full path compression: every pixel's parent becomes its ultimate root.
 // Run after each uf_merge.comp pass (and once more at the end) so that
 // downstream shaders can treat `parent[i]` as the final blob label.
+//
+// The store is guarded: once a chain is already flat (n == i, i.e. parent[i]
+// was already its root), rewriting the identical value is pure write
+// traffic with no effect. That is the common case for the LAST compression
+// pass of a chunk - the one whose only job is to observe convergence, after
+// a merge pass that changed nothing - so guarding it turns that pass into a
+// read-only chain check instead of a full 2 MB rewrite.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
@@ -18,9 +25,13 @@ void main() {
 
   uint n = i;
   uint p = parent[n];
+  const uint original = p;
   while (p != n) {
     n = p;
     p = parent[n];
   }
-  parent[i] = n;
+  // parent[i] is only ever written by this invocation (each thread owns
+  // exactly one entry), so `original` - captured before the walk - is still
+  // exactly what's in the buffer now; no need to re-read it.
+  if (n != original) parent[i] = n;
 }

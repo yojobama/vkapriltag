@@ -12,9 +12,10 @@
 // array, its traffic, and that whole second pass.
 //
 // Every read here is now spatially local. The blob identity and the
-// "big enough to matter" test both come from pixel_label[] (see
-// label_pixels.comp), which replaced six random gathers into blob_size[] per
-// interior pixel plus two more per emitted point into root_dense_id[].
+// "big enough to matter" test both come from parent[] (repurposed in place
+// by label_pixels.comp - see its comment), which replaced six random gathers
+// into blob_size[] per interior pixel plus two more per emitted point into
+// root_dense_id[].
 //
 // Ordering: the append order is nondeterministic (it depends on atomic
 // arrival order). Nothing depends on it - the points are immediately grouped
@@ -37,7 +38,9 @@
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer Thresholded { uint thresholded[]; };
-layout(std430, binding = 1) readonly buffer PixelLabel { uint pixel_label[]; };
+// Repurposed by label_pixels.comp: 0 (no usable blob) or 1 + root index. See
+// that shader's comment - this used to be a separate PixelLabel buffer.
+layout(std430, binding = 1) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 2) writeonly buffer Compacted { QBPoint compacted[]; };
 layout(std430, binding = 3) buffer Counter { uint counter; };
 layout(std430, binding = 4) writeonly buffer KeysHi { uint keys_hi[]; };
@@ -88,7 +91,7 @@ void main() {
 
   uint idx = x + y * pc.width;
   uint v0 = thresholded[idx];
-  uint l0 = pixel_label[idx];
+  uint l0 = parent[idx];
 
   // Ambiguous pixel, or a blob too small to matter: contributes nothing.
   if (v0 == 127u || l0 == 0u) return;
@@ -107,11 +110,11 @@ void main() {
   uint vSW = thresholded[idxSW];
   uint vW = thresholded[idxW];
 
-  uint lE = pixel_label[idxE];
-  uint lSE = pixel_label[idxSE];
-  uint lS = pixel_label[idxS];
-  uint lSW = pixel_label[idxSW];
-  uint lW = pixel_label[idxW];
+  uint lE = parent[idxE];
+  uint lSE = parent[idxSE];
+  uint lS = parent[idxS];
+  uint lSW = parent[idxSW];
+  uint lW = parent[idxW];
 
   uint rep0 = l0 - 1u;
 

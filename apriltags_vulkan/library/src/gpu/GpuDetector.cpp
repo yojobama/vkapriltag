@@ -219,7 +219,6 @@ void GpuDetector::CreateBuffers() {
   parent_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   blob_size_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   uf_changed_buf_ = ssbo(4);
-  pixel_label_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
 
   qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(QBPoint));
   qbp_counter_buf_ = ssbo(4);
@@ -234,7 +233,6 @@ void GpuDetector::CreateBuffers() {
   remap_buf_ = ssbo(VkDeviceSize(config_.max_raw_blobs) * 4);
 
   index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
-  index_points_counter_buf_ = ssbo(4);
   index_points_sorted_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
   blob_point_offsets_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 4);
 
@@ -325,13 +323,12 @@ void GpuDetector::CreatePipelines() {
 
   blob_diff_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("blob_diff"),
-      {thresholded_buf_.get(), pixel_label_buf_.get(), qbp_compacted_buf_.get(),
+      {thresholded_buf_.get(), parent_buf_.get(), qbp_compacted_buf_.get(),
        qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get()},
       12, wg2d_);
 
   label_pixels_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("label_pixels"),
-      {parent_buf_.get(), blob_size_buf_.get(), pixel_label_buf_.get()}, 8, wg1d_);
+      ctx_, ShaderPath("label_pixels"), {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
 
   init_extents_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4, wg1d_);
@@ -395,7 +392,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("scatter_index_points"),
       {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(), remap_buf_.get(),
        selected_extents_buf_.get(), blob_point_offsets_buf_.get(), blob_cursor_buf_.get(),
-       index_points_buf_.get(), index_points_counter_buf_.get()},
+       index_points_buf_.get()},
       12, wg1d_);
 
   compute_line_fit_points_pl_ = vk::ComputePipeline(
@@ -487,7 +484,6 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   }
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
-  index_points_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
   blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
@@ -663,9 +659,19 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     // needed. Profiling only.
     RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
     RecordCounterCopy(cmd, hash_drop_counter_buf_, kSlotHashDrops);
+
+    // No separate output counter for scatter_index_points.comp's write count
+    // (see its comment): blob_point_offsets_buf_[max_blobs - 1] is the
+    // inclusive scan's final running total, which already equals the sum of
+    // every selected blob's point count - entries beyond num_selected_blobs
+    // are zero-padded by extract_blob_counts.comp, so this static offset
+    // (known at record time, unlike num_selected_blobs) gives the exact same
+    // total regardless of how many blobs were actually selected this frame.
+    blob_point_offsets_buf_.RecordCopyTo(
+        cmd, counter_staging_, 4, VkDeviceSize(std::max(config_.max_blobs, 1u) - 1u) * 4,
+        VkDeviceSize(kSlotPointCount) * 4);
   }
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
-  RecordCounterCopy(cmd, index_points_counter_buf_, kSlotPointCount);
   vk::ComputePipeline::HostReadBarrier(cmd);
   ctx_.SubmitAndWait(cmd);
 
@@ -673,7 +679,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const uint32_t hash_probe_drops = (qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0;
   const uint32_t num_selected_blobs =
       std::min(ReadCounterSlot(kSlotSelectedCount), config_.max_blobs);
-  const uint32_t num_points = std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_);
+  const uint32_t num_points =
+      (qbp_count > 0) ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_) : 0;
   const auto t_sort_group = Clock::now();
 
   // ------------------------------------------------------------------
