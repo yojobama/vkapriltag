@@ -340,6 +340,23 @@ void GpuDetector::CreatePipelines() {
     return u8 ? u8_name : base_name;
   };
 
+  // Picks the subgroup-aggregated variant (see uf_final_subgroup.comp /
+  // reduce_extents_hash_subgroup.comp / blob_diff_body.glsl's
+  // AGGREGATE_APPEND_COUNTER) when the device's subgroup exposes BALLOT,
+  // ARITHMETIC and SHUFFLE in COMPUTE - gated on all three together for all
+  // three sites for simplicity, even though not every site needs every bit:
+  // blob_diff's variant only needs BALLOT; uf_final's and reduce_extents_
+  // hash's reduce-by-key loop also need SHUFFLE, to look a runtime-computed
+  // leader lane's value up (subgroupBroadcast's id must be a compile-time
+  // constant - a real SPIR-V restriction - so a dynamic lane index needs
+  // subgroupShuffle instead); reduce_extents_hash's needs ARITHMETIC too, to
+  // reduce per-point values, not just counts.
+  const bool subgroup = ctx_.caps().has_subgroup_ballot && ctx_.caps().has_subgroup_arithmetic &&
+                        ctx_.caps().has_subgroup_shuffle;
+  auto pick_sg = [subgroup](const char *base_name, const char *subgroup_name) {
+    return subgroup ? subgroup_name : base_name;
+  };
+
   // 2D so the shader recovers its (x, y) from gl_GlobalInvocationID.xy rather
   // than a runtime `%`/`/` by a push-constant width - see each shader's own
   // comment. Mali (Valhall) has no integer divide instruction.
@@ -363,11 +380,16 @@ void GpuDetector::CreatePipelines() {
       {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8, wg1d_);
   uf_compress_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("uf_compress"), {parent_buf_.get()}, 8, wg1d_);
-  uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_final"),
+  uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick_sg("uf_final", "uf_final_subgroup")),
                                      {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
 
+  // Four-way choice: blob_diff_body.glsl is parametrized on both the u8 and
+  // subgroup axes (it's the one shader affected by both - see its own
+  // comment), so pick/pick_sg alone don't cover it.
+  const char *blob_diff_shader = u8 ? (subgroup ? "blob_diff_u8_subgroup" : "blob_diff_u8")
+                                    : (subgroup ? "blob_diff_subgroup" : "blob_diff");
   blob_diff_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
+      ctx_, ShaderPath(blob_diff_shader),
       {thresholded_buf_.get(), parent_buf_.get(), qbp_compacted_buf_.get(),
        qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get()},
       12, wg2d_);
@@ -433,7 +455,7 @@ void GpuDetector::CreatePipelines() {
       {raw_blob_counter_buf_.get(), indirect_args_buf_.get()}, 4,
       vk::WorkgroupSize{1, 1, 1});
   reduce_extents_hash_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("reduce_extents_hash"),
+      ctx_, ShaderPath(pick_sg("reduce_extents_hash", "reduce_extents_hash_subgroup")),
       {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(),
        extents_buf_.get()},
       8, wg1d_);

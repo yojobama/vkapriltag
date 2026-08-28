@@ -1,98 +1,12 @@
 #version 450
-// Identical to blob_diff.comp except Thresholded is uint8_t per pixel
-// instead of uint - see decimate_u8.comp's comment. Parent, the compaction
-// buffers and QBPoint's packing are unaffected by this: only Thresholded
-// changes width here.
+// 8-bit-storage Thresholded, scalar (non-aggregated) counter. See
+// blob_diff_body.glsl for the shader itself.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #include "common.glsl"
 
-layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
-
 layout(std430, binding = 0) readonly buffer Thresholded { uint8_t thresholded[]; };
-layout(std430, binding = 1) readonly buffer Parent { uint parent[]; };
-layout(std430, binding = 2) writeonly buffer Compacted { uint compacted[]; };
-layout(std430, binding = 3) buffer Counter { uint counter; };
-layout(std430, binding = 4) writeonly buffer KeysHi { uint keys_hi[]; };
-layout(std430, binding = 5) writeonly buffer KeysLo { uint keys_lo[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
 
-layout(push_constant) uniform PushConstants {
-  uint width;
-  uint height;
-  uint capacity;
-} pc;
-
-void append(uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
-  uint pos = atomicAdd(counter, 1u);
-  if (pos >= pc.capacity) return;
-
-  compacted[pos] = PackQBPoint(px, py, gx, gy);
-  keys_hi[pos] = min(rep_a, rep_b);
-  keys_lo[pos] = max(rep_a, rep_b);
-}
-
-void main() {
-  uint iw = pc.width - 2u;
-  uint ih = pc.height - 2u;
-  uint ox = gl_GlobalInvocationID.x;
-  uint oy = gl_GlobalInvocationID.y;
-  if (ox >= iw || oy >= ih) return;
-
-  uint x = ox + 1u;
-  uint y = oy + 1u;
-
-  uint idx = x + y * pc.width;
-  uint v0 = uint(thresholded[idx]);
-  uint l0 = parent[idx];
-
-  // Ambiguous pixel, or a blob too small to matter: contributes nothing.
-  if (v0 == 127u || l0 == 0u) return;
-
-  // Neighbor samples. The dispatch covers interior pixels only
-  // (x in [1, width-1), y in [1, height-1)), so all five are in range.
-  uint idxE = idx + 1u;
-  uint idxSE = idx + pc.width + 1u;
-  uint idxS = idx + pc.width;
-  uint idxSW = idx + pc.width - 1u;
-  uint idxW = idx - 1u;
-
-  uint vE = uint(thresholded[idxE]);
-  uint vSE = uint(thresholded[idxSE]);
-  uint vS = uint(thresholded[idxS]);
-  uint vSW = uint(thresholded[idxSW]);
-  uint vW = uint(thresholded[idxW]);
-
-  uint lE = parent[idxE];
-  uint lSE = parent[idxSE];
-  uint lS = parent[idxS];
-  uint lSW = parent[idxSW];
-  uint lW = parent[idxW];
-
-  uint rep0 = l0 - 1u;
-
-  // Connections 0 (E), 1 (SE), 2 (S): emit a point if the two pixels straddle
-  // a black/white boundary.
-  if (v0 + vE == 255u && lE != 0u) {
-    append(rep0, lE - 1u, x * 2u + 1u, y * 2u, (vE > v0) ? 1 : -1, 0);
-  }
-  if (v0 + vSE == 255u && lSE != 0u) {
-    int g = (vSE > v0) ? 1 : -1;
-    append(rep0, lSE - 1u, x * 2u + 1u, y * 2u + 1u, g, g);
-  }
-  if (v0 + vS == 255u && lS != 0u) {
-    append(rep0, lS - 1u, x * 2u, y * 2u + 1u, 0, (vS > v0) ? 1 : -1);
-  }
-
-  // Dedup check: if the West and South neighbors are both unambiguous and
-  // differ from one another, the SW diagonal connection (3) would duplicate
-  // the topological edge already captured by the West pixel's own SE (=our
-  // South) diagonal connection, so skip emitting it.
-  bool sw_is_duplicate = vW != 127u && vS != 127u && vS != vW && x != 1u &&
-                         lW != 0u && lS != 0u;
-  if (sw_is_duplicate) return;
-
-  if (v0 + vSW == 255u && lSW != 0u) {
-    append(rep0, lSW - 1u, x * 2u - 1u, y * 2u + 1u, (vSW > v0) ? -1 : 1, (vSW > v0) ? 1 : -1);
-  }
-}
+#include "blob_diff_body.glsl"

@@ -179,6 +179,8 @@ Context::Context(const ContextOptions &options_in) {
     options.workgroup_size_override = static_cast<uint32_t>(env_int);
   }
   EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
+  if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
+  if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
   if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
     options.max_invocations_override = static_cast<uint32_t>(env_int);
   }
@@ -189,7 +191,7 @@ Context::Context(const ContextOptions &options_in) {
 
   CreateInstance(options);
   SelectPhysicalDevice(options);
-  CreateLogicalDevice();
+  CreateLogicalDevice(options);
   QueryCaps(options);
   pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
                                      options.verbose);
@@ -211,6 +213,8 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
         options.workgroup_size_override = static_cast<uint32_t>(env_int);
     }
     EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
+    if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
+    if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
     if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
         options.max_invocations_override = static_cast<uint32_t>(env_int);
     }
@@ -221,7 +225,7 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
 
     CreateInstance(options);
     SelectPhysicalDevice(deviceName, options);
-    CreateLogicalDevice();
+    CreateLogicalDevice(options);
     QueryCaps(options);
     pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
                                        options.verbose);
@@ -426,7 +430,7 @@ void Context::SelectPhysicalDevice(const std::string& deviceName, const ContextO
     }
 }
 
-void Context::CreateLogicalDevice() {
+void Context::CreateLogicalDevice(const ContextOptions &options) {
   uint32_t qf_count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qf_count, nullptr);
   std::vector<VkQueueFamilyProperties> qfs(qf_count);
@@ -460,7 +464,7 @@ void Context::CreateLogicalDevice() {
   // one uint32 per pixel) purely for the memory-traffic win on parts that
   // support it, selected at runtime via caps().has_8bit_storage - the
   // 32-bit variants remain the default/fallback path for everything else.
-  supports_8bit_storage_ = Supports8BitStorage(physical_device_);
+  supports_8bit_storage_ = !options.force_no_8bit_storage && Supports8BitStorage(physical_device_);
 
   VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
   storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
@@ -515,6 +519,37 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.type = props.deviceType;
   caps_.api_version = props.apiVersion;
   caps_.vendor_id = props.vendorID;
+  // Set by CreateLogicalDevice (the only place that can request+enable the
+  // extension), not re-queried here.
+  caps_.has_8bit_storage = supports_8bit_storage_;
+
+  // Subgroup properties: core Vulkan 1.1, via the VkPhysicalDeviceProperties2
+  // pNext chain (a separate query from the plain vkGetPhysicalDeviceProperties
+  // above, which has no room for extension structs).
+  {
+    VkPhysicalDeviceSubgroupProperties subgroup_props{};
+    subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &subgroup_props;
+    vkGetPhysicalDeviceProperties2(physical_device_, &props2);
+    const bool ballot_in_compute = (subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                                   (subgroup_props.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    const bool arithmetic_in_compute =
+        (subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup_props.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    const bool shuffle_in_compute =
+        (subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup_props.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    caps_.has_subgroup_ballot = ballot_in_compute;
+    caps_.has_subgroup_arithmetic = arithmetic_in_compute;
+    caps_.has_subgroup_shuffle = shuffle_in_compute;
+    if (options.force_no_subgroup) {
+      caps_.has_subgroup_ballot = false;
+      caps_.has_subgroup_arithmetic = false;
+      caps_.has_subgroup_shuffle = false;
+    }
+  }
 
   const VkPhysicalDeviceLimits &l = props.limits;
   caps_.max_workgroup_invocations = l.maxComputeWorkGroupInvocations;
@@ -873,7 +908,10 @@ std::string Context::DescribeDevice() const {
      << ", maxComputeWorkGroupSize.x=" << caps_.max_workgroup_size[0]
      << ", maxComputeSharedMemorySize=" << caps_.max_shared_memory_bytes
      << ", float64=" << (caps_.has_shader_float64 ? "yes" : "no")
-     << ", int64=" << (caps_.has_shader_int64 ? "yes" : "no");
+     << ", int64=" << (caps_.has_shader_int64 ? "yes" : "no")
+     << ", 8bit_storage=" << (caps_.has_8bit_storage ? "yes" : "no")
+     << ", subgroup_ballot=" << (caps_.has_subgroup_ballot ? "yes" : "no")
+     << ", subgroup_arithmetic=" << (caps_.has_subgroup_arithmetic ? "yes" : "no");
   os << "\n  chosen geometry: wg1d=" << caps_.wg1d << ", wg2d=" << caps_.wg2d_x << "x"
      << caps_.wg2d_y << ", scan_wg=" << caps_.scan_wg
      << ", unified_memory=" << (caps_.unified_memory ? "yes" : "no")

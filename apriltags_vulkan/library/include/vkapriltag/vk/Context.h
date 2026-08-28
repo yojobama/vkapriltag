@@ -28,6 +28,16 @@ struct ContextOptions {
   // Env override: APRILTAG_VK_ALLOW_CPU=1
   bool allow_cpu_device = false;
 
+  // Diagnostic aids: force DeviceCaps::has_8bit_storage / has_subgroup_* to
+  // false even when the device actually supports them, so the two feature
+  // axes can be isolated and A/B'd independently on hardware that supports
+  // both (bisecting a regression, or measuring one optimization's effect
+  // without the other's).
+  // Env override: APRILTAG_VK_FORCE_NO_8BIT=1
+  bool force_no_8bit_storage = false;
+  // Env override: APRILTAG_VK_FORCE_NO_SUBGROUP=1
+  bool force_no_subgroup = false;
+
   // -1 selects by score (discrete > integrated > virtual > cpu). Otherwise a
   // raw index into vkEnumeratePhysicalDevices order.
   // Env override: APRILTAG_VK_DEVICE=<n>
@@ -100,6 +110,27 @@ struct DeviceCaps {
   // GpuDetector::ShaderPath), with the plain 32-bit-per-pixel shaders as the
   // fallback on parts that lack it (the codebase's default assumption).
   bool has_8bit_storage = false;
+  // Subgroup capability, queried via VkPhysicalDeviceSubgroupProperties
+  // (core Vulkan 1.1, no extension/device-feature enablement needed - unlike
+  // 8-bit storage, subgroup operations are gated purely by what the SPIR-V
+  // is allowed to use, which the driver permits directly from these bits).
+  // GpuDetector picks subgroup-aggregated shader variants (uf_final,
+  // reduce_extents_hash, blob_diff's counter) when both are true; ballot
+  // alone (without arithmetic) still lets blob_diff's variant work, since
+  // it only needs ballot + broadcast + elect, but the codebase gates all
+  // three sites on the same combined flag for simplicity, since Vulkan 1.1
+  // guarantees ARITHMETIC and BALLOT are reported together far more often
+  // than apart in practice.
+  bool has_subgroup_ballot = false;
+  bool has_subgroup_arithmetic = false;
+  // Needed for a RUNTIME-variable lane index (subgroupShuffle) - the reduce-
+  // by-key loop in uf_final_subgroup.comp / reduce_extents_hash_subgroup.
+  // comp elects a leader lane computed at runtime (findLSB of a ballot), and
+  // subgroupBroadcast's id operand must be a compile-time constant (a real
+  // SPIR-V restriction, not a portability guess - OpGroupNonUniformBroadcast
+  // requires a constant id; only OpGroupNonUniformShuffle takes a dynamic
+  // one), so a fixed-lane broadcast cannot substitute here.
+  bool has_subgroup_shuffle = false;
 
   // --- Memory topology ---
   // True when device-local memory is also host-visible (integrated/unified
@@ -198,7 +229,7 @@ public:
   void CreateInstance(const ContextOptions &options);
   void SelectPhysicalDevice(const ContextOptions &options);
   void SelectPhysicalDevice(const std::string& deviceName, const ContextOptions& options);
-  void CreateLogicalDevice();
+  void CreateLogicalDevice(const ContextOptions &options);
   void QueryCaps(const ContextOptions &options);
   void CreateCommandResources();
 
