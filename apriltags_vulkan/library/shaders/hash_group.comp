@@ -19,12 +19,25 @@
 // already visible. No thread ever waits on another thread's later write, which
 // matters: Vulkan does not guarantee independent forward progress between
 // workgroups, so a spin here could deadlock on a conformant implementation.
+//
+// The thread whose atomicCompSwap actually wins a slot (prev == 0u) is the
+// UNIQUE claimant of that slot for the whole frame - no other thread can ever
+// win the same slot after it, and this thread runs this branch exactly once.
+// That makes it the natural place to assign the slot's dense (1-based) raw
+// blob id too, with one atomicAdd on a per-frame counter: mark_slots.comp
+// plus a full scan over the (much larger, mostly-empty) hash table used to
+// exist purely to recover this same "count the occupied slots, number them"
+// result from the outside, one pass later. Nothing downstream needs the
+// dense ids to be assigned in slot order - only that they're distinct and
+// 1-based - so this is a strict replacement, not an approximation.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer KeysHi { uint keys_hi[]; };
 layout(std430, binding = 1) readonly buffer KeysLo { uint keys_lo[]; };
 layout(std430, binding = 2) buffer HashOwner { uint hash_owner[]; };
 layout(std430, binding = 3) writeonly buffer PointSlot { uint point_slot[]; };
+layout(std430, binding = 4) writeonly buffer SlotDense { uint slot_dense[]; };
+layout(std430, binding = 5) buffer RawBlobCounter { uint raw_blob_counter; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -49,6 +62,12 @@ void main() {
     uint owner = hash_owner[h];
     if (owner == 0u) {
       uint prev = atomicCompSwap(hash_owner[h], 0u, i + 1u);
+      if (prev == 0u) {
+        // Won the slot: the unique claimant, now and for the rest of the
+        // frame. Number it.
+        uint dense = atomicAdd(raw_blob_counter, 1u);
+        slot_dense[h] = dense + 1u;
+      }
       owner = (prev == 0u) ? (i + 1u) : prev;
     }
     uint o = owner - 1u;

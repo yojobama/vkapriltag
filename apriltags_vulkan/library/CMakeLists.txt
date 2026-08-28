@@ -62,7 +62,6 @@ set(SHADER_SOURCES
   shaders/sort_points_local.comp
   shaders/compute_line_fit_points.comp
   shaders/hash_group.comp
-  shaders/mark_slots.comp
   shaders/reduce_extents_hash.comp
   shaders/scatter_index_points.comp
 )

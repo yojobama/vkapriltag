@@ -248,8 +248,8 @@ void GpuDetector::CreateBuffers() {
   slot_dense_buf_ = ssbo(VkDeviceSize(hash_table_size_) * 4);
   point_slot_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
   blob_cursor_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 4);
+  raw_blob_counter_buf_ = ssbo(4);
 
-  slot_scan_chain_ = BuildScanChain(hash_table_size_);
   blob_scan_chain_ = BuildScanChain(std::max(config_.max_blobs, 1u));
 
   // Readback staging starts at a size that covers the extents plus a healthy
@@ -371,10 +371,8 @@ void GpuDetector::CreatePipelines() {
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
       {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), hash_owner_buf_.get(),
-       point_slot_buf_.get()},
+       point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get()},
       12, wg1d_);
-  mark_slots_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("mark_slots"), {hash_owner_buf_.get(), slot_dense_buf_.get()}, 4, wg1d_);
   reduce_extents_hash_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("reduce_extents_hash"),
       {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(),
@@ -386,30 +384,6 @@ void GpuDetector::CreatePipelines() {
        selected_extents_buf_.get(), blob_point_offsets_buf_.get(), blob_cursor_buf_.get(),
        index_points_buf_.get(), index_points_counter_buf_.get()},
       12, wg1d_);
-
-  // Scan chain over the hash table.
-  {
-    const vk::WorkgroupSize scan_wg{scan_wg_, 1, 1};
-    VkBuffer prev_values = slot_dense_buf_.get();
-    VkBuffer prev_output = slot_dense_buf_.get();
-    for (size_t i = 0; i < slot_scan_chain_.level_buffers.size(); ++i) {
-      VkBuffer block_sums = slot_scan_chain_.level_buffers[i].get();
-      slot_scan_block_pls_.push_back(vk::ComputePipeline(
-          ctx_, ShaderPath("scan_block"), {prev_values, prev_output, block_sums}, 4, scan_wg));
-      prev_values = block_sums;
-      prev_output = block_sums;
-    }
-    slot_scan_block_pls_.push_back(vk::ComputePipeline(
-        ctx_, ShaderPath("scan_block"), {prev_values, prev_output, prev_output}, 4, scan_wg));
-
-    std::vector<VkBuffer> level_values = {slot_dense_buf_.get()};
-    for (auto &buf : slot_scan_chain_.level_buffers) level_values.push_back(buf.get());
-    for (size_t i = 0; i + 1 < level_values.size(); ++i) {
-      slot_scan_add_offsets_pls_.push_back(vk::ComputePipeline(
-          ctx_, ShaderPath("scan_add_offsets"), {level_values[i], level_values[i + 1]}, 4,
-          scan_wg));
-    }
-  }
 
   compute_line_fit_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("compute_line_fit_points"),
@@ -505,6 +479,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
   blob_cursor_buf_.FillZero(cmd);
+  raw_blob_counter_buf_.FillZero(cmd);
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
@@ -627,13 +602,6 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     hash_group_pl_.Dispatch1D(cmd, qbp_count, &hash_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
-    struct { uint32_t table_size; } slots_pc{hash_table_size_};
-    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanMarkScan));
-    mark_slots_pl_.Dispatch1D(cmd, hash_table_size_, &slots_pc);
-    RunInclusiveScan(cmd, hash_table_size_, slot_scan_chain_, slot_scan_block_pls_,
-                     slot_scan_add_offsets_pls_);
-    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanMarkScan));
-
     // init_extents and select_blobs are dispatched over max_raw_blobs rather
     // than the frame's actual raw blob count, which only exists on the device
     // at this point. That is about 6 MB of wasted traffic, worth 0.25 ms here.
@@ -675,11 +643,11 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                                         BarrierKind::ComputeAndTransfer);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
 
-    // The slot scan's last element is the number of distinct (rep0, rep1)
-    // pairs this frame - i.e. the raw blob count. Profiling only.
-    slot_dense_buf_.RecordCopyTo(cmd, counter_staging_, 4,
-                                 VkDeviceSize(hash_table_size_ - 1) * 4,
-                                 VkDeviceSize(kSlotRawBlobs) * 4);
+    // raw_blob_counter_buf_ is now the number of distinct (rep0, rep1) pairs
+    // this frame - assigned directly by hash_group.comp's winning CAS thread
+    // (see its comment), so this is the frame's raw blob count with no scan
+    // needed. Profiling only.
+    RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
   }
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
   RecordCounterCopy(cmd, index_points_counter_buf_, kSlotPointCount);

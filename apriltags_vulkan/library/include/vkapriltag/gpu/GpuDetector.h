@@ -180,19 +180,18 @@ class GpuDetector {
     // APRILTAG_VK_TIMESTAMPS=1 - and costs nothing when timestamps aren't
     // supported or the pool wasn't constructed.
     bool has_gpu_stage_breakdown = false;
-    std::array<double, 12> gpu_stage_ms = {};
+    std::array<double, 11> gpu_stage_ms = {};
   };
 
   // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
   // vkCmdWriteTimestamp pair (start, end) recorded around the named group of
   // dispatches - see the kSpan* constants and their use in Detect().
-  static constexpr std::array<const char *, 12> kGpuStageNames = {
+  static constexpr std::array<const char *, 11> kGpuStageNames = {
       "threshold",       // decimate + block_minmax + block_filter + threshold
       "labelling",       // uf_init + uf_compress + the uf_merge/uf_compress loop
       "label_finalize",  // uf_final + label_pixels
       "boundary",        // blob_diff (append + compaction)
-      "hash_group",      // hash_group.comp
-      "mark_scan",       // mark_slots.comp + its scan chain
+      "hash_group",      // hash_group.comp (also assigns dense raw blob ids)
       "extents",         // init_extents.comp + reduce_extents_hash.comp
       "select",          // select_blobs.comp
       "blob_scan",       // extract_blob_counts.comp + its scan chain
@@ -288,10 +287,14 @@ class GpuDetector {
   // --- Hash grouping (replaces the global (rep0, rep1) sort) ---
   // hash_owner_buf_[slot] is 0 when free, else 1 + the index of the boundary
   // point that claimed the slot. point_slot_buf_[i] is point i's slot.
-  // slot_dense_buf_ is mark_slots.comp's 0/1 flags, scanned in place into a
-  // 1-based raw blob id. blob_cursor_buf_ is one output cursor per selected
-  // blob for scatter_index_points.comp.
+  // slot_dense_buf_[slot] is a 1-based raw blob id, assigned directly by
+  // hash_group.comp's winning atomicCompSwap thread (see its comment) - no
+  // separate mark+scan pass. raw_blob_counter_buf_ is that assignment's
+  // shared atomic counter; its value after hash_group.comp runs is the
+  // frame's raw blob count. blob_cursor_buf_ is one output cursor per
+  // selected blob for scatter_index_points.comp.
   vk::Buffer hash_owner_buf_, point_slot_buf_, slot_dense_buf_, blob_cursor_buf_;
+  vk::Buffer raw_blob_counter_buf_;
   uint32_t hash_table_size_ = 0;
 
   // --- Host-visible staging, allocated once and permanently mapped ---
@@ -303,9 +306,9 @@ class GpuDetector {
   VkDeviceSize readback_capacity_ = 0;
   bool gray_direct_write_ = false;
 
-  // Scan chains for the root-dense-id assignment (sized to `pixels`) and the
-  // per-blob point-offset assignment (sized to config_.max_blobs).
-  ScanChain slot_scan_chain_;
+  // Scan chain for the per-blob point-offset assignment (sized to
+  // config_.max_blobs). The hash table's raw-blob numbering no longer needs
+  // one - see raw_blob_counter_buf_.
   ScanChain blob_scan_chain_;
   // Largest point count sort_points_local.comp can sort in shared memory for
   // one blob (a power of two, derived from device limits at construction).
@@ -331,10 +334,7 @@ class GpuDetector {
   vk::ComputePipeline select_blobs_pl_;
 
   vk::ComputePipeline compute_line_fit_points_pl_;
-  vk::ComputePipeline hash_group_pl_, mark_slots_pl_, reduce_extents_hash_pl_,
-      scatter_index_points_pl_;
-  std::vector<vk::ComputePipeline> slot_scan_block_pls_;
-  std::vector<vk::ComputePipeline> slot_scan_add_offsets_pls_;
+  vk::ComputePipeline hash_group_pl_, reduce_extents_hash_pl_, scatter_index_points_pl_;
 
 
   // Per-blob point base-offset assignment (extract_blob_counts.comp + an
@@ -366,7 +366,6 @@ class GpuDetector {
     kSpanLabelFinalize,
     kSpanBoundary,
     kSpanHashGroup,
-    kSpanMarkScan,
     kSpanExtents,
     kSpanSelect,
     kSpanBlobScan,
