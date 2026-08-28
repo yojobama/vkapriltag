@@ -1,0 +1,38 @@
+#version 450
+// Identical to decimate.comp except DecimatedImage is uint8_t per pixel
+// instead of uint - selected at runtime (GpuDetector::ShaderPath) on devices
+// that report storageBuffer8BitAccess, quartering decimated_buf_'s size and
+// every shader's traffic through it (decimate's own write, block_minmax's
+// read, and sort_points_local.comp's gradient sample). See common.glsl's
+// note on why the codebase defaults to the 32-bit path otherwise: no
+// optional device feature may be assumed.
+//
+// GrayImage stays packed uint32 regardless - it is the upload buffer, sized
+// once per frame from the host, and unrelated to this device feature.
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };
+layout(std430, binding = 1) writeonly buffer DecimatedImage { uint8_t decimated[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+} pc;
+
+void main() {
+  uint decimated_width = pc.width / 2u;
+  uint decimated_height = pc.height / 2u;
+  uint dx = gl_GlobalInvocationID.x;
+  uint dy = gl_GlobalInvocationID.y;
+  if (dx >= decimated_width || dy >= decimated_height) return;
+
+  uint sx = dx * 2u;
+  uint sy = dy * 2u;
+
+  uint linear = sy * pc.width + sx;
+  uint word = gray_packed[linear >> 2u];
+  decimated[dy * decimated_width + dx] = uint8_t((word >> ((linear & 3u) * 8u)) & 0xFFu);
+}

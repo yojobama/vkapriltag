@@ -1,0 +1,50 @@
+#version 450
+// Identical to block_minmax.comp except DecimatedImage is uint8_t per pixel
+// instead of uint - see decimate_u8.comp's comment. UnfilteredMinMax stays a
+// packed uint (min | max<<8): it is a 4x-smaller array than the per-pixel
+// image already (one entry per 4x4 block), so packing it further isn't
+// where the traffic is.
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer DecimatedImage { uint8_t decimated[]; };
+layout(std430, binding = 1) writeonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint decimated_width;
+  uint decimated_height;
+  uint block_width;
+  uint block_height;
+} pc;
+
+// decimated_width_/height_ need not be a multiple of 4 (only the original
+// image's width/height are guaranteed even), so the last block column/row
+// can be ragged. Edge-clamp rather than bounds-check-and-skip: a 4x4 min/max
+// window that runs past the real image just repeats the edge pixel, which is
+// a standard, harmless way to extend a min/max filter past the image border.
+uint sampleAt(uint x, uint y) {
+  x = min(x, pc.decimated_width - 1u);
+  y = min(y, pc.decimated_height - 1u);
+  return uint(decimated[y * pc.decimated_width + x]);
+}
+
+void main() {
+  uint bw = pc.block_width;
+  uint bh = pc.block_height;
+  uint bx = gl_GlobalInvocationID.x;
+  uint by = gl_GlobalInvocationID.y;
+  if (bx >= bw || by >= bh) return;
+
+  uint mn = 255u;
+  uint mx = 0u;
+  for (uint j = 0; j < 4u; ++j) {
+    for (uint i = 0; i < 4u; ++i) {
+      uint v = sampleAt(bx * 4u + i, by * 4u + j);
+      mn = min(mn, v);
+      mx = max(mx, v);
+    }
+  }
+  minmax_unfiltered[by * bw + bx] = mn | (mx << 8u);
+}

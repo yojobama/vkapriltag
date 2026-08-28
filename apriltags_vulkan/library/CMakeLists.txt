@@ -45,21 +45,28 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
 
 set(SHADER_SOURCES
   shaders/decimate.comp
+  shaders/decimate_u8.comp
   shaders/block_minmax.comp
+  shaders/block_minmax_u8.comp
   shaders/block_filter.comp
   shaders/threshold.comp
+  shaders/threshold_u8.comp
   shaders/uf_init.comp
+  shaders/uf_init_u8.comp
   shaders/uf_merge.comp
+  shaders/uf_merge_u8.comp
   shaders/uf_compress.comp
   shaders/uf_final.comp
   shaders/label_pixels.comp
   shaders/blob_diff.comp
+  shaders/blob_diff_u8.comp
   shaders/scan_block.comp
   shaders/scan_add_offsets.comp
   shaders/init_extents.comp
   shaders/select_blobs.comp
   shaders/extract_blob_counts.comp
   shaders/sort_points_local.comp
+  shaders/sort_points_local_u8.comp
   shaders/hash_group.comp
   shaders/build_indirect_args.comp
   shaders/reduce_extents_hash.comp

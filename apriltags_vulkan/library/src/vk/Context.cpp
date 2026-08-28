@@ -48,6 +48,43 @@ const char *DeviceTypeName(VkPhysicalDeviceType t) {
   }
 }
 
+// True when `physical_device` lists `extension_name` among its supported
+// device extensions. Vulkan device extensions must be explicitly requested
+// at vkCreateDevice time even when the underlying driver's apiVersion is new
+// enough that the extension's functionality was later folded into core -
+// this project targets Vulkan 1.1 (VK_API_VERSION_1_1, see CreateInstance),
+// so VK_KHR_8bit_storage (core as of 1.2) still needs to be named here.
+bool DeviceHasExtension(VkPhysicalDevice physical_device, const char *extension_name) {
+  uint32_t count = 0;
+  vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &count, nullptr);
+  std::vector<VkExtensionProperties> extensions(count);
+  vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &count, extensions.data());
+  for (const auto &ext : extensions) {
+    if (std::strcmp(ext.extensionName, extension_name) == 0) return true;
+  }
+  return false;
+}
+
+// Queries whether the device both exposes VK_KHR_8bit_storage (or its
+// Vulkan 1.2 core promotion) and actually supports storageBuffer8BitAccess -
+// the specific sub-feature GpuDetector's 8-bit shader variants need (byte
+// buffer element access; storageBuffer16BitAccess-style structure packing
+// is not what this project uses 8-bit storage for). Callable before device
+// creation: feature queries only need the physical device.
+bool Supports8BitStorage(VkPhysicalDevice physical_device) {
+  if (!DeviceHasExtension(physical_device, "VK_KHR_8bit_storage")) return false;
+
+  VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
+  storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
+
+  VkPhysicalDeviceFeatures2 features2{};
+  features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  features2.pNext = &storage8bit;
+
+  vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+  return storage8bit.storageBuffer8BitAccess == VK_TRUE;
+}
+
 bool EnvFlag(const char *name) {
   const char *v = std::getenv(name);
   return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -415,16 +452,53 @@ void Context::CreateLogicalDevice() {
   queue_info.queueCount = 1;
   queue_info.pQueuePriorities = &priority;
 
-  // Deliberately enable *no* optional features: every shader here is written
-  // against core Vulkan 1.1 compute so that Mali/Adreno parts lacking
-  // shaderFloat64 / shaderInt64 / 8-bit storage still work.
-  VkPhysicalDeviceFeatures enabled_features{};
+  // Every shader in the base corpus is written against core Vulkan 1.1
+  // compute so that Mali/Adreno parts lacking shaderFloat64 / shaderInt64 /
+  // 8-bit storage still work - none of those are requested here. 8-bit
+  // storage is the one exception: GpuDetector has a parallel set of shader
+  // variants that use it (uint8_t decimated_buf_/thresholded_buf_ instead of
+  // one uint32 per pixel) purely for the memory-traffic win on parts that
+  // support it, selected at runtime via caps().has_8bit_storage - the
+  // 32-bit variants remain the default/fallback path for everything else.
+  supports_8bit_storage_ = Supports8BitStorage(physical_device_);
+
+  VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
+  storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
+  storage8bit.storageBuffer8BitAccess = VK_TRUE;
+
+  VkPhysicalDeviceFeatures2 features2{};
+  features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  // features2.features is left zeroed: this is still "enable no *core*
+  // optional features", just routed through the pNext chain instead of
+  // VkDeviceCreateInfo::pEnabledFeatures, which the spec requires to be
+  // NULL whenever a VkPhysicalDeviceFeatures2 is chained in.
+  if (supports_8bit_storage_) {
+    features2.pNext = &storage8bit;
+  }
+
+  std::vector<const char *> enabled_extensions;
+  if (supports_8bit_storage_) {
+    enabled_extensions.push_back("VK_KHR_8bit_storage");
+    // VK_KHR_8bit_storage depends on VK_KHR_storage_buffer_storage_class,
+    // which every Vulkan 1.1+ implementation supports (folded into 1.1
+    // core) but which still needs to be *named* as a device extension pre-
+    // 1.2, exactly like 8bit_storage itself - both were core-promoted at
+    // the same 1.2 boundary this project's VK_API_VERSION_1_1 instance sits
+    // before.
+    if (DeviceHasExtension(physical_device_, "VK_KHR_storage_buffer_storage_class")) {
+      enabled_extensions.push_back("VK_KHR_storage_buffer_storage_class");
+    }
+  }
 
   VkDeviceCreateInfo device_info{};
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  device_info.pNext = &features2;
   device_info.queueCreateInfoCount = 1;
   device_info.pQueueCreateInfos = &queue_info;
-  device_info.pEnabledFeatures = &enabled_features;
+  device_info.pEnabledFeatures = nullptr;
+  device_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
+  device_info.ppEnabledExtensionNames =
+      enabled_extensions.empty() ? nullptr : enabled_extensions.data();
 
   CheckVk(vkCreateDevice(physical_device_, &device_info, nullptr, &device_), "vkCreateDevice");
   vkGetDeviceQueue(device_, queue_family_, 0, &queue_);

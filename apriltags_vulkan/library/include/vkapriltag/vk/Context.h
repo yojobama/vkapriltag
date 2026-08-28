@@ -92,6 +92,14 @@ struct DeviceCaps {
   // shader here is written to need neither. Reported for diagnostics only.
   bool has_shader_float64 = false;
   bool has_shader_int64 = false;
+  // True when VK_KHR_8bit_storage (or its Vulkan 1.2 core promotion) is
+  // present AND storageBuffer8BitAccess is actually supported, in which case
+  // Context has already requested and enabled it at device creation. Unlike
+  // the two above, this one IS used - GpuDetector picks 8-bit-storage shader
+  // variants for decimated_buf_/thresholded_buf_ when this is true (see
+  // GpuDetector::ShaderPath), with the plain 32-bit-per-pixel shaders as the
+  // fallback on parts that lack it (the codebase's default assumption).
+  bool has_8bit_storage = false;
 
   // --- Memory topology ---
   // True when device-local memory is also host-visible (integrated/unified
@@ -205,6 +213,10 @@ public:
 
   VkPhysicalDeviceMemoryProperties mem_props_{};
   DeviceCaps caps_;
+  // Set by CreateLogicalDevice (which runs before QueryCaps and is the only
+  // place that can actually request+enable the extension), read by
+  // QueryCaps to populate caps_.has_8bit_storage.
+  bool supports_8bit_storage_ = false;
   PipelineCache pipeline_cache_;
 
   // Reusable command buffers plus the fence tracking each one's submission.

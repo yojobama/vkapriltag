@@ -222,10 +222,19 @@ void GpuDetector::CreateBuffers() {
   counter_staging_ = vk::Buffer(ctx_, kCounterStagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 vk::MemoryKind::HostVisibleCached);
 
-  decimated_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
+  // 1 byte/pixel on devices with storageBuffer8BitAccess (see
+  // decimate_u8.comp's comment), else the 4-byte-per-pixel fallback layout
+  // every shader in the base corpus assumes. Shared by decimated_buf_ and
+  // thresholded_buf_: threshold.comp/threshold_u8.comp reads the former and
+  // writes the latter in the same dispatch, so the two switch together, not
+  // independently.
+  const VkDeviceSize decimated_bytes_per_pixel = ctx_.caps().has_8bit_storage ? 1 : 4;
+  decimated_buf_ =
+      ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
   minmax_unfiltered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   minmax_filtered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
-  thresholded_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
+  thresholded_buf_ =
+      ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
 
   parent_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   blob_size_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
@@ -319,25 +328,38 @@ GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
 }
 
 void GpuDetector::CreatePipelines() {
+  // Picks the "_u8" shader variant when the device supports
+  // storageBuffer8BitAccess, else the 32-bit-per-pixel fallback every other
+  // device uses - see decimate_u8.comp's comment. Covers every consumer of
+  // decimated_buf_ (decimate/block_minmax/sort_points_local) and
+  // thresholded_buf_ (threshold/uf_init/uf_merge/blob_diff) - the two
+  // switch together (threshold(_u8).comp reads the former and writes the
+  // latter in one dispatch, so they can't vary independently).
+  const bool u8 = ctx_.caps().has_8bit_storage;
+  auto pick = [u8](const char *base_name, const char *u8_name) {
+    return u8 ? u8_name : base_name;
+  };
+
   // 2D so the shader recovers its (x, y) from gl_GlobalInvocationID.xy rather
   // than a runtime `%`/`/` by a push-constant width - see each shader's own
   // comment. Mali (Valhall) has no integer divide instruction.
-  decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath("decimate"),
+  decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick("decimate", "decimate_u8")),
                                      {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_);
   block_minmax_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("block_minmax"), {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16,
-      wg2d_);
+      ctx_, ShaderPath(pick("block_minmax", "block_minmax_u8")),
+      {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_);
   block_filter_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
       8, wg2d_);
   threshold_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("threshold"),
+      ctx_, ShaderPath(pick("threshold", "threshold_u8")),
       {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_);
 
   uf_init_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("uf_init"), {parent_buf_.get(), thresholded_buf_.get()}, 8, wg2d_);
+      ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
+      8, wg2d_);
   uf_merge_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("uf_merge"),
+      ctx_, ShaderPath(pick("uf_merge", "uf_merge_u8")),
       {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8, wg1d_);
   uf_compress_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("uf_compress"), {parent_buf_.get()}, 8, wg1d_);
@@ -345,7 +367,7 @@ void GpuDetector::CreatePipelines() {
                                      {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
 
   blob_diff_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("blob_diff"),
+      ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
       {thresholded_buf_.get(), parent_buf_.get(), qbp_compacted_buf_.get(),
        qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get()},
       12, wg2d_);
@@ -395,7 +417,7 @@ void GpuDetector::CreatePipelines() {
   }
 
   sort_points_local_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("sort_points_local"),
+      ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
        decimated_buf_.get(), line_fit_points_buf_.get()},
       12, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
