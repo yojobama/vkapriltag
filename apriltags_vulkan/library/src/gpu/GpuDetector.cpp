@@ -269,6 +269,17 @@ void GpuDetector::CreateBuffers() {
   raw_blob_counter_buf_ = ssbo(4);
   hash_drop_counter_buf_ = ssbo(4);
 
+  // VkDispatchIndirectCommand (groupCountX/Y/Z), built on-device from
+  // raw_blob_counter_buf_ by build_indirect_args_pl_ so init_extents_pl_ /
+  // select_blobs_pl_ dispatch over the frame's actual raw blob count instead
+  // of the worst-case max_raw_blobs - see build_indirect_args.comp.
+  {
+    vk::Buffer b(ctx_, 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                vk::MemoryKind::DeviceLocal);
+    device_bytes_ += b.size();
+    indirect_args_buf_ = std::move(b);
+  }
+
   blob_scan_chain_ = BuildScanChain(std::max(config_.max_blobs, 1u));
 
   // Readback staging starts at a size that covers the extents plus a healthy
@@ -395,6 +406,10 @@ void GpuDetector::CreatePipelines() {
        point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
        hash_drop_counter_buf_.get()},
       12, wg1d_);
+  build_indirect_args_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("build_indirect_args"),
+      {raw_blob_counter_buf_.get(), indirect_args_buf_.get()}, 4,
+      vk::WorkgroupSize{1, 1, 1});
   reduce_extents_hash_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("reduce_extents_hash"),
       {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(),
@@ -618,15 +633,22 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     hash_group_pl_.Dispatch1D(cmd, qbp_count, &hash_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
-    // init_extents and select_blobs are dispatched over max_raw_blobs rather
-    // than the frame's actual raw blob count, which only exists on the device
-    // at this point. That is about 6 MB of wasted traffic, worth 0.25 ms here.
-    // Buying the exact count with an extra submit + fence was measured to be a
-    // wash (the round trip costs what the traffic does), so the right fix is
-    // vkCmdDispatchIndirect - see OPTIMIZATION_NOTES.md.
+    // init_extents and select_blobs used to be dispatched over max_raw_blobs
+    // rather than the frame's actual raw blob count, which only exists on
+    // the device at this point - about 6 MB of wasted traffic. Building the
+    // dispatch arguments on the device (from raw_blob_counter_buf_, which
+    // hash_group_pl_'s default Compute-kind barrier already made visible)
+    // avoids the host round-trip that made buying the exact count a wash
+    // before. Both consumers still bounds-check every invocation against
+    // max_raw_blobs (unchanged, passed as before), so a rounded-up overshoot
+    // from build_indirect_args.comp's ceiling division is harmless.
+    struct { uint32_t workgroup_size; } build_indirect_pc{wg1d_.x};
+    build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
+    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+
     struct { uint32_t capacity; } extentscap_pc{config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
-    init_extents_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &extentscap_pc);
+    init_extents_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &extentscap_pc);
 
     struct { uint32_t count, max_raw_blobs; } reduce_pc{qbp_count, config_.max_raw_blobs};
     reduce_extents_hash_pl_.Dispatch1D(cmd, qbp_count, &reduce_pc);
@@ -642,7 +664,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                 config_.aspect_max,         config_.fill_min,
                 config_.fill_max};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
-    select_blobs_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &select_pc);
+    select_blobs_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &select_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
     struct { uint32_t capacity; } extract_pc{config_.max_blobs};

@@ -307,6 +307,11 @@ class GpuDetector {
   vk::Buffer hash_drop_counter_buf_;
   uint32_t hash_table_size_ = 0;
 
+  // VkDispatchIndirectCommand built on-device from raw_blob_counter_buf_ by
+  // build_indirect_args_pl_, so init_extents_pl_ / select_blobs_pl_ dispatch
+  // over the frame's actual raw blob count instead of max_raw_blobs.
+  vk::Buffer indirect_args_buf_;
+
   // --- Host-visible staging, allocated once and permanently mapped ---
   // upload_staging_ is unused on unified-memory devices, where gray_buf_ is
   // itself host-visible and written directly.
@@ -342,6 +347,9 @@ class GpuDetector {
   vk::ComputePipeline init_extents_pl_;
   vk::ComputePipeline label_pixels_pl_;
   vk::ComputePipeline select_blobs_pl_;
+  // Builds indirect_args_buf_ from raw_blob_counter_buf_ - see that buffer's
+  // comment.
+  vk::ComputePipeline build_indirect_args_pl_;
 
   vk::ComputePipeline hash_group_pl_, reduce_extents_hash_pl_, scatter_index_points_pl_;
 

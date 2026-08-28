@@ -206,6 +206,22 @@ void ComputePipeline::DispatchRaw(VkCommandBuffer cmd, uint32_t gx, uint32_t gy,
   Barrier(cmd, barrier);
 }
 
+void ComputePipeline::DispatchIndirect(VkCommandBuffer cmd, VkBuffer indirect_buffer,
+                                       VkDeviceSize offset, const void *push_constants,
+                                       BarrierKind barrier) const {
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+  if (descriptor_set_ != VK_NULL_HANDLE) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1,
+                           &descriptor_set_, 0, nullptr);
+  }
+  if (push_constant_bytes_ > 0) {
+    vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       push_constant_bytes_, push_constants);
+  }
+  vkCmdDispatchIndirect(cmd, indirect_buffer, offset);
+  Barrier(cmd, barrier);
+}
+
 void ComputePipeline::Dispatch1D(VkCommandBuffer cmd, uint32_t elements,
                                  const void *push_constants, BarrierKind barrier) const {
   if (elements == 0) return;
@@ -248,6 +264,16 @@ void ComputePipeline::HostReadBarrier(VkCommandBuffer cmd) {
   barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
                        &barrier, 0, nullptr, 0, nullptr);
+}
+
+void ComputePipeline::IndirectDispatchBarrier(VkCommandBuffer cmd) {
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &barrier, 0, nullptr, 0,
+                       nullptr);
 }
 
 }  // namespace apriltag_vulkan::vk
