@@ -41,7 +41,7 @@ layout(std430, binding = 0) readonly buffer Thresholded { uint thresholded[]; };
 // Repurposed by label_pixels.comp: 0 (no usable blob) or 1 + root index. See
 // that shader's comment - this used to be a separate PixelLabel buffer.
 layout(std430, binding = 1) readonly buffer Parent { uint parent[]; };
-layout(std430, binding = 2) writeonly buffer Compacted { QBPoint compacted[]; };
+layout(std430, binding = 2) writeonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 3) buffer Counter { uint counter; };
 layout(std430, binding = 4) writeonly buffer KeysHi { uint keys_hi[]; };
 layout(std430, binding = 5) writeonly buffer KeysLo { uint keys_lo[]; };
@@ -56,27 +56,19 @@ layout(push_constant) uniform PushConstants {
 //
 // rep_a/rep_b are raw union-find roots (decimated pixel indices). They are no
 // longer translated to dense ids: the grouping is a hash table now, so the key
-// only has to be distinct per blob, not narrow.
+// only has to be distinct per blob, not narrow. They are also no longer part
+// of QBPoint itself (see common.glsl) - nothing downstream ever read them out
+// of the compacted point, only out of these key arrays.
 void append(uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
   uint pos = atomicAdd(counter, 1u);
   if (pos >= pc.capacity) return;
 
-  QBPoint p;
-  p.rep0 = min(rep_a, rep_b);
-  p.rep1 = max(rep_a, rep_b);
-  p.x = px;
-  p.y = py;
-  p.gx = gx;
-  p.gy = gy;
-  p.valid = 1u;
-  p.pad0 = 0u;
-  compacted[pos] = p;
+  compacted[pos] = PackQBPoint(px, py, gx, gy);
 
-  // The key is re-read by hash_group.comp when it compares a probed slot's
-  // claimant against this point, which is why it lives in its own tight
-  // arrays rather than being read out of the 32-byte QBPoint.
-  keys_hi[pos] = p.rep0;
-  keys_lo[pos] = p.rep1;
+  // Re-read by hash_group.comp when it compares a probed slot's claimant
+  // against this point.
+  keys_hi[pos] = min(rep_a, rep_b);
+  keys_lo[pos] = max(rep_a, rep_b);
 }
 
 void main() {

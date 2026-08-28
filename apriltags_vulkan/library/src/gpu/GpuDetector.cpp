@@ -67,6 +67,13 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   if (config_.width % 2 != 0 || config_.height % 2 != 0) {
     throw std::runtime_error("width and height must both be even");
   }
+  // QBPoint/IPoint pack the un-decimated pixel coordinate into 14 bits per
+  // axis (see common.glsl's PackXY) - two orders of magnitude past any
+  // realistic sensor, but a hard requirement for the packed coordinate to be
+  // lossless.
+  if (config_.width > 16383 || config_.height > 16383) {
+    throw std::runtime_error("width and height must each be <= 16383");
+  }
 
   // --- Environment overrides. These must all be applied before any capacity
   // or launch geometry is derived from the config. ---
@@ -220,7 +227,9 @@ void GpuDetector::CreateBuffers() {
   blob_size_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   uf_changed_buf_ = ssbo(4);
 
-  qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(QBPoint));
+  // QBPoint is packed into one uint32 on the GPU side (see common.glsl); no
+  // C++ mirror struct exists since nothing on the host ever reads one back.
+  qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(uint32_t));
   qbp_counter_buf_ = ssbo(4);
   // Only the grouping hash reads these now, so they are sized to the actual
   // point capacity rather than the power of two a bitonic network needed.
@@ -386,7 +395,7 @@ void GpuDetector::CreatePipelines() {
   reduce_extents_hash_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("reduce_extents_hash"),
       {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(),
-       hash_owner_buf_.get(), extents_buf_.get()},
+       extents_buf_.get()},
       8, wg1d_);
   scatter_index_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("scatter_index_points"),

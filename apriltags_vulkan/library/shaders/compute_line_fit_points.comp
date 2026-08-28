@@ -26,8 +26,8 @@ void main() {
 
   IPoint p = points[gid];
 
-  int ix2 = int(p.x) + 1;
-  int iy2 = int(p.y) + 1;
+  int ix2 = int(UnpackX(p.xy)) + 1;
+  int iy2 = int(UnpackY(p.xy)) + 1;
   int ix = ix2 / 2;
   int iy = iy2 / 2;
 

@@ -21,13 +21,9 @@ void main() {
   e.min_y = 2147483647;
   e.max_x = -2147483647;
   e.max_y = -2147483647;
-  e.starting_offset = 0u;
   e.count = 0u;
   e.gx_sum = 0;
   e.gy_sum = 0;
   e.pxgx_plus_pygy_sum = 0;
-  e.rep0 = 0u;
-  e.rep1 = 0u;
-  e.pad0 = 0u;
   extents[i] = e;
 }

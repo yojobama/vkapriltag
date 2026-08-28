@@ -23,7 +23,7 @@
 
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer Compacted { QBPoint compacted[]; };
+layout(std430, binding = 0) readonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
 layout(std430, binding = 3) readonly buffer Remap { uint remap[]; };
@@ -52,8 +52,7 @@ void main() {
   uint sel = remap[bi];
   if (sel == 0xFFFFFFFFu) return;
 
-  QBPoint p = compacted[i];
-  if (p.valid == 0u) return;
+  QBPoint p = UnpackQBPoint(compacted[i]);
 
   MinMaxExtentsGpu e = selected[sel];
   float cx = (float(e.min_x) + float(e.max_x)) * 0.5 + 0.05118;
@@ -70,12 +69,7 @@ void main() {
 
   IPoint out_pt;
   out_pt.blob_index = sel;
-  out_pt.x = p.x;
-  out_pt.y = p.y;
-  out_pt.gx = p.gx;
-  out_pt.gy = p.gy;
+  out_pt.xy = PackXY(p.x, p.y);
   out_pt.theta_key = theta_key;
-  out_pt.pad0 = 0u;
-  out_pt.pad1 = 0u;
   output_points[pos] = out_pt;
 }
