@@ -210,6 +210,9 @@ int main(int argc, char **argv) {
           << " ms)" << std::endl;
       std::cout << "  work: boundary_points=" << profile.boundary_points
           << ", raw_blobs=" << profile.raw_blobs
+          << (profile.hash_probe_drops > 0
+                  ? (" (" + std::to_string(profile.hash_probe_drops) + " HASH DROPS)")
+                  : std::string())
           << ", uf_iterations=" << profile.uf_iterations
           << (profile.uf_converged ? "" : " (HIT LIMIT)")
           << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs

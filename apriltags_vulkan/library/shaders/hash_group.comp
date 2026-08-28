@@ -38,6 +38,7 @@ layout(std430, binding = 2) buffer HashOwner { uint hash_owner[]; };
 layout(std430, binding = 3) writeonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 4) writeonly buffer SlotDense { uint slot_dense[]; };
 layout(std430, binding = 5) buffer RawBlobCounter { uint raw_blob_counter; };
+layout(std430, binding = 6) buffer DropCounter { uint drop_counter; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -77,8 +78,11 @@ void main() {
     }
     h = (h + 1u) & pc.table_mask;
   }
-  // Table effectively full along this probe chain. Dropping the point is the
-  // same defensive behaviour the capacity clamps elsewhere use; at the sizing
-  // below (table = 4x max_raw_blobs) it cannot happen for a real frame.
+  // Table effectively full along this probe chain (or genuinely full, if
+  // this frame's distinct-pair count approaches max_raw_blobs). Dropping the
+  // point is the same defensive behaviour the capacity clamps elsewhere use.
+  // Counted rather than silent, so a table sized too tightly for some future
+  // scene shows up in profiling instead of quietly losing points.
+  atomicAdd(drop_counter, 1u);
   point_slot[i] = 0xFFFFFFFFu;
 }

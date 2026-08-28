@@ -57,6 +57,7 @@ constexpr uint32_t kSlotQbpCount = 1;
 constexpr uint32_t kSlotSelectedCount = 2;
 constexpr uint32_t kSlotPointCount = 3;
 constexpr uint32_t kSlotRawBlobs = 4;
+constexpr uint32_t kSlotHashDrops = 5;
 constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 }  // namespace
@@ -239,16 +240,24 @@ void GpuDetector::CreateBuffers() {
 
   line_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
 
-  // Open-addressing table for the (rep0, rep1) grouping. 4x max_raw_blobs
-  // keeps the load factor at or below 25%, where linear probing averages well
-  // under two probes; the table is only ever as full as the frame's distinct
-  // blob-pair count.
-  hash_table_size_ = NextPow2(std::max(config_.max_raw_blobs, 1u) * 4u);
+  // Open-addressing table for the (rep0, rep1) grouping, sized to
+  // max_raw_blobs itself (previously 4x, for a 25% worst-case load factor -
+  // but that worst case is the same defensive margin every other capacity
+  // clamp in this pipeline already provides: a frame that actually reaches
+  // max_raw_blobs distinct pairs degrades to dropping the excess via the
+  // probe-cap fallback in hash_group.comp, exactly like select_blobs.comp's
+  // counter clamp or qbp_compacted_buf_'s capacity does elsewhere). A real
+  // 1080p frame's raw blob count is a couple orders of magnitude below
+  // max_raw_blobs (734 of 65536, measured), so this table is sparse at
+  // realistic load either way - the 4x only mattered for a pathological
+  // frame this table's own probe-cap fallback already covers.
+  hash_table_size_ = NextPow2(std::max(config_.max_raw_blobs, 1u));
   hash_owner_buf_ = ssbo(VkDeviceSize(hash_table_size_) * 4);
   slot_dense_buf_ = ssbo(VkDeviceSize(hash_table_size_) * 4);
   point_slot_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
   blob_cursor_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 4);
   raw_blob_counter_buf_ = ssbo(4);
+  hash_drop_counter_buf_ = ssbo(4);
 
   blob_scan_chain_ = BuildScanChain(std::max(config_.max_blobs, 1u));
 
@@ -371,7 +380,8 @@ void GpuDetector::CreatePipelines() {
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
       {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), hash_owner_buf_.get(),
-       point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get()},
+       point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
+       hash_drop_counter_buf_.get()},
       12, wg1d_);
   reduce_extents_hash_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("reduce_extents_hash"),
@@ -480,6 +490,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   hash_owner_buf_.FillZero(cmd);
   blob_cursor_buf_.FillZero(cmd);
   raw_blob_counter_buf_.FillZero(cmd);
+  hash_drop_counter_buf_.FillZero(cmd);
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
@@ -648,6 +659,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     // (see its comment), so this is the frame's raw blob count with no scan
     // needed. Profiling only.
     RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
+    RecordCounterCopy(cmd, hash_drop_counter_buf_, kSlotHashDrops);
   }
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
   RecordCounterCopy(cmd, index_points_counter_buf_, kSlotPointCount);
@@ -655,6 +667,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   ctx_.SubmitAndWait(cmd);
 
   const uint32_t num_raw_blobs = (qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0;
+  const uint32_t hash_probe_drops = (qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0;
   const uint32_t num_selected_blobs =
       std::min(ReadCounterSlot(kSlotSelectedCount), config_.max_blobs);
   const uint32_t num_points = std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_);
@@ -725,6 +738,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.points = num_points;
   last_profile_.boundary_points = qbp_count;
   last_profile_.raw_blobs = num_raw_blobs;
+  last_profile_.hash_probe_drops = hash_probe_drops;
   last_profile_.uf_iterations = uf_iterations;
   last_profile_.uf_converged = converged;
   last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);

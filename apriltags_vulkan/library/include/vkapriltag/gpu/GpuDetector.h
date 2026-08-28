@@ -166,6 +166,11 @@ class GpuDetector {
     // Work actually dispatched, which is the interesting part.
     uint32_t boundary_points = 0;     // compacted QBPoints this frame
     uint32_t raw_blobs = 0;           // distinct (rep0, rep1) pairs this frame
+    // Boundary points hash_group.comp couldn't place within max_probes probes
+    // (see its comment) - i.e. dropped, not grouped into any blob. 0 for
+    // every real scene at the current table sizing; watch this if
+    // max_raw_blobs / the hash table sizing is ever tightened further.
+    uint32_t hash_probe_drops = 0;
     uint32_t uf_iterations = 0;       // labelling passes until convergence
     uint32_t submits = 0;             // queue submissions this frame
     bool uf_converged = true;         // false if max_uf_iterations was hit
@@ -295,6 +300,9 @@ class GpuDetector {
   // selected blob for scatter_index_points.comp.
   vk::Buffer hash_owner_buf_, point_slot_buf_, slot_dense_buf_, blob_cursor_buf_;
   vk::Buffer raw_blob_counter_buf_;
+  // Points hash_group.comp couldn't place within max_probes - see
+  // DetectProfile::hash_probe_drops.
+  vk::Buffer hash_drop_counter_buf_;
   uint32_t hash_table_size_ = 0;
 
   // --- Host-visible staging, allocated once and permanently mapped ---
