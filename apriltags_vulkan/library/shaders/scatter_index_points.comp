@@ -58,7 +58,14 @@ void main() {
   float cx = (float(e.min_x) + float(e.max_x)) * 0.5 + 0.05118;
   float cy = (float(e.min_y) + float(e.max_y)) * 0.5 + -0.028581;
 
-  float theta = (atan(float(p.y) - cy, float(p.x) - cx) + float(PI)) * 8e6;
+  // Scaled to fit 21 bits (max ~1,570,796 at 2*PI): sort_points_local.comp
+  // packs this key together with an 11-bit local sort index into one shared
+  // word (21 + 11 = 32), so the key only needs enough resolution to order
+  // points around a blob's perimeter - nowhere near the 26 bits an
+  // unscaled-for-packing key would have used. Adjacent boundary points on a
+  // real tag perimeter are ~6e-3 rad apart; this scale still resolves better
+  // than 4e-6 rad, four orders of magnitude finer.
+  float theta = (atan(float(p.y) - cy, float(p.x) - cx) + float(PI)) * 2.5e5;
   int theta_int = int(round(theta));
   uint theta_key = uint(max(theta_int, 0));
 

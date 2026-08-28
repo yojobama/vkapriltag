@@ -139,7 +139,8 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   gray_words_ = (config_.width * config_.height) / 4u;
 
   // sort_points_local.comp handles one selected blob per workgroup, sorting
-  // its points entirely in shared memory (2 words/point: key + local index).
+  // its points entirely in shared memory (1 word/point: key and local index
+  // share a word, packed key-high/index-low - see that shader's comment).
   // local_sort_cap_ is the workgroup's thread count, bounded by the device's
   // max workgroup invocation count (a real dispatch limit); it no longer
   // needs to also bound the shared array size (see local_sort_virtual_cap_
@@ -160,15 +161,18 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   // device's max workgroup invocation count. This lets blobs bigger than the
   // device can run as a single workgroup (e.g. a large tag's own border)
   // still get properly angle-sorted instead of falling back to an unsorted
-  // identity copy. Capped at 4096 (32 KiB on an 8-byte/element budget) rather
-  // than using the full shared-memory budget: every workgroup allocates this
-  // much shared memory regardless of the blob it draws, so sizing it to the
-  // device's absolute max here would collapse occupancy for the vast
-  // majority of (much smaller) blobs. 4096 comfortably covers real tag
+  // identity copy. Hard-capped at 2048 regardless of the shared-memory
+  // budget: sort_points_local.comp packs the local sort index into the low
+  // 11 bits of its shared word (kLocalIndexBits), so 2048 slots is the most
+  // the packing itself can address, not merely a budget choice - this must
+  // stay in sync with that shader's kLocalIndexBits. On every real device
+  // (Vulkan guarantees >= 16 KiB of shared memory, this device has 32 KiB)
+  // the /4u budget bound below is already looser than the 2048 index cap, so
+  // in practice this constant IS the limit. 2048 comfortably covers real tag
   // borders (a 1920x1080 frame's largest observed tag border is ~1200
-  // points) while leaving most of the shared-memory budget free.
+  // points).
   local_sort_virtual_cap_ =
-      std::min(PrevPow2(std::max(caps.max_shared_memory_bytes / 8u, 1u)), 2048u);
+      std::min(PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u)), 2048u);
 
   CreateBuffers();
   CreatePipelines();

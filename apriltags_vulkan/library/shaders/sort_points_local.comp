@@ -42,8 +42,17 @@ layout(push_constant) uniform PushConstants {
   uint num_selected_blobs;
 } pc;
 
-shared uint s_key[kLocalCap];
-shared uint s_idx[kLocalCap];
+// theta_key (scatter_index_points.comp) is scaled to fit 21 bits and
+// kLocalCap is capped at 2048 (11 bits), so key and local index share one
+// word - key in the high 21 bits, index in the low 11 - instead of two
+// separate arrays. Comparing packed values directly still sorts by key
+// first (it occupies the high bits), with the index as an incidental,
+// harmless tiebreaker; this halves the network's shared-memory footprint
+// and its per-compare traffic (one load/store pair instead of two).
+const uint kLocalIndexBits = 11u;
+const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
+
+shared uint s_packed[kLocalCap];
 
 void main() {
   uint blob = gl_WorkGroupID.x;
@@ -68,8 +77,8 @@ void main() {
   while (cap < count) cap <<= 1u;
 
   for (uint idx = tid; idx < cap; idx += threads) {
-    s_key[idx] = (idx < count) ? src[base + idx].theta_key : 0xFFFFFFFFu;
-    s_idx[idx] = idx;
+    uint key = (idx < count) ? min(src[base + idx].theta_key, kMaxThetaKey) : kMaxThetaKey;
+    s_packed[idx] = (key << kLocalIndexBits) | idx;
   }
   memoryBarrierShared();
   barrier();
@@ -80,16 +89,12 @@ void main() {
         uint partner = idx ^ j;
         if (partner > idx) {
           bool ascending = ((idx & k) == 0u);
-          uint a_key = s_key[idx];
-          uint b_key = s_key[partner];
-          bool swap = ascending ? (b_key < a_key) : (a_key < b_key);
+          uint a = s_packed[idx];
+          uint b = s_packed[partner];
+          bool swap = ascending ? (b < a) : (a < b);
           if (swap) {
-            uint a_idx = s_idx[idx];
-            uint b_idx = s_idx[partner];
-            s_key[idx] = b_key;
-            s_idx[idx] = b_idx;
-            s_key[partner] = a_key;
-            s_idx[partner] = a_idx;
+            s_packed[idx] = b;
+            s_packed[partner] = a;
           }
         }
       }
@@ -99,6 +104,7 @@ void main() {
   }
 
   for (uint idx = tid; idx < count; idx += threads) {
-    dst[base + idx] = src[base + s_idx[idx]];
+    uint local_idx = s_packed[idx] & ((1u << kLocalIndexBits) - 1u);
+    dst[base + idx] = src[base + local_idx];
   }
 }
