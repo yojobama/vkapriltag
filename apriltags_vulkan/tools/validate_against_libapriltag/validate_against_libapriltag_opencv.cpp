@@ -216,6 +216,14 @@ int main(int argc, char **argv) {
           << ", points=" << profile.points << std::endl;
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
+      if (profile.has_gpu_stage_breakdown) {
+        std::cout << "  GPU stage breakdown (last iteration, APRILTAG_VK_TIMESTAMPS=1):"
+            << std::endl;
+        for (size_t s = 0; s < apriltag_vulkan::GpuDetector::kGpuStageNames.size(); ++s) {
+          std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[s] << "="
+              << profile.gpu_stage_ms[s] << " ms" << std::endl;
+        }
+      }
       std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
       PrintStats("GPU total", metrics.gpu_total_ms, iterations);
       PrintStats("quad_decode", metrics.quad_decode_ms, iterations);

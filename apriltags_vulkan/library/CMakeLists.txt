@@ -107,6 +107,7 @@ add_library(vkapriltag STATIC
   src/vk/Shader.cpp
   src/vk/ComputePipeline.cpp
   src/vk/PipelineCache.cpp
+  src/vk/QueryPool.cpp
   src/gpu/GpuDetector.cpp
   src/gpu/QuadDecode.cpp
   src/apriltag_family.cpp

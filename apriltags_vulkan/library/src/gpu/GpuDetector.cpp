@@ -170,6 +170,17 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   // binary) rather than shut down cleanly would otherwise lose the cache
   // every time. Cheap when nothing changed - see PipelineCache::Save().
   ctx_.FlushPipelineCache();
+
+  // Opt-in per-shader GPU timing (see DetectProfile::gpu_stage_ms /
+  // kGpuStageNames). Off by default: a query pool costs nothing idle, but
+  // constructing one and threading the reset/write/read calls through every
+  // frame is pure overhead a normal run shouldn't pay for.
+  if (const char *ts = std::getenv("APRILTAG_VK_TIMESTAMPS")) {
+    if (std::strtol(ts, nullptr, 10) != 0 && caps.timestamps_supported) {
+      timestamp_pool_ = vk::QueryPool(ctx_.device(), kNumGpuStageSpans * 2);
+      timestamps_enabled_ = timestamp_pool_.valid();
+    }
+  }
 }
 
 void GpuDetector::CreateBuffers() {
@@ -479,6 +490,11 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // connected-component labelling.
   // ------------------------------------------------------------------
   VkCommandBuffer cmd = ctx_.BeginCommands();
+  // One reset covers every span's timestamp pair for the whole frame: every
+  // later submission this frame runs strictly after this one's fence has
+  // signaled (SubmitAndWait blocks), so nothing after this point can race a
+  // query this reset just cleared. See vk::QueryPool's own comment.
+  timestamp_pool_.Reset(cmd);
   if (!gray_direct_write_) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
@@ -493,6 +509,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
   decimate_pl_.Dispatch1D(cmd, pixels, &dims_pc);
   block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
@@ -500,7 +517,9 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
       decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
   threshold_pl_.Dispatch1D(cmd, pixels, &thresh_pc);
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
   uf_init_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
   // Flatten the run chains uf_init.comp just built before the first merge
   // pass walks them. Without this the vertical unions pay an O(run length)
@@ -530,6 +549,13 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
   chunk = std::min(chunk, config_.max_uf_iterations);
   record_uf_chunk(cmd, chunk);
+  // "labelling" ends here even if a rare extra convergence chunk follows
+  // below (see the while loop) - a query can't be rewritten without an
+  // intervening reset, and the common case (this corpus, default config)
+  // always converges within the first chunk. The wall-clock
+  // threshold_label_ms figure still includes any extra chunks; only this
+  // per-shader breakdown misses them.
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
   vk::ComputePipeline::HostReadBarrier(cmd);
   ctx_.SubmitAndWait(cmd);
@@ -555,6 +581,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // compacted count is the number every later stage is sized by.
   // ------------------------------------------------------------------
   cmd = ctx_.BeginCommands();
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelFinalize));
   uf_final_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
 
   // Fold blob identity and the min-size test into one spatially-local value
@@ -562,14 +589,17 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // label_pixels.comp.
   struct { uint32_t count, min_blob; } label_pc{pixels, config_.min_cluster_pixels};
   label_pixels_pl_.Dispatch1D(cmd, pixels, &label_pc);
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelFinalize));
 
   // blob_diff appends valid boundary points (with their sort keys) directly
   // into the compacted buffer, so there is no dense intermediate array and no
   // separate full-capacity compaction pass.
   struct { uint32_t w, h, capacity; } blobdiff_pc{decimated_width_, decimated_height_,
                                                    qbp_capacity_};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   blob_diff_pl_.Dispatch1D(cmd, interior_width_ * interior_height_, &blobdiff_pc,
                            BarrierKind::ComputeAndTransfer);
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
   vk::ComputePipeline::HostReadBarrier(cmd);
@@ -593,12 +623,16 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     // grouping, never the order.
     struct { uint32_t count, table_mask, max_probes; } hash_pc{
         qbp_count, hash_table_size_ - 1u, 128u};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
     hash_group_pl_.Dispatch1D(cmd, qbp_count, &hash_pc);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
     struct { uint32_t table_size; } slots_pc{hash_table_size_};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanMarkScan));
     mark_slots_pl_.Dispatch1D(cmd, hash_table_size_, &slots_pc);
     RunInclusiveScan(cmd, hash_table_size_, slot_scan_chain_, slot_scan_block_pls_,
                      slot_scan_add_offsets_pls_);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanMarkScan));
 
     // init_extents and select_blobs are dispatched over max_raw_blobs rather
     // than the frame's actual raw blob count, which only exists on the device
@@ -607,10 +641,12 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     // wash (the round trip costs what the traffic does), so the right fix is
     // vkCmdDispatchIndirect - see OPTIMIZATION_NOTES.md.
     struct { uint32_t capacity; } extentscap_pc{config_.max_raw_blobs};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
     init_extents_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &extentscap_pc);
 
     struct { uint32_t count, max_raw_blobs; } reduce_pc{qbp_count, config_.max_raw_blobs};
     reduce_extents_hash_pl_.Dispatch1D(cmd, qbp_count, &reduce_pc);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
     struct {
       uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal;
@@ -621,17 +657,23 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                 config_.normal_border ? 1u : 0u,
                 config_.aspect_max,         config_.fill_min,
                 config_.fill_max};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
     select_blobs_pl_.Dispatch1D(cmd, config_.max_raw_blobs, &select_pc);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
     struct { uint32_t capacity; } extract_pc{config_.max_blobs};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
     extract_blob_counts_pl_.Dispatch1D(cmd, config_.max_blobs, &extract_pc);
     RunInclusiveScan(cmd, config_.max_blobs, blob_scan_chain_, blob_scan_block_pls_,
                      blob_scan_add_offsets_pls_);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
     struct { uint32_t count, capacity, max_raw_blobs; } scatter_pc{qbp_count, ipoint_capacity_,
                                                                    config_.max_raw_blobs};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
     scatter_index_points_pl_.Dispatch1D(cmd, qbp_count, &scatter_pc,
                                         BarrierKind::ComputeAndTransfer);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
 
     // The slot scan's last element is the number of distinct (rep0, rep1)
     // pairs this frame - i.e. the raw blob count. Profiling only.
@@ -666,12 +708,16 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     // angular order is a one-workgroup-per-blob shared-memory sort - no
     // composite (blob_index, theta) key, no separate gather pass.
     struct { uint32_t num_selected_blobs; } sort_pc{num_selected_blobs};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
     sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &sort_pc);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
 
     struct { uint32_t count; int dw, dh; } linefit_pc{
         num_points, static_cast<int>(decimated_width_), static_cast<int>(decimated_height_)};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLinefitCompute));
     compute_line_fit_points_pl_.Dispatch1D(cmd, num_points, &linefit_pc,
                                            BarrierKind::ComputeAndTransfer);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLinefitCompute));
   }
   if (extents_bytes > 0) {
     selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);
@@ -714,6 +760,22 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.uf_iterations = uf_iterations;
   last_profile_.uf_converged = converged;
   last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);
+
+  if (timestamps_enabled_) {
+    const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
+    const double ns_per_tick = ctx_.caps().timestamp_period_ns;
+    for (uint32_t s = 0; s < kNumGpuStageSpans; ++s) {
+      const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
+      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
+      // Both ends of a span are always written together (see the WriteTimestamp
+      // call sites above), so either both are available or neither is - this
+      // is a defensive check, not an expected partial-write case.
+      if (start.available && end.available && end.ticks >= start.ticks) {
+        last_profile_.gpu_stage_ms[s] = double(end.ticks - start.ticks) * ns_per_tick / 1.0e6;
+      }
+    }
+    last_profile_.has_gpu_stage_breakdown = true;
+  }
 
   // Quad fitting itself happens in QuadDecode (CPU tail); Detect() only runs
   // the GPU pipeline and exposes its outputs via last_selected_extents /

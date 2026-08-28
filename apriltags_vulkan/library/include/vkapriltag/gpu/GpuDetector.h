@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -11,6 +12,7 @@
 #include "vkapriltag/vk/Buffer.h"
 #include "vkapriltag/vk/ComputePipeline.h"
 #include "vkapriltag/vk/Context.h"
+#include "vkapriltag/vk/QueryPool.h"
 
 namespace apriltag_vulkan {
 
@@ -167,6 +169,36 @@ class GpuDetector {
     uint32_t uf_iterations = 0;       // labelling passes until convergence
     uint32_t submits = 0;             // queue submissions this frame
     bool uf_converged = true;         // false if max_uf_iterations was hit
+
+    // Per-shader-group GPU timing, from vkCmdWriteTimestamp pairs bracketing
+    // each named span - finer than the four submission-level phases above.
+    // Populated only when vk::DeviceCaps::timestamps_supported is true;
+    // gpu_stage_ms[i] is 0 for a span this frame's control flow skipped
+    // entirely (e.g. the boundary-point stages when qbp_count == 0). See
+    // GpuDetector::kGpuStageNames for what each index means. This is
+    // diagnostic only - printed by the validate tool behind
+    // APRILTAG_VK_TIMESTAMPS=1 - and costs nothing when timestamps aren't
+    // supported or the pool wasn't constructed.
+    bool has_gpu_stage_breakdown = false;
+    std::array<double, 12> gpu_stage_ms = {};
+  };
+
+  // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
+  // vkCmdWriteTimestamp pair (start, end) recorded around the named group of
+  // dispatches - see the kSpan* constants and their use in Detect().
+  static constexpr std::array<const char *, 12> kGpuStageNames = {
+      "threshold",       // decimate + block_minmax + block_filter + threshold
+      "labelling",       // uf_init + uf_compress + the uf_merge/uf_compress loop
+      "label_finalize",  // uf_final + label_pixels
+      "boundary",        // blob_diff (append + compaction)
+      "hash_group",      // hash_group.comp
+      "mark_scan",       // mark_slots.comp + its scan chain
+      "extents",         // init_extents.comp + reduce_extents_hash.comp
+      "select",          // select_blobs.comp
+      "blob_scan",       // extract_blob_counts.comp + its scan chain
+      "scatter",         // scatter_index_points.comp
+      "sort",            // sort_points_local.comp
+      "linefit_compute", // compute_line_fit_points.comp
   };
 
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
@@ -319,6 +351,33 @@ class GpuDetector {
   // Seeds the first labelling chunk, so steady-state video converges in one
   // chunk plus one verification rather than rediscovering the count each frame.
   uint32_t last_uf_iterations_ = 0;
+
+  // --- GPU timestamp profiling (see kGpuStageNames) ---
+  // Two timestamps (start, end) per named span; kGpuStageNames.size() spans.
+  // Constructed only when caps().timestamps_supported and
+  // APRILTAG_VK_TIMESTAMPS=1 are both set, so a normal run allocates nothing
+  // and every WriteTimestamp() call below is a no-op (QueryPool::valid() ==
+  // false).
+  vk::QueryPool timestamp_pool_;
+  bool timestamps_enabled_ = false;
+  enum GpuStageSpan {
+    kSpanThreshold = 0,
+    kSpanLabelling,
+    kSpanLabelFinalize,
+    kSpanBoundary,
+    kSpanHashGroup,
+    kSpanMarkScan,
+    kSpanExtents,
+    kSpanSelect,
+    kSpanBlobScan,
+    kSpanScatter,
+    kSpanSort,
+    kSpanLinefitCompute,
+    kNumGpuStageSpans,
+  };
+  // WriteTimestamp() index for a span's start/end - 2 slots per span.
+  static constexpr uint32_t SpanStart(GpuStageSpan s) { return static_cast<uint32_t>(s) * 2; }
+  static constexpr uint32_t SpanEnd(GpuStageSpan s) { return static_cast<uint32_t>(s) * 2 + 1; }
 
  public:
   // Readback results exposed for QuadDecode after Detect() runs the GPU
