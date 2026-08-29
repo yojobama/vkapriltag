@@ -104,21 +104,31 @@ GpuLineFitMomentsRaw AccumulatePoint(GpuLineFitMomentsRaw prev, RawLineFitPointG
   return r;
 }
 
-// Broadcasts invocation `id`'s copy of `v` to every lane in the subgroup -
-// a plain subgroupShuffle per field, since subgroup arithmetic/shuffle
-// built-ins only operate on scalars/vectors, not arbitrary structs.
+// Broadcasts invocation `id`'s copy of `v` to every lane in the subgroup.
+// Packed into 3 vector subgroupShuffle calls (ivec4 + ivec3 + uvec3)
+// instead of 10 scalar ones, since subgroupShuffle natively supports
+// vectors up to 4 components - measured to matter: this scan runs its
+// combine step (and this broadcast) once per log2(subgroup_size)
+// iteration, PER BLOB, regardless of blob size, so with many small blobs
+// (a 1080p frame's few hundred blobs average only a couple dozen points
+// each) that fixed per-blob shuffle-instruction count, not the per-point
+// arithmetic, was the dominant cost.
 GpuLineFitMomentsRaw ShuffleMoments(GpuLineFitMomentsRaw v, uint id) {
+  ivec4 abcn = subgroupShuffle(ivec4(v.Mx, v.My, v.W, v.N), id);
+  ivec3 his = subgroupShuffle(ivec3(v.Mxx_hi, v.Myy_hi, v.Mxy_hi), id);
+  uvec3 los = subgroupShuffle(uvec3(v.Mxx_lo, v.Myy_lo, v.Mxy_lo), id);
+
   GpuLineFitMomentsRaw r;
-  r.Mx = subgroupShuffle(v.Mx, id);
-  r.My = subgroupShuffle(v.My, id);
-  r.W = subgroupShuffle(v.W, id);
-  r.Mxx_hi = subgroupShuffle(v.Mxx_hi, id);
-  r.Mxx_lo = subgroupShuffle(v.Mxx_lo, id);
-  r.Myy_hi = subgroupShuffle(v.Myy_hi, id);
-  r.Myy_lo = subgroupShuffle(v.Myy_lo, id);
-  r.Mxy_hi = subgroupShuffle(v.Mxy_hi, id);
-  r.Mxy_lo = subgroupShuffle(v.Mxy_lo, id);
-  r.N = subgroupShuffle(v.N, id);
+  r.Mx = abcn.x;
+  r.My = abcn.y;
+  r.W = abcn.z;
+  r.N = abcn.w;
+  r.Mxx_hi = his.x;
+  r.Myy_hi = his.y;
+  r.Mxy_hi = his.z;
+  r.Mxx_lo = los.x;
+  r.Myy_lo = los.y;
+  r.Mxy_lo = los.z;
   return r;
 }
 
