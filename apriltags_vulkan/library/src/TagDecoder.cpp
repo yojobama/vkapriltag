@@ -2,6 +2,7 @@
 
 extern "C" {
 #include "common/g2d.h"
+#include "common/matd.h"
 
 // Exposed as non-static entry points by cmake/patches/apriltag-expose-decode-steps.patch,
 // applied to the fetched (unmodified upstream) apriltag library - not exposed via
@@ -69,6 +70,23 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     // quad_decode_index appends any successful decode(s) (one per matching
     // tag family) to detections_; it computes quad->H/Hinv itself.
     quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, detections_);
+
+    // ...and leaves both of those allocated on the quad we passed in.
+    // Nothing inside frees them: upstream's apriltag_detector_detect keeps
+    // its quads in a zarray and destroys them itself once the decode loop is
+    // done, so ownership of H/Hinv lands on whoever supplied the quad. Ours
+    // is a stack local, so skipping this leaked two matd_t per quad - four
+    // allocations, since matd_create() callocs the header and the data
+    // separately - every quad of every frame. At ~100 candidate quads and 30
+    // fps that is roughly 2 GB/hour in a continuous camera loop, which is
+    // exactly this library's intended workload.
+    //
+    // Safe unconditionally: quad_update_homographies only ever leaves H/Hinv
+    // freshly allocated or NULL when they were NULL on entry, which the
+    // initialisation above guarantees for every iteration (it is only
+    // reusing a quad across calls that can leave Hinv dangling there).
+    if (quad_original.H) matd_destroy(quad_original.H);
+    if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
   }
 
   reconcile_detections(detections_, poly0_, poly1_);
