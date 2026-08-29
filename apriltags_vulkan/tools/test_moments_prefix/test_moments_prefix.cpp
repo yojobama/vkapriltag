@@ -439,10 +439,10 @@ int main() {
   vk::ComputePipeline pipeline(
       ctx, ShaderPath("compute_moments_prefix"),
       {points_buf.get(), ranges_buf.get(), moments_buf.get()}, sizeof(PushConstants),
-      vk::WorkgroupSize{1, 1, 1});
+      vk::WorkgroupSize{256, 1, 1});
 
   VkCommandBuffer cmd = ctx.BeginCommands();
-  pipeline.Dispatch1D(cmd, static_cast<uint32_t>(kNumBlobs), &pc, vk::BarrierKind::Compute);
+  pipeline.DispatchRaw(cmd, static_cast<uint32_t>(kNumBlobs), 1, 1, &pc, vk::BarrierKind::Compute);
   vk::ComputePipeline::HostReadBarrier(cmd);
   ctx.SubmitAndWait(cmd);
 
@@ -579,10 +579,11 @@ int main() {
   vk::ComputePipeline peaks_pipeline(
       ctx, ShaderPath("compute_peaks"),
       {ranges_buf.get(), error_buf.get(), point_indices_buf.get(), num_selected_buf.get()},
-      sizeof(PushConstants), vk::WorkgroupSize{1, 1, 1});
+      sizeof(PushConstants), vk::WorkgroupSize{256, 1, 1});
 
   cmd = ctx.BeginCommands();
-  peaks_pipeline.Dispatch1D(cmd, static_cast<uint32_t>(kNumBlobs), &pc, vk::BarrierKind::Compute);
+  peaks_pipeline.DispatchRaw(cmd, static_cast<uint32_t>(kNumBlobs), 1, 1, &pc,
+                             vk::BarrierKind::Compute);
   vk::ComputePipeline::HostReadBarrier(cmd);
   ctx.SubmitAndWait(cmd);
 

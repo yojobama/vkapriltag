@@ -3,27 +3,46 @@
 // detection + top-10 peak selection (QuadDecode.cpp, FitQuadForBlob lines
 // ~362-397), built on stage 2's error[] (compute_window_error.comp).
 //
-// One invocation per blob (single-thread, like stage 1 - correctness
-// first, not yet the final launch geometry). filtered[i] is recomputed
-// from scratch (a fresh 7-tap convolution over error[]) every time it's
-// needed rather than materialized into a per-blob array: it's a pure
-// function of error[], so this is redundant work (up to 3x, since a point
-// and its two neighbors each need their own filtered value) but needs no
-// blob-size-dependent scratch storage at all - unlike stage 1/2, this
-// stage has no upper bound on blob size to worry about.
+// One workgroup per blob, gl_WorkGroupSize.x threads. Peak detection is
+// embarrassingly parallel (each thread handles a strided subset of
+// points, i, i+WGSize, i+2*WGSize, ... - independent of every other
+// point once error[] is computed), unlike the top-10 selection, which
+// needs a global view. Two-level reduction:
+//   1. Each thread maintains its OWN top-10 among the peaks it personally
+//      finds (same streaming "replace worst on strict improvement" trick
+//      as the original single-thread version - still correct here since
+//      a fixed thread's strided sequence visits points in strictly
+//      ascending index order).
+//   2. Every thread's local top-10 is written to shared memory. One
+//      thread (0) then does an exact top-10 selection over that small,
+//      bounded candidate pool (<= gl_WorkGroupSize.x * 10 entries) - a
+//      thread that doesn't appear in its own local top-10 can never be in
+//      the true global top-10 either (something already beat it 10 times
+//      over within its own partition), so no candidate is lost by only
+//      keeping each thread's local top-10.
+// Step 2's per-pass argmin over the candidate pool does NOT tie-break by
+// index (unlike step 1, which naturally does via processing order) -
+// exact float ties are rare enough that this is accepted the same way as
+// this stage's other precision-driven wobble (see the module comment
+// below).
 //
-// Peak selection mirrors CPU's `peaks.emplace_back(-cur, i)` followed by
-// `std::stable_sort` (ascending by -cur, i.e. strongest peaks first) and
-// taking the first min(peaks.size(), 10) - WITHOUT ever materializing the
-// full peaks list. Processing points in ascending i and maintaining a
-// bounded best-10 list, replacing its current worst entry only on STRICT
-// improvement (never on a tie), exactly reproduces stable_sort's tie
-// rule: two peaks of equal value keep their relative (ascending index)
-// order, so the earlier one is always the one still present when a later,
-// equal-valued one arrives and correctly fails to displace it.
+// This replaces an earlier single-thread-per-blob version: correct, and
+// fine for standalone verification, but measured as a severe regression
+// on Mali-G610 in the real pipeline for the same reason as stage 1's
+// rewrite (see that shader's comment) - this version keeps every lane
+// busy for the expensive per-point filter/peak-detection work, leaving
+// only the small, bounded merge step serial.
 #extension GL_GOOGLE_include_directive : require
 
-layout(local_size_x_id = 0, local_size_x = 1) in;
+// Matches GpuDetector's local_sort_cap_ (see compute_moments_prefix.comp's
+// identical choice) - the shared arrays below are sized to it.
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+const uint kNMaxima = 10u;
+const uint kMaxWg = 256u;
+shared float cand_val[kMaxWg * kNMaxima];
+shared uint cand_idx[kMaxWg * kNMaxima];
+shared uint cand_count[kMaxWg];
 
 layout(std430, binding = 0) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 1) readonly buffer ErrorIn { float error_in[]; };
@@ -57,20 +76,20 @@ float Filtered(uint begin, uint n, uint i) {
 }
 
 void main() {
-  uint b = gl_GlobalInvocationID.x;
+  uint b = gl_WorkGroupID.x;
   if (b >= pc.num_blobs) return;
 
   uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
   uint end = blob_point_offsets[b];
   uint n = end - begin;
+  uint tid = gl_LocalInvocationID.x;
 
-  const uint kNMaxima = 10u;
   float best_val[kNMaxima];
   uint best_idx[kNMaxima];
   uint count = 0u;
 
   if (n >= 4u) {
-    for (uint i = 0u; i < n; ++i) {
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
       uint i_before = (i == 0u) ? (n - 1u) : (i - 1u);
       uint i_after = (i + 1u == n) ? 0u : (i + 1u);
       float cur = Filtered(begin, n, i);
@@ -100,27 +119,51 @@ void main() {
     }
   }
 
-  if (count < 4u) {
-    num_selected_out[b] = 0u;
-    return;
+  cand_count[tid] = count;
+  for (uint k = 0u; k < kNMaxima; ++k) {
+    cand_val[tid * kNMaxima + k] = (k < count) ? best_val[k] : 3.402823466e+38;
+    cand_idx[tid * kNMaxima + k] = (k < count) ? best_idx[k] : 0u;
   }
+  barrier();
 
-  // std::sort(point_indices.begin(), point_indices.begin() + K) - ascending
-  // by point index (not by peak value, which was only needed to pick the
-  // K survivors). count <= 10, so a plain insertion sort is fine.
-  for (uint i = 1u; i < count; ++i) {
-    uint key = best_idx[i];
-    uint j = i;
-    while (j > 0u && best_idx[j - 1u] > key) {
-      best_idx[j] = best_idx[j - 1u];
-      --j;
+  if (tid == 0u) {
+    uint total = 0u;
+    for (uint t = 0u; t < gl_WorkGroupSize.x; ++t) total += cand_count[t];
+    uint K = min(total, kNMaxima);
+
+    if (K >= 4u) {
+      uint sel_idx[kNMaxima];
+      uint pool_size = gl_WorkGroupSize.x * kNMaxima;
+      for (uint k = 0u; k < K; ++k) {
+        uint best_slot = 0u;
+        float best = cand_val[0];
+        for (uint s = 1u; s < pool_size; ++s) {
+          if (cand_val[s] < best) {
+            best = cand_val[s];
+            best_slot = s;
+          }
+        }
+        sel_idx[k] = cand_idx[best_slot];
+        cand_val[best_slot] = 3.402823466e+38;  // consumed - exclude from later passes
+      }
+
+      // std::sort(point_indices.begin(), point_indices.begin() + K) -
+      // ascending by point index. K <= 10, plain insertion sort is fine.
+      for (uint i = 1u; i < K; ++i) {
+        uint key = sel_idx[i];
+        uint j = i;
+        while (j > 0u && sel_idx[j - 1u] > key) {
+          sel_idx[j] = sel_idx[j - 1u];
+          --j;
+        }
+        sel_idx[j] = key;
+      }
+
+      num_selected_out[b] = K;
+      uint out_base = b * kNMaxima;
+      for (uint k = 0u; k < K; ++k) point_indices_out[out_base + k] = sel_idx[k];
+    } else {
+      num_selected_out[b] = 0u;
     }
-    best_idx[j] = key;
-  }
-
-  num_selected_out[b] = count;
-  uint out_base = b * kNMaxima;
-  for (uint k = 0u; k < count; ++k) {
-    point_indices_out[out_base + k] = best_idx[k];
   }
 }
