@@ -185,13 +185,13 @@ class GpuDetector {
     // APRILTAG_VK_TIMESTAMPS=1 - and costs nothing when timestamps aren't
     // supported or the pool wasn't constructed.
     bool has_gpu_stage_breakdown = false;
-    std::array<double, 10> gpu_stage_ms = {};
+    std::array<double, 14> gpu_stage_ms = {};
   };
 
   // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
   // vkCmdWriteTimestamp pair (start, end) recorded around the named group of
   // dispatches - see the kSpan* constants and their use in Detect().
-  static constexpr std::array<const char *, 10> kGpuStageNames = {
+  static constexpr std::array<const char *, 14> kGpuStageNames = {
       "threshold",      // decimate + block_minmax + block_filter + threshold
       "labelling",      // uf_init + uf_compress + the uf_merge/uf_compress loop
       "label_finalize", // uf_final + label_pixels
@@ -203,6 +203,11 @@ class GpuDetector {
       "scatter",        // scatter_index_points.comp
       "sort",           // sort_points_local.comp - fused with the line-fit
                         // moment computation, see its own comment
+      // A9 (only populated when config.quad_fit_method == kPeaks):
+      "a9_moments",     // compute_moments_prefix.comp
+      "a9_window_err",  // compute_window_error.comp
+      "a9_peaks",       // compute_peaks.comp
+      "a9_quad_search", // compute_quad_search.comp
   };
 
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
@@ -411,6 +416,10 @@ class GpuDetector {
     kSpanBlobScan,
     kSpanScatter,
     kSpanSort,
+    kSpanA9Moments,
+    kSpanA9WindowError,
+    kSpanA9Peaks,
+    kSpanA9QuadSearch,
     kNumGpuStageSpans,
   };
   // WriteTimestamp() index for a span's start/end - 2 slots per span.

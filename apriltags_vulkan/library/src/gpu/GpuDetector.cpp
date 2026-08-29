@@ -861,11 +861,19 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
     if (use_gpu_quad_fit) {
       struct { uint32_t num_blobs; } blob_pc{num_selected_blobs};
+      timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanA9Moments));
       compute_moments_prefix_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &blob_pc,
                                              BarrierKind::Compute);
+      timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanA9Moments));
+
+      timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanA9WindowError));
       compute_window_error_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &blob_pc,
                                            BarrierKind::Compute);
+      timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanA9WindowError));
+
+      timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanA9Peaks));
       compute_peaks_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &blob_pc, BarrierKind::Compute);
+      timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanA9Peaks));
 
       struct {
         uint32_t num_blobs;
@@ -873,8 +881,10 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
         float cos_critical_rad;
       } quad_pc{num_selected_blobs, config_.max_line_fit_mse,
                static_cast<float>(config_.cos_critical_rad)};
+      timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanA9QuadSearch));
       compute_quad_search_pl_.Dispatch1D(cmd, num_selected_blobs, &quad_pc,
                                          BarrierKind::ComputeAndTransfer);
+      timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanA9QuadSearch));
     }
   }
   if (extents_bytes > 0) {
