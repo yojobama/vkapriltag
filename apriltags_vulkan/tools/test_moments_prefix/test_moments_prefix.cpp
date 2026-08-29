@@ -13,6 +13,8 @@
 #include "vkapriltag/vk/Context.h"
 #include "vkapriltag/vk/EmbeddedShaders.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +22,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace apriltag_vulkan {
@@ -186,6 +189,56 @@ std::vector<WindowErrorEntry> CpuWindowError(const std::vector<LineFitMoments> &
 bool IsIllConditioned(int32_t window_W) {
   const double eight_w_squared = 8.0 * static_cast<double>(window_W) * window_W;
   return eight_w_squared < 1e6;
+}
+
+// --- Stage 3 (compute_peaks.comp) CPU reference ---
+// Exact copy of DoFitLines' 7-tap filter + peak detection + top-10
+// selection (QuadDecode.cpp, FitQuadForBlob lines ~362-397), including the
+// double-precision filter accumulation the real production code actually
+// uses (float32-precision error[] values, but summed in double) - this is
+// the TRUE reference, not a float32-only approximation, so the comparison
+// below measures the real gap the GPU's float32-only accumulation
+// introduces, not an artificially narrowed one.
+constexpr std::array<double, 7> kFilterCoefficientsRef = {
+    0.01110899634659290314, 0.13533528149127960205, 0.60653066635131835938,
+    1.00000000000000000000, 0.60653066635131835938, 0.13533528149127960205,
+    0.01110899634659290314,
+};
+
+std::vector<double> CpuFiltered(const std::vector<float> &error, size_t n) {
+  std::vector<double> filtered(n);
+  constexpr size_t kHalf = 3;
+  for (size_t i = 0; i < n; ++i) {
+    double accumulated = 0.0;
+    size_t idx = (i >= kHalf) ? (i - kHalf) : (i + n - kHalf);
+    for (size_t j = 0; j < kFilterCoefficientsRef.size(); ++j) {
+      accumulated += static_cast<double>(error[idx]) * kFilterCoefficientsRef[j];
+      if (++idx == n) idx = 0;
+    }
+    filtered[i] = accumulated;
+  }
+  return filtered;
+}
+
+// Returns the selected point indices, ascending, or empty if K < 4.
+std::vector<uint32_t> CpuSelectPeaks(const std::vector<double> &filtered, size_t n) {
+  std::vector<std::pair<double, uint32_t>> peaks;
+  double before = filtered[n - 1];
+  double cur = filtered[0];
+  for (size_t i = 0; i < n; ++i) {
+    const double after = filtered[(i + 1 == n) ? 0 : (i + 1)];
+    if (cur > before && cur > after) peaks.emplace_back(-cur, static_cast<uint32_t>(i));
+    before = cur;
+    cur = after;
+  }
+  const size_t K = std::min<size_t>(peaks.size(), 10);
+  if (K < 4) return {};
+  std::stable_sort(peaks.begin(), peaks.end(),
+                   [](const auto &a, const auto &b) { return a.first < b.first; });
+  std::vector<uint32_t> point_indices(K);
+  for (size_t k = 0; k < K; ++k) point_indices[k] = peaks[k].second;
+  std::sort(point_indices.begin(), point_indices.end());
+  return point_indices;
 }
 
 }  // namespace
@@ -389,9 +442,92 @@ int main() {
           "within tolerance (%d residual, rate %.5f%% <= accepted 0.01%%).\n",
           error_compared - error_mismatches, error_compared, error_mismatches,
           mismatch_rate * 100.0);
-    return 0;
+  } else {
+    printf("FAIL (stage 2): %d / %d well-conditioned entries outside tolerance (rate %.5f%%).\n",
+          error_mismatches, error_compared, mismatch_rate * 100.0);
+    return 1;
   }
-  printf("FAIL (stage 2): %d / %d well-conditioned entries outside tolerance (rate %.5f%%).\n",
-        error_mismatches, error_compared, mismatch_rate * 100.0);
-  return 1;
+
+  // --- Stage 3: compute_peaks.comp ---
+  vk::Buffer point_indices_buf(ctx, static_cast<size_t>(kNumBlobs) * 10 * sizeof(uint32_t),
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               vk::MemoryKind::HostVisibleCached);
+  vk::Buffer num_selected_buf(ctx, static_cast<size_t>(kNumBlobs) * sizeof(uint32_t),
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              vk::MemoryKind::HostVisibleCached);
+
+  vk::ComputePipeline peaks_pipeline(
+      ctx, ShaderPath("compute_peaks"),
+      {ranges_buf.get(), error_buf.get(), point_indices_buf.get(), num_selected_buf.get()},
+      sizeof(PushConstants), vk::WorkgroupSize{1, 1, 1});
+
+  cmd = ctx.BeginCommands();
+  peaks_pipeline.Dispatch1D(cmd, static_cast<uint32_t>(kNumBlobs), &pc, vk::BarrierKind::Compute);
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  ctx.SubmitAndWait(cmd);
+
+  std::vector<uint32_t> gpu_point_indices(static_cast<size_t>(kNumBlobs) * 10);
+  std::vector<uint32_t> gpu_num_selected(kNumBlobs);
+  point_indices_buf.Read(gpu_point_indices.data(), gpu_point_indices.size() * sizeof(uint32_t));
+  num_selected_buf.Read(gpu_num_selected.data(), gpu_num_selected.size() * sizeof(uint32_t));
+
+  int blobs_compared = 0;
+  int blobs_exact_match = 0;
+  int blobs_k_mismatch = 0;
+  int blobs_index_mismatch = 0;
+  for (int b = 0; b < kNumBlobs; ++b) {
+    const auto &[begin, end] = ranges[b];
+    const size_t n = end - begin;
+    // compute_peaks.comp (GPU) reads error_buf, which stage 2 already
+    // populated on the GPU - so gpu_selected below reflects the combined
+    // stage 2 + stage 3 GPU pipeline. The CPU reference recomputes error[]
+    // independently (CpuWindowError) rather than reading the GPU's values,
+    // so this comparison also (harmlessly) folds in stage 2's own
+    // already-verified, tiny residual.
+    std::vector<LineFitMoments> cpu_cs = CpuPrefixSumMoments(points, begin, end);
+    std::vector<WindowErrorEntry> cpu_err_entries = CpuWindowError(cpu_cs, n);
+    std::vector<float> cpu_error(n);
+    for (size_t i = 0; i < n; ++i) cpu_error[i] = cpu_err_entries[i].error;
+    if (n < 4) continue;
+
+    ++blobs_compared;
+    std::vector<double> cpu_filtered = CpuFiltered(cpu_error, n);
+    std::vector<uint32_t> cpu_selected = CpuSelectPeaks(cpu_filtered, n);
+
+    const uint32_t gpu_k = gpu_num_selected[b];
+    std::vector<uint32_t> gpu_selected(gpu_point_indices.begin() + b * 10,
+                                       gpu_point_indices.begin() + b * 10 + gpu_k);
+
+    if (gpu_k != cpu_selected.size()) {
+      ++blobs_k_mismatch;
+    } else if (gpu_selected == cpu_selected) {
+      ++blobs_exact_match;
+    } else {
+      ++blobs_index_mismatch;
+    }
+  }
+
+  printf(
+      "stage 3: %d blobs compared (n>=4); %d exact index-set matches, %d same-K but "
+      "different indices, %d different K (out of %d)\n",
+      blobs_compared, blobs_exact_match, blobs_index_mismatch, blobs_k_mismatch, blobs_compared);
+  // Not held to exact peak-set equality: CPU accumulates the 7-tap filter
+  // in double precision (see CpuFiltered), the GPU in float32 only (no
+  // shaderFloat64 on Mali) - is_peak's strict `>` comparisons can
+  // legitimately flip near-tied neighbors between the two precisions,
+  // same accepted-wobble class as A5's pseudo-angle tie order
+  // (OPTIMIZATION_NOTES.md). What matters is that the overwhelming
+  // majority of blobs still select the identical peak set - a low match
+  // rate would mean a real logic bug in compute_peaks.comp, not precision
+  // noise.
+  const double exact_match_rate =
+      blobs_compared > 0 ? static_cast<double>(blobs_exact_match) / blobs_compared : 1.0;
+  if (exact_match_rate < 0.95) {
+    printf("FAIL (stage 3): exact match rate %.2f%% is too low to be precision noise.\n",
+          exact_match_rate * 100.0);
+    return 1;
+  }
+  printf("PASS (stage 3): %.2f%% of blobs select an identical peak set (>= 95%% required).\n",
+        exact_match_rate * 100.0);
+  return 0;
 }
