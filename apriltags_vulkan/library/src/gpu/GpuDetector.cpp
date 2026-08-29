@@ -593,6 +593,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (!gray_direct_write_) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanClear));
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
@@ -601,6 +602,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   blob_cursor_buf_.FillZero(cmd);
   raw_blob_counter_buf_.FillZero(cmd);
   hash_drop_counter_buf_.FillZero(cmd);
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanClear));
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,

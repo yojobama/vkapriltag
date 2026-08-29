@@ -190,7 +190,7 @@ class GpuDetector {
     // APRILTAG_VK_TIMESTAMPS=1 - and costs nothing when timestamps aren't
     // supported or the pool wasn't constructed.
     bool has_gpu_stage_breakdown = false;
-    std::array<double, 11> gpu_stage_ms = {};
+    std::array<double, 12> gpu_stage_ms = {};
 
     // --- Host-side cost of driving the GPU, split out from the phase timers
     // above. The phase timers (threshold_label_ms etc.) are wall-clock and so
@@ -213,7 +213,11 @@ class GpuDetector {
   // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
   // vkCmdWriteTimestamp pair (start, end) recorded around the named group of
   // dispatches - see the kSpan* constants and their use in Detect().
-  static constexpr std::array<const char *, 11> kGpuStageNames = {
+  static constexpr std::array<const char *, 12> kGpuStageNames = {
+      "clear",          // the per-frame vkCmdFillBuffer set + the gray upload
+                        // copy. ~2.3 MB of fills at 1080p, and outside every
+                        // other span, so it was landing in the unattributed
+                        // gap that the submit-count reduction failed to move.
       "threshold",      // decimate + block_minmax + block_filter + threshold
       "labelling",      // uf_init + uf_compress + the uf_merge/uf_compress loop
       "label_finalize", // uf_final + label_pixels
@@ -422,7 +426,8 @@ class GpuDetector {
   vk::QueryPool timestamp_pool_;
   bool timestamps_enabled_ = false;
   enum GpuStageSpan {
-    kSpanThreshold = 0,
+    kSpanClear = 0,
+    kSpanThreshold,
     kSpanLabelling,
     kSpanLabelFinalize,
     kSpanBoundary,
