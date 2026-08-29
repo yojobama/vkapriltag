@@ -1,0 +1,194 @@
+#version 450
+// A9 stage 4: GPU port of DoFitQuads' C(10,4) combinatorial search
+// (QuadDecode.cpp, FitQuadForBlob lines ~399-469) over stage 3's selected
+// peak indices, picking the 4 that form the lowest-total-error quad.
+//
+// One invocation per blob (single-thread, like stages 1 and 3 -
+// correctness first). The search itself is tiny (at most 7*8*9*10 nested
+// iterations, heavily pruned by the early continues/breaks below, exactly
+// as the CPU version is) so this is not a performance concern even
+// single-threaded.
+//
+// Outputs the 4 winning LOCAL point indices (0-based within the blob, same
+// convention as stage 3's point_indices/CPU's FitQuadResult::indices) and
+// a valid flag - NOT the final quad corners. Reconstructing corners from 4
+// known indices via ReadMomentsWindow + FitLine's line-intersection math is
+// cheap (four blobs' worth of work per accepted quad, not per boundary
+// point), so that step is left on the CPU exactly as it works today; this
+// stage replaces the expensive O(total boundary points) search, not the
+// O(1) corner reconstruction after it.
+#extension GL_GOOGLE_include_directive : require
+#include "int64_emu.glsl"
+#include "line_fit_moments.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Ranges { uvec2 ranges[]; };
+layout(std430, binding = 1) readonly buffer Moments { GpuLineFitMomentsRaw cs[]; };
+// From stage 3 (compute_peaks.comp): up to 10 selected LOCAL point indices
+// per blob, ascending, valid up to NumSelected[blob].
+layout(std430, binding = 2) readonly buffer PeakIndices { uint peak_indices[]; };
+layout(std430, binding = 3) readonly buffer NumSelected { uint num_selected[]; };
+// 4 LOCAL point indices per blob (garbage if ValidOut[blob] == 0).
+layout(std430, binding = 4) writeonly buffer BestIndicesOut { uint best_indices_out[]; };
+layout(std430, binding = 5) writeonly buffer ValidOut { uint valid_out[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint num_blobs;
+  float max_line_fit_mse;
+  float cos_critical_rad;
+} pc;
+
+const float kFloatMax = 3.402823466e+38;
+const uint kNMaxima = 10u;
+const uint kCacheDim = 7u;  // kNMaxima - 3
+
+// Port of ReadMomentsWindow (QuadDecode.cpp) - identical to stage 2's
+// (compute_window_error.comp), including the same index0 > 0 guard fix
+// (see that shader's comment; QuadDecode.cpp itself was fixed the same
+// way - see fix/read-moments-window-oob).
+GpuLineFitMomentsRaw ReadMomentsWindowLocal(uint begin, uint total_points, uint index0,
+                                            uint index1) {
+  GpuLineFitMomentsRaw result;
+  if (index0 < index1) {
+    result = cs[begin + index1];
+    if (index0 > 0u) {
+      result = SubMoments(result, cs[begin + index0 - 1u]);
+    }
+    result.N = int(index1 - index0 + 1u);
+  } else {
+    GpuLineFitMomentsRaw lfsz = cs[begin + total_points - 1u];
+    result = lfsz;
+    if (index0 > 0u) {
+      result = SubMoments(lfsz, cs[begin + index0 - 1u]);
+    }
+    result = AddMoments(result, cs[begin + index1]);
+    result.N = int(total_points - index0 + index1 + 1u);
+  }
+  return result;
+}
+
+// Port of FitLine (QuadDecode.cpp) - only the pieces DoFitQuads actually
+// uses (err, mse, and the unit normal "lineparam23"; lineparam01 is never
+// read in the combinatorial search itself, so it isn't computed here).
+struct FitLineResult23 {
+  float err;
+  float mse;
+  vec2 normal;
+};
+
+FitLineResult23 FitLine23(GpuLineFitMomentsRaw m) {
+  I64 Cxx = Sub64(Mul64By32(GetMxx(m), m.W), Mul32x32To64(m.Mx, m.Mx));
+  I64 Cxy = Sub64(Mul64By32(GetMxy(m), m.W), Mul32x32To64(m.Mx, m.My));
+  I64 Cyy = Sub64(Mul64By32(GetMyy(m), m.W), Mul32x32To64(m.My, m.My));
+
+  // Same exact-64-bit-before-float ordering as line_fit_moments.glsl's
+  // FitLineError, for the same catastrophic-cancellation reason.
+  float diff_f = ToFloat64(Sub64(Cxx, Cyy));    // Cxx - Cyy
+  float sum_f = ToFloat64(Add64(Cxx, Cyy));     // Cxx + Cyy
+  float cxy2_f = ToFloat64(Add64(Cxy, Cxy));    // 2 * Cxy
+
+  float hypot_cached = length(vec2(diff_f, cxy2_f));
+  float eight_w_squared = float(m.W) * float(m.W) * 8.0;
+  float eig_small = (sum_f - hypot_cached) / eight_w_squared;
+
+  float nx1 = diff_f - hypot_cached;
+  float ny1 = cxy2_f;
+  float M1v = nx1 * nx1 + ny1 * ny1;
+  float nx2 = cxy2_f;
+  float ny2 = -diff_f - hypot_cached;  // Cyy - Cxx == -(Cxx - Cyy)
+  float M2v = nx2 * nx2 + ny2 * ny2;
+
+  vec2 n = (M1v > M2v) ? vec2(nx1, ny1) : vec2(nx2, ny2);
+
+  FitLineResult23 r;
+  r.err = float(m.N) * eig_small;
+  r.mse = eig_small;
+  r.normal = normalize(n);
+  return r;
+}
+
+void main() {
+  uint b = gl_GlobalInvocationID.x;
+  if (b >= pc.num_blobs) return;
+
+  uint K = num_selected[b];
+  if (K < 4u) {
+    valid_out[b] = 0u;
+    return;
+  }
+
+  uint begin = ranges[b].x;
+  uint n = ranges[b].y - begin;
+
+  uint pidx[kNMaxima];
+  for (uint k = 0u; k < K; ++k) pidx[k] = peak_indices[b * kNMaxima + k];
+
+  float error_m0_m1[kCacheDim][kCacheDim];
+  vec2 params_m0_m1[kCacheDim][kCacheDim];
+  for (uint i = 0u; i < kCacheDim; ++i) {
+    for (uint j = 0u; j < kCacheDim; ++j) error_m0_m1[i][j] = kFloatMax;
+  }
+
+  for (uint m0 = 0u; m0 < kCacheDim; ++m0) {
+    for (uint m1 = m0 + 1u; m1 < kNMaxima - 2u; ++m1) {
+      if (m1 >= K) continue;
+      FitLineResult23 fl = FitLine23(ReadMomentsWindowLocal(begin, n, pidx[m0], pidx[m1]));
+      float err01 = fl.err;
+      if (fl.mse > pc.max_line_fit_mse) err01 = kFloatMax;
+      error_m0_m1[m0][m1 - 1u] = err01;
+      params_m0_m1[m0][m1 - 1u] = fl.normal;
+    }
+  }
+
+  float best_error = kFloatMax;
+  uint best0 = 0u, best1 = 0u, best2 = 0u, best3 = 0u;
+
+  for (uint m0 = 0u; m0 < kCacheDim; ++m0) {
+    for (uint m1 = m0 + 1u; m1 < kNMaxima - 2u; ++m1) {
+      float errm0m1 = error_m0_m1[m0][m1 - 1u];
+      if (errm0m1 == kFloatMax) continue;
+      vec2 paramsm0m1 = params_m0_m1[m0][m1 - 1u];
+
+      for (uint m2 = m1 + 1u; m2 < kNMaxima - 1u; ++m2) {
+        if (m2 >= K) break;
+        FitLineResult23 fl12 = FitLine23(ReadMomentsWindowLocal(begin, n, pidx[m1], pidx[m2]));
+        if (fl12.mse > pc.max_line_fit_mse) continue;
+
+        float dot = paramsm0m1.x * fl12.normal.x + paramsm0m1.y * fl12.normal.y;
+        if (abs(dot) > pc.cos_critical_rad) continue;
+
+        for (uint m3 = m2 + 1u; m3 < kNMaxima; ++m3) {
+          if (m3 >= K) break;
+
+          FitLineResult23 fl23 = FitLine23(ReadMomentsWindowLocal(begin, n, pidx[m2], pidx[m3]));
+          if (fl23.mse > pc.max_line_fit_mse) continue;
+
+          FitLineResult23 fl30 = FitLine23(ReadMomentsWindowLocal(begin, n, pidx[m3], pidx[m0]));
+          if (fl30.mse > pc.max_line_fit_mse) continue;
+
+          float total = errm0m1 + fl12.err + fl23.err + fl30.err;
+          if (total < best_error) {
+            best_error = total;
+            best0 = m0;
+            best1 = m1;
+            best2 = m2;
+            best3 = m3;
+          }
+        }
+      }
+    }
+  }
+
+  if (best_error == kFloatMax || !(best_error < pc.max_line_fit_mse * float(n))) {
+    valid_out[b] = 0u;
+    return;
+  }
+
+  valid_out[b] = 1u;
+  uint out_base = b * 4u;
+  best_indices_out[out_base + 0u] = pidx[best0];
+  best_indices_out[out_base + 1u] = pidx[best1];
+  best_indices_out[out_base + 2u] = pidx[best2];
+  best_indices_out[out_base + 3u] = pidx[best3];
+}

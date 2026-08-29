@@ -78,6 +78,7 @@ set(SHADER_SOURCES
   shaders/compute_moments_prefix.comp
   shaders/compute_window_error.comp
   shaders/compute_peaks.comp
+  shaders/compute_quad_search.comp
 )
 
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)
