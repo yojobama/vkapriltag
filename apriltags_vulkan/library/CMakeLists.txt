@@ -76,6 +76,7 @@ set(SHADER_SOURCES
   shaders/reduce_extents_hash_subgroup.comp
   shaders/scatter_index_points.comp
   shaders/compute_moments_prefix.comp
+  shaders/compute_window_error.comp
 )
 
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)

@@ -4,13 +4,19 @@
 // signed; lo: low 32 bits, unsigned) - reconstructible on the host as
 // (int64_t(hi) << 32) | uint32_t(lo).
 //
-// Only the operations FitQuadForBlob's moment prefix sum
-// (QuadDecode.cpp: Mx/My/W/Mxx/Mxy/Myy accumulation) actually needs are
-// provided: a 32x32->64 signed multiply, a 64x32->64 truncated multiply-
-// widen (for Mxx += wx * x2, where wx is already 64-bit), and 64-bit add.
-// All arithmetic is exactly mod 2^64 (truncating), matching what every real
-// C++ compiler does for int64_t overflow in practice - this is a faithful
-// bit-for-bit port, not an approximation.
+// Add64/Sub64/Mul32x32To64/Mul64By32/Trunc32 are exact (mod 2^64,
+// truncating - matching what every real C++ compiler does for int64_t
+// overflow in practice) and are what FitQuadForBlob's moment prefix sum
+// (compute_moments_prefix.comp) is verified bit-for-bit against.
+//
+// ToFloat64 is NOT exact (not a correctly-rounded int64->float32
+// conversion) - deliberately so: every caller of it downstream
+// (FitLineError's Cxx/Cxy/Cyy) only ever consumes the result as float32
+// anyway (the CPU reference itself immediately does `static_cast<float>`
+// on these), so a perfectly-rounded conversion buys nothing. Differences
+// here are the same kind of accepted float-precision wobble as A5's
+// pseudo-angle tie-order changes - see that item's rationale in
+// OPTIMIZATION_NOTES.md.
 struct I64 {
   int hi;
   uint lo;
@@ -50,8 +56,27 @@ I64 Add64(I64 a, I64 b) {
   return I64(hi, lo);
 }
 
+// -a, mod 2^64 (standard two's-complement negate: ~a + 1).
+I64 Neg64(I64 a) {
+  uint lo_not = ~a.lo;
+  uint carry = (lo_not == 0xFFFFFFFFu) ? 1u : 0u;
+  uint lo = lo_not + 1u;
+  int hi = ~a.hi + int(carry);
+  return I64(hi, lo);
+}
+
+// a - b, mod 2^64.
+I64 Sub64(I64 a, I64 b) {
+  return Add64(a, Neg64(b));
+}
+
 // Low 32 bits of a 64-bit value, reinterpreted as signed - matches C++'s
 // `int32_t(some_int64_t)` narrowing conversion (bit-pattern preserving).
 int Trunc32(I64 a) {
   return int(a.lo);
+}
+
+// See the file comment: approximate, not correctly-rounded.
+float ToFloat64(I64 a) {
+  return float(a.hi) * 4294967296.0 + float(a.lo);
 }

@@ -19,6 +19,7 @@
 // int64_emu.glsl for the emulation this depends on.
 #extension GL_GOOGLE_include_directive : require
 #include "int64_emu.glsl"
+#include "line_fit_moments.glsl"
 
 layout(local_size_x_id = 0, local_size_x = 1) in;
 
@@ -30,22 +31,10 @@ struct RawLineFitPointGpu {
   uint blob_index;
 };
 
-// Mirrors GpuLineFitMomentsRaw (gpu/Types.h) - std430 layout, 40 bytes.
-// One entry written per input point (at that point's own global index),
-// holding the running sum through and including that point - i.e. this
-// buffer IS `cs[]`, laid out contiguously across all blobs in input order.
-struct GpuLineFitMomentsRaw {
-  int Mx;
-  int My;
-  int W;
-  int Mxx_hi;
-  uint Mxx_lo;
-  int Myy_hi;
-  uint Myy_lo;
-  int Mxy_hi;
-  uint Mxy_lo;
-  int N;
-};
+// MomentsOut below is `cs[]`: one GpuLineFitMomentsRaw written per input
+// point (at that point's own global index), holding the running sum
+// through and including that point, laid out contiguously across all
+// blobs in input order (see line_fit_moments.glsl for the struct).
 
 layout(std430, binding = 0) readonly buffer Points { RawLineFitPointGpu points[]; };
 // One (begin, end) pair per blob - end is exclusive, matching

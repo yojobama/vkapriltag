@@ -1,0 +1,93 @@
+#version 450
+// A9 stage 2: GPU port of DoFitLines' windowed error per point
+// (QuadDecode.cpp: the `error[i] = FitLineError(ReadMomentsWindow(...))`
+// loop), built on stage 1's cs[] (compute_moments_prefix.comp).
+//
+// One workgroup per blob; threads stride over the blob's points (the same
+// "workgroup per blob, strided threads" shape sort_points_local.comp uses).
+// Unlike stage 1, this is genuinely parallel per point - windowed error at
+// point i only reads cs[] (already fully computed), it doesn't accumulate
+// a running value the way the prefix sum itself does.
+//
+// This stage's output is float-precision only (see line_fit_moments.glsl's
+// FitLineError / int64_emu.glsl's ToFloat64 comments) - not held to stage
+// 1's bit-exactness bar, verified instead by a tolerance-based comparison
+// (see test_moments_prefix's window-error mode) and, ultimately, by the
+// existing corpus decode/corner-RMS gate once this is wired into the real
+// pipeline.
+#extension GL_GOOGLE_include_directive : require
+#include "int64_emu.glsl"
+#include "line_fit_moments.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+// One (begin, end) pair per blob - end exclusive, matching
+// FitQuadForBlob(config, points, begin, end)'s own convention (see stage
+// 1's compute_moments_prefix.comp, which uses the same Ranges buffer).
+layout(std430, binding = 0) readonly buffer Ranges { uvec2 ranges[]; };
+layout(std430, binding = 1) readonly buffer Moments { GpuLineFitMomentsRaw cs[]; };
+layout(std430, binding = 2) writeonly buffer ErrorOut { float error_out[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint num_blobs;
+} pc;
+
+// Port of ReadMomentsWindow (QuadDecode.cpp). `begin` is cs[]'s global
+// offset for this blob; index0/index1 are LOCAL indices in [0,
+// total_points). Faithfully replicates the original's index0<index1
+// branch, including its behavior at index0==index1 (the "wrap" branch).
+GpuLineFitMomentsRaw ReadMomentsWindowLocal(uint begin, uint total_points, uint index0,
+                                            uint index1) {
+  GpuLineFitMomentsRaw result;
+  if (index0 < index1) {
+    result = cs[begin + index1];
+    if (index0 > 0u) {
+      result = SubMoments(result, cs[begin + index0 - 1u]);
+    }
+    result.N = int(index1 - index0 + 1u);
+  } else {
+    // index0 > 0u guard: NOT present in QuadDecode.cpp's ReadMomentsWindow
+    // (its else branch unconditionally reads cs[index0 - 1]) - that is a
+    // real out-of-bounds read on the CPU too whenever index0 == 0 (which
+    // happens whenever ksz == 0, i.e. blobs with fewer than 12 points, at
+    // point i == 0), landing on whatever heap memory happens to precede
+    // the cs[] vector. Faithfully reproducing that on the GPU would mean
+    // reading some arbitrary SSBO location, which is a real hazard here
+    // (unlike the CPU's heap, an out-of-range SSBO index can read another
+    // buffer's memory or fault outright) for no benefit - the CPU's own
+    // result at that point is already meaningless garbage, not a value
+    // worth matching. Guarded the same way the index0 < index1 branch
+    // above already guards its own index0 - 1 read.
+    GpuLineFitMomentsRaw lfsz = cs[begin + total_points - 1u];
+    result = lfsz;
+    if (index0 > 0u) {
+      result = SubMoments(lfsz, cs[begin + index0 - 1u]);
+    }
+    result = AddMoments(result, cs[begin + index1]);
+    result.N = int(total_points - index0 + index1 + 1u);
+  }
+  return result;
+}
+
+void main() {
+  uint b = gl_WorkGroupID.x;
+  if (b >= pc.num_blobs) return;
+
+  uint begin = ranges[b].x;
+  uint end = ranges[b].y;
+  uint n = end - begin;
+  // FitQuadForBlob returns immediately (no error[] computed at all) for
+  // blobs under 4 points - matches that guard.
+  if (n < 4u) return;
+
+  int ksz = min(20, int(n) / 12);
+  uint k_off = uint(ksz);
+
+  for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
+    uint i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+    uint i1 = i + k_off;
+    if (i1 >= n) i1 -= n;
+    GpuLineFitMomentsRaw m = ReadMomentsWindowLocal(begin, n, i0, i1);
+    error_out[begin + i] = FitLineError(m.N, m.Mx, m.My, m.W, GetMxx(m), GetMyy(m), GetMxy(m));
+  }
+}
