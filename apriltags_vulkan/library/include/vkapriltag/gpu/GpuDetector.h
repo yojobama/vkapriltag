@@ -150,8 +150,13 @@ class GpuDetector {
     // Wall-clock, host side.
     double upload_ms = 0.0;
     double threshold_label_ms = 0.0;  // submits up to and including labelling
-    double boundary_ms = 0.0;         // blob_diff + compaction
-    double sort_group_ms = 0.0;       // qbp sort, grouping, blob selection
+    // blob_diff + compaction + hash grouping + blob selection + scatter.
+    // These were two submissions until the boundary-point count stopped
+    // being read back mid-frame (see build_indirect_args.comp), so they are
+    // now one phase and sort_group_ms is always 0 - kept rather than removed
+    // so the field layout stays stable for embedders.
+    double boundary_ms = 0.0;
+    double sort_group_ms = 0.0;       // folded into boundary_ms, see above
     double linefit_ms = 0.0;          // ipoint sort + line fit moments
     double readback_ms = 0.0;         // payload readback + host copies
     double gpu_ms = 0.0;              // sum of the GPU-work phases above
@@ -344,6 +349,9 @@ class GpuDetector {
   // build_indirect_args_pl_, so init_extents_pl_ / select_blobs_pl_ dispatch
   // over the frame's actual raw blob count instead of max_raw_blobs.
   vk::Buffer indirect_args_buf_;
+  // Device-side clamped counts that replaced host-passed push constants once
+  // their consumers became indirectly dispatched - see build_indirect_args.comp.
+  vk::Buffer resolved_counts_buf_;
 
   // --- Host-visible staging, allocated once and permanently mapped ---
   // upload_staging_ is unused on unified-memory devices, where gray_buf_ is
@@ -383,6 +391,9 @@ class GpuDetector {
   // Builds indirect_args_buf_ from raw_blob_counter_buf_ - see that buffer's
   // comment.
   vk::ComputePipeline build_indirect_args_pl_;
+  // Same shader, reading qbp_counter_buf_ instead - the descriptor set is
+  // fixed at construction, so a second source counter needs its own pipeline.
+  vk::ComputePipeline build_qbp_args_pl_;
 
   vk::ComputePipeline hash_group_pl_, reduce_extents_hash_pl_, scatter_index_points_pl_;
 

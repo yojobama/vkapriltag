@@ -278,16 +278,23 @@ void GpuDetector::CreateBuffers() {
   raw_blob_counter_buf_ = ssbo(4);
   hash_drop_counter_buf_ = ssbo(4);
 
-  // VkDispatchIndirectCommand (groupCountX/Y/Z), built on-device from
-  // raw_blob_counter_buf_ by build_indirect_args_pl_ so init_extents_pl_ /
-  // select_blobs_pl_ dispatch over the frame's actual raw blob count instead
-  // of the worst-case max_raw_blobs - see build_indirect_args.comp.
+  // Two VkDispatchIndirectCommands (groupCountX/Y/Z each), built on-device by
+  // build_indirect_args.comp so their consumers dispatch over the frame's
+  // actual work instead of a worst-case capacity, without the host having to
+  // read the counts back first:
+  //   slot 0 <- raw_blob_counter_buf_, sizes init_extents / select_blobs
+  //   slot 1 <- qbp_counter_buf_,      sizes hash_group / reduce_extents_hash
+  //                                    / scatter_index_points
   {
-    vk::Buffer b(ctx_, 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+    vk::Buffer b(ctx_, 2 * 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                 vk::MemoryKind::DeviceLocal);
     device_bytes_ += b.size();
     indirect_args_buf_ = std::move(b);
   }
+  // The same counts, clamped to capacity, for consumers to bounds-check
+  // against - see build_indirect_args.comp. Slot 0 is the boundary-point
+  // count that used to travel as a push constant.
+  resolved_counts_buf_ = ssbo(4 * sizeof(uint32_t));
 
   blob_scan_chain_ = BuildScanChain(std::max(config_.max_blobs, 1u));
 
@@ -465,23 +472,30 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("hash_group"),
       {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), hash_owner_buf_.get(),
        point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
-       hash_drop_counter_buf_.get()},
-      12, wg1d_);
+       hash_drop_counter_buf_.get(), resolved_counts_buf_.get()},
+      8, wg1d_);
+  // Two instances of the same shader, differing only in which device counter
+  // they read - the descriptor set is baked at construction, so a second
+  // source counter needs a second pipeline rather than a rebind.
   build_indirect_args_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("build_indirect_args"),
-      {raw_blob_counter_buf_.get(), indirect_args_buf_.get()}, 4,
+      {raw_blob_counter_buf_.get(), indirect_args_buf_.get(), resolved_counts_buf_.get()}, 16,
+      vk::WorkgroupSize{1, 1, 1});
+  build_qbp_args_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("build_indirect_args"),
+      {qbp_counter_buf_.get(), indirect_args_buf_.get(), resolved_counts_buf_.get()}, 16,
       vk::WorkgroupSize{1, 1, 1});
   reduce_extents_hash_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick_sg("reduce_extents_hash", "reduce_extents_hash_subgroup")),
       {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(),
-       extents_buf_.get()},
-      8, wg1d_);
+       extents_buf_.get(), resolved_counts_buf_.get()},
+      4, wg1d_);
   scatter_index_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("scatter_index_points"),
       {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(), remap_buf_.get(),
        selected_extents_buf_.get(), blob_point_offsets_buf_.get(), blob_cursor_buf_.get(),
-       index_points_buf_.get()},
-      12, wg1d_);
+       index_points_buf_.get(), resolved_counts_buf_.get()},
+      8, wg1d_);
 }
 
 void GpuDetector::RunInclusiveScan(
@@ -684,29 +698,41 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
-  vk::ComputePipeline::HostReadBarrier(cmd);
-  SubmitTimedAndWait(cmd);
-
-  const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
-  const auto t_boundary = Clock::now();
 
   // ------------------------------------------------------------------
-  // Submit 3: group the boundary points by (rep0, rep1), select plausible tag
-  // quads, and scatter the survivors into per-blob contiguous runs.
+  // ...and, in the SAME submission, group the boundary points by
+  // (rep0, rep1), select plausible tag quads, and scatter the survivors into
+  // per-blob contiguous runs.
   //
-  // Everything here is dispatched over qbp_count, not qbp_capacity_ - at 1080p
-  // a couple of hundred thousand real points rather than the ~2M dense bound.
+  // Everything here is sized by the boundary-point count, which exists only
+  // on the device at this point. This used to be a separate submission purely
+  // so the host could read that count back and pass it as a push constant -
+  // measured at ~0.37 ms for the round trip on Mali-G610, against roughly
+  // 1.1 ms of actual GPU work in the stages it was sizing. Building the
+  // dispatch arguments and the clamped count on the device instead
+  // (build_qbp_args_pl_) removes the round trip and keeps the exact sizing.
+  //
+  // No `if (count > 0)` guard any more, since the host no longer knows the
+  // count here. It is not needed: a zero count makes every indirect dispatch
+  // below a zero-workgroup no-op, and extract_blob_counts.comp reads the
+  // (per-frame zeroed) selected counter itself and emits zeros, so the scan
+  // and the point total downstream all come out zero exactly as before.
   // ------------------------------------------------------------------
-  // ------------------------------------------------------------------
-  cmd = BeginTimedCommands();
-  if (qbp_count > 0) {
+  {
+    struct { uint32_t workgroup_size, capacity, args_slot, resolved_slot; } qbp_args_pc{
+        wg1d_.x, qbp_capacity_, 1u, 0u};
+    build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::Compute);
+    // Compute barrier above covers the shader reads of resolved_counts_buf_;
+    // this one covers the indirect read of the argument buffer, which is a
+    // different pipeline stage (see IndirectDispatchBarrier).
+    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+
     // Group the boundary points by (rep0, rep1) with a hash table instead of
     // sorting them. See hash_group.comp: the pipeline only ever needed the
     // grouping, never the order.
-    struct { uint32_t count, table_mask, max_probes; } hash_pc{
-        qbp_count, hash_table_size_ - 1u, 128u};
+    struct { uint32_t table_mask, max_probes; } hash_pc{hash_table_size_ - 1u, 128u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
-    hash_group_pl_.Dispatch1D(cmd, qbp_count, &hash_pc);
+    hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
     // init_extents and select_blobs used to be dispatched over max_raw_blobs
@@ -718,16 +744,17 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     // before. Both consumers still bounds-check every invocation against
     // max_raw_blobs (unchanged, passed as before), so a rounded-up overshoot
     // from build_indirect_args.comp's ceiling division is harmless.
-    struct { uint32_t workgroup_size; } build_indirect_pc{wg1d_.x};
-    build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
+    struct { uint32_t workgroup_size, capacity, args_slot, resolved_slot; } build_indirect_pc{
+        wg1d_.x, config_.max_raw_blobs, 0u, 1u};
+    build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::Compute);
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
     struct { uint32_t capacity; } extentscap_pc{config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
     init_extents_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &extentscap_pc);
 
-    struct { uint32_t count, max_raw_blobs; } reduce_pc{qbp_count, config_.max_raw_blobs};
-    reduce_extents_hash_pl_.Dispatch1D(cmd, qbp_count, &reduce_pc);
+    struct { uint32_t max_raw_blobs; } reduce_pc{config_.max_raw_blobs};
+    reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &reduce_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
     struct {
@@ -750,11 +777,11 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                      blob_scan_add_offsets_pls_);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
-    struct { uint32_t count, capacity, max_raw_blobs; } scatter_pc{qbp_count, ipoint_capacity_,
-                                                                   config_.max_raw_blobs};
+    struct { uint32_t capacity, max_raw_blobs; } scatter_pc{ipoint_capacity_,
+                                                            config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
-    scatter_index_points_pl_.Dispatch1D(cmd, qbp_count, &scatter_pc,
-                                        BarrierKind::ComputeAndTransfer);
+    scatter_index_points_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
+                                              BarrierKind::ComputeAndTransfer);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
 
     // raw_blob_counter_buf_ is now the number of distinct (rep0, rep1) pairs
@@ -779,13 +806,18 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   vk::ComputePipeline::HostReadBarrier(cmd);
   SubmitTimedAndWait(cmd);
 
-  const uint32_t num_raw_blobs = (qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0;
-  const uint32_t hash_probe_drops = (qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0;
+  // All four counts land in the same readback, after the one fence this
+  // submission costs. qbp_count is now read purely to report it - nothing is
+  // sized by it on the host any more (build_qbp_args_pl_ does that on the
+  // device), and it is clamped here exactly as that shader clamps it.
+  const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
+  const uint32_t num_raw_blobs = ReadCounterSlot(kSlotRawBlobs);
+  const uint32_t hash_probe_drops = ReadCounterSlot(kSlotHashDrops);
   const uint32_t num_selected_blobs =
       std::min(ReadCounterSlot(kSlotSelectedCount), config_.max_blobs);
-  const uint32_t num_points =
-      (qbp_count > 0) ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_) : 0;
-  const auto t_sort_group = Clock::now();
+  const uint32_t num_points = std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_);
+  const auto t_boundary = Clock::now();
+  const auto t_sort_group = t_boundary;
 
   // ------------------------------------------------------------------
   // Submit 4: sort the surviving points around each blob's perimeter, compute

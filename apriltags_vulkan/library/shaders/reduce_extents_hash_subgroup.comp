@@ -44,15 +44,20 @@ layout(std430, binding = 0) readonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
 layout(std430, binding = 3) buffer Extents { MinMaxExtentsGpu extents[]; };
+layout(std430, binding = 4) readonly buffer ResolvedCounts { uint resolved_counts[]; };
 
+// pc.count is gone: this shader is now dispatched INDIRECTLY, so the host
+// never learns the boundary-point count and cannot pass it. The count comes
+// from resolved_counts[0], written by build_indirect_args.comp from the same
+// device counter, clamped identically to how the host used to clamp it. See
+// that shader for why the host read-back was worth removing.
 layout(push_constant) uniform PushConstants {
-  uint count;
   uint max_raw_blobs;
 } pc;
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
-  bool is_active = i < pc.count;
+  bool is_active = i < resolved_counts[0];
 
   // bi stays 0xFFFFFFFFu (never a valid dense-minus-1 index) for every lane
   // that is out of range, unmatched, or dropped - the same sentinel value

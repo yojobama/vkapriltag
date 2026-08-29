@@ -1,34 +1,48 @@
 #version 450
 // Builds a VkDispatchIndirectCommand (groupCountX/Y/Z) from a device-side
-// count, so init_extents.comp / select_blobs.comp can be dispatched over the
-// frame's actual raw blob count instead of the worst-case max_raw_blobs -
-// the count (raw_blob_counter_buf_, populated by hash_group.comp's winning
-// CAS threads) only exists on the device at this point in the frame, so
-// avoiding a host round-trip to read it back means building the dispatch
-// arguments here instead.
+// count, plus the clamped count itself, so consumers can be dispatched over
+// the frame's actual work rather than a worst-case capacity - and, crucially,
+// without the host having to read the count back first.
 //
-// Single invocation: negligible cost next to the traffic it saves
-// downstream (both consumers were previously dispatched over the full
-// max_raw_blobs capacity - 65536 by default, against a couple hundred to a
-// couple thousand real raw blobs on a typical frame).
+// Avoiding that read-back is the whole point: every host read of a device
+// counter costs a full queue submit plus a blocking fence wait, measured at
+// ~0.37 ms per round trip on Mali-G610 (see DetectProfile::cpu_submit_wait_ms
+// versus the sum of gpu_stage_ms). That is far more than the dispatch waste
+// it was buying back.
 //
-// groupCountX is rounded UP to the next whole workgroup, so the last
-// partial group may cover a few indices past the real count - harmless,
-// since both consumers already bounds-check every invocation against
-// max_raw_blobs (a compile/record-time-known push constant, unchanged by
-// this) before touching any buffer; this shader only has to get "large
-// enough to cover the count", not exact.
+// Single invocation; negligible cost next to the traffic it saves.
+//
+// Two outputs, because a consumer needs both:
+//  - args[args_slot*3 .. +2]: the dispatch dimensions. groupCountX is rounded
+//    UP to a whole workgroup, so the last partial group may cover indices
+//    past the real count.
+//  - resolved[resolved_slot]: the count itself, clamped to capacity exactly
+//    as the host used to clamp it (min(counter, capacity)) before passing it
+//    as a push constant. Consumers bounds-check against this, which is what
+//    makes the rounded-up overshoot above harmless. It must be the SAME
+//    clamp the host applies, or a frame that overflows a capacity would have
+//    the shaders and the host disagreeing about how many entries are valid.
 layout(local_size_x_id = 0, local_size_x = 1) in;
 
 layout(std430, binding = 0) readonly buffer Count { uint count; };
 layout(std430, binding = 1) writeonly buffer IndirectArgs { uint args[]; };
+layout(std430, binding = 2) writeonly buffer ResolvedCounts { uint resolved[]; };
 
 layout(push_constant) uniform PushConstants {
+  // Workgroup size of the consumer being sized. 1 means "one workgroup per
+  // element" (sort_points_local.comp's shape), which the ceiling division
+  // below yields naturally, so that needs no special case.
   uint workgroup_size;
+  uint capacity;
+  uint args_slot;
+  uint resolved_slot;
 } pc;
 
 void main() {
-  args[0] = (count + pc.workgroup_size - 1u) / pc.workgroup_size;
-  args[1] = 1u;
-  args[2] = 1u;
+  uint c = min(count, pc.capacity);
+  uint wg = max(pc.workgroup_size, 1u);
+  args[pc.args_slot * 3u + 0u] = (c + wg - 1u) / wg;
+  args[pc.args_slot * 3u + 1u] = 1u;
+  args[pc.args_slot * 3u + 2u] = 1u;
+  resolved[pc.resolved_slot] = c;
 }
