@@ -815,12 +815,14 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                                       BarrierKind::ComputeAndTransfer);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
   }
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanReadbackCopy));
   if (extents_bytes > 0) {
     selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);
   }
   if (linefit_bytes > 0) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
   }
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanReadbackCopy));
   vk::ComputePipeline::HostReadBarrier(cmd);
   SubmitTimedAndWait(cmd);
   const auto t_linefit = Clock::now();
