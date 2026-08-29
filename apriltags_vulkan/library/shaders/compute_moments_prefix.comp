@@ -1,48 +1,27 @@
 #version 450
 // A9 stage 1: GPU port of FitQuadForBlob's moment prefix-sum
-// (QuadDecode.cpp, the `cs[k] = running` loop).
+// (QuadDecode.cpp, the `cs[k] = running` loop) - computed here only to be
+// verified bit-for-bit against the CPU, before anything is built on top of
+// it (windowed error, the 7-tap filter, peak detection, the combinatorial
+// search - all still CPU-side).
 //
-// One workgroup per blob, gl_WorkGroupSize.x threads cooperating on a
-// classic two-pass chunked scan (the same shape scan_block.comp's
-// Hillis-Steele step uses, generalized from a scalar uint to the
-// GpuLineFitMomentsRaw struct via AddMoments):
-//   1. Each thread sequentially sums its own contiguous chunk of the
-//      blob's points into a single total (no output written yet), and
-//      stores that total in shared memory.
-//   2. An in-workgroup inclusive scan (Hillis-Steele) combines the
-//      per-thread chunk totals, so afterward slot t holds the sum of
-//      chunks [0, t].
-//   3. Each thread replays its chunk a SECOND time, seeded with the
-//      exclusive prefix (the inclusive scan's slot t-1) instead of zero,
-//      writing cs[] as it goes.
-// Recomputing each chunk's sum twice (steps 1 and 3) trades a 2x compute
-// factor for needing no per-thread scratch storage proportional to chunk
-// size - the same tradeoff stage 3's peak selection already makes for a
-// different reason (see that shader's comment).
+// One workgroup per blob, a single invocation doing a plain sequential
+// scan over that blob's points - deliberately not parallelized yet. The
+// CPU code is itself sequential (an inherently serial running sum), and
+// getting a bit-exact port right, including the exact 32-bit truncations
+// the CPU relies on for Mx/My, matters more at this stage than the launch
+// geometry. This still runs one blob's scan per GPU workgroup, i.e. all
+// blobs in the frame in parallel - a real if coarse-grained parallelization,
+// not equivalent to a single-threaded CPU pass.
 //
-// This chunking is EXACT, not an approximation: integer addition (mod
-// 2^32/2^64, see int64_emu.glsl) is exactly associative, so summing in
-// chunks and combining produces bit-for-bit the same result as one
-// straight sequential sum - this still needs to satisfy stage 1's
-// bit-exactness bar, and does (re-verified via test_moments_prefix after
-// this rewrite).
-//
-// This replaces an earlier single-thread-per-blob version: correct, and
-// fine for standalone verification, but measured as a severe regression
-// on Mali-G610 in the real pipeline (leaving 1 of the subgroup's 16 lanes
-// active per blob wastes the overwhelming majority of the device's
-// parallelism) - pipeline_total roughly doubled versus the pre-A9
-// baseline. This version keeps every lane in the workgroup busy.
+// Values here can exceed the ~53-bit range float64 could represent exactly,
+// and this device has neither shaderInt64 nor shaderFloat64 - see
+// int64_emu.glsl for the emulation this depends on.
 #extension GL_GOOGLE_include_directive : require
 #include "int64_emu.glsl"
 #include "line_fit_moments.glsl"
 
-// Matches GpuDetector's local_sort_cap_ (already capped at 256 there for
-// the same reason: PrevPow2(min(device max invocations, 256))) - reused
-// here as this shader's workgroup size, so the shared array below only
-// ever needs to cover the values GpuDetector actually specializes it to.
-layout(local_size_x_id = 0, local_size_x = 256) in;
-shared GpuLineFitMomentsRaw chunk_totals[256];
+layout(local_size_x_id = 0, local_size_x = 1) in;
 
 // Mirrors RawLineFitPoint (gpu/Types.h) - std430 layout, 16 bytes.
 struct RawLineFitPointGpu {
@@ -58,8 +37,12 @@ struct RawLineFitPointGpu {
 // blobs in input order (see line_fit_moments.glsl for the struct).
 
 layout(std430, binding = 0) readonly buffer Points { RawLineFitPointGpu points[]; };
-// See compute_window_error.comp for this buffer's convention - the same
-// one sort_points_local.comp/scatter_index_points.comp use.
+// Inclusive prefix sum of per-(selected)-blob point counts, indexed by the
+// same compact 0..num_selected_blobs-1 numbering sort_points_local.comp
+// dispatches over - the same buffer and convention that shader and
+// scatter_index_points.comp already use (blob_point_offsets[blob] is the
+// blob's END offset, exclusive; its START is blob_point_offsets[blob-1],
+// or 0 for blob 0).
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 2) writeonly buffer MomentsOut { GpuLineFitMomentsRaw moments[]; };
 
@@ -67,83 +50,41 @@ layout(push_constant) uniform PushConstants {
   uint num_blobs;
 } pc;
 
-GpuLineFitMomentsRaw ZeroMoments() {
-  GpuLineFitMomentsRaw z;
-  z.Mx = 0;
-  z.My = 0;
-  z.W = 0;
-  z.Mxx_hi = 0;
-  z.Mxx_lo = 0u;
-  z.Myy_hi = 0;
-  z.Myy_lo = 0u;
-  z.Mxy_hi = 0;
-  z.Mxy_lo = 0u;
-  z.N = 0;
-  return z;
-}
-
-// One step of FitQuadForBlob's running-sum update (the `cs[k] = running`
-// loop body), applied to an arbitrary starting value rather than always
-// zero - lets both the chunk-total pass and the seeded replay pass share
-// the exact same accumulation code.
-GpuLineFitMomentsRaw AccumulatePoint(GpuLineFitMomentsRaw prev, RawLineFitPointGpu p) {
-  I64 wx = Mul32x32To64(p.W, p.x2);
-  I64 wy = Mul32x32To64(p.W, p.y2);
-
-  GpuLineFitMomentsRaw r;
-  r.Mx = prev.Mx + Trunc32(wx);
-  r.My = prev.My + Trunc32(wy);
-  r.W = prev.W + p.W;
-  I64 mxx = Add64(GetMxx(prev), Mul64By32(wx, p.x2));
-  I64 mxy = Add64(GetMxy(prev), Mul64By32(wx, p.y2));
-  I64 myy = Add64(GetMyy(prev), Mul64By32(wy, p.y2));
-  r.Mxx_hi = mxx.hi;
-  r.Mxx_lo = mxx.lo;
-  r.Mxy_hi = mxy.hi;
-  r.Mxy_lo = mxy.lo;
-  r.Myy_hi = myy.hi;
-  r.Myy_lo = myy.lo;
-  r.N = 0;
-  return r;
-}
-
 void main() {
-  uint b = gl_WorkGroupID.x;
+  uint b = gl_GlobalInvocationID.x;
   if (b >= pc.num_blobs) return;
 
   uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
   uint end = blob_point_offsets[b];
-  uint n = end - begin;
 
-  uint tid = gl_LocalInvocationID.x;
-  uint chunk = (n + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x;
-  uint chunk_start = tid * chunk;
-  uint chunk_end = min(chunk_start + chunk, n);
+  int running_Mx = 0, running_My = 0, running_W = 0;
+  I64 running_Mxx = I64(0, 0u);
+  I64 running_Myy = I64(0, 0u);
+  I64 running_Mxy = I64(0, 0u);
 
-  // Pass 1: this thread's chunk total only.
-  GpuLineFitMomentsRaw total = ZeroMoments();
-  for (uint k = chunk_start; k < chunk_end; ++k) {
-    total = AccumulatePoint(total, points[begin + k]);
-  }
-  chunk_totals[tid] = total;
-  barrier();
+  for (uint k = begin; k < end; ++k) {
+    RawLineFitPointGpu p = points[k];
+    I64 wx = Mul32x32To64(p.W, p.x2);
+    I64 wy = Mul32x32To64(p.W, p.y2);
 
-  // Inclusive scan across the per-thread chunk totals.
-  for (uint offset = 1u; offset < gl_WorkGroupSize.x; offset <<= 1u) {
-    GpuLineFitMomentsRaw addend = (tid >= offset) ? chunk_totals[tid - offset] : ZeroMoments();
-    barrier();
-    chunk_totals[tid] = AddMoments(chunk_totals[tid], addend);
-    barrier();
-  }
+    running_Mx += Trunc32(wx);
+    running_My += Trunc32(wy);
+    running_W += p.W;
+    running_Mxx = Add64(running_Mxx, Mul64By32(wx, p.x2));
+    running_Mxy = Add64(running_Mxy, Mul64By32(wx, p.y2));
+    running_Myy = Add64(running_Myy, Mul64By32(wy, p.y2));
 
-  // Exclusive prefix for this thread's chunk = the inclusive scan's
-  // previous slot (zero for thread 0).
-  GpuLineFitMomentsRaw seed = (tid == 0u) ? ZeroMoments() : chunk_totals[tid - 1u];
-
-  // Pass 2: replay the chunk, seeded correctly this time, writing cs[].
-  GpuLineFitMomentsRaw running = seed;
-  for (uint k = chunk_start; k < chunk_end; ++k) {
-    running = AccumulatePoint(running, points[begin + k]);
-    moments[begin + k] = running;
+    GpuLineFitMomentsRaw m;
+    m.Mx = running_Mx;
+    m.My = running_My;
+    m.W = running_W;
+    m.Mxx_hi = running_Mxx.hi;
+    m.Mxx_lo = running_Mxx.lo;
+    m.Myy_hi = running_Myy.hi;
+    m.Myy_lo = running_Myy.lo;
+    m.Mxy_hi = running_Mxy.hi;
+    m.Mxy_lo = running_Mxy.lo;
+    m.N = 0;
+    moments[k] = m;
   }
 }
