@@ -196,10 +196,25 @@ class GpuDetector {
     // span - so `sum(gpu_stage_ms)` being well under `gpu_ms` says the
     // difference is host-side, but not which part. These three say which.
     //
-    // cpu_submit_wait_ms in particular INCLUDES the GPU execution it waits
-    // on, so the quantity that matters for "is the round trip itself
-    // expensive?" is (cpu_submit_wait_ms - sum(gpu_stage_ms)): submit ioctl
-    // plus fence-signal wakeup latency, paid once per submission.
+    // cpu_submit_wait_ms INCLUDES the GPU execution it waits on, so
+    // (cpu_submit_wait_ms - sum(gpu_stage_ms)) is the frame's GPU-side time
+    // that no span accounts for. At 1080p on Mali-G610 that residual is
+    // ~1.5 ms, and it is worth recording what it is NOT, because the
+    // intuitive readings were measured and disproved:
+    //
+    //  - It is not per-submission latency. Dividing it by the submit count
+    //    suggested ~0.37 ms per submit, so the frame was restructured from 4
+    //    submissions to 3 (device-side dispatch sizing, so the host no longer
+    //    read a counter back mid-frame). That moved the residual by 0.05 ms,
+    //    not 0.37 - and the divided figure went UP, which is the signature of
+    //    a mostly-fixed cost being spread over fewer submissions. Reverted.
+    //  - It is not the per-frame buffer clears. Those are ~2.3 MB of
+    //    vkCmdFillBuffer and measure 0.08 ms (see kSpanClear).
+    //
+    // What remains is the ~25 inter-dispatch pipeline barriers, each forcing
+    // a cache flush/invalidate and pipeline drain on a tile-based GPU:
+    // roughly 0.05 ms apiece. Reducing barrier count or strength is the
+    // lever here; reducing submission count is not.
     double cpu_begin_ms = 0.0;        // BeginCommands: ring fence wait + resets
     double cpu_submit_wait_ms = 0.0;  // EndCommandBuffer + QueueSubmit + WaitForFences
     double cpu_counter_read_ms = 0.0; // ReadCounterSlot invalidate + read
