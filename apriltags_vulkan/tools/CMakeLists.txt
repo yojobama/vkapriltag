@@ -34,3 +34,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 install(TARGETS apriltag_vulkan_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# A9 stage 1: verifies compute_moments_prefix.comp's int64-emulated moment
+# prefix sum against QuadDecode.cpp's CPU reference, bit-for-bit.
+add_executable(test_moments_prefix test_moments_prefix/test_moments_prefix.cpp)
+target_link_libraries(test_moments_prefix PRIVATE vkapriltag::vkapriltag)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(test_moments_prefix PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()

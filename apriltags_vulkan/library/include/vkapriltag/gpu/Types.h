@@ -77,6 +77,26 @@ struct LineFitMoments {
   int32_t N = 0;
 };
 
+// GPU-side prefix-summed moments (A9 stage 1: compute_moments_prefix.comp),
+// bit-for-bit equivalent to one LineFitMoments cs[] entry but laid out to
+// match the shader's std430 struct exactly - Mxx/Myy/Mxy split into
+// (hi: high 32 bits signed, lo: low 32 bits unsigned) since this device has
+// no shaderInt64 (see int64_emu.glsl). Reconstruct the signed 64-bit value
+// on the host as (int64_t(hi) << 32) | uint32_t(lo).
+struct GpuLineFitMomentsRaw {
+  int32_t Mx = 0;
+  int32_t My = 0;
+  int32_t W = 0;
+  int32_t Mxx_hi = 0;
+  uint32_t Mxx_lo = 0;
+  int32_t Myy_hi = 0;
+  uint32_t Myy_lo = 0;
+  int32_t Mxy_hi = 0;
+  uint32_t Mxy_lo = 0;
+  int32_t N = 0;
+};
+static_assert(sizeof(GpuLineFitMomentsRaw) == 40, "GpuLineFitMomentsRaw must match std430 layout");
+
 // Final fitted quad corners in un-decimated pixel coordinates (mirrors
 // frc971::apriltag::QuadCorners).
 struct QuadCorners {

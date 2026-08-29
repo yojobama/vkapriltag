@@ -1,0 +1,97 @@
+#version 450
+// A9 stage 1: GPU port of FitQuadForBlob's moment prefix-sum
+// (QuadDecode.cpp, the `cs[k] = running` loop) - computed here only to be
+// verified bit-for-bit against the CPU, before anything is built on top of
+// it (windowed error, the 7-tap filter, peak detection, the combinatorial
+// search - all still CPU-side).
+//
+// One workgroup per blob, a single invocation doing a plain sequential
+// scan over that blob's points - deliberately not parallelized yet. The
+// CPU code is itself sequential (an inherently serial running sum), and
+// getting a bit-exact port right, including the exact 32-bit truncations
+// the CPU relies on for Mx/My, matters more at this stage than the launch
+// geometry. This still runs one blob's scan per GPU workgroup, i.e. all
+// blobs in the frame in parallel - a real if coarse-grained parallelization,
+// not equivalent to a single-threaded CPU pass.
+//
+// Values here can exceed the ~53-bit range float64 could represent exactly,
+// and this device has neither shaderInt64 nor shaderFloat64 - see
+// int64_emu.glsl for the emulation this depends on.
+#extension GL_GOOGLE_include_directive : require
+#include "int64_emu.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 1) in;
+
+// Mirrors RawLineFitPoint (gpu/Types.h) - std430 layout, 16 bytes.
+struct RawLineFitPointGpu {
+  int x2;
+  int y2;
+  int W;
+  uint blob_index;
+};
+
+// Mirrors GpuLineFitMomentsRaw (gpu/Types.h) - std430 layout, 40 bytes.
+// One entry written per input point (at that point's own global index),
+// holding the running sum through and including that point - i.e. this
+// buffer IS `cs[]`, laid out contiguously across all blobs in input order.
+struct GpuLineFitMomentsRaw {
+  int Mx;
+  int My;
+  int W;
+  int Mxx_hi;
+  uint Mxx_lo;
+  int Myy_hi;
+  uint Myy_lo;
+  int Mxy_hi;
+  uint Mxy_lo;
+  int N;
+};
+
+layout(std430, binding = 0) readonly buffer Points { RawLineFitPointGpu points[]; };
+// One (begin, end) pair per blob - end is exclusive, matching
+// FitQuadForBlob(config, points, begin, end)'s own convention.
+layout(std430, binding = 1) readonly buffer Ranges { uvec2 ranges[]; };
+layout(std430, binding = 2) writeonly buffer MomentsOut { GpuLineFitMomentsRaw moments[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint num_blobs;
+} pc;
+
+void main() {
+  uint b = gl_GlobalInvocationID.x;
+  if (b >= pc.num_blobs) return;
+
+  uint begin = ranges[b].x;
+  uint end = ranges[b].y;
+
+  int running_Mx = 0, running_My = 0, running_W = 0;
+  I64 running_Mxx = I64(0, 0u);
+  I64 running_Myy = I64(0, 0u);
+  I64 running_Mxy = I64(0, 0u);
+
+  for (uint k = begin; k < end; ++k) {
+    RawLineFitPointGpu p = points[k];
+    I64 wx = Mul32x32To64(p.W, p.x2);
+    I64 wy = Mul32x32To64(p.W, p.y2);
+
+    running_Mx += Trunc32(wx);
+    running_My += Trunc32(wy);
+    running_W += p.W;
+    running_Mxx = Add64(running_Mxx, Mul64By32(wx, p.x2));
+    running_Mxy = Add64(running_Mxy, Mul64By32(wx, p.y2));
+    running_Myy = Add64(running_Myy, Mul64By32(wy, p.y2));
+
+    GpuLineFitMomentsRaw m;
+    m.Mx = running_Mx;
+    m.My = running_My;
+    m.W = running_W;
+    m.Mxx_hi = running_Mxx.hi;
+    m.Mxx_lo = running_Mxx.lo;
+    m.Myy_hi = running_Myy.hi;
+    m.Myy_lo = running_Myy.lo;
+    m.Mxy_hi = running_Mxy.hi;
+    m.Mxy_lo = running_Mxy.lo;
+    m.N = 0;
+    moments[k] = m;
+  }
+}
