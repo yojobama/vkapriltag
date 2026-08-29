@@ -37,9 +37,13 @@ struct RawLineFitPointGpu {
 // blobs in input order (see line_fit_moments.glsl for the struct).
 
 layout(std430, binding = 0) readonly buffer Points { RawLineFitPointGpu points[]; };
-// One (begin, end) pair per blob - end is exclusive, matching
-// FitQuadForBlob(config, points, begin, end)'s own convention.
-layout(std430, binding = 1) readonly buffer Ranges { uvec2 ranges[]; };
+// Inclusive prefix sum of per-(selected)-blob point counts, indexed by the
+// same compact 0..num_selected_blobs-1 numbering sort_points_local.comp
+// dispatches over - the same buffer and convention that shader and
+// scatter_index_points.comp already use (blob_point_offsets[blob] is the
+// blob's END offset, exclusive; its START is blob_point_offsets[blob-1],
+// or 0 for blob 0).
+layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 2) writeonly buffer MomentsOut { GpuLineFitMomentsRaw moments[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -50,8 +54,8 @@ void main() {
   uint b = gl_GlobalInvocationID.x;
   if (b >= pc.num_blobs) return;
 
-  uint begin = ranges[b].x;
-  uint end = ranges[b].y;
+  uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
+  uint end = blob_point_offsets[b];
 
   int running_Mx = 0, running_My = 0, running_W = 0;
   I64 running_Mxx = I64(0, 0u);

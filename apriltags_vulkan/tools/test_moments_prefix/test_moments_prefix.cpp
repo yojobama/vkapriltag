@@ -412,16 +412,17 @@ int main() {
   vk::Context ctx;
   fprintf(stderr, "%s\n", ctx.DescribeDevice().c_str());
 
-  std::vector<uint32_t> ranges_flat(ranges.size() * 2);
-  for (size_t i = 0; i < ranges.size(); ++i) {
-    ranges_flat[i * 2 + 0] = ranges[i].first;
-    ranges_flat[i * 2 + 1] = ranges[i].second;
-  }
+  // blob_point_offsets convention (matches sort_points_local.comp /
+  // scatter_index_points.comp / GpuDetector's real blob_point_offsets_buf_):
+  // one inclusive-prefix-sum END offset per blob - ranges[i].second already
+  // is exactly that, since points are appended blob-by-blob in order.
+  std::vector<uint32_t> blob_offsets_flat(ranges.size());
+  for (size_t i = 0; i < ranges.size(); ++i) blob_offsets_flat[i] = ranges[i].second;
 
   vk::Buffer points_buf(ctx, total_points * sizeof(RawLineFitPoint),
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                         vk::MemoryKind::HostVisible);
-  vk::Buffer ranges_buf(ctx, ranges_flat.size() * sizeof(uint32_t),
+  vk::Buffer ranges_buf(ctx, blob_offsets_flat.size() * sizeof(uint32_t),
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                         vk::MemoryKind::HostVisible);
   vk::Buffer moments_buf(ctx, total_points * sizeof(GpuLineFitMomentsRaw),
@@ -429,7 +430,7 @@ int main() {
                          vk::MemoryKind::HostVisibleCached);
 
   points_buf.Write(points.data(), points.size() * sizeof(RawLineFitPoint));
-  ranges_buf.Write(ranges_flat.data(), ranges_flat.size() * sizeof(uint32_t));
+  ranges_buf.Write(blob_offsets_flat.data(), blob_offsets_flat.size() * sizeof(uint32_t));
 
   struct PushConstants {
     uint32_t num_blobs;

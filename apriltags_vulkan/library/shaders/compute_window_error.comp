@@ -21,10 +21,9 @@
 
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-// One (begin, end) pair per blob - end exclusive, matching
-// FitQuadForBlob(config, points, begin, end)'s own convention (see stage
-// 1's compute_moments_prefix.comp, which uses the same Ranges buffer).
-layout(std430, binding = 0) readonly buffer Ranges { uvec2 ranges[]; };
+// See stage 1's compute_moments_prefix.comp for this buffer's convention -
+// the same one sort_points_local.comp/scatter_index_points.comp use.
+layout(std430, binding = 0) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 1) readonly buffer Moments { GpuLineFitMomentsRaw cs[]; };
 layout(std430, binding = 2) writeonly buffer ErrorOut { float error_out[]; };
 
@@ -73,8 +72,8 @@ void main() {
   uint b = gl_WorkGroupID.x;
   if (b >= pc.num_blobs) return;
 
-  uint begin = ranges[b].x;
-  uint end = ranges[b].y;
+  uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
+  uint end = blob_point_offsets[b];
   uint n = end - begin;
   // FitQuadForBlob returns immediately (no error[] computed at all) for
   // blobs under 4 points - matches that guard.

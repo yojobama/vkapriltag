@@ -25,7 +25,7 @@
 
 layout(local_size_x_id = 0, local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer Ranges { uvec2 ranges[]; };
+layout(std430, binding = 0) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 1) readonly buffer ErrorIn { float error_in[]; };
 // 10 uints per blob - the selected point indices, ascending, valid up to
 // num_selected[blob] (garbage beyond that, matching CPU's untouched tail
@@ -60,8 +60,8 @@ void main() {
   uint b = gl_GlobalInvocationID.x;
   if (b >= pc.num_blobs) return;
 
-  uint begin = ranges[b].x;
-  uint end = ranges[b].y;
+  uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
+  uint end = blob_point_offsets[b];
   uint n = end - begin;
 
   const uint kNMaxima = 10u;

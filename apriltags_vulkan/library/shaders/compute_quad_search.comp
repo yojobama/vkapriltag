@@ -23,7 +23,7 @@
 
 layout(local_size_x_id = 0, local_size_x = 1) in;
 
-layout(std430, binding = 0) readonly buffer Ranges { uvec2 ranges[]; };
+layout(std430, binding = 0) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 1) readonly buffer Moments { GpuLineFitMomentsRaw cs[]; };
 // From stage 3 (compute_peaks.comp): up to 10 selected LOCAL point indices
 // per blob, ascending, valid up to NumSelected[blob].
@@ -118,8 +118,8 @@ void main() {
     return;
   }
 
-  uint begin = ranges[b].x;
-  uint n = ranges[b].y - begin;
+  uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
+  uint n = blob_point_offsets[b] - begin;
 
   uint pidx[kNMaxima];
   for (uint k = 0u; k < K; ++k) pidx[k] = peak_indices[b * kNMaxima + k];
