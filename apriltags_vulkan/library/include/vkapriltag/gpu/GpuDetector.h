@@ -291,6 +291,22 @@ class GpuDetector {
   // sort - see that shader's comment. No intermediate sorted-IPoint buffer.
   vk::Buffer line_fit_points_buf_;
 
+  // --- A9: GPU quad fit (compute_moments_prefix/compute_window_error/
+  // compute_peaks/compute_quad_search.comp) - only dispatched and read back
+  // when config_.quad_fit_method == kPeaks; the GPU pipeline doesn't
+  // implement the DP corner-seeding path, so kDp still uses the CPU
+  // QuadDecode::Decode() path unchanged (full line_fit_points readback).
+  // Sized to ipoint_capacity_ (one entry per selected point, same as
+  // line_fit_points_buf_).
+  vk::Buffer line_fit_moments_buf_;  // cs[] - see line_fit_moments.glsl
+  vk::Buffer boundary_error_buf_;    // error[] - one float per point
+  // Sized to config_.max_blobs.
+  vk::Buffer peak_indices_buf_;       // 10 uint per blob - GPU-internal only
+  vk::Buffer num_selected_peaks_buf_; // 1 uint per blob - GPU-internal only
+  vk::Buffer quad_best_indices_buf_;  // 4 uint per blob - GPU-internal only
+  vk::Buffer quad_valid_buf_;         // 1 uint per blob - read back
+  vk::Buffer quad_best_moments_buf_;  // 4 GpuLineFitMomentsRaw per blob - read back
+
   // --- Hash grouping (replaces the global (rep0, rep1) sort) ---
   // hash_owner_buf_[slot] is 0 when free, else 1 + the index of the boundary
   // point that claimed the slot. point_slot_buf_[i] is point i's slot.
@@ -362,6 +378,13 @@ class GpuDetector {
   std::vector<vk::ComputePipeline> blob_scan_add_offsets_pls_;
   vk::ComputePipeline sort_points_local_pl_;
 
+  // A9: see the buffer block above - only used when config_.quad_fit_method
+  // == kPeaks.
+  vk::ComputePipeline compute_moments_prefix_pl_;
+  vk::ComputePipeline compute_window_error_pl_;
+  vk::ComputePipeline compute_peaks_pl_;
+  vk::ComputePipeline compute_quad_search_pl_;
+
   DetectProfile last_profile_;
   uint64_t device_bytes_ = 0;
 
@@ -398,7 +421,20 @@ class GpuDetector {
   // Readback results exposed for QuadDecode after Detect() runs the GPU
   // pipeline; sized to the actual (not capacity) counts for the frame.
   std::vector<MinMaxExtentsGpu> last_selected_extents;
+  // Populated only when config().quad_fit_method == kDp - QuadDecode::
+  // Decode() needs the raw points for TryDpQuad's geometric corner
+  // seeding, which the GPU pipeline doesn't implement. Empty in kPeaks
+  // mode (use last_gpu_quad_moments/last_gpu_quad_valid with
+  // QuadDecode::DecodeFromGpu() instead - skipping this readback
+  // entirely there is also a real bandwidth win: O(selected blobs)
+  // instead of O(selected points)).
   std::vector<RawLineFitPoint> last_line_fit_points;
+  // Populated only when config().quad_fit_method == kPeaks - see
+  // QuadDecode::DecodeFromGpu(). Sized to 4 * last_selected_extents.size()
+  // (last_gpu_quad_moments) / last_selected_extents.size()
+  // (last_gpu_quad_valid). Empty in kDp mode.
+  std::vector<GpuLineFitMomentsRaw> last_gpu_quad_moments;
+  std::vector<uint32_t> last_gpu_quad_valid;
 };
 
 }  // namespace apriltag_vulkan

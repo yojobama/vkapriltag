@@ -168,7 +168,17 @@ int main(int argc, char **argv) {
           gpu_totals.push_back(profile.total_ms);
 
           const auto t_quad0 = std::chrono::steady_clock::now();
-          quads = quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+          // A9: kPeaks quads are already fully searched on the GPU
+          // (GpuDetector::Detect() populates last_gpu_quad_moments/
+          // last_gpu_quad_valid in that mode) - DecodeFromGpu just does the
+          // O(1)-per-quad corner reconstruction. kDp still needs the CPU's
+          // own search (raw line_fit_points), since the GPU pipeline
+          // doesn't implement DP corner seeding.
+          quads = config.quad_fit_method == apriltag_vulkan::DetectorConfig::QuadFitMethod::kPeaks
+                      ? quad_decode.DecodeFromGpu(detector.last_gpu_quad_moments,
+                                                  detector.last_gpu_quad_valid)
+                      : quad_decode.Decode(detector.last_selected_extents,
+                                           detector.last_line_fit_points);
           const auto t_quad1 = std::chrono::steady_clock::now();
           quad_decode_totals.push_back(
               std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());

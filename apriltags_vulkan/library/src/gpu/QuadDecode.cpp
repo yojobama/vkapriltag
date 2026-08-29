@@ -139,6 +139,93 @@ void FitLine(const LineFitMoments &moments, double *lineparam01, double *linepar
   *mse = eig_small;
 }
 
+// Reconstructs a real int64_t LineFitMoments from the GPU pipeline's hi/lo
+// split representation (see int64_emu.glsl / gpu/Types.h) - the reverse of
+// the packing GpuLineFitMomentsRaw's own comment describes.
+LineFitMoments ToLineFitMoments(const GpuLineFitMomentsRaw &g) {
+  LineFitMoments m;
+  m.Mx = g.Mx;
+  m.My = g.My;
+  m.W = g.W;
+  m.Mxx = (static_cast<int64_t>(g.Mxx_hi) << 32) | static_cast<uint32_t>(g.Mxx_lo);
+  m.Myy = (static_cast<int64_t>(g.Myy_hi) << 32) | static_cast<uint32_t>(g.Myy_lo);
+  m.Mxy = (static_cast<int64_t>(g.Mxy_hi) << 32) | static_cast<uint32_t>(g.Mxy_lo);
+  m.N = g.N;
+  return m;
+}
+
+// UpdateFitQuads (apriltag_detect.cu): refit lines from 4 corner-window
+// moments, intersect adjacent lines to get corners, and apply geometric
+// sanity checks (area, convex/consistent winding). Shared between Decode()
+// (moments computed by FitQuadForBlob) and DecodeFromGpu() (moments
+// computed by the GPU's compute_quad_search.comp) - the two only differ in
+// how the 4 moments were obtained, not in what happens to them afterward.
+// Returns false (leaving *out untouched) when the quad fails a sanity
+// check.
+bool BuildDetectedQuadFromMoments(const DetectorConfig &config, const LineFitMoments moments[4],
+                                  DetectedQuad *out) {
+  const double min_tag_width = std::max(3.0, config.tag_width / 2.0);  // fixed 2x decimation
+
+  double lines[4][4];
+  for (int i = 0; i < 4; ++i) {
+    double err, mse;
+    FitLine(moments[i], lines[i], lines[i] + 2, &err, &mse);
+  }
+
+  double corners[4][2];
+  for (int i = 0; i < 4; ++i) {
+    const int j = (i + 1) & 3;
+    double A00 = lines[i][3], A01 = -lines[j][3];
+    double A10 = -lines[i][2], A11 = lines[j][2];
+    double B0 = -lines[i][0] + lines[j][0];
+    double B1 = -lines[i][1] + lines[j][1];
+
+    double det = A00 * A11 - A10 * A01;
+    if (std::fabs(det) < 0.001) return false;
+    double W00 = A11 / det, W01 = -A01 / det;
+    double L0 = W00 * B0 + W01 * B1;
+
+    corners[i][0] = lines[i][0] + L0 * A00;
+    corners[i][1] = lines[i][1] + L0 * A10;
+  }
+
+  // Area check: sum of the two triangles (0,1,2) and (2,3,0).
+  {
+    auto triangle_area = [&](int a, int b, int c) {
+      double la = std::hypot(corners[b][0] - corners[a][0], corners[b][1] - corners[a][1]);
+      double lb = std::hypot(corners[c][0] - corners[b][0], corners[c][1] - corners[b][1]);
+      double lc = std::hypot(corners[a][0] - corners[c][0], corners[a][1] - corners[c][1]);
+      double p = (la + lb + lc) / 2;
+      double v = p * (p - la) * (p - lb) * (p - lc);
+      return v > 0 ? std::sqrt(v) : 0.0;
+    };
+    double area = triangle_area(0, 1, 2) + triangle_area(2, 3, 0);
+    if (area < 0.95 * min_tag_width * min_tag_width) return false;
+  }
+
+  // Reject quads whose cumulative angle change isn't consistent with a
+  // convex, consistently-wound quadrilateral.
+  for (int i = 0; i < 4; ++i) {
+    int i0 = i, i1 = (i + 1) & 3, i2 = (i + 2) & 3;
+    double dx1 = corners[i1][0] - corners[i0][0];
+    double dy1 = corners[i1][1] - corners[i0][1];
+    double dx2 = corners[i2][0] - corners[i1][0];
+    double dy2 = corners[i2][1] - corners[i1][1];
+    double cos_dtheta = (dx1 * dx2 + dy1 * dy2) /
+                       std::sqrt((dx1 * dx1 + dy1 * dy1) * (dx2 * dx2 + dy2 * dy2));
+    if (std::fabs(cos_dtheta) > config.cos_critical_rad || dx1 * dy2 < dy1 * dx2) {
+      return false;
+    }
+  }
+
+  // AdjustPixelCenters (fixed 2x decimation case): pixel = (c - 0.5) * 2 + 0.5.
+  for (int i = 0; i < 4; ++i) {
+    out->p[i][0] = (corners[i][0] - 0.5) * 2.0 + 0.5;
+    out->p[i][1] = (corners[i][1] - 0.5) * 2.0 + 0.5;
+  }
+  return true;
+}
+
 // Per-blob result of the quad fit, from either the combinatorial search
 // (mirrors FitQuad in line_fit_filter.h) or the item-3 DP corner-seeding
 // path.
@@ -568,79 +655,30 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
 
   // UpdateFitQuads: refit lines from the moments, intersect adjacent lines
   // to get corners, and apply geometric sanity checks.
-  const double min_tag_width = std::max(3.0, config_.tag_width / 2.0);  // fixed 2x decimation
   for (const FitQuadResult &quad : fit_quads) {
-    double lines[4][4];
-    bool line_ok = true;
-    for (int i = 0; i < 4; ++i) {
-      double err, mse;
-      FitLine(quad.moments[i], lines[i], lines[i] + 2, &err, &mse);
-    }
-
-    double corners[4][2];
-    bool bad_determinant = false;
-    for (int i = 0; i < 4; ++i) {
-      const int j = (i + 1) & 3;
-      double A00 = lines[i][3], A01 = -lines[j][3];
-      double A10 = -lines[i][2], A11 = lines[j][2];
-      double B0 = -lines[i][0] + lines[j][0];
-      double B1 = -lines[i][1] + lines[j][1];
-
-      double det = A00 * A11 - A10 * A01;
-      if (std::fabs(det) < 0.001) {
-        bad_determinant = true;
-        break;
-      }
-      double W00 = A11 / det, W01 = -A01 / det;
-      double L0 = W00 * B0 + W01 * B1;
-
-      corners[i][0] = lines[i][0] + L0 * A00;
-      corners[i][1] = lines[i][1] + L0 * A10;
-    }
-    if (bad_determinant) continue;
-    (void)line_ok;
-
-    // Area check: sum of the two triangles (0,1,2) and (2,3,0).
-    {
-      auto triangle_area = [&](int a, int b, int c) {
-        double la = std::hypot(corners[b][0] - corners[a][0], corners[b][1] - corners[a][1]);
-        double lb = std::hypot(corners[c][0] - corners[b][0], corners[c][1] - corners[b][1]);
-        double lc = std::hypot(corners[a][0] - corners[c][0], corners[a][1] - corners[c][1]);
-        double p = (la + lb + lc) / 2;
-        double v = p * (p - la) * (p - lb) * (p - lc);
-        return v > 0 ? std::sqrt(v) : 0.0;
-      };
-      double area = triangle_area(0, 1, 2) + triangle_area(2, 3, 0);
-      if (area < 0.95 * min_tag_width * min_tag_width) continue;
-    }
-
-    // Reject quads whose cumulative angle change isn't consistent with a
-    // convex, consistently-wound quadrilateral.
-    bool reject = false;
-    for (int i = 0; i < 4 && !reject; ++i) {
-      int i0 = i, i1 = (i + 1) & 3, i2 = (i + 2) & 3;
-      double dx1 = corners[i1][0] - corners[i0][0];
-      double dy1 = corners[i1][1] - corners[i0][1];
-      double dx2 = corners[i2][0] - corners[i1][0];
-      double dy2 = corners[i2][1] - corners[i1][1];
-      double cos_dtheta = (dx1 * dx2 + dy1 * dy2) /
-                         std::sqrt((dx1 * dx1 + dy1 * dy1) * (dx2 * dx2 + dy2 * dy2));
-      if (std::fabs(cos_dtheta) > config_.cos_critical_rad || dx1 * dy2 < dy1 * dx2) {
-        reject = true;
-      }
-    }
-    if (reject) continue;
-
-    // AdjustPixelCenters (fixed 2x decimation case): pixel = (c - 0.5) * 2 + 0.5.
     DetectedQuad out;
-    for (int i = 0; i < 4; ++i) {
-      out.p[i][0] = (corners[i][0] - 0.5) * 2.0 + 0.5;
-      out.p[i][1] = (corners[i][1] - 0.5) * 2.0 + 0.5;
-    }
-    output.push_back(out);
+    if (BuildDetectedQuadFromMoments(config_, quad.moments, &out)) output.push_back(out);
   }
 
   (void)selected_extents;  // Not needed beyond what's already folded into blob_index grouping.
+  return output;
+}
+
+std::vector<DetectedQuad> QuadDecode::DecodeFromGpu(
+    const std::vector<GpuLineFitMomentsRaw> &gpu_quad_moments,
+    const std::vector<uint32_t> &gpu_quad_valid) const {
+  std::vector<DetectedQuad> output;
+  output.reserve(gpu_quad_valid.size());
+
+  for (size_t b = 0; b < gpu_quad_valid.size(); ++b) {
+    if (!gpu_quad_valid[b]) continue;
+
+    LineFitMoments moments[4];
+    for (int k = 0; k < 4; ++k) moments[k] = ToLineFitMoments(gpu_quad_moments[b * 4 + k]);
+
+    DetectedQuad out;
+    if (BuildDetectedQuadFromMoments(config_, moments, &out)) output.push_back(out);
+  }
   return output;
 }
 

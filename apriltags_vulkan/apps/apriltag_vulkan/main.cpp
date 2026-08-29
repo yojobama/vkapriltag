@@ -124,8 +124,12 @@ int main(int argc, char **argv) {
       const auto &profile = detector.last_profile();
 
       const auto t0 = std::chrono::steady_clock::now();
+      // A9: see the OpenCV validate tool's identical branch for why.
       std::vector<apriltag_vulkan::DetectedQuad> quads =
-          quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+          config.quad_fit_method == apriltag_vulkan::DetectorConfig::QuadFitMethod::kPeaks
+              ? quad_decode.DecodeFromGpu(detector.last_gpu_quad_moments,
+                                         detector.last_gpu_quad_valid)
+              : quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
       const auto t1 = std::chrono::steady_clock::now();
 
       zarray_t *detections = tag_decoder.Decode(quads, gray.data(), width, height,

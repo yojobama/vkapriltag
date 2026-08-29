@@ -142,7 +142,12 @@ int main(int argc, char **argv) {
       gpu_totals.push_back(profile.total_ms);
 
       const auto t_quad0 = std::chrono::steady_clock::now();
-      quads = quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+      // A9: see the OpenCV validate tool's identical branch for why.
+      quads = config.quad_fit_method == apriltag_vulkan::DetectorConfig::QuadFitMethod::kPeaks
+                  ? quad_decode.DecodeFromGpu(detector.last_gpu_quad_moments,
+                                              detector.last_gpu_quad_valid)
+                  : quad_decode.Decode(detector.last_selected_extents,
+                                       detector.last_line_fit_points);
       const auto t_quad1 = std::chrono::steady_clock::now();
       quad_decode_totals.push_back(
           std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());

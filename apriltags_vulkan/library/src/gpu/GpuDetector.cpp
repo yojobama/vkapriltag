@@ -259,6 +259,21 @@ void GpuDetector::CreateBuffers() {
 
   line_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
 
+  // A9 (see GpuDetector.h's buffer block comment) - only ever dispatched
+  // into when config_.quad_fit_method == kPeaks, but allocated
+  // unconditionally: it's a small, fixed, per-device cost (max_blobs is
+  // already tiny relative to the rest of this pipeline's memory), and
+  // config_ is fixed for this detector's lifetime, so there's no benefit
+  // to conditioning allocation on it too.
+  line_fit_moments_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(GpuLineFitMomentsRaw));
+  boundary_error_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(float));
+  peak_indices_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 10 * sizeof(uint32_t));
+  num_selected_peaks_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * sizeof(uint32_t));
+  quad_best_indices_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 4 * sizeof(uint32_t));
+  quad_valid_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * sizeof(uint32_t));
+  quad_best_moments_buf_ =
+      ssbo(VkDeviceSize(config_.max_blobs) * 4 * sizeof(GpuLineFitMomentsRaw));
+
   // Open-addressing table for the (rep0, rep1) grouping, sized to
   // max_raw_blobs itself (previously 4x, for a 25% worst-case load factor -
   // but that worst case is the same defensive margin every other capacity
@@ -460,6 +475,28 @@ void GpuDetector::CreatePipelines() {
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
        decimated_buf_.get(), line_fit_points_buf_.get()},
       12, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
+
+  // A9: only ever dispatched when config_.quad_fit_method == kPeaks (see
+  // Detect()), but always created - same reasoning as the buffers above.
+  compute_moments_prefix_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("compute_moments_prefix"),
+      {line_fit_points_buf_.get(), blob_point_offsets_buf_.get(), line_fit_moments_buf_.get()}, 4,
+      vk::WorkgroupSize{1, 1, 1});
+  compute_window_error_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("compute_window_error"),
+      {blob_point_offsets_buf_.get(), line_fit_moments_buf_.get(), boundary_error_buf_.get()}, 4,
+      wg1d_);
+  compute_peaks_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("compute_peaks"),
+      {blob_point_offsets_buf_.get(), boundary_error_buf_.get(), peak_indices_buf_.get(),
+       num_selected_peaks_buf_.get()},
+      4, vk::WorkgroupSize{1, 1, 1});
+  compute_quad_search_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("compute_quad_search"),
+      {blob_point_offsets_buf_.get(), line_fit_moments_buf_.get(), peak_indices_buf_.get(),
+       num_selected_peaks_buf_.get(), quad_best_indices_buf_.get(), quad_valid_buf_.get(),
+       quad_best_moments_buf_.get()},
+      12, vk::WorkgroupSize{1, 1, 1});
 
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
@@ -774,12 +811,27 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
   // ------------------------------------------------------------------
   // Submit 4: sort the surviving points around each blob's perimeter, compute
-  // per-point line-fit moments, and stage both payloads for readback.
+  // per-point line-fit moments, and stage both payloads for readback. When
+  // quad_fit_method == kPeaks, also run the A9 GPU quad-fit pipeline (moment
+  // prefix sums -> windowed error -> peak selection -> combinatorial search)
+  // and read back only its compact per-blob results instead of every raw
+  // line-fit point - the GPU pipeline doesn't implement the DP corner-
+  // seeding path, so kDp is untouched (full line_fit_points readback, as
+  // before).
   // ------------------------------------------------------------------
+  const bool use_gpu_quad_fit = config_.quad_fit_method == DetectorConfig::QuadFitMethod::kPeaks;
   const VkDeviceSize extents_bytes = VkDeviceSize(num_selected_blobs) * sizeof(MinMaxExtentsGpu);
   const VkDeviceSize linefit_offset = (extents_bytes + 15) & ~VkDeviceSize(15);
-  const VkDeviceSize linefit_bytes = VkDeviceSize(num_points) * sizeof(RawLineFitPoint);
-  EnsureReadbackCapacity(linefit_offset + linefit_bytes);
+  const VkDeviceSize linefit_bytes =
+      use_gpu_quad_fit ? 0 : VkDeviceSize(num_points) * sizeof(RawLineFitPoint);
+  const VkDeviceSize quad_valid_offset = (linefit_offset + linefit_bytes + 15) & ~VkDeviceSize(15);
+  const VkDeviceSize quad_valid_bytes =
+      use_gpu_quad_fit ? VkDeviceSize(num_selected_blobs) * sizeof(uint32_t) : 0;
+  const VkDeviceSize quad_moments_offset =
+      (quad_valid_offset + quad_valid_bytes + 15) & ~VkDeviceSize(15);
+  const VkDeviceSize quad_moments_bytes =
+      use_gpu_quad_fit ? VkDeviceSize(num_selected_blobs) * 4 * sizeof(GpuLineFitMomentsRaw) : 0;
+  EnsureReadbackCapacity(quad_moments_offset + quad_moments_bytes);
 
   cmd = ctx_.BeginCommands();
   if (num_points > 0) {
@@ -799,12 +851,37 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &sort_pc,
                                       BarrierKind::ComputeAndTransfer);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
+
+    if (use_gpu_quad_fit) {
+      struct { uint32_t num_blobs; } blob_pc{num_selected_blobs};
+      compute_moments_prefix_pl_.Dispatch1D(cmd, num_selected_blobs, &blob_pc,
+                                            BarrierKind::Compute);
+      compute_window_error_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &blob_pc,
+                                           BarrierKind::Compute);
+      compute_peaks_pl_.Dispatch1D(cmd, num_selected_blobs, &blob_pc, BarrierKind::Compute);
+
+      struct {
+        uint32_t num_blobs;
+        float max_line_fit_mse;
+        float cos_critical_rad;
+      } quad_pc{num_selected_blobs, config_.max_line_fit_mse,
+               static_cast<float>(config_.cos_critical_rad)};
+      compute_quad_search_pl_.Dispatch1D(cmd, num_selected_blobs, &quad_pc,
+                                         BarrierKind::ComputeAndTransfer);
+    }
   }
   if (extents_bytes > 0) {
     selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);
   }
   if (linefit_bytes > 0) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
+  }
+  if (quad_valid_bytes > 0) {
+    quad_valid_buf_.RecordCopyTo(cmd, readback_staging_, quad_valid_bytes, 0, quad_valid_offset);
+  }
+  if (quad_moments_bytes > 0) {
+    quad_best_moments_buf_.RecordCopyTo(cmd, readback_staging_, quad_moments_bytes, 0,
+                                        quad_moments_offset);
   }
   vk::ComputePipeline::HostReadBarrier(cmd);
   ctx_.SubmitAndWait(cmd);
@@ -814,12 +891,20 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Host-side copies out of the persistently mapped readback buffer.
   // ------------------------------------------------------------------
   last_selected_extents.resize(num_selected_blobs);
-  last_line_fit_points.resize(num_points);
+  last_line_fit_points.resize(linefit_bytes > 0 ? num_points : 0);
+  last_gpu_quad_valid.resize(quad_valid_bytes > 0 ? num_selected_blobs : 0);
+  last_gpu_quad_moments.resize(quad_moments_bytes > 0 ? size_t(num_selected_blobs) * 4 : 0);
   if (extents_bytes > 0) {
     readback_staging_.Read(last_selected_extents.data(), extents_bytes, 0);
   }
   if (linefit_bytes > 0) {
     readback_staging_.Read(last_line_fit_points.data(), linefit_bytes, linefit_offset);
+  }
+  if (quad_valid_bytes > 0) {
+    readback_staging_.Read(last_gpu_quad_valid.data(), quad_valid_bytes, quad_valid_offset);
+  }
+  if (quad_moments_bytes > 0) {
+    readback_staging_.Read(last_gpu_quad_moments.data(), quad_moments_bytes, quad_moments_offset);
   }
   const auto t_end = Clock::now();
 
@@ -833,7 +918,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
                          last_profile_.sort_group_ms + last_profile_.linefit_ms;
   last_profile_.total_ms = MsSince(t_begin, t_end);
   last_profile_.upload_bytes = gray_bytes;
-  last_profile_.readback_bytes = extents_bytes + linefit_bytes + 16;
+  last_profile_.readback_bytes = extents_bytes + linefit_bytes + quad_valid_bytes +
+                                 quad_moments_bytes + 16;
   last_profile_.selected_blobs = num_selected_blobs;
   last_profile_.points = num_points;
   last_profile_.boundary_points = qbp_count;

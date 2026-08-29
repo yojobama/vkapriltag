@@ -39,6 +39,24 @@ class QuadDecode {
   std::vector<DetectedQuad> Decode(const std::vector<MinMaxExtentsGpu> &selected_extents,
                                    const std::vector<RawLineFitPoint> &line_fit_points) const;
 
+  // A9: like Decode(), but consumes the GPU pipeline's own peak-finding +
+  // combinatorial quad search results (compute_moments_prefix.comp /
+  // compute_window_error.comp / compute_peaks.comp / compute_quad_search.
+  // comp) instead of recomputing cumulative moments, peaks, and the
+  // combinatorial search from raw line_fit_points on the CPU - only the
+  // O(1)-per-quad corner intersection + geometric sanity checks (shared
+  // with Decode(), via BuildDetectedQuadFromMoments) still run here.
+  //
+  // Only valid when config.quad_fit_method == kPeaks - the GPU pipeline
+  // doesn't implement the DP corner-seeding path, so GpuDetector only
+  // populates these buffers in kPeaks mode (see its own quad_fit_method
+  // gate). gpu_quad_moments holds 4 GpuLineFitMomentsRaw per selected blob
+  // (the window from indices[k] to indices[(k+1)%4], same convention as
+  // FitQuadResult::moments); gpu_quad_valid one byte per blob. Both come
+  // from GpuDetector::last_gpu_quad_moments/last_gpu_quad_valid.
+  std::vector<DetectedQuad> DecodeFromGpu(const std::vector<GpuLineFitMomentsRaw> &gpu_quad_moments,
+                                          const std::vector<uint32_t> &gpu_quad_valid) const;
+
   unsigned threads() const { return pool_->threads(); }
 
   // Per-blob outcome of the item-3 DP corner-seeding path (config.
