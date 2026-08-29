@@ -519,10 +519,25 @@ void GpuDetector::RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &count
   counter.RecordCopyTo(cmd, counter_staging_, 4, 0, VkDeviceSize(slot) * 4);
 }
 
-uint32_t GpuDetector::ReadCounterSlot(uint32_t slot) const {
+uint32_t GpuDetector::ReadCounterSlot(uint32_t slot) {
+  const auto t0 = Clock::now();
   uint32_t value = 0;
   counter_staging_.Read(&value, 4, VkDeviceSize(slot) * 4);
+  last_profile_.cpu_counter_read_ms += MsSince(t0, Clock::now());
   return value;
+}
+
+VkCommandBuffer GpuDetector::BeginTimedCommands() {
+  const auto t0 = Clock::now();
+  VkCommandBuffer cmd = ctx_.BeginCommands();
+  last_profile_.cpu_begin_ms += MsSince(t0, Clock::now());
+  return cmd;
+}
+
+void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
+  const auto t0 = Clock::now();
+  ctx_.SubmitAndWait(cmd);
+  last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
 
 void GpuDetector::Detect(const uint8_t *gray_frame) {
@@ -555,7 +570,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Submit 1: decimate, adaptive threshold, and the first chunk of
   // connected-component labelling.
   // ------------------------------------------------------------------
-  VkCommandBuffer cmd = ctx_.BeginCommands();
+  VkCommandBuffer cmd = BeginTimedCommands();
   // One reset covers every span's timestamp pair for the whole frame: every
   // later submission this frame runs strictly after this one's fence has
   // signaled (SubmitAndWait blocks), so nothing after this point can race a
@@ -625,18 +640,18 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
   vk::ComputePipeline::HostReadBarrier(cmd);
-  ctx_.SubmitAndWait(cmd);
+  SubmitTimedAndWait(cmd);
 
   uint32_t uf_iterations = chunk;
   bool converged = ReadCounterSlot(kSlotUfChanged) == 0;
   while (!converged && uf_iterations < config_.max_uf_iterations) {
     const uint32_t next =
         std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
-    cmd = ctx_.BeginCommands();
+    cmd = BeginTimedCommands();
     record_uf_chunk(cmd, next);
     RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
     vk::ComputePipeline::HostReadBarrier(cmd);
-    ctx_.SubmitAndWait(cmd);
+    SubmitTimedAndWait(cmd);
     uf_iterations += next;
     converged = ReadCounterSlot(kSlotUfChanged) == 0;
   }
@@ -647,7 +662,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Submit 2: blob sizes, boundary point extraction, and compaction. The
   // compacted count is the number every later stage is sized by.
   // ------------------------------------------------------------------
-  cmd = ctx_.BeginCommands();
+  cmd = BeginTimedCommands();
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelFinalize));
   uf_final_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
 
@@ -670,7 +685,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
   vk::ComputePipeline::HostReadBarrier(cmd);
-  ctx_.SubmitAndWait(cmd);
+  SubmitTimedAndWait(cmd);
 
   const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
   const auto t_boundary = Clock::now();
@@ -683,7 +698,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // a couple of hundred thousand real points rather than the ~2M dense bound.
   // ------------------------------------------------------------------
   // ------------------------------------------------------------------
-  cmd = ctx_.BeginCommands();
+  cmd = BeginTimedCommands();
   if (qbp_count > 0) {
     // Group the boundary points by (rep0, rep1) with a hash table instead of
     // sorting them. See hash_group.comp: the pipeline only ever needed the
@@ -762,7 +777,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   }
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
   vk::ComputePipeline::HostReadBarrier(cmd);
-  ctx_.SubmitAndWait(cmd);
+  SubmitTimedAndWait(cmd);
 
   const uint32_t num_raw_blobs = (qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0;
   const uint32_t hash_probe_drops = (qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0;
@@ -781,7 +796,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const VkDeviceSize linefit_bytes = VkDeviceSize(num_points) * sizeof(RawLineFitPoint);
   EnsureReadbackCapacity(linefit_offset + linefit_bytes);
 
-  cmd = ctx_.BeginCommands();
+  cmd = BeginTimedCommands();
   if (num_points > 0) {
     // rewrite_index_points.comp already packed every selected blob's points
     // into one contiguous range, so sorting each blob's own points into
@@ -807,7 +822,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
   }
   vk::ComputePipeline::HostReadBarrier(cmd);
-  ctx_.SubmitAndWait(cmd);
+  SubmitTimedAndWait(cmd);
   const auto t_linefit = Clock::now();
 
   // ------------------------------------------------------------------

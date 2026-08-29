@@ -219,13 +219,30 @@ int main(int argc, char **argv) {
           << ", points=" << profile.points << std::endl;
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
+      double gpu_span_total = 0.0;
       if (profile.has_gpu_stage_breakdown) {
         std::cout << "  GPU stage breakdown (last iteration, APRILTAG_VK_TIMESTAMPS=1):"
             << std::endl;
         for (size_t s = 0; s < apriltag_vulkan::GpuDetector::kGpuStageNames.size(); ++s) {
           std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[s] << "="
               << profile.gpu_stage_ms[s] << " ms" << std::endl;
+          gpu_span_total += profile.gpu_stage_ms[s];
         }
+        std::cout << "    (sum of spans = " << gpu_span_total << " ms)" << std::endl;
+      }
+      // Host-side cost of driving the GPU - see DetectProfile's cpu_*_ms
+      // comment. The last line is the one that matters for "would fewer
+      // submissions help?": it is the round-trip cost that is NOT the GPU
+      // actually computing anything.
+      std::cout << "  Host-side submission cost (last iteration): begin="
+          << profile.cpu_begin_ms << " ms, submit+wait=" << profile.cpu_submit_wait_ms
+          << " ms, counter_reads=" << profile.cpu_counter_read_ms << " ms, over "
+          << profile.submits << " submit(s)" << std::endl;
+      if (profile.has_gpu_stage_breakdown) {
+        const double round_trip = profile.cpu_submit_wait_ms - gpu_span_total;
+        std::cout << "    submit+wait minus GPU spans = " << round_trip << " ms ("
+            << (profile.submits > 0 ? round_trip / profile.submits : 0.0)
+            << " ms per submit)" << std::endl;
       }
       std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
       PrintStats("GPU total", metrics.gpu_total_ms, iterations);

@@ -186,6 +186,23 @@ class GpuDetector {
     // supported or the pool wasn't constructed.
     bool has_gpu_stage_breakdown = false;
     std::array<double, 10> gpu_stage_ms = {};
+
+    // --- Host-side cost of driving the GPU, split out from the phase timers
+    // above. The phase timers (threshold_label_ms etc.) are wall-clock and so
+    // bundle four distinct things together: command recording, the queue
+    // submit, the blocking fence wait (which spans the GPU's actual
+    // execution), and the counter readbacks between submits. gpu_stage_ms
+    // measures only the third of those, and only the parts inside a named
+    // span - so `sum(gpu_stage_ms)` being well under `gpu_ms` says the
+    // difference is host-side, but not which part. These three say which.
+    //
+    // cpu_submit_wait_ms in particular INCLUDES the GPU execution it waits
+    // on, so the quantity that matters for "is the round trip itself
+    // expensive?" is (cpu_submit_wait_ms - sum(gpu_stage_ms)): submit ioctl
+    // plus fence-signal wakeup latency, paid once per submission.
+    double cpu_begin_ms = 0.0;        // BeginCommands: ring fence wait + resets
+    double cpu_submit_wait_ms = 0.0;  // EndCommandBuffer + QueueSubmit + WaitForFences
+    double cpu_counter_read_ms = 0.0; // ReadCounterSlot invalidate + read
   };
 
   // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
@@ -243,7 +260,19 @@ class GpuDetector {
   // Copies a device counter into the shared counter staging buffer and reads
   // it back after the submission retires.
   void RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &counter, uint32_t slot);
-  uint32_t ReadCounterSlot(uint32_t slot) const;
+  // Non-const because it accumulates its own cost into last_profile_ (the
+  // counter readback is a real per-submission cost on a device where the
+  // staging buffer is non-coherent and needs an invalidate - see
+  // MemoryKind::HostVisibleCached).
+  uint32_t ReadCounterSlot(uint32_t slot);
+
+  // ctx_.BeginCommands() / ctx_.SubmitAndWait() with the host-side cost
+  // accumulated into last_profile_ (see DetectProfile::cpu_*_ms). Detect()
+  // uses these rather than calling the Context methods directly, so the
+  // per-submission overhead is attributed rather than silently folded into
+  // whichever wall-clock phase happened to contain it.
+  VkCommandBuffer BeginTimedCommands();
+  void SubmitTimedAndWait(VkCommandBuffer cmd);
 
   // Grows the readback staging buffer if needed (never shrinks, so steady
   // state performs no allocation).
