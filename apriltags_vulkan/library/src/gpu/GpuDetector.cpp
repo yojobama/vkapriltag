@@ -478,10 +478,17 @@ void GpuDetector::CreatePipelines() {
 
   // A9: only ever dispatched when config_.quad_fit_method == kPeaks (see
   // Detect()), but always created - same reasoning as the buffers above.
+  // Sized to EXACTLY one subgroup (not local_sort_cap_/wg1d_) - every
+  // cross-lane communication in these two shaders is a subgroupShuffle,
+  // which only has well-defined semantics within a single subgroup. See
+  // compute_moments_prefix.comp's comment for why (a workgroup-wide
+  // shared-memory version measured as a catastrophic regression on
+  // Mali-G610).
+  const vk::WorkgroupSize subgroup_wg{ctx_.caps().subgroup_size, 1, 1};
   compute_moments_prefix_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("compute_moments_prefix"),
       {line_fit_points_buf_.get(), blob_point_offsets_buf_.get(), line_fit_moments_buf_.get()}, 4,
-      vk::WorkgroupSize{1, 1, 1});
+      subgroup_wg);
   compute_window_error_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("compute_window_error"),
       {blob_point_offsets_buf_.get(), line_fit_moments_buf_.get(), boundary_error_buf_.get()}, 4,
@@ -490,7 +497,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("compute_peaks"),
       {blob_point_offsets_buf_.get(), boundary_error_buf_.get(), peak_indices_buf_.get(),
        num_selected_peaks_buf_.get()},
-      4, vk::WorkgroupSize{1, 1, 1});
+      4, subgroup_wg);
   compute_quad_search_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("compute_quad_search"),
       {blob_point_offsets_buf_.get(), line_fit_moments_buf_.get(), peak_indices_buf_.get(),
@@ -854,11 +861,11 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
     if (use_gpu_quad_fit) {
       struct { uint32_t num_blobs; } blob_pc{num_selected_blobs};
-      compute_moments_prefix_pl_.Dispatch1D(cmd, num_selected_blobs, &blob_pc,
-                                            BarrierKind::Compute);
+      compute_moments_prefix_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &blob_pc,
+                                             BarrierKind::Compute);
       compute_window_error_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &blob_pc,
                                            BarrierKind::Compute);
-      compute_peaks_pl_.Dispatch1D(cmd, num_selected_blobs, &blob_pc, BarrierKind::Compute);
+      compute_peaks_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &blob_pc, BarrierKind::Compute);
 
       struct {
         uint32_t num_blobs;

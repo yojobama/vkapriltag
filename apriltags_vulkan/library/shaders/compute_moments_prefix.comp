@@ -1,27 +1,45 @@
 #version 450
 // A9 stage 1: GPU port of FitQuadForBlob's moment prefix-sum
-// (QuadDecode.cpp, the `cs[k] = running` loop) - computed here only to be
-// verified bit-for-bit against the CPU, before anything is built on top of
-// it (windowed error, the 7-tap filter, peak detection, the combinatorial
-// search - all still CPU-side).
+// (QuadDecode.cpp, the `cs[k] = running` loop).
 //
-// One workgroup per blob, a single invocation doing a plain sequential
-// scan over that blob's points - deliberately not parallelized yet. The
-// CPU code is itself sequential (an inherently serial running sum), and
-// getting a bit-exact port right, including the exact 32-bit truncations
-// the CPU relies on for Mx/My, matters more at this stage than the launch
-// geometry. This still runs one blob's scan per GPU workgroup, i.e. all
-// blobs in the frame in parallel - a real if coarse-grained parallelization,
-// not equivalent to a single-threaded CPU pass.
+// One workgroup per blob, sized to EXACTLY one subgroup (see
+// GpuDetector.cpp: WorkgroupSize{ctx_.caps().subgroup_size, 1, 1}) - every
+// cross-lane communication here is a subgroupShuffle (a register shuffle),
+// never shared memory + a barrier(). This matters a lot in practice: an
+// earlier version used a workgroup-wide Hillis-Steele scan in shared
+// memory (the same shape scan_block.comp uses for scalar uints), which
+// measured as a catastrophic ~25x regression on Mali-G610 (already
+// documented in OPTIMIZATION_NOTES.md: Valhall has no dedicated
+// shared-memory hardware, so it's backed by L2, making barrier-heavy
+// workgroup-wide algorithms there extremely slow). This version keeps the
+// same two-pass chunked-scan shape but never touches shared memory.
 //
-// Values here can exceed the ~53-bit range float64 could represent exactly,
-// and this device has neither shaderInt64 nor shaderFloat64 - see
-// int64_emu.glsl for the emulation this depends on.
+// Two-pass chunked scan, generalized from a scalar Hillis-Steele scan via
+// AccumulatePoint/AddMoments/ShuffleMoments:
+//   1. Each lane sequentially sums its own contiguous chunk of the blob's
+//      points into a single total (no output written yet).
+//   2. A subgroup-wide inclusive scan (Hillis-Steele via subgroupShuffle)
+//      combines the per-lane chunk totals, so afterward lane t holds the
+//      sum of chunks [0, t].
+//   3. Each lane replays its chunk a SECOND time, seeded with the
+//      exclusive prefix (the inclusive scan's lane t-1), writing cs[] as
+//      it goes.
+// Recomputing each chunk's sum twice (steps 1 and 3) trades a 2x compute
+// factor for needing no per-lane scratch storage proportional to chunk
+// size.
+//
+// This chunking is EXACT, not an approximation: integer addition (mod
+// 2^32/2^64, see int64_emu.glsl) is exactly associative, so summing in
+// chunks and combining produces bit-for-bit the same result as one
+// straight sequential sum - re-verified via test_moments_prefix after
+// this rewrite (unchanged: all entries bit-exact).
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 #include "int64_emu.glsl"
 #include "line_fit_moments.glsl"
 
-layout(local_size_x_id = 0, local_size_x = 1) in;
+layout(local_size_x_id = 0, local_size_x = 16) in;
 
 // Mirrors RawLineFitPoint (gpu/Types.h) - std430 layout, 16 bytes.
 struct RawLineFitPointGpu {
@@ -37,12 +55,8 @@ struct RawLineFitPointGpu {
 // blobs in input order (see line_fit_moments.glsl for the struct).
 
 layout(std430, binding = 0) readonly buffer Points { RawLineFitPointGpu points[]; };
-// Inclusive prefix sum of per-(selected)-blob point counts, indexed by the
-// same compact 0..num_selected_blobs-1 numbering sort_points_local.comp
-// dispatches over - the same buffer and convention that shader and
-// scatter_index_points.comp already use (blob_point_offsets[blob] is the
-// blob's END offset, exclusive; its START is blob_point_offsets[blob-1],
-// or 0 for blob 0).
+// See compute_window_error.comp for this buffer's convention - the same
+// one sort_points_local.comp/scatter_index_points.comp use.
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 2) writeonly buffer MomentsOut { GpuLineFitMomentsRaw moments[]; };
 
@@ -50,41 +64,109 @@ layout(push_constant) uniform PushConstants {
   uint num_blobs;
 } pc;
 
+GpuLineFitMomentsRaw ZeroMoments() {
+  GpuLineFitMomentsRaw z;
+  z.Mx = 0;
+  z.My = 0;
+  z.W = 0;
+  z.Mxx_hi = 0;
+  z.Mxx_lo = 0u;
+  z.Myy_hi = 0;
+  z.Myy_lo = 0u;
+  z.Mxy_hi = 0;
+  z.Mxy_lo = 0u;
+  z.N = 0;
+  return z;
+}
+
+// One step of FitQuadForBlob's running-sum update (the `cs[k] = running`
+// loop body), applied to an arbitrary starting value rather than always
+// zero - lets both the chunk-total pass and the seeded replay pass share
+// the exact same accumulation code.
+GpuLineFitMomentsRaw AccumulatePoint(GpuLineFitMomentsRaw prev, RawLineFitPointGpu p) {
+  I64 wx = Mul32x32To64(p.W, p.x2);
+  I64 wy = Mul32x32To64(p.W, p.y2);
+
+  GpuLineFitMomentsRaw r;
+  r.Mx = prev.Mx + Trunc32(wx);
+  r.My = prev.My + Trunc32(wy);
+  r.W = prev.W + p.W;
+  I64 mxx = Add64(GetMxx(prev), Mul64By32(wx, p.x2));
+  I64 mxy = Add64(GetMxy(prev), Mul64By32(wx, p.y2));
+  I64 myy = Add64(GetMyy(prev), Mul64By32(wy, p.y2));
+  r.Mxx_hi = mxx.hi;
+  r.Mxx_lo = mxx.lo;
+  r.Mxy_hi = mxy.hi;
+  r.Mxy_lo = mxy.lo;
+  r.Myy_hi = myy.hi;
+  r.Myy_lo = myy.lo;
+  r.N = 0;
+  return r;
+}
+
+// Broadcasts invocation `id`'s copy of `v` to every lane in the subgroup -
+// a plain subgroupShuffle per field, since subgroup arithmetic/shuffle
+// built-ins only operate on scalars/vectors, not arbitrary structs.
+GpuLineFitMomentsRaw ShuffleMoments(GpuLineFitMomentsRaw v, uint id) {
+  GpuLineFitMomentsRaw r;
+  r.Mx = subgroupShuffle(v.Mx, id);
+  r.My = subgroupShuffle(v.My, id);
+  r.W = subgroupShuffle(v.W, id);
+  r.Mxx_hi = subgroupShuffle(v.Mxx_hi, id);
+  r.Mxx_lo = subgroupShuffle(v.Mxx_lo, id);
+  r.Myy_hi = subgroupShuffle(v.Myy_hi, id);
+  r.Myy_lo = subgroupShuffle(v.Myy_lo, id);
+  r.Mxy_hi = subgroupShuffle(v.Mxy_hi, id);
+  r.Mxy_lo = subgroupShuffle(v.Mxy_lo, id);
+  r.N = subgroupShuffle(v.N, id);
+  return r;
+}
+
 void main() {
-  uint b = gl_GlobalInvocationID.x;
+  uint b = gl_WorkGroupID.x;
   if (b >= pc.num_blobs) return;
 
   uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
   uint end = blob_point_offsets[b];
+  uint n = end - begin;
 
-  int running_Mx = 0, running_My = 0, running_W = 0;
-  I64 running_Mxx = I64(0, 0u);
-  I64 running_Myy = I64(0, 0u);
-  I64 running_Mxy = I64(0, 0u);
+  // gl_LocalInvocationID.x == gl_SubgroupInvocationID here since the
+  // workgroup IS one subgroup (see GpuDetector.cpp).
+  uint tid = gl_SubgroupInvocationID;
+  uint sg_size = gl_SubgroupSize;
 
-  for (uint k = begin; k < end; ++k) {
-    RawLineFitPointGpu p = points[k];
-    I64 wx = Mul32x32To64(p.W, p.x2);
-    I64 wy = Mul32x32To64(p.W, p.y2);
+  uint chunk = (n + sg_size - 1u) / sg_size;
+  uint chunk_start = tid * chunk;
+  uint chunk_end = min(chunk_start + chunk, n);
 
-    running_Mx += Trunc32(wx);
-    running_My += Trunc32(wy);
-    running_W += p.W;
-    running_Mxx = Add64(running_Mxx, Mul64By32(wx, p.x2));
-    running_Mxy = Add64(running_Mxy, Mul64By32(wx, p.y2));
-    running_Myy = Add64(running_Myy, Mul64By32(wy, p.y2));
+  // Pass 1: this lane's chunk total only.
+  GpuLineFitMomentsRaw total = ZeroMoments();
+  for (uint k = chunk_start; k < chunk_end; ++k) {
+    total = AccumulatePoint(total, points[begin + k]);
+  }
 
-    GpuLineFitMomentsRaw m;
-    m.Mx = running_Mx;
-    m.My = running_My;
-    m.W = running_W;
-    m.Mxx_hi = running_Mxx.hi;
-    m.Mxx_lo = running_Mxx.lo;
-    m.Myy_hi = running_Myy.hi;
-    m.Myy_lo = running_Myy.lo;
-    m.Mxy_hi = running_Mxy.hi;
-    m.Mxy_lo = running_Mxy.lo;
-    m.N = 0;
-    moments[k] = m;
+  // Subgroup-wide inclusive scan (Hillis-Steele via shuffle - every lane
+  // calls subgroupShuffle unconditionally each iteration, reading the
+  // PRE-update value, matching the standard warp-scan pattern; only the
+  // combine step is conditioned on lane id).
+  GpuLineFitMomentsRaw scanned = total;
+  for (uint offset = 1u; offset < sg_size; offset <<= 1u) {
+    uint src = (tid >= offset) ? (tid - offset) : 0u;
+    GpuLineFitMomentsRaw shuffled = ShuffleMoments(scanned, src);
+    if (tid >= offset) scanned = AddMoments(scanned, shuffled);
+  }
+
+  // Exclusive prefix for this lane's chunk = the inclusive scan's
+  // previous lane (zero for lane 0). The shuffle call itself is still
+  // uniform (every lane participates, using id 0 as a safe fallback for
+  // lane 0); only the resulting value is overridden to zero for lane 0.
+  GpuLineFitMomentsRaw seed = ShuffleMoments(scanned, (tid == 0u) ? 0u : (tid - 1u));
+  if (tid == 0u) seed = ZeroMoments();
+
+  // Pass 2: replay the chunk, seeded correctly this time, writing cs[].
+  GpuLineFitMomentsRaw running = seed;
+  for (uint k = chunk_start; k < chunk_end; ++k) {
+    running = AccumulatePoint(running, points[begin + k]);
+    moments[begin + k] = running;
   }
 }

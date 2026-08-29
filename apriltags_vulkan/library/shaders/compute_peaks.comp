@@ -3,27 +3,36 @@
 // detection + top-10 peak selection (QuadDecode.cpp, FitQuadForBlob lines
 // ~362-397), built on stage 2's error[] (compute_window_error.comp).
 //
-// One invocation per blob (single-thread, like stage 1 - correctness
-// first, not yet the final launch geometry). filtered[i] is recomputed
-// from scratch (a fresh 7-tap convolution over error[]) every time it's
-// needed rather than materialized into a per-blob array: it's a pure
-// function of error[], so this is redundant work (up to 3x, since a point
-// and its two neighbors each need their own filtered value) but needs no
-// blob-size-dependent scratch storage at all - unlike stage 1/2, this
-// stage has no upper bound on blob size to worry about.
-//
-// Peak selection mirrors CPU's `peaks.emplace_back(-cur, i)` followed by
-// `std::stable_sort` (ascending by -cur, i.e. strongest peaks first) and
-// taking the first min(peaks.size(), 10) - WITHOUT ever materializing the
-// full peaks list. Processing points in ascending i and maintaining a
-// bounded best-10 list, replacing its current worst entry only on STRICT
-// improvement (never on a tie), exactly reproduces stable_sort's tie
-// rule: two peaks of equal value keep their relative (ascending index)
-// order, so the earlier one is always the one still present when a later,
-// equal-valued one arrives and correctly fails to displace it.
+// One workgroup per blob, sized to EXACTLY one subgroup (see
+// compute_moments_prefix.comp's comment for why - shared-memory/barrier-
+// based cooperation measured catastrophically slow on Mali). Peak
+// detection is embarrassingly parallel (each lane's strided subset of
+// points is independent once error[] exists); the top-10 selection is a
+// two-level reduction done entirely with subgroupShuffle, no shared
+// memory:
+//   1. Each lane maintains its OWN top-10 among the peaks it personally
+//      finds (the streaming "replace worst on strict improvement" trick -
+//      still correct here since a fixed lane's strided sequence visits
+//      points in strictly ascending index order).
+//   2. Lane 0 gathers every other lane's local top-10 via subgroupShuffle
+//      (called uniformly by all lanes each iteration, so every lane's
+//      values are read on the same instruction regardless of which one
+//      "owns" the final merge) and folds them into a single final top-10
+//      with the same streaming trick. A lane that doesn't appear in its
+//      own local top-10 can never be in the true global top-10 either
+//      (something already beat it 10 times over within its own
+//      partition), so no candidate is lost by only keeping each lane's
+//      local top-10.
+// Step 2's merge does NOT tie-break by index the way step 1 naturally
+// does (gather order is by lane, not by global point index) - exact float
+// ties are rare enough that this is accepted the same way as this stage's
+// other precision-driven wobble (see the earlier bit-exactness-vs-
+// tolerance discussion for stage 2).
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
-layout(local_size_x_id = 0, local_size_x = 1) in;
+layout(local_size_x_id = 0, local_size_x = 16) in;
 
 layout(std430, binding = 0) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 1) readonly buffer ErrorIn { float error_in[]; };
@@ -39,6 +48,7 @@ layout(push_constant) uniform PushConstants {
   uint num_blobs;
 } pc;
 
+const uint kNMaxima = 10u;
 const int kFilterHalf = 3;
 const float kFilterCoefficients[7] =
     float[7](0.01110899634659290314, 0.13533528149127960205, 0.60653066635131835938, 1.0,
@@ -57,20 +67,21 @@ float Filtered(uint begin, uint n, uint i) {
 }
 
 void main() {
-  uint b = gl_GlobalInvocationID.x;
+  uint b = gl_WorkGroupID.x;
   if (b >= pc.num_blobs) return;
 
   uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
   uint end = blob_point_offsets[b];
   uint n = end - begin;
+  uint tid = gl_SubgroupInvocationID;
+  uint sg_size = gl_SubgroupSize;
 
-  const uint kNMaxima = 10u;
   float best_val[kNMaxima];
   uint best_idx[kNMaxima];
   uint count = 0u;
 
   if (n >= 4u) {
-    for (uint i = 0u; i < n; ++i) {
+    for (uint i = tid; i < n; i += sg_size) {
       uint i_before = (i == 0u) ? (n - 1u) : (i - 1u);
       uint i_after = (i + 1u == n) ? 0u : (i + 1u);
       float cur = Filtered(begin, n, i);
@@ -100,27 +111,61 @@ void main() {
     }
   }
 
-  if (count < 4u) {
+  // Merge every lane's local top-10 into lane 0's final top-10, using only
+  // subgroupShuffle (uniformly called by every lane each iteration - no
+  // shared memory, no barrier).
+  float final_val[kNMaxima];
+  uint final_idx[kNMaxima];
+  uint final_count = 0u;
+
+  for (uint src = 0u; src < sg_size; ++src) {
+    uint src_count = subgroupShuffle(count, src);  // uniform across all lanes
+    for (uint k = 0u; k < src_count; ++k) {
+      float v = subgroupShuffle(best_val[k], src);
+      uint idx = subgroupShuffle(best_idx[k], src);
+      if (tid == 0u) {
+        if (final_count < kNMaxima) {
+          final_val[final_count] = v;
+          final_idx[final_count] = idx;
+          ++final_count;
+        } else {
+          uint worst_slot = 0u;
+          float worst_val = final_val[0];
+          for (uint j = 1u; j < kNMaxima; ++j) {
+            if (final_val[j] > worst_val) {
+              worst_val = final_val[j];
+              worst_slot = j;
+            }
+          }
+          if (v < worst_val) {
+            final_val[worst_slot] = v;
+            final_idx[worst_slot] = idx;
+          }
+        }
+      }
+    }
+  }
+
+  if (tid != 0u) return;
+
+  if (final_count < 4u) {
     num_selected_out[b] = 0u;
     return;
   }
 
-  // std::sort(point_indices.begin(), point_indices.begin() + K) - ascending
-  // by point index (not by peak value, which was only needed to pick the
-  // K survivors). count <= 10, so a plain insertion sort is fine.
-  for (uint i = 1u; i < count; ++i) {
-    uint key = best_idx[i];
+  // std::sort(point_indices.begin(), point_indices.begin() + K) -
+  // ascending by point index. final_count <= 10, plain insertion sort.
+  for (uint i = 1u; i < final_count; ++i) {
+    uint key = final_idx[i];
     uint j = i;
-    while (j > 0u && best_idx[j - 1u] > key) {
-      best_idx[j] = best_idx[j - 1u];
+    while (j > 0u && final_idx[j - 1u] > key) {
+      final_idx[j] = final_idx[j - 1u];
       --j;
     }
-    best_idx[j] = key;
+    final_idx[j] = key;
   }
 
-  num_selected_out[b] = count;
+  num_selected_out[b] = final_count;
   uint out_base = b * kNMaxima;
-  for (uint k = 0u; k < count; ++k) {
-    point_indices_out[out_base + k] = best_idx[k];
-  }
+  for (uint k = 0u; k < final_count; ++k) point_indices_out[out_base + k] = final_idx[k];
 }

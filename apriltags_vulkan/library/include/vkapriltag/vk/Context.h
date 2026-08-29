@@ -131,6 +131,16 @@ struct DeviceCaps {
   // requires a constant id; only OpGroupNonUniformShuffle takes a dynamic
   // one), so a fixed-lane broadcast cannot substitute here.
   bool has_subgroup_shuffle = false;
+  // Reported subgroupSize (VkPhysicalDeviceSubgroupProperties) - Mali-G610
+  // reports 16, the RX 9060 XT test machine 64. A9's GPU quad-fit stages use
+  // this to size a workgroup to EXACTLY one subgroup (see GpuDetector.cpp),
+  // so every cross-lane communication in that shader is a register shuffle,
+  // never shared memory + a barrier - measured necessary on Mali, whose
+  // Valhall architecture has no dedicated shared-memory hardware (shared
+  // memory is backed by L2), making barrier-heavy workgroup-wide algorithms
+  // there catastrophically slow (a documented, previously-measured issue -
+  // see OPTIMIZATION_NOTES.md's tile-local shared-memory rejection).
+  uint32_t subgroup_size = 1;
 
   // --- Memory topology ---
   // True when device-local memory is also host-visible (integrated/unified
