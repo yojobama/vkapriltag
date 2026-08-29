@@ -138,11 +138,26 @@ void main() {
   uint chunk = (n + sg_size - 1u) / sg_size;
   uint chunk_start = tid * chunk;
   uint chunk_end = min(chunk_start + chunk, n);
+  uint chunk_len = chunk_end - chunk_start;
 
-  // Pass 1: this lane's chunk total only.
+  // Pass 1: this lane's chunk total, caching every intermediate running
+  // value along the way (starting from zero, not yet knowing the seed
+  // from earlier chunks) when the chunk is small enough to fit
+  // kCacheCap - this lets pass 2 below skip AccumulatePoint's expensive
+  // 64-bit multiplies entirely and just add the seed once per cached
+  // entry, instead of redoing the full per-point accumulation a second
+  // time. Real blobs average roughly (points per blob) / subgroup_size
+  // per lane here - a few tens at most - so kCacheCap covers the common
+  // case; oversized chunks fall back to the original recompute-based
+  // pass 2 below, preserving correctness with no cap on blob size.
+  const uint kCacheCap = 64u;
+  GpuLineFitMomentsRaw cache[kCacheCap];
+  bool use_cache = chunk_len <= kCacheCap;
+
   GpuLineFitMomentsRaw total = ZeroMoments();
   for (uint k = chunk_start; k < chunk_end; ++k) {
     total = AccumulatePoint(total, points[begin + k]);
+    if (use_cache) cache[k - chunk_start] = total;
   }
 
   // Subgroup-wide inclusive scan (Hillis-Steele via shuffle - every lane
@@ -163,10 +178,17 @@ void main() {
   GpuLineFitMomentsRaw seed = ShuffleMoments(scanned, (tid == 0u) ? 0u : (tid - 1u));
   if (tid == 0u) seed = ZeroMoments();
 
-  // Pass 2: replay the chunk, seeded correctly this time, writing cs[].
-  GpuLineFitMomentsRaw running = seed;
-  for (uint k = chunk_start; k < chunk_end; ++k) {
-    running = AccumulatePoint(running, points[begin + k]);
-    moments[begin + k] = running;
+  // Pass 2: add the seed to each cached partial sum (cheap - no
+  // multiplies) when cached, otherwise fall back to the original replay.
+  if (use_cache) {
+    for (uint k = 0u; k < chunk_len; ++k) {
+      moments[begin + chunk_start + k] = AddMoments(seed, cache[k]);
+    }
+  } else {
+    GpuLineFitMomentsRaw running = seed;
+    for (uint k = chunk_start; k < chunk_end; ++k) {
+      running = AccumulatePoint(running, points[begin + k]);
+      moments[begin + k] = running;
+    }
   }
 }
