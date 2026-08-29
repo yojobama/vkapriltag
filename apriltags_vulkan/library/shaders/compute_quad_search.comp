@@ -32,6 +32,12 @@ layout(std430, binding = 3) readonly buffer NumSelected { uint num_selected[]; }
 // 4 LOCAL point indices per blob (garbage if ValidOut[blob] == 0).
 layout(std430, binding = 4) writeonly buffer BestIndicesOut { uint best_indices_out[]; };
 layout(std430, binding = 5) writeonly buffer ValidOut { uint valid_out[]; };
+// The 4 corresponding window moments (indices[k] to indices[(k+1)%4]),
+// mirroring FitQuadForBlob's final `result.moments[k] =
+// ReadMomentsWindow(...)` step - computed here so the CPU tail needs no
+// further cs[]/per-point access at all to reconstruct the quad's actual
+// corners (just FitLine's line-intersection math on 4 known moments).
+layout(std430, binding = 6) writeonly buffer BestMomentsOut { GpuLineFitMomentsRaw best_moments_out[]; };
 
 layout(push_constant) uniform PushConstants {
   uint num_blobs;
@@ -187,8 +193,14 @@ void main() {
 
   valid_out[b] = 1u;
   uint out_base = b * 4u;
-  best_indices_out[out_base + 0u] = pidx[best0];
-  best_indices_out[out_base + 1u] = pidx[best1];
-  best_indices_out[out_base + 2u] = pidx[best2];
-  best_indices_out[out_base + 3u] = pidx[best3];
+  uint best_local[4] = uint[4](pidx[best0], pidx[best1], pidx[best2], pidx[best3]);
+  best_indices_out[out_base + 0u] = best_local[0];
+  best_indices_out[out_base + 1u] = best_local[1];
+  best_indices_out[out_base + 2u] = best_local[2];
+  best_indices_out[out_base + 3u] = best_local[3];
+
+  for (uint k = 0u; k < 4u; ++k) {
+    best_moments_out[out_base + k] =
+        ReadMomentsWindowLocal(begin, n, best_local[k], best_local[(k + 1u) % 4u]);
+  }
 }

@@ -660,6 +660,9 @@ int main() {
   vk::Buffer valid_buf(ctx, static_cast<size_t>(kNumBlobs) * sizeof(uint32_t),
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                        vk::MemoryKind::HostVisibleCached);
+  vk::Buffer best_moments_buf(ctx, static_cast<size_t>(kNumBlobs) * 4 * sizeof(GpuLineFitMomentsRaw),
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              vk::MemoryKind::HostVisibleCached);
 
   struct QuadSearchPushConstants {
     uint32_t num_blobs;
@@ -670,7 +673,7 @@ int main() {
   vk::ComputePipeline quad_search_pipeline(
       ctx, ShaderPath("compute_quad_search"),
       {ranges_buf.get(), moments_buf.get(), point_indices_buf.get(), num_selected_buf.get(),
-       best_indices_buf.get(), valid_buf.get()},
+       best_indices_buf.get(), valid_buf.get(), best_moments_buf.get()},
       sizeof(QuadSearchPushConstants), vk::WorkgroupSize{1, 1, 1});
 
   cmd = ctx.BeginCommands();
@@ -681,8 +684,10 @@ int main() {
 
   std::vector<uint32_t> gpu_best_indices(static_cast<size_t>(kNumBlobs) * 4);
   std::vector<uint32_t> gpu_valid(kNumBlobs);
+  std::vector<GpuLineFitMomentsRaw> gpu_best_moments(static_cast<size_t>(kNumBlobs) * 4);
   best_indices_buf.Read(gpu_best_indices.data(), gpu_best_indices.size() * sizeof(uint32_t));
   valid_buf.Read(gpu_valid.data(), gpu_valid.size() * sizeof(uint32_t));
+  best_moments_buf.Read(gpu_best_moments.data(), gpu_best_moments.size() * sizeof(GpuLineFitMomentsRaw));
 
   int quad_blobs_compared = 0;
   int quad_exact_match = 0;
@@ -716,7 +721,26 @@ int main() {
     for (int k = 0; k < 4; ++k) {
       if (gpu_best_indices[b * 4 + k] != cpu_quad.indices[k]) match = false;
     }
-    if (match) ++quad_exact_match;
+    if (!match) continue;
+    ++quad_exact_match;
+
+    // best_moments_out is pure 64-bit integer window arithmetic (no
+    // ToFloat64 involved) - same bit-exactness class as stage 1, so this
+    // should match exactly whenever the indices did, with no tolerance.
+    for (int k = 0; k < 4; ++k) {
+      const uint32_t i0 = cpu_quad.indices[k];
+      const uint32_t i1 = cpu_quad.indices[(k + 1) % 4];
+      LineFitMoments cpu_m = ReadMomentsWindowRef(cpu_cs, n, i0, i1);
+      const GpuLineFitMomentsRaw &g = gpu_best_moments[b * 4 + k];
+      const int64_t gpu_Mxx = (static_cast<int64_t>(g.Mxx_hi) << 32) | g.Mxx_lo;
+      const int64_t gpu_Myy = (static_cast<int64_t>(g.Myy_hi) << 32) | g.Myy_lo;
+      const int64_t gpu_Mxy = (static_cast<int64_t>(g.Mxy_hi) << 32) | g.Mxy_lo;
+      if (g.Mx != cpu_m.Mx || g.My != cpu_m.My || g.W != cpu_m.W || gpu_Mxx != cpu_m.Mxx ||
+          gpu_Myy != cpu_m.Myy || gpu_Mxy != cpu_m.Mxy) {
+        fprintf(stderr, "MOMENTS MISMATCH blob=%d k=%d\n", b, k);
+        ++quad_validity_mismatch;  // reuse this counter to flip PASS to FAIL below
+      }
+    }
   }
 
   printf("stage 4: %d blobs compared; %d exact matches (including agreeing invalid), %d "
