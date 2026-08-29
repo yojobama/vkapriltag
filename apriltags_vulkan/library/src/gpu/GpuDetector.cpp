@@ -503,7 +503,7 @@ void GpuDetector::CreatePipelines() {
       {blob_point_offsets_buf_.get(), line_fit_moments_buf_.get(), peak_indices_buf_.get(),
        num_selected_peaks_buf_.get(), quad_best_indices_buf_.get(), quad_valid_buf_.get(),
        quad_best_moments_buf_.get()},
-      12, vk::WorkgroupSize{1, 1, 1});
+      12, subgroup_wg);
 
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
@@ -882,8 +882,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
       } quad_pc{num_selected_blobs, config_.max_line_fit_mse,
                static_cast<float>(config_.cos_critical_rad)};
       timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanA9QuadSearch));
-      compute_quad_search_pl_.Dispatch1D(cmd, num_selected_blobs, &quad_pc,
-                                         BarrierKind::ComputeAndTransfer);
+      compute_quad_search_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &quad_pc,
+                                          BarrierKind::ComputeAndTransfer);
       timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanA9QuadSearch));
     }
   }

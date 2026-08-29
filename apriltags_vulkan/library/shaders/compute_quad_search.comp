@@ -3,11 +3,19 @@
 // (QuadDecode.cpp, FitQuadForBlob lines ~399-469) over stage 3's selected
 // peak indices, picking the 4 that form the lowest-total-error quad.
 //
-// One invocation per blob (single-thread, like stages 1 and 3 -
-// correctness first). The search itself is tiny (at most 7*8*9*10 nested
-// iterations, heavily pruned by the early continues/breaks below, exactly
-// as the CPU version is) so this is not a performance concern even
-// single-threaded.
+// One workgroup per blob, sized to EXACTLY one subgroup (see
+// compute_moments_prefix.comp's comment for why). The search naturally
+// splits across the m0 dimension (at most kCacheDim = 7 distinct values):
+// each lane owns one m0 and runs its own complete, independent m1/m2/m3
+// search (no cross-lane data dependency within that work - m0's own
+// cached m0-m1 row only needs pidx[] and cs[], both read-only), then a
+// small subgroup reduction (subgroupMin + a ballot to find which lane
+// achieved it) picks the global winner. Measured necessary: an earlier
+// single-thread-per-blob version cost ~1.57 ms of the ~4.2 ms A9 added to
+// the Mali G610 pipeline (of a ~11.3 ms pre-A9 baseline) - the most
+// expensive single stage after compute_moments_prefix.comp, despite
+// looking small (up to 7*8*9*10 heavily-pruned iterations) - it runs
+// entirely on one lane, once per blob, with no parallelism at all.
 //
 // Outputs the 4 winning LOCAL point indices (0-based within the blob, same
 // convention as stage 3's point_indices/CPU's FitQuadResult::indices) and
@@ -18,10 +26,15 @@
 // stage replaces the expensive O(total boundary points) search, not the
 // O(1) corner reconstruction after it.
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 #include "int64_emu.glsl"
 #include "line_fit_moments.glsl"
+#include "subgroup_ballot128.glsl"
 
-layout(local_size_x_id = 0, local_size_x = 1) in;
+layout(local_size_x_id = 0, local_size_x = 16) in;
 
 layout(std430, binding = 0) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 1) readonly buffer Moments { GpuLineFitMomentsRaw cs[]; };
@@ -115,46 +128,45 @@ FitLineResult23 FitLine23(GpuLineFitMomentsRaw m) {
 }
 
 void main() {
-  uint b = gl_GlobalInvocationID.x;
+  uint b = gl_WorkGroupID.x;
   if (b >= pc.num_blobs) return;
 
+  uint tid = gl_SubgroupInvocationID;
   uint K = num_selected[b];
-  if (K < 4u) {
-    valid_out[b] = 0u;
-    return;
-  }
-
-  uint begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
-  uint n = blob_point_offsets[b] - begin;
 
   uint pidx[kNMaxima];
-  for (uint k = 0u; k < K; ++k) pidx[k] = peak_indices[b * kNMaxima + k];
+  uint begin = 0u, n = 0u;
+  float local_best_error = kFloatMax;
+  uint local_best0 = 0u, local_best1 = 0u, local_best2 = 0u, local_best3 = 0u;
 
-  float error_m0_m1[kCacheDim][kCacheDim];
-  vec2 params_m0_m1[kCacheDim][kCacheDim];
-  for (uint i = 0u; i < kCacheDim; ++i) {
-    for (uint j = 0u; j < kCacheDim; ++j) error_m0_m1[i][j] = kFloatMax;
-  }
+  // Only lanes [0, kCacheDim) own an m0; the rest contribute nothing
+  // (local_best_error stays kFloatMax) but still participate uniformly in
+  // every subgroup op below.
+  if (K >= 4u && tid < kCacheDim) {
+    begin = (b == 0u) ? 0u : blob_point_offsets[b - 1u];
+    n = blob_point_offsets[b] - begin;
+    for (uint k = 0u; k < K; ++k) pidx[k] = peak_indices[b * kNMaxima + k];
 
-  for (uint m0 = 0u; m0 < kCacheDim; ++m0) {
+    uint m0 = tid;
+    // This lane's own row of the m0-m1 cache - only m1 in (m0, kNMaxima-2)
+    // is ever read below, so no larger cache table is needed.
+    float error_m0_row[kCacheDim];
+    vec2 params_m0_row[kCacheDim];
+    for (uint j = 0u; j < kCacheDim; ++j) error_m0_row[j] = kFloatMax;
+
     for (uint m1 = m0 + 1u; m1 < kNMaxima - 2u; ++m1) {
       if (m1 >= K) continue;
       FitLineResult23 fl = FitLine23(ReadMomentsWindowLocal(begin, n, pidx[m0], pidx[m1]));
       float err01 = fl.err;
       if (fl.mse > pc.max_line_fit_mse) err01 = kFloatMax;
-      error_m0_m1[m0][m1 - 1u] = err01;
-      params_m0_m1[m0][m1 - 1u] = fl.normal;
+      error_m0_row[m1 - 1u] = err01;
+      params_m0_row[m1 - 1u] = fl.normal;
     }
-  }
 
-  float best_error = kFloatMax;
-  uint best0 = 0u, best1 = 0u, best2 = 0u, best3 = 0u;
-
-  for (uint m0 = 0u; m0 < kCacheDim; ++m0) {
     for (uint m1 = m0 + 1u; m1 < kNMaxima - 2u; ++m1) {
-      float errm0m1 = error_m0_m1[m0][m1 - 1u];
+      float errm0m1 = error_m0_row[m1 - 1u];
       if (errm0m1 == kFloatMax) continue;
-      vec2 paramsm0m1 = params_m0_m1[m0][m1 - 1u];
+      vec2 paramsm0m1 = params_m0_row[m1 - 1u];
 
       for (uint m2 = m1 + 1u; m2 < kNMaxima - 1u; ++m2) {
         if (m2 >= K) break;
@@ -174,26 +186,52 @@ void main() {
           if (fl30.mse > pc.max_line_fit_mse) continue;
 
           float total = errm0m1 + fl12.err + fl23.err + fl30.err;
-          if (total < best_error) {
-            best_error = total;
-            best0 = m0;
-            best1 = m1;
-            best2 = m2;
-            best3 = m3;
+          if (total < local_best_error) {
+            local_best_error = total;
+            local_best0 = m0;
+            local_best1 = m1;
+            local_best2 = m2;
+            local_best3 = m3;
           }
         }
       }
     }
   }
 
-  if (best_error == kFloatMax || !(best_error < pc.max_line_fit_mse * float(n))) {
+  // Subgroup reduction: find the global minimum and which lane holds it.
+  // subgroupMin is a native op (float, no struct decomposition needed);
+  // exact-value ties are vanishingly unlikely with floats and, if they
+  // happen, FindLSB128 picks the lowest lane id deterministically rather
+  // than being undefined.
+  float global_best_error = subgroupMin(local_best_error);
+  bool is_winner = local_best_error == global_best_error;
+  uvec4 winner_ballot = subgroupBallot(is_winner);
+  uint winner_lane = AnyBits128(winner_ballot) ? FindLSB128(winner_ballot) : 0u;
+
+  uint out_m0 = subgroupShuffle(local_best0, winner_lane);
+  uint out_m1 = subgroupShuffle(local_best1, winner_lane);
+  uint out_m2 = subgroupShuffle(local_best2, winner_lane);
+  uint out_m3 = subgroupShuffle(local_best3, winner_lane);
+  uint winner_begin = subgroupShuffle(begin, winner_lane);
+  uint winner_n = subgroupShuffle(n, winner_lane);
+
+  if (tid != 0u) return;
+
+  if (global_best_error == kFloatMax ||
+      !(global_best_error < pc.max_line_fit_mse * float(winner_n))) {
     valid_out[b] = 0u;
     return;
   }
 
-  valid_out[b] = 1u;
+  // pidx[] (an array, per-lane private storage) was never shuffled - only
+  // the 4 winning m0..m3 indices are needed here, and every lane (lane 0
+  // included) can read peak_indices[] directly, so there's no need to
+  // reconstruct the winner's whole pidx[] array.
   uint out_base = b * 4u;
-  uint best_local[4] = uint[4](pidx[best0], pidx[best1], pidx[best2], pidx[best3]);
+  uint best_local[4] = uint[4](peak_indices[b * kNMaxima + out_m0], peak_indices[b * kNMaxima + out_m1],
+                               peak_indices[b * kNMaxima + out_m2], peak_indices[b * kNMaxima + out_m3]);
+
+  valid_out[b] = 1u;
   best_indices_out[out_base + 0u] = best_local[0];
   best_indices_out[out_base + 1u] = best_local[1];
   best_indices_out[out_base + 2u] = best_local[2];
@@ -201,6 +239,6 @@ void main() {
 
   for (uint k = 0u; k < 4u; ++k) {
     best_moments_out[out_base + k] =
-        ReadMomentsWindowLocal(begin, n, best_local[k], best_local[(k + 1u) % 4u]);
+        ReadMomentsWindowLocal(winner_begin, winner_n, best_local[k], best_local[(k + 1u) % 4u]);
   }
 }

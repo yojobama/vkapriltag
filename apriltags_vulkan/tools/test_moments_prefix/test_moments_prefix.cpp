@@ -675,11 +675,11 @@ int main() {
       ctx, ShaderPath("compute_quad_search"),
       {ranges_buf.get(), moments_buf.get(), point_indices_buf.get(), num_selected_buf.get(),
        best_indices_buf.get(), valid_buf.get(), best_moments_buf.get()},
-      sizeof(QuadSearchPushConstants), vk::WorkgroupSize{1, 1, 1});
+      sizeof(QuadSearchPushConstants), subgroup_wg);
 
   cmd = ctx.BeginCommands();
-  quad_search_pipeline.Dispatch1D(cmd, static_cast<uint32_t>(kNumBlobs), &quad_pc,
-                                  vk::BarrierKind::Compute);
+  quad_search_pipeline.DispatchRaw(cmd, static_cast<uint32_t>(kNumBlobs), 1, 1, &quad_pc,
+                                   vk::BarrierKind::Compute);
   vk::ComputePipeline::HostReadBarrier(cmd);
   ctx.SubmitAndWait(cmd);
 
