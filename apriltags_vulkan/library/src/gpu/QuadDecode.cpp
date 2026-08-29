@@ -51,6 +51,17 @@ LineFitMoments Sub(const LineFitMoments &a, const LineFitMoments &b) {
 // replicates the original's `index0 < index1` branch condition (including
 // its behavior when index0 == index1, which falls into the "wrap around"
 // branch exactly as in the original).
+//
+// Bug fix: the wrap-around branch used to read cs[index0 - 1]
+// unconditionally, unlike the index0 < index1 branch just above it, which
+// already guards the equivalent read with `if (index0 > 0)`. index0 == 0
+// reaches this branch whenever ksz == 0 (blobs under 12 points, at point
+// index 0 - see FitQuadForBlob's `const int ksz = ...`), which read
+// cs[SIZE_MAX]: an out-of-bounds read landing on whatever memory happens to
+// sit just before the cs vector's buffer. Found while porting this window
+// read to GPU (A9) and cross-checking against synthetic inputs small
+// enough to hit this path - see the GPU shader's mirroring guard
+// (compute_window_error.comp) for the equivalent fix on that side.
 LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, size_t total_points,
                                 size_t index0, size_t index1) {
   LineFitMoments result;
@@ -61,9 +72,11 @@ LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, size_t t
     }
     result.N = static_cast<int32_t>(index1 - index0 + 1);
   } else {
-    LineFitMoments lf0 = cs[index0 - 1];
     LineFitMoments lfsz = cs[total_points - 1];
-    result = Sub(lfsz, lf0);
+    result = lfsz;
+    if (index0 > 0) {
+      result = Sub(lfsz, cs[index0 - 1]);
+    }
     result = Add(result, cs[index1]);
     result.N = static_cast<int32_t>(total_points - index0 + index1 + 1);
   }
