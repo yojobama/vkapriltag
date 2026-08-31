@@ -25,6 +25,15 @@ function(compile_shaders TARGET_NAME SHADER_LIST OUT_DIR_VAR)
   set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
   file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 
+  # Every .comp file may `#include` any of these via GL_GOOGLE_include_directive
+  # (common.glsl today; any future shared header lands here too, via the glob).
+  # glslangValidator's own dependency info isn't wired into this build, so
+  # without this, editing a shared header leaves every .comp file that
+  # #includes it silently stale - Ninja/Make see no reason to recompile a
+  # .comp file whose own timestamp didn't change, and the previous .spv (built
+  # against the header's old layout) stays right where CMake left it.
+  file(GLOB SHADER_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.glsl")
+
   set(SPIRV_BINARIES)
   foreach(SHADER_SOURCE ${SHADER_LIST})
     get_filename_component(SHADER_NAME ${SHADER_SOURCE} NAME)
@@ -36,7 +45,7 @@ function(compile_shaders TARGET_NAME SHADER_LIST OUT_DIR_VAR)
               -I${CMAKE_CURRENT_SOURCE_DIR}/shaders
               -o ${SPIRV_OUTPUT}
               ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}
-      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE}
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SOURCE} ${SHADER_HEADERS}
       COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
       VERBATIM
     )

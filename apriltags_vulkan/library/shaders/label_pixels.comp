@@ -1,11 +1,16 @@
 #version 450
 // Folds "which blob does this pixel belong to" and "is that blob big enough to
-// matter" into a single spatially-local per-pixel value, so blob_diff.comp can
-// read it with the same locality it already reads `thresholded` with.
+// matter" into a single spatially-local per-pixel value, written back into
+// `parent[]` itself, so blob_diff.comp can read it with the same locality it
+// already reads `thresholded` with.
 //
-// pixel_label[i] is 0 when the pixel's blob is below min_blob_pixels (or the
-// pixel is otherwise uninteresting), and 1 + the union-find root index
-// otherwise.
+// parent[i] is repurposed: after this pass it holds 0 when the pixel's blob
+// is below min_blob_pixels (or the pixel is otherwise uninteresting), and
+// 1 + the union-find root index otherwise - the same "pixel_label" value a
+// separate buffer used to hold. This is safe in place because each
+// invocation reads and writes only its OWN entry (parent[i]) - no thread
+// ever reads another thread's parent[] entry in this shader - so there is no
+// separate buffer left to allocate, zero, bind, or read.
 //
 // Why this exists: blob_diff.comp looked up blob_size[parent[n]] for the pixel
 // and each of its five neighbours - six RANDOM gathers into a 2 MB array per
@@ -19,9 +24,8 @@
 // single comparison.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
+layout(std430, binding = 0) buffer Parent { uint parent[]; };
 layout(std430, binding = 1) readonly buffer BlobSize { uint blob_size[]; };
-layout(std430, binding = 2) writeonly buffer PixelLabel { uint pixel_label[]; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -32,5 +36,5 @@ void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= pc.count) return;
   uint r = parent[i];
-  pixel_label[i] = (blob_size[r] >= pc.min_blob_pixels) ? (r + 1u) : 0u;
+  parent[i] = (blob_size[r] >= pc.min_blob_pixels) ? (r + 1u) : 0u;
 }

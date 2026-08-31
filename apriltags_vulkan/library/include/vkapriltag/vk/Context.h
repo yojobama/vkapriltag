@@ -28,6 +28,16 @@ struct ContextOptions {
   // Env override: APRILTAG_VK_ALLOW_CPU=1
   bool allow_cpu_device = false;
 
+  // Diagnostic aids: force DeviceCaps::has_8bit_storage / has_subgroup_* to
+  // false even when the device actually supports them, so the two feature
+  // axes can be isolated and A/B'd independently on hardware that supports
+  // both (bisecting a regression, or measuring one optimization's effect
+  // without the other's).
+  // Env override: APRILTAG_VK_FORCE_NO_8BIT=1
+  bool force_no_8bit_storage = false;
+  // Env override: APRILTAG_VK_FORCE_NO_SUBGROUP=1
+  bool force_no_subgroup = false;
+
   // -1 selects by score (discrete > integrated > virtual > cpu). Otherwise a
   // raw index into vkEnumeratePhysicalDevices order.
   // Env override: APRILTAG_VK_DEVICE=<n>
@@ -41,6 +51,15 @@ struct ContextOptions {
   // and clamped to device limits). 0 = pick automatically.
   // Env override: APRILTAG_VK_WG=<n>
   uint32_t workgroup_size_override = 0;
+
+  // Override the 2D compute workgroup size (used by decimate/threshold/
+  // uf_init/blob_diff/block_minmax/block_filter). 0 = pick automatically
+  // (16x16 where the device supports 256 invocations per group, 8x8
+  // otherwise). A testing aid for sweeping launch geometry on a specific
+  // device - see OPTIMIZATION_NOTES.md's workgroup-size item.
+  // Env override: APRILTAG_VK_WG2D=<w>x<h>
+  uint32_t workgroup_size_2d_x = 0;
+  uint32_t workgroup_size_2d_y = 0;
 
   // Pretend the device reports at most this many invocations per workgroup.
   // Purely a testing aid: it lets a desktop GPU exercise the exact launch
@@ -83,12 +102,45 @@ struct DeviceCaps {
   // shader here is written to need neither. Reported for diagnostics only.
   bool has_shader_float64 = false;
   bool has_shader_int64 = false;
+  // True when VK_KHR_8bit_storage (or its Vulkan 1.2 core promotion) is
+  // present AND storageBuffer8BitAccess is actually supported, in which case
+  // Context has already requested and enabled it at device creation. Unlike
+  // the two above, this one IS used - GpuDetector picks 8-bit-storage shader
+  // variants for decimated_buf_/thresholded_buf_ when this is true (see
+  // GpuDetector::ShaderPath), with the plain 32-bit-per-pixel shaders as the
+  // fallback on parts that lack it (the codebase's default assumption).
+  bool has_8bit_storage = false;
+  // Subgroup capability, queried via VkPhysicalDeviceSubgroupProperties
+  // (core Vulkan 1.1, no extension/device-feature enablement needed - unlike
+  // 8-bit storage, subgroup operations are gated purely by what the SPIR-V
+  // is allowed to use, which the driver permits directly from these bits).
+  // GpuDetector picks subgroup-aggregated shader variants (uf_final,
+  // reduce_extents_hash, blob_diff's counter) when both are true; ballot
+  // alone (without arithmetic) still lets blob_diff's variant work, since
+  // it only needs ballot + broadcast + elect, but the codebase gates all
+  // three sites on the same combined flag for simplicity, since Vulkan 1.1
+  // guarantees ARITHMETIC and BALLOT are reported together far more often
+  // than apart in practice.
+  bool has_subgroup_ballot = false;
+  bool has_subgroup_arithmetic = false;
+  // Needed for a RUNTIME-variable lane index (subgroupShuffle) - the reduce-
+  // by-key loop in uf_final_subgroup.comp / reduce_extents_hash_subgroup.
+  // comp elects a leader lane computed at runtime (findLSB of a ballot), and
+  // subgroupBroadcast's id operand must be a compile-time constant (a real
+  // SPIR-V restriction, not a portability guess - OpGroupNonUniformBroadcast
+  // requires a constant id; only OpGroupNonUniformShuffle takes a dynamic
+  // one), so a fixed-lane broadcast cannot substitute here.
+  bool has_subgroup_shuffle = false;
 
   // --- Memory topology ---
   // True when device-local memory is also host-visible (integrated/unified
   // parts such as Mali). Lets us skip staging copies entirely.
   bool unified_memory = false;
   bool has_host_cached = false;
+  // VkPhysicalDeviceLimits::nonCoherentAtomSize. Non-coherent host-visible
+  // reads/writes (see MemoryKind::HostVisibleCached) must be invalidated/
+  // flushed on a range aligned to this size.
+  VkDeviceSize non_coherent_atom_size = 1;
 
   // --- Timestamp queries (for honest GPU-side timings) ---
   bool timestamps_supported = false;
@@ -152,6 +204,13 @@ public:
   uint32_t FindMemoryTypeOrThrow(uint32_t type_bits, VkMemoryPropertyFlags required,
                                  VkMemoryPropertyFlags preferred = 0) const;
 
+  // The property flags of a memory type index returned by FindMemoryType, so
+  // a caller (Buffer) can tell which optional bits (e.g. HOST_COHERENT)
+  // actually landed on the type it was handed.
+  VkMemoryPropertyFlags MemoryTypeFlags(uint32_t type_index) const {
+    return mem_props_.memoryTypes[type_index].propertyFlags;
+  }
+
   // Begins recording into a pooled, reused command buffer, first waiting for
   // that slot's previous submission to retire. No per-frame allocation.
   VkCommandBuffer BeginCommands() const;
@@ -170,7 +229,7 @@ public:
   void CreateInstance(const ContextOptions &options);
   void SelectPhysicalDevice(const ContextOptions &options);
   void SelectPhysicalDevice(const std::string& deviceName, const ContextOptions& options);
-  void CreateLogicalDevice();
+  void CreateLogicalDevice(const ContextOptions &options);
   void QueryCaps(const ContextOptions &options);
   void CreateCommandResources();
 
@@ -185,6 +244,10 @@ public:
 
   VkPhysicalDeviceMemoryProperties mem_props_{};
   DeviceCaps caps_;
+  // Set by CreateLogicalDevice (which runs before QueryCaps and is the only
+  // place that can actually request+enable the extension), read by
+  // QueryCaps to populate caps_.has_8bit_storage.
+  bool supports_8bit_storage_ = false;
   PipelineCache pipeline_cache_;
 
   // Reusable command buffers plus the fence tracking each one's submission.

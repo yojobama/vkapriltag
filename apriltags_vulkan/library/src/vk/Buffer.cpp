@@ -20,9 +20,15 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
     case MemoryKind::DeviceLocal:
       return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false};
     case MemoryKind::HostVisible:
-      // HOST_CACHED is only a preference: without it, host reads of readback
-      // staging go through uncached memory and cost several times more.
-      return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, true};
+    case MemoryKind::HostVisibleCached:
+      // COHERENT is deliberately NOT required: on devices with no memory
+      // type that is both COHERENT and CACHED (e.g. Mali-G610), requiring it
+      // would silently exclude the cached type and fall through to uncached
+      // memory - measured 4x slower for readback on that device. Buffer::
+      // Read()/Write() detect the resulting non-coherent type (via
+      // Context::MemoryTypeFlags) and invalidate/flush explicitly.
+      return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
               ctx.caps().has_host_cached
                   ? static_cast<VkMemoryPropertyFlags>(VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
                   : static_cast<VkMemoryPropertyFlags>(0),
@@ -76,6 +82,8 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
   // Map once, for the buffer's whole lifetime.
   if (request.map) {
     CheckVk(vkMapMemory(device_, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_), "vkMapMemory");
+    coherent_ = (ctx.MemoryTypeFlags(type_index) & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    non_coherent_atom_size_ = ctx.caps().non_coherent_atom_size;
   }
 }
 
@@ -98,7 +106,9 @@ Buffer::Buffer(Buffer &&other) noexcept
       buffer_(other.buffer_),
       memory_(other.memory_),
       size_(other.size_),
-      mapped_(other.mapped_) {
+      mapped_(other.mapped_),
+      coherent_(other.coherent_),
+      non_coherent_atom_size_(other.non_coherent_atom_size_) {
   other.buffer_ = VK_NULL_HANDLE;
   other.memory_ = VK_NULL_HANDLE;
   other.mapped_ = nullptr;
@@ -113,6 +123,8 @@ Buffer &Buffer::operator=(Buffer &&other) noexcept {
     memory_ = other.memory_;
     size_ = other.size_;
     mapped_ = other.mapped_;
+    coherent_ = other.coherent_;
+    non_coherent_atom_size_ = other.non_coherent_atom_size_;
     other.buffer_ = VK_NULL_HANDLE;
     other.memory_ = VK_NULL_HANDLE;
     other.mapped_ = nullptr;
@@ -120,6 +132,27 @@ Buffer &Buffer::operator=(Buffer &&other) noexcept {
   }
   return *this;
 }
+
+namespace {
+// vkFlushMappedMemoryRanges/vkInvalidateMappedMemoryRanges both require an
+// offset that's a multiple of nonCoherentAtomSize and a size that's either a
+// multiple of it or VK_WHOLE_SIZE - round outward rather than clamp the
+// range down, so the whole requested [offset, offset+bytes) is covered.
+VkMappedMemoryRange AlignedRange(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize bytes,
+                                 VkDeviceSize atom, VkDeviceSize buffer_size) {
+  const VkDeviceSize aligned_offset = (offset / atom) * atom;
+  const VkDeviceSize end = std::min(offset + bytes, buffer_size);
+  VkDeviceSize aligned_size = ((end - aligned_offset + atom - 1) / atom) * atom;
+  aligned_size = std::min(aligned_size, buffer_size - aligned_offset);
+
+  VkMappedMemoryRange range{};
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.memory = memory;
+  range.offset = aligned_offset;
+  range.size = aligned_size;
+  return range;
+}
+}  // namespace
 
 void Buffer::Write(const void *src, VkDeviceSize bytes, VkDeviceSize offset) {
   if (mapped_ == nullptr) {
@@ -129,6 +162,11 @@ void Buffer::Write(const void *src, VkDeviceSize bytes, VkDeviceSize offset) {
     throw std::runtime_error("Buffer::Write out of range");
   }
   std::memcpy(static_cast<uint8_t *>(mapped_) + offset, src, static_cast<size_t>(bytes));
+  if (!coherent_ && bytes > 0) {
+    VkMappedMemoryRange range =
+        AlignedRange(memory_, offset, bytes, non_coherent_atom_size_, size_);
+    vkFlushMappedMemoryRanges(device_, 1, &range);
+  }
 }
 
 void Buffer::Read(void *dst, VkDeviceSize bytes, VkDeviceSize offset) const {
@@ -137,6 +175,11 @@ void Buffer::Read(void *dst, VkDeviceSize bytes, VkDeviceSize offset) const {
   }
   if (offset + bytes > size_) {
     throw std::runtime_error("Buffer::Read out of range");
+  }
+  if (!coherent_ && bytes > 0) {
+    VkMappedMemoryRange range =
+        AlignedRange(memory_, offset, bytes, non_coherent_atom_size_, size_);
+    vkInvalidateMappedMemoryRanges(device_, 1, &range);
   }
   std::memcpy(dst, static_cast<const uint8_t *>(mapped_) + offset, static_cast<size_t>(bytes));
 }

@@ -48,6 +48,43 @@ const char *DeviceTypeName(VkPhysicalDeviceType t) {
   }
 }
 
+// True when `physical_device` lists `extension_name` among its supported
+// device extensions. Vulkan device extensions must be explicitly requested
+// at vkCreateDevice time even when the underlying driver's apiVersion is new
+// enough that the extension's functionality was later folded into core -
+// this project targets Vulkan 1.1 (VK_API_VERSION_1_1, see CreateInstance),
+// so VK_KHR_8bit_storage (core as of 1.2) still needs to be named here.
+bool DeviceHasExtension(VkPhysicalDevice physical_device, const char *extension_name) {
+  uint32_t count = 0;
+  vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &count, nullptr);
+  std::vector<VkExtensionProperties> extensions(count);
+  vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &count, extensions.data());
+  for (const auto &ext : extensions) {
+    if (std::strcmp(ext.extensionName, extension_name) == 0) return true;
+  }
+  return false;
+}
+
+// Queries whether the device both exposes VK_KHR_8bit_storage (or its
+// Vulkan 1.2 core promotion) and actually supports storageBuffer8BitAccess -
+// the specific sub-feature GpuDetector's 8-bit shader variants need (byte
+// buffer element access; storageBuffer16BitAccess-style structure packing
+// is not what this project uses 8-bit storage for). Callable before device
+// creation: feature queries only need the physical device.
+bool Supports8BitStorage(VkPhysicalDevice physical_device) {
+  if (!DeviceHasExtension(physical_device, "VK_KHR_8bit_storage")) return false;
+
+  VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
+  storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
+
+  VkPhysicalDeviceFeatures2 features2{};
+  features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  features2.pNext = &storage8bit;
+
+  vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+  return storage8bit.storageBuffer8BitAccess == VK_TRUE;
+}
+
 bool EnvFlag(const char *name) {
   const char *v = std::getenv(name);
   return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -57,6 +94,23 @@ bool EnvInt(const char *name, int *out) {
   const char *v = std::getenv(name);
   if (v == nullptr || v[0] == '\0') return false;
   *out = std::atoi(v);
+  return true;
+}
+
+// Parses "WxH" (e.g. "32x8"). Returns false (leaving *w/*h untouched) if the
+// variable is unset or malformed, so a bad value falls back to automatic
+// selection rather than silently picking 0x0.
+bool EnvWxH(const char *name, uint32_t *w, uint32_t *h) {
+  const char *v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return false;
+  char *end = nullptr;
+  long parsed_w = std::strtol(v, &end, 10);
+  if (end == v || *end != 'x' || parsed_w <= 0) return false;
+  const char *h_start = end + 1;
+  long parsed_h = std::strtol(h_start, &end, 10);
+  if (end == h_start || *end != '\0' || parsed_h <= 0) return false;
+  *w = static_cast<uint32_t>(parsed_w);
+  *h = static_cast<uint32_t>(parsed_h);
   return true;
 }
 
@@ -124,6 +178,9 @@ Context::Context(const ContextOptions &options_in) {
   if (EnvInt("APRILTAG_VK_WG", &env_int) && env_int > 0) {
     options.workgroup_size_override = static_cast<uint32_t>(env_int);
   }
+  EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
+  if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
+  if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
   if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
     options.max_invocations_override = static_cast<uint32_t>(env_int);
   }
@@ -134,7 +191,7 @@ Context::Context(const ContextOptions &options_in) {
 
   CreateInstance(options);
   SelectPhysicalDevice(options);
-  CreateLogicalDevice();
+  CreateLogicalDevice(options);
   QueryCaps(options);
   pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
                                      options.verbose);
@@ -155,6 +212,9 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
     if (EnvInt("APRILTAG_VK_WG", &env_int) && env_int > 0) {
         options.workgroup_size_override = static_cast<uint32_t>(env_int);
     }
+    EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
+    if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
+    if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
     if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
         options.max_invocations_override = static_cast<uint32_t>(env_int);
     }
@@ -165,7 +225,7 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
 
     CreateInstance(options);
     SelectPhysicalDevice(deviceName, options);
-    CreateLogicalDevice();
+    CreateLogicalDevice(options);
     QueryCaps(options);
     pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
                                        options.verbose);
@@ -370,7 +430,7 @@ void Context::SelectPhysicalDevice(const std::string& deviceName, const ContextO
     }
 }
 
-void Context::CreateLogicalDevice() {
+void Context::CreateLogicalDevice(const ContextOptions &options) {
   uint32_t qf_count = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qf_count, nullptr);
   std::vector<VkQueueFamilyProperties> qfs(qf_count);
@@ -396,16 +456,53 @@ void Context::CreateLogicalDevice() {
   queue_info.queueCount = 1;
   queue_info.pQueuePriorities = &priority;
 
-  // Deliberately enable *no* optional features: every shader here is written
-  // against core Vulkan 1.1 compute so that Mali/Adreno parts lacking
-  // shaderFloat64 / shaderInt64 / 8-bit storage still work.
-  VkPhysicalDeviceFeatures enabled_features{};
+  // Every shader in the base corpus is written against core Vulkan 1.1
+  // compute so that Mali/Adreno parts lacking shaderFloat64 / shaderInt64 /
+  // 8-bit storage still work - none of those are requested here. 8-bit
+  // storage is the one exception: GpuDetector has a parallel set of shader
+  // variants that use it (uint8_t decimated_buf_/thresholded_buf_ instead of
+  // one uint32 per pixel) purely for the memory-traffic win on parts that
+  // support it, selected at runtime via caps().has_8bit_storage - the
+  // 32-bit variants remain the default/fallback path for everything else.
+  supports_8bit_storage_ = !options.force_no_8bit_storage && Supports8BitStorage(physical_device_);
+
+  VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
+  storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
+  storage8bit.storageBuffer8BitAccess = VK_TRUE;
+
+  VkPhysicalDeviceFeatures2 features2{};
+  features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  // features2.features is left zeroed: this is still "enable no *core*
+  // optional features", just routed through the pNext chain instead of
+  // VkDeviceCreateInfo::pEnabledFeatures, which the spec requires to be
+  // NULL whenever a VkPhysicalDeviceFeatures2 is chained in.
+  if (supports_8bit_storage_) {
+    features2.pNext = &storage8bit;
+  }
+
+  std::vector<const char *> enabled_extensions;
+  if (supports_8bit_storage_) {
+    enabled_extensions.push_back("VK_KHR_8bit_storage");
+    // VK_KHR_8bit_storage depends on VK_KHR_storage_buffer_storage_class,
+    // which every Vulkan 1.1+ implementation supports (folded into 1.1
+    // core) but which still needs to be *named* as a device extension pre-
+    // 1.2, exactly like 8bit_storage itself - both were core-promoted at
+    // the same 1.2 boundary this project's VK_API_VERSION_1_1 instance sits
+    // before.
+    if (DeviceHasExtension(physical_device_, "VK_KHR_storage_buffer_storage_class")) {
+      enabled_extensions.push_back("VK_KHR_storage_buffer_storage_class");
+    }
+  }
 
   VkDeviceCreateInfo device_info{};
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  device_info.pNext = &features2;
   device_info.queueCreateInfoCount = 1;
   device_info.pQueueCreateInfos = &queue_info;
-  device_info.pEnabledFeatures = &enabled_features;
+  device_info.pEnabledFeatures = nullptr;
+  device_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
+  device_info.ppEnabledExtensionNames =
+      enabled_extensions.empty() ? nullptr : enabled_extensions.data();
 
   CheckVk(vkCreateDevice(physical_device_, &device_info, nullptr, &device_), "vkCreateDevice");
   vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
@@ -422,6 +519,37 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.type = props.deviceType;
   caps_.api_version = props.apiVersion;
   caps_.vendor_id = props.vendorID;
+  // Set by CreateLogicalDevice (the only place that can request+enable the
+  // extension), not re-queried here.
+  caps_.has_8bit_storage = supports_8bit_storage_;
+
+  // Subgroup properties: core Vulkan 1.1, via the VkPhysicalDeviceProperties2
+  // pNext chain (a separate query from the plain vkGetPhysicalDeviceProperties
+  // above, which has no room for extension structs).
+  {
+    VkPhysicalDeviceSubgroupProperties subgroup_props{};
+    subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &subgroup_props;
+    vkGetPhysicalDeviceProperties2(physical_device_, &props2);
+    const bool ballot_in_compute = (subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                                   (subgroup_props.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
+    const bool arithmetic_in_compute =
+        (subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup_props.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    const bool shuffle_in_compute =
+        (subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        (subgroup_props.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    caps_.has_subgroup_ballot = ballot_in_compute;
+    caps_.has_subgroup_arithmetic = arithmetic_in_compute;
+    caps_.has_subgroup_shuffle = shuffle_in_compute;
+    if (options.force_no_subgroup) {
+      caps_.has_subgroup_ballot = false;
+      caps_.has_subgroup_arithmetic = false;
+      caps_.has_subgroup_shuffle = false;
+    }
+  }
 
   const VkPhysicalDeviceLimits &l = props.limits;
   caps_.max_workgroup_invocations = l.maxComputeWorkGroupInvocations;
@@ -463,6 +591,7 @@ void Context::QueryCaps(const ContextOptions &options) {
       caps_.has_host_cached = true;
     }
   }
+  caps_.non_coherent_atom_size = std::max<VkDeviceSize>(l.nonCoherentAtomSize, 1);
 
   // --- Derived launch geometry ---
   // 1D: 256 is a good default on desktop; Mali-class parts do better with
@@ -477,8 +606,30 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.wg1d = std::max(FloorPow2(want_1d), 1u);
 
   // 2D: prefer 16x16, fall back to 8x8 on parts that cannot host 256
-  // invocations per group.
-  if (caps_.max_workgroup_invocations >= 256 && caps_.max_workgroup_size[0] >= 16 &&
+  // invocations per group - except integrated GPUs, which get 8x8
+  // unconditionally. Measured on Mali-G610 (Orange Pi 5) across the four
+  // shaders wg2d_ actually drives (decimate/threshold/uf_init/blob_diff,
+  // since A6's move to 2D dispatch): 8x8 beat 16x16 by ~1-2% on
+  // pipeline_total, consistently across three repeated A/B runs (e.g.
+  // 11.616/11.772/11.618 ms median for 8x8 vs. 11.772/11.808/11.778 ms for
+  // 16x16). A parallel sweep of wg1d_ (64/128/256/512, via
+  // APRILTAG_VK_WG - the remaining 1D shaders: uf_merge/uf_compress/
+  // uf_final/hash_group/reduce_extents_hash/select_blobs/
+  // extract_blob_counts/scatter_index_points/label_pixels) showed no signal
+  // at all - every value landed within the ~0.2 ms run-to-run noise band -
+  // so wg1d_'s existing 128-for-integrated-GPU default is left as is.
+  // options.workgroup_size_2d_x/y (APRILTAG_VK_WG2D) overrides this
+  // outright for sweeping launch geometry on a specific device;
+  // ComputePipeline's own construction-time check throws loudly if the
+  // override exceeds the device's real limits, so no extra validation is
+  // needed here.
+  if (options.workgroup_size_2d_x > 0 && options.workgroup_size_2d_y > 0) {
+    caps_.wg2d_x = options.workgroup_size_2d_x;
+    caps_.wg2d_y = options.workgroup_size_2d_y;
+  } else if (caps_.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+    caps_.wg2d_x = 8;
+    caps_.wg2d_y = 8;
+  } else if (caps_.max_workgroup_invocations >= 256 && caps_.max_workgroup_size[0] >= 16 &&
       caps_.max_workgroup_size[1] >= 16) {
     caps_.wg2d_x = 16;
     caps_.wg2d_y = 16;
@@ -621,6 +772,7 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
                 caps.has_host_cached = true;
             }
         }
+        caps.non_coherent_atom_size = std::max<VkDeviceSize>(l.nonCoherentAtomSize, 1);
 
         // --- Derived launch geometry ---
         // 1D: 256 is a good default on desktop; Mali-class parts do better with
@@ -756,7 +908,10 @@ std::string Context::DescribeDevice() const {
      << ", maxComputeWorkGroupSize.x=" << caps_.max_workgroup_size[0]
      << ", maxComputeSharedMemorySize=" << caps_.max_shared_memory_bytes
      << ", float64=" << (caps_.has_shader_float64 ? "yes" : "no")
-     << ", int64=" << (caps_.has_shader_int64 ? "yes" : "no");
+     << ", int64=" << (caps_.has_shader_int64 ? "yes" : "no")
+     << ", 8bit_storage=" << (caps_.has_8bit_storage ? "yes" : "no")
+     << ", subgroup_ballot=" << (caps_.has_subgroup_ballot ? "yes" : "no")
+     << ", subgroup_arithmetic=" << (caps_.has_subgroup_arithmetic ? "yes" : "no");
   os << "\n  chosen geometry: wg1d=" << caps_.wg1d << ", wg2d=" << caps_.wg2d_x << "x"
      << caps_.wg2d_y << ", scan_wg=" << caps_.scan_wg
      << ", unified_memory=" << (caps_.unified_memory ? "yes" : "no")

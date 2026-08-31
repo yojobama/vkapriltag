@@ -8,14 +8,20 @@
 // Order within a blob is atomic-arrival dependent, exactly as the boundary
 // point append order in blob_diff.comp already was - and it is immediately
 // overwritten by the angular sort in sort_points_local.comp.
+//
+// No separate output counter: every point that reaches the `atomicAdd(
+// blob_cursor[sel], ...)` below is, by construction, one of exactly
+// e.count points sharing that blob's (rep0, rep1) key (reduce_extents_hash.
+// comp counted them the same way), so the total written across every
+// selected blob is exactly blob_point_offsets_buf_'s last (inclusive-scanned)
+// entry - already computed by extract_blob_counts.comp's scan chain, with no
+// separate atomic needed here.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-#define PI 3.14159265358979323846
-
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer Compacted { QBPoint compacted[]; };
+layout(std430, binding = 0) readonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
 layout(std430, binding = 3) readonly buffer Remap { uint remap[]; };
@@ -23,7 +29,6 @@ layout(std430, binding = 4) readonly buffer Selected { MinMaxExtentsGpu selected
 layout(std430, binding = 5) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 6) buffer BlobCursor { uint blob_cursor[]; };
 layout(std430, binding = 7) writeonly buffer Output { IPoint output_points[]; };
-layout(std430, binding = 8) buffer Counter { uint counter; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -45,15 +50,37 @@ void main() {
   uint sel = remap[bi];
   if (sel == 0xFFFFFFFFu) return;
 
-  QBPoint p = compacted[i];
-  if (p.valid == 0u) return;
+  QBPoint p = UnpackQBPoint(compacted[i]);
 
   MinMaxExtentsGpu e = selected[sel];
   float cx = (float(e.min_x) + float(e.max_x)) * 0.5 + 0.05118;
   float cy = (float(e.min_y) + float(e.max_y)) * 0.5 + -0.028581;
 
-  float theta = (atan(float(p.y) - cy, float(p.x) - cx) + float(PI)) * 8e6;
-  int theta_int = int(round(theta));
+  // A pseudo-angle instead of atan2(dy, dx): only the SORT ORDER around the
+  // blob's perimeter is ever consumed (sort_points_local.comp), never the
+  // angle's actual value, and this is monotonic in true angle - strictly
+  // increasing counterclockwise through the same four quadrant crossings
+  // atan2 would - at a fraction of the cost (one divide, no transcendental).
+  // Standard "diamond" construction: walks 0->1 across the first quadrant,
+  // 1->3 across dx<0 (both remaining quadrants in one branch, since -dy/d
+  // is already monotonic decreasing through dy>0 -> dy<0 there), 3->4 back
+  // across dx>=0, dy<0. The absolute zero point differs from atan2+PI's
+  // (this one starts at the +x axis, not needing the +PI shift at all), but
+  // nothing here depends on that - a blob's points are sorted circularly,
+  // so where the "seam" falls doesn't change the ordering FitQuadForBlob
+  // reads back out on the CPU side.
+  float dx = float(p.x) - cx;
+  float dy = float(p.y) - cy;
+  float d = abs(dx) + abs(dy);
+  float ratio = (d > 0.0) ? (dy / d) : 0.0;
+  float pseudo_angle = (dx >= 0.0) ? ((dy >= 0.0) ? ratio : (4.0 + ratio)) : (2.0 - ratio);
+
+  // Scaled to fit 21 bits (max 1,600,000 at pseudo_angle==4): sort_points_
+  // local.comp packs this key together with an 11-bit local sort index into
+  // one shared word (21 + 11 = 32), so the key only needs enough resolution
+  // to order points around a blob's perimeter - nowhere near the precision
+  // an unscaled-for-packing key would carry.
+  int theta_int = int(round(pseudo_angle * 4e5));
   uint theta_key = uint(max(theta_int, 0));
 
   uint rank = atomicAdd(blob_cursor[sel], 1u);
@@ -61,16 +88,9 @@ void main() {
   uint pos = blob_point_offsets[sel] - e.count + rank;
   if (pos >= pc.capacity) return;
 
-  atomicAdd(counter, 1u);
-
   IPoint out_pt;
   out_pt.blob_index = sel;
-  out_pt.x = p.x;
-  out_pt.y = p.y;
-  out_pt.gx = p.gx;
-  out_pt.gy = p.gy;
+  out_pt.xy = PackXY(p.x, p.y);
   out_pt.theta_key = theta_key;
-  out_pt.pad0 = 0u;
-  out_pt.pad1 = 0u;
   output_points[pos] = out_pt;
 }

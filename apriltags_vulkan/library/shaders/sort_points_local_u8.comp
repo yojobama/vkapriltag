@@ -1,0 +1,13 @@
+#version 450
+// 8-bit-storage DecimatedImage variant - see sort_points_local_body.glsl for
+// the shader itself and sort_points_local.comp for the 32-bit-per-pixel
+// fallback GpuDetector uses on devices without storageBuffer8BitAccess.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+
+layout(std430, binding = 3) readonly buffer DecimatedImage { uint8_t decimated[]; };
+#define DECIMATED_AT(i) (uint(decimated[(i)]))
+
+#include "sort_points_local_body.glsl"

@@ -1,104 +1,11 @@
 #version 450
-// Sorts each selected blob's points into ascending angular order around its
-// centroid, one workgroup per blob. rewrite_index_points.comp already packed
-// every blob's points into one contiguous range [base, base+count) of the
-// input array, so this needs no composite key at all - only theta_key, and
-// only within the blob's own range. That replaces what used to be a single
-// flat radix/bitonic sort across every selected blob's points combined
-// (which needed a (blob_index, theta) composite key purely to keep
-// different blobs' points from interleaving).
-//
-// The bitonic network operates over kLocalCap virtual slots, independent of
-// gl_WorkGroupSize.x: each thread owns kLocalCap/gl_WorkGroupSize.x slots in
-// a strided pattern (idx = tid, tid+threads, tid+2*threads, ...), so the
-// per-blob capacity can be sized from the shared-memory budget alone rather
-// than being capped at the workgroup's thread count. This matters because
-// real blobs (e.g. a large tag's own border) can comfortably exceed the
-// device's max workgroup invocation count while still fitting in shared
-// memory.
-//
-// Blobs whose point count exceeds kLocalCap fall back to an identity copy:
-// correctness (no lost points, no crash) is preserved, but that blob's
-// points won't be angularly resorted. Selected blobs have already passed the
-// shape/size quad filters in select_blobs.comp, so real tag candidates are
-// expected to stay under this cap in practice; it exists as a defensive
-// bound for pathological inputs, in the same spirit as the capacity clamps
-// elsewhere in this pipeline.
+// 32-bit-per-pixel DecimatedImage variant - see sort_points_local_body.glsl
+// for the shader itself and sort_points_local_u8.comp for the 8-bit-storage
+// sibling GpuDetector picks on devices that support it.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-layout(local_size_x_id = 0, local_size_x = 256) in;
-// Virtual per-blob element capacity, decoupled from the workgroup's thread
-// count and derived from the device's shared memory budget (2 words/point:
-// key + local index) - see local_sort_virtual_cap_ in GpuDetector.cpp.
-layout(constant_id = 3) const uint kLocalCap = 1024;
+layout(std430, binding = 3) readonly buffer DecimatedImage { uint decimated[]; };
+#define DECIMATED_AT(i) (decimated[(i)])
 
-layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
-layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
-layout(std430, binding = 2) readonly buffer Src { IPoint src[]; };
-layout(std430, binding = 3) writeonly buffer Dst { IPoint dst[]; };
-
-layout(push_constant) uniform PushConstants {
-  uint num_selected_blobs;
-} pc;
-
-shared uint s_key[kLocalCap];
-shared uint s_idx[kLocalCap];
-
-void main() {
-  uint blob = gl_WorkGroupID.x;
-  if (blob >= pc.num_selected_blobs) return;
-
-  uint tid = gl_LocalInvocationID.x;
-  uint threads = gl_WorkGroupSize.x;
-  uint count = selected[blob].count;
-  uint base = blob_point_offsets[blob] - count;
-
-  if (count > kLocalCap) {
-    for (uint idx = tid; idx < count; idx += threads) {
-      dst[base + idx] = src[base + idx];
-    }
-    return;
-  }
-
-  // Size the network to THIS blob, not to kLocalCap. `count` is uniform across
-  // the workgroup, so `cap` is too, and every barrier below is still reached
-  // by every invocation.
-  uint cap = 1u;
-  while (cap < count) cap <<= 1u;
-
-  for (uint idx = tid; idx < cap; idx += threads) {
-    s_key[idx] = (idx < count) ? src[base + idx].theta_key : 0xFFFFFFFFu;
-    s_idx[idx] = idx;
-  }
-  memoryBarrierShared();
-  barrier();
-
-  for (uint k = 2u; k <= cap; k <<= 1u) {
-    for (uint j = k >> 1u; j > 0u; j >>= 1u) {
-      for (uint idx = tid; idx < cap; idx += threads) {
-        uint partner = idx ^ j;
-        if (partner > idx) {
-          bool ascending = ((idx & k) == 0u);
-          uint a_key = s_key[idx];
-          uint b_key = s_key[partner];
-          bool swap = ascending ? (b_key < a_key) : (a_key < b_key);
-          if (swap) {
-            uint a_idx = s_idx[idx];
-            uint b_idx = s_idx[partner];
-            s_key[idx] = b_key;
-            s_idx[idx] = b_idx;
-            s_key[partner] = a_key;
-            s_idx[partner] = a_idx;
-          }
-        }
-      }
-      memoryBarrierShared();
-      barrier();
-    }
-  }
-
-  for (uint idx = tid; idx < count; idx += threads) {
-    dst[base + idx] = src[base + s_idx[idx]];
-  }
-}
+#include "sort_points_local_body.glsl"

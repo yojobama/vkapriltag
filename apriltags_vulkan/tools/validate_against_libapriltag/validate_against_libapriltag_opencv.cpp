@@ -210,12 +210,41 @@ int main(int argc, char **argv) {
           << " ms)" << std::endl;
       std::cout << "  work: boundary_points=" << profile.boundary_points
           << ", raw_blobs=" << profile.raw_blobs
+          << (profile.hash_probe_drops > 0
+                  ? (" (" + std::to_string(profile.hash_probe_drops) + " HASH DROPS)")
+                  : std::string())
           << ", uf_iterations=" << profile.uf_iterations
           << (profile.uf_converged ? "" : " (HIT LIMIT)")
           << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs
           << ", points=" << profile.points << std::endl;
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
+      double gpu_span_total = 0.0;
+      if (profile.has_gpu_stage_breakdown) {
+        std::cout << "  GPU stage breakdown (last iteration, APRILTAG_VK_TIMESTAMPS=1):"
+            << std::endl;
+        for (size_t s = 0; s < apriltag_vulkan::GpuDetector::kGpuStageNames.size(); ++s) {
+          std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[s] << "="
+              << profile.gpu_stage_ms[s] << " ms" << std::endl;
+          gpu_span_total += profile.gpu_stage_ms[s];
+        }
+        std::cout << "    (sum of spans = " << gpu_span_total << " ms)" << std::endl;
+      }
+      // Host-side cost of driving the GPU - see DetectProfile's cpu_*_ms
+      // comment for what the residual below is (and, importantly, what it
+      // is not).
+      std::cout << "  Host-side submission cost (last iteration): begin="
+          << profile.cpu_begin_ms << " ms, submit+wait=" << profile.cpu_submit_wait_ms
+          << " ms, counter_reads=" << profile.cpu_counter_read_ms << " ms, over "
+          << profile.submits << " submit(s)" << std::endl;
+      if (profile.has_gpu_stage_breakdown) {
+        // Deliberately NOT divided by the submit count: that reading
+        // ("cost per round trip") was tested by removing a submission and
+        // disproved - see DetectProfile's cpu_*_ms comment. This is GPU-side
+        // time no span covers, dominated by inter-dispatch barriers.
+        std::cout << "    unspanned GPU time (submit+wait minus spans) = "
+            << (profile.cpu_submit_wait_ms - gpu_span_total) << " ms" << std::endl;
+      }
       std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
       PrintStats("GPU total", metrics.gpu_total_ms, iterations);
       PrintStats("quad_decode", metrics.quad_decode_ms, iterations);

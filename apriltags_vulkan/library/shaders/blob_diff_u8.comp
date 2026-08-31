@@ -1,0 +1,12 @@
+#version 450
+// 8-bit-storage Thresholded, scalar (non-aggregated) counter. See
+// blob_diff_body.glsl for the shader itself.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+
+layout(std430, binding = 0) readonly buffer Thresholded { uint8_t thresholded[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
+
+#include "blob_diff_body.glsl"
