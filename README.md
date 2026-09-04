@@ -39,8 +39,11 @@ This port intentionally does less than the CUDA original and upstream
 - **`RefineEdges`** (camera-distortion-based edge refinement) is not ported.
 - **Pose estimation** (`apriltag_pose.h`) is not wired up — it needs a
   calibrated camera matrix and tag size, which is out of scope here.
-- **Decimation is fixed at 2x.** The CUDA original's configurable
-  `quad_decimate` is not exposed.
+- **Decimation must be set at detector creation.** `DetectorConfig::decimation`
+  accepts any factor that divides the frame evenly (1, 2, 4, ...; default 2),
+  but it is a specialization constant baked into the pipelines, so it is fixed
+  for a detector's lifetime — changing it means constructing a new detector,
+  unlike the CUDA original's per-call `quad_decimate`.
 - **Single border polarity per run.** `reversed_border` must match across
   every tag family added to the detector in one run — mixing normal- and
   reversed-border families in a single pass is not supported.

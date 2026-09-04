@@ -75,12 +75,14 @@ void main() {
   float ratio = (d > 0.0) ? (dy / d) : 0.0;
   float pseudo_angle = (dx >= 0.0) ? ((dy >= 0.0) ? ratio : (4.0 + ratio)) : (2.0 - ratio);
 
-  // Scaled to fit 21 bits (max 1,600,000 at pseudo_angle==4): sort_points_
-  // local.comp packs this key together with an 11-bit local sort index into
-  // one shared word (21 + 11 = 32), so the key only needs enough resolution
+  // Scaled to fit 20 bits (max 1,000,000 at pseudo_angle==4): sort_points_
+  // local.comp packs this key together with a 12-bit local sort index into
+  // one shared word (20 + 12 = 32), so the key only needs enough resolution
   // to order points around a blob's perimeter - nowhere near the precision
-  // an unscaled-for-packing key would carry.
-  int theta_int = int(round(pseudo_angle * 4e5));
+  // an unscaled-for-packing key would carry. With the 4096-point ceiling
+  // that 12-bit index implies, a full blob still gets ~244 key units per
+  // point, so ties remain vanishingly rare at any decimation.
+  int theta_int = int(round(pseudo_angle * 2.5e5));
   uint theta_key = uint(max(theta_int, 0));
 
   uint rank = atomicAdd(blob_cursor[sel], 1u);

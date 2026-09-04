@@ -24,12 +24,24 @@
 // memory.
 //
 // Blobs whose point count exceeds kLocalCap fall back to processing points
-// in their original (unsorted) order: correctness (no lost points, no
-// crash) is preserved, but that blob's points won't be angularly resorted.
-// Selected blobs have already passed the shape/size quad filters in
-// select_blobs.comp, so real tag candidates are expected to stay under this
-// cap in practice; it exists as a defensive bound for pathological inputs,
-// in the same spirit as the capacity clamps elsewhere in this pipeline.
+// in their original (unsorted) order: no lost points and no crash, but that
+// blob's points aren't angularly resorted, and FitQuadForBlob consumes them
+// as an ordered walk around the perimeter - so such a blob yields a
+// geometrically meaningless quad rather than a slightly worse one. A tag
+// whose own border lands here stops being detectable at all, which is
+// exactly what happened at decimation 1 before the ceiling was made to
+// scale with decimation (see local_sort_virtual_cap_ in GpuDetector.cpp).
+// Because the failure is silent and total rather than gradual, each blob
+// that takes this path bumps OversizedBlobs below, surfaced as
+// DetectProfile::oversized_sort_blobs. A handful per frame is normal (large
+// background structures that clear select_blobs.comp's filters and then fit
+// junk quads that harmlessly fail to decode); the counter earns its keep
+// when an expected tag goes missing, which is otherwise invisible.
+// select_blobs.comp's shape/size filters do not bound point count, so this
+// path is reached by ordinary scenes rather than only pathological ones -
+// what the cap has to guarantee is headroom above a real *tag* border at
+// the configured decimation, which is why it is derived from decimation
+// rather than being a flat constant.
 //
 // Fused with the line-fit moment computation (formerly a separate
 // compute_line_fit_points.comp dispatch reading this shader's sorted
@@ -50,6 +62,8 @@ layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 2) readonly buffer Src { IPoint src[]; };
 layout(std430, binding = 4) writeonly buffer Output { RawLineFitPoint output_points[]; };
+// One atomic bump per blob that overflows kLocalCap - see the header comment.
+layout(std430, binding = 5) buffer OversizedBlobs { uint oversized_blobs; };
 
 layout(push_constant) uniform PushConstants {
   uint num_selected_blobs;
@@ -84,14 +98,21 @@ RawLineFitPoint ComputeLineFitPoint(IPoint p) {
   return out_pt;
 }
 
-// theta_key (scatter_index_points.comp) is scaled to fit 21 bits and
-// kLocalCap is capped at 2048 (11 bits), so key and local index share one
-// word - key in the high 21 bits, index in the low 11 - instead of two
+// theta_key (scatter_index_points.comp) is scaled to fit 20 bits and
+// kLocalCap is capped at 4096 (12 bits), so key and local index share one
+// word - key in the high 20 bits, index in the low 12 - instead of two
 // separate arrays. Comparing packed values directly still sorts by key
 // first (it occupies the high bits), with the index as an incidental,
 // harmless tiebreaker; this halves the network's shared-memory footprint
 // and its per-compare traffic (one load/store pair instead of two).
-const uint kLocalIndexBits = 11u;
+//
+// 12 rather than 11 bits because a blob's perimeter, in decimated points,
+// scales as 1/decimation: the ~1200-point border of a 1080p tag at
+// decimation 2 becomes ~2400 at decimation 1, which overflowed the old
+// 2048-slot ceiling and silently took the unsorted fallback below - see the
+// host's local_sort_virtual_cap_ derivation, which only requests the larger
+// ceiling for the decimations that actually need it.
+const uint kLocalIndexBits = 12u;
 const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
 
 shared uint s_packed[kLocalCap];
@@ -106,6 +127,9 @@ void main() {
   uint base = blob_point_offsets[blob] - count;
 
   if (count > kLocalCap) {
+    // One bump per blob, not per point: this counts candidates that came out
+    // unsorted, which is the number a caller can act on.
+    if (tid == 0u) atomicAdd(oversized_blobs, 1u);
     for (uint idx = tid; idx < count; idx += threads) {
       output_points[base + idx] = ComputeLineFitPoint(src[base + idx]);
     }

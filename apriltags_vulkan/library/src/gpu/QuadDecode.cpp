@@ -568,7 +568,8 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
 
   // UpdateFitQuads: refit lines from the moments, intersect adjacent lines
   // to get corners, and apply geometric sanity checks.
-  const double min_tag_width = std::max(3.0, config_.tag_width / 2.0);  // fixed 2x decimation
+  const double min_tag_width =
+      std::max(3.0, config_.tag_width / static_cast<double>(config_.decimation));
   for (const FitQuadResult &quad : fit_quads) {
     double lines[4][4];
     bool line_ok = true;
@@ -631,11 +632,28 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
     }
     if (reject) continue;
 
-    // AdjustPixelCenters (fixed 2x decimation case): pixel = (c - 0.5) * 2 + 0.5.
+    // AdjustPixelCenters, generalized from the fixed-2x-decimation original:
+    // pixel = (c - 0.5) * decimation + 0.5. The two 0.5 offsets have
+    // different origins and neither scales with decimation:
+    //   - the leading "- 0.5" undoes a constant +1 shift ComputeLineFitPoint
+    //     (sort_points_local_body.glsl) applies to every point's x2/y2
+    //     before any moment is accumulated - that shift happens entirely
+    //     within the DECIMATED grid's own index space, so it is exactly
+    //     half a DECIMATED pixel regardless of how coarse that grid is.
+    //   - the trailing "+ 0.5" converts from a pixel-INDEX coordinate (0 at
+    //     the first pixel) to the caller's pixel-CENTER convention, applied
+    //     AFTER scaling to full resolution - so it is exactly half a
+    //     FULL-RESOLUTION pixel, independent of decimation.
+    // Sanity check: at decimation=1 (no downsampling), the formula must
+    // reduce to the identity (corners[] is already in full-resolution
+    // units) - (c - 0.5) * 1 + 0.5 = c, confirming both constants are right
+    // where they are. Verified empirically against upstream apriltag's own
+    // (integer) quad_decimate at 1x/2x/4x - see apriltag_vulkan_validate.
+    const double decimation = static_cast<double>(config_.decimation);
     DetectedQuad out;
     for (int i = 0; i < 4; ++i) {
-      out.p[i][0] = (corners[i][0] - 0.5) * 2.0 + 0.5;
-      out.p[i][1] = (corners[i][1] - 0.5) * 2.0 + 0.5;
+      out.p[i][0] = (corners[i][0] - 0.5) * decimation + 0.5;
+      out.p[i][1] = (corners[i][1] - 0.5) * decimation + 0.5;
     }
     output.push_back(out);
   }

@@ -24,6 +24,25 @@ struct DetectorConfig {
   uint32_t width = 0;
   uint32_t height = 0;
 
+  // Integer downsampling factor applied before thresholding/labelling - 1
+  // disables decimation entirely (the full-resolution image is processed
+  // as-is), 2 is this pipeline's original fixed behaviour, 4 halves linear
+  // resolution again, etc. Matches upstream apriltag's `quad_decimate`,
+  // restricted to integers (this pipeline's decimate.comp always samples
+  // one representative pixel per NxN block - "copies rather than
+  // averages", matching CudaToGreyscaleAndDecimateHalide - it never
+  // implements upstream's separate 1.5x blended-average path).
+  //
+  // Fixed for the lifetime of a GpuDetector/QuadDecode pair: it is baked
+  // into decimate.comp's dispatch as a specialization constant (resolved
+  // at CreatePipelines() time, not read per-invocation), so choosing a
+  // value costs nothing beyond the pixel count that value implies - a
+  // smaller factor means more decimated pixels for every downstream stage
+  // to process, which is a real, unavoidable cost of the lower decimation,
+  // not overhead this field adds on top of it. `width`/`height` must each
+  // be evenly divisible by this value.
+  uint32_t decimation = 2;
+
   uint32_t min_white_black_diff = 5;
   uint32_t min_cluster_pixels = 24;
   uint32_t max_cluster_pixels = 100000;
@@ -35,7 +54,7 @@ struct DetectorConfig {
   // (default) disables this and leaves min_cluster_pixels as the only floor.
   // When set, GpuDetector raises min_cluster_pixels to whatever a
   // min_tag_pixels-wide square tag's boundary-point count would be at this
-  // pipeline's fixed 2x decimation (4 sides x min_tag_pixels/2 decimated
+  // detector's `decimation` (4 sides x min_tag_pixels/decimation decimated
   // pixels each), so undersized noise/text/foliage blobs never reach the
   // expensive per-blob CPU quad fit. Declaring this is strictly a recall/
   // throughput trade: tags smaller than it are guaranteed to be dropped.
@@ -171,6 +190,24 @@ class GpuDetector {
     // every real scene at the current table sizing; watch this if
     // max_raw_blobs / the hash table sizing is ever tightened further.
     uint32_t hash_probe_drops = 0;
+    // Selected blobs whose point count exceeded sort_points_local's per-blob
+    // capacity (local_sort_virtual_cap_) and so came back in their original,
+    // unsorted order. Unlike a merely imprecise fit this is a silent total
+    // failure for those candidates: QuadDecode walks these points as an
+    // ordered perimeter, so an unsorted blob fits a meaningless quad rather
+    // than a slightly worse one.
+    //
+    // Nonzero is normal and not by itself a problem - a 1080p scene yields a
+    // handful of large background structures that pass select_blobs.comp's
+    // shape filters and exceed any sane per-blob capacity (measured: 4 at
+    // decimation 2, 3 at decimation 1, 1 at decimation 4). Those fit junk
+    // quads that harmlessly fail to decode. What this counter is for is the
+    // case where an *expected tag* goes missing: a tag's own border landing
+    // here cannot be detected at all, and that failure is otherwise
+    // invisible. If a tag is missing and this is nonzero, the capacity is
+    // the first thing to suspect - that is precisely how decimation 1 was
+    // broken, its ~2400-point tag border overflowing a 2048-slot ceiling.
+    uint32_t oversized_sort_blobs = 0;
     uint32_t uf_iterations = 0;       // labelling passes until convergence
     uint32_t submits = 0;             // queue submissions this frame
     bool uf_converged = true;         // false if max_uf_iterations was hit
@@ -357,6 +394,9 @@ class GpuDetector {
   // Points hash_group.comp couldn't place within max_probes - see
   // DetectProfile::hash_probe_drops.
   vk::Buffer hash_drop_counter_buf_;
+  // Blobs sort_points_local.comp had to pass through unsorted - see
+  // DetectProfile::oversized_sort_blobs.
+  vk::Buffer oversized_sort_counter_buf_;
   uint32_t hash_table_size_ = 0;
 
   // VkDispatchIndirectCommand built on-device from raw_blob_counter_buf_ by

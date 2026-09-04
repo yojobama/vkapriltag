@@ -58,21 +58,32 @@ constexpr uint32_t kSlotSelectedCount = 2;
 constexpr uint32_t kSlotPointCount = 3;
 constexpr uint32_t kSlotRawBlobs = 4;
 constexpr uint32_t kSlotHashDrops = 5;
+constexpr uint32_t kSlotOversizedSortBlobs = 6;
 constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 }  // namespace
 
 GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     : ctx_(ctx), config_(config) {
-  if (config_.width % 2 != 0 || config_.height % 2 != 0) {
-    throw std::runtime_error("width and height must both be even");
+  if (config_.decimation == 0) {
+    throw std::runtime_error("decimation must be >= 1");
   }
-  // QBPoint/IPoint pack the un-decimated pixel coordinate into 14 bits per
-  // axis (see common.glsl's PackXY) - two orders of magnitude past any
-  // realistic sensor, but a hard requirement for the packed coordinate to be
-  // lossless.
-  if (config_.width > 16383 || config_.height > 16383) {
-    throw std::runtime_error("width and height must each be <= 16383");
+  if (config_.width % config_.decimation != 0 || config_.height % config_.decimation != 0) {
+    throw std::runtime_error("width and height must each be evenly divisible by decimation");
+  }
+  // QBPoint/IPoint pack a boundary coordinate into 14 bits per axis (see
+  // common.glsl's PackXY). That coordinate is the *doubled* decimated index
+  // (x2 = 2*decimated_x +/- 1, so boundaries land on half-integers), whose
+  // maximum is 2*width/decimation - not width. The two coincide only at
+  // decimation 2, which is why a bare `width <= 16383` test was right while
+  // decimation was hardcoded and is off by 2x at decimation 1. Checked
+  // against the real packed range so a lossy configuration is rejected up
+  // front instead of silently truncating coordinates.
+  const uint32_t max_packed_x = 2u * (config_.width / config_.decimation);
+  const uint32_t max_packed_y = 2u * (config_.height / config_.decimation);
+  if (max_packed_x > 16383 || max_packed_y > 16383) {
+    throw std::runtime_error(
+        "2*(width/decimation) and 2*(height/decimation) must each be <= 16383");
   }
 
   // --- Environment overrides. These must all be applied before any capacity
@@ -102,9 +113,9 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   }
   if (config_.min_tag_pixels > 0) {
     // Perimeter, in decimated-grid boundary points, of a square tag whose
-    // full-resolution side is min_tag_pixels, at this pipeline's fixed 2x
-    // decimation: 4 sides x (min_tag_pixels / 2) decimated pixels each.
-    const uint32_t derived_min_cluster = 2u * config_.min_tag_pixels;
+    // full-resolution side is min_tag_pixels, at this detector's decimation:
+    // 4 sides x (min_tag_pixels / decimation) decimated pixels each.
+    const uint32_t derived_min_cluster = 4u * (config_.min_tag_pixels / config_.decimation);
     config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, derived_min_cluster);
   }
 
@@ -114,10 +125,11 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   wg2d_ = vk::WorkgroupSize{caps.wg2d_x, caps.wg2d_y, 1};
   scan_wg_ = caps.scan_wg;
 
-  decimated_width_ = config_.width / 2;
-  decimated_height_ = config_.height / 2;
-  // Rounded up rather than floored: the input is only guaranteed even, not a
-  // multiple of 8, so decimated_width_/height_ need not be a multiple of 4.
+  decimated_width_ = config_.width / config_.decimation;
+  decimated_height_ = config_.height / config_.decimation;
+  // Rounded up rather than floored: width/height are only guaranteed
+  // divisible by decimation, not by a further factor of 4, so
+  // decimated_width_/height_ need not be a multiple of 4.
   // block_minmax.comp/threshold.comp handle the resulting ragged trailing
   // block explicitly (edge-clamped sampling / an explicit block_width push
   // constant) rather than assuming block_width_ * 4 == decimated_width_.
@@ -160,19 +172,32 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   // pattern), so it only needs to fit the shared-memory budget - not the
   // device's max workgroup invocation count. This lets blobs bigger than the
   // device can run as a single workgroup (e.g. a large tag's own border)
-  // still get properly angle-sorted instead of falling back to an unsorted
-  // identity copy. Hard-capped at 2048 regardless of the shared-memory
-  // budget: sort_points_local.comp packs the local sort index into the low
-  // 11 bits of its shared word (kLocalIndexBits), so 2048 slots is the most
-  // the packing itself can address, not merely a budget choice - this must
-  // stay in sync with that shader's kLocalIndexBits. On every real device
+  // still get properly angle-sorted instead of falling back to the unsorted
+  // identity copy in sort_points_local_body.glsl - a fallback that yields
+  // geometrically meaningless quads, since FitQuadForBlob consumes these
+  // points as an ordered walk around the perimeter.
+  //
+  // The ceiling has to scale with decimation. A blob's perimeter in
+  // decimated points goes as 1/decimation, so the ~1200-point border of a
+  // 1080p tag at decimation 2 is ~2400 points at decimation 1. 2048 slots
+  // (the old fixed ceiling) covered the former and silently mis-sorted the
+  // latter. Anchor on the value validated at decimation 2 and scale it, but
+  // never request less than that anchor: coarser decimation keeps exactly
+  // today's geometry - and therefore today's measured cost - while only
+  // decimation 1 pays for the larger shared array.
+  const uint32_t kCapAtDecimation2 = 2048u;
+  const uint32_t scaled_cap = (kCapAtDecimation2 * 2u) / config_.decimation;
+  // Hard-capped at 4096 regardless of the shared-memory budget:
+  // sort_points_local.comp packs the local sort index into the low 12 bits
+  // of its shared word (kLocalIndexBits), so 4096 slots is the most the
+  // packing itself can address, not merely a budget choice - this must stay
+  // in sync with that shader's kLocalIndexBits. On every real device
   // (Vulkan guarantees >= 16 KiB of shared memory, this device has 32 KiB)
-  // the /4u budget bound below is already looser than the 2048 index cap, so
-  // in practice this constant IS the limit. 2048 comfortably covers real tag
-  // borders (a 1920x1080 frame's largest observed tag border is ~1200
-  // points).
+  // the /4u budget bound is already looser than the 4096 index cap.
   local_sort_virtual_cap_ =
-      std::min(PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u)), 2048u);
+      std::min(std::max(scaled_cap, kCapAtDecimation2), 4096u);
+  local_sort_virtual_cap_ = std::min(
+      local_sort_virtual_cap_, PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u)));
 
   CreateBuffers();
   CreatePipelines();
@@ -277,6 +302,7 @@ void GpuDetector::CreateBuffers() {
   blob_cursor_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 4);
   raw_blob_counter_buf_ = ssbo(4);
   hash_drop_counter_buf_ = ssbo(4);
+  oversized_sort_counter_buf_ = ssbo(4);
 
   // VkDispatchIndirectCommand (groupCountX/Y/Z), built on-device from
   // raw_blob_counter_buf_ by build_indirect_args_pl_ so init_extents_pl_ /
@@ -377,8 +403,17 @@ void GpuDetector::CreatePipelines() {
   // 2D so the shader recovers its (x, y) from gl_GlobalInvocationID.xy rather
   // than a runtime `%`/`/` by a push-constant width - see each shader's own
   // comment. Mali (Valhall) has no integer divide instruction.
+  // decimation is baked in as a specialization constant (id 3, right after
+  // the workgroup size's 0/1/2) rather than read from the push constant
+  // block: it is fixed for this detector's whole lifetime, so resolving it
+  // at pipeline-creation time lets the compiler fold `dx * decimation` into
+  // a shift when decimation is a power of two, exactly as the literal `2`
+  // it replaces already did - a runtime (push-constant) value would not get
+  // that treatment, and Mali (Valhall) has no integer divide instruction to
+  // fall back on.
   decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick("decimate", "decimate_u8")),
-                                     {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_);
+                                     {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_,
+                                     {config_.decimation});
   block_minmax_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("block_minmax", "block_minmax_u8")),
       {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_);
@@ -458,7 +493,7 @@ void GpuDetector::CreatePipelines() {
   sort_points_local_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
-       decimated_buf_.get(), line_fit_points_buf_.get()},
+       decimated_buf_.get(), line_fit_points_buf_.get(), oversized_sort_counter_buf_.get()},
       12, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
 
   hash_group_pl_ = vk::ComputePipeline(
@@ -562,7 +597,14 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const auto t_upload1 = Clock::now();
 
   // Push constants shared across several stages.
-  struct { uint32_t w, h; } dims_pc{config_.width, config_.height};
+  // decimate_pl_'s only consumer of this: the decimated dimensions are
+  // already known host-side (decimated_width_/height_ are also this
+  // dispatch's own launch geometry, just below), so passing them directly
+  // avoids the shader recomputing width/decimation on every invocation -
+  // decimation is a specialization constant now, not a push constant, so
+  // that recomputation would otherwise be a genuine runtime divide instead
+  // of the free (compile-time-constant) one the literal `2` used to be.
+  struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
   struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
 
@@ -588,6 +630,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   blob_cursor_buf_.FillZero(cmd);
   raw_blob_counter_buf_.FillZero(cmd);
   hash_drop_counter_buf_.FillZero(cmd);
+  oversized_sort_counter_buf_.FillZero(cmd);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanClear));
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
@@ -825,9 +868,13 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanReadbackCopy));
+  // Counted by sort_points_local, so this is the first submit that can carry
+  // it back.
+  RecordCounterCopy(cmd, oversized_sort_counter_buf_, kSlotOversizedSortBlobs);
   vk::ComputePipeline::HostReadBarrier(cmd);
   SubmitTimedAndWait(cmd);
   const auto t_linefit = Clock::now();
+  const uint32_t oversized_sort_blobs = ReadCounterSlot(kSlotOversizedSortBlobs);
 
   // ------------------------------------------------------------------
   // Host-side copies out of the persistently mapped readback buffer.
@@ -858,6 +905,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.boundary_points = qbp_count;
   last_profile_.raw_blobs = num_raw_blobs;
   last_profile_.hash_probe_drops = hash_probe_drops;
+  last_profile_.oversized_sort_blobs = oversized_sort_blobs;
   last_profile_.uf_iterations = uf_iterations;
   last_profile_.uf_converged = converged;
   last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);
