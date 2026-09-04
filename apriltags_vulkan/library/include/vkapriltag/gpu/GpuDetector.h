@@ -190,6 +190,24 @@ class GpuDetector {
     // every real scene at the current table sizing; watch this if
     // max_raw_blobs / the hash table sizing is ever tightened further.
     uint32_t hash_probe_drops = 0;
+    // Selected blobs whose point count exceeded sort_points_local's per-blob
+    // capacity (local_sort_virtual_cap_) and so came back in their original,
+    // unsorted order. Unlike a merely imprecise fit this is a silent total
+    // failure for those candidates: QuadDecode walks these points as an
+    // ordered perimeter, so an unsorted blob fits a meaningless quad rather
+    // than a slightly worse one.
+    //
+    // Nonzero is normal and not by itself a problem - a 1080p scene yields a
+    // handful of large background structures that pass select_blobs.comp's
+    // shape filters and exceed any sane per-blob capacity (measured: 4 at
+    // decimation 2, 3 at decimation 1, 1 at decimation 4). Those fit junk
+    // quads that harmlessly fail to decode. What this counter is for is the
+    // case where an *expected tag* goes missing: a tag's own border landing
+    // here cannot be detected at all, and that failure is otherwise
+    // invisible. If a tag is missing and this is nonzero, the capacity is
+    // the first thing to suspect - that is precisely how decimation 1 was
+    // broken, its ~2400-point tag border overflowing a 2048-slot ceiling.
+    uint32_t oversized_sort_blobs = 0;
     uint32_t uf_iterations = 0;       // labelling passes until convergence
     uint32_t submits = 0;             // queue submissions this frame
     bool uf_converged = true;         // false if max_uf_iterations was hit
@@ -376,6 +394,9 @@ class GpuDetector {
   // Points hash_group.comp couldn't place within max_probes - see
   // DetectProfile::hash_probe_drops.
   vk::Buffer hash_drop_counter_buf_;
+  // Blobs sort_points_local.comp had to pass through unsorted - see
+  // DetectProfile::oversized_sort_blobs.
+  vk::Buffer oversized_sort_counter_buf_;
   uint32_t hash_table_size_ = 0;
 
   // VkDispatchIndirectCommand built on-device from raw_blob_counter_buf_ by

@@ -223,7 +223,12 @@ int main(int argc, char **argv) {
           << ", uf_iterations=" << profile.uf_iterations
           << (profile.uf_converged ? "" : " (HIT LIMIT)")
           << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs
-          << ", points=" << profile.points << std::endl;
+          << ", points=" << profile.points
+          << (profile.oversized_sort_blobs > 0
+                  ? (", oversized_unsorted=" +
+                     std::to_string(profile.oversized_sort_blobs))
+                  : std::string())
+          << std::endl;
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
       double gpu_span_total = 0.0;

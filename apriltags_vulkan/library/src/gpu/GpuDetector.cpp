@@ -58,6 +58,7 @@ constexpr uint32_t kSlotSelectedCount = 2;
 constexpr uint32_t kSlotPointCount = 3;
 constexpr uint32_t kSlotRawBlobs = 4;
 constexpr uint32_t kSlotHashDrops = 5;
+constexpr uint32_t kSlotOversizedSortBlobs = 6;
 constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 }  // namespace
@@ -301,6 +302,7 @@ void GpuDetector::CreateBuffers() {
   blob_cursor_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 4);
   raw_blob_counter_buf_ = ssbo(4);
   hash_drop_counter_buf_ = ssbo(4);
+  oversized_sort_counter_buf_ = ssbo(4);
 
   // VkDispatchIndirectCommand (groupCountX/Y/Z), built on-device from
   // raw_blob_counter_buf_ by build_indirect_args_pl_ so init_extents_pl_ /
@@ -491,7 +493,7 @@ void GpuDetector::CreatePipelines() {
   sort_points_local_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
-       decimated_buf_.get(), line_fit_points_buf_.get()},
+       decimated_buf_.get(), line_fit_points_buf_.get(), oversized_sort_counter_buf_.get()},
       12, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
 
   hash_group_pl_ = vk::ComputePipeline(
@@ -628,6 +630,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   blob_cursor_buf_.FillZero(cmd);
   raw_blob_counter_buf_.FillZero(cmd);
   hash_drop_counter_buf_.FillZero(cmd);
+  oversized_sort_counter_buf_.FillZero(cmd);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanClear));
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
@@ -865,9 +868,13 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanReadbackCopy));
+  // Counted by sort_points_local, so this is the first submit that can carry
+  // it back.
+  RecordCounterCopy(cmd, oversized_sort_counter_buf_, kSlotOversizedSortBlobs);
   vk::ComputePipeline::HostReadBarrier(cmd);
   SubmitTimedAndWait(cmd);
   const auto t_linefit = Clock::now();
+  const uint32_t oversized_sort_blobs = ReadCounterSlot(kSlotOversizedSortBlobs);
 
   // ------------------------------------------------------------------
   // Host-side copies out of the persistently mapped readback buffer.
@@ -898,6 +905,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.boundary_points = qbp_count;
   last_profile_.raw_blobs = num_raw_blobs;
   last_profile_.hash_probe_drops = hash_probe_drops;
+  last_profile_.oversized_sort_blobs = oversized_sort_blobs;
   last_profile_.uf_iterations = uf_iterations;
   last_profile_.uf_converged = converged;
   last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);
