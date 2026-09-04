@@ -3,6 +3,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -59,5 +61,20 @@ class WorkerPool {
   uint64_t generation_ = 0;
   bool stop_ = false;
 };
+
+// Resolves a WorkerPool's degree of parallelism the same way everywhere it's
+// constructed in the CPU tail (QuadDecode, TagDecoder): an explicit config
+// value wins, then APRILTAG_CPU_THREADS, then WorkerPool's own
+// hardware_concurrency default. Kept in one place so the env var means the
+// same thing - and can be set once to affect both phases - regardless of
+// which phase is constructing the pool.
+inline unsigned ResolveThreadCount(uint32_t configured) {
+  if (configured > 0) return configured;
+  if (const char *t = std::getenv("APRILTAG_CPU_THREADS")) {
+    const long parsed = std::strtol(t, nullptr, 10);
+    if (parsed > 0) return static_cast<unsigned>(parsed);
+  }
+  return 0;
+}
 
 }  // namespace apriltag_vulkan
