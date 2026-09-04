@@ -84,14 +84,21 @@ RawLineFitPoint ComputeLineFitPoint(IPoint p) {
   return out_pt;
 }
 
-// theta_key (scatter_index_points.comp) is scaled to fit 21 bits and
-// kLocalCap is capped at 2048 (11 bits), so key and local index share one
-// word - key in the high 21 bits, index in the low 11 - instead of two
+// theta_key (scatter_index_points.comp) is scaled to fit 20 bits and
+// kLocalCap is capped at 4096 (12 bits), so key and local index share one
+// word - key in the high 20 bits, index in the low 12 - instead of two
 // separate arrays. Comparing packed values directly still sorts by key
 // first (it occupies the high bits), with the index as an incidental,
 // harmless tiebreaker; this halves the network's shared-memory footprint
 // and its per-compare traffic (one load/store pair instead of two).
-const uint kLocalIndexBits = 11u;
+//
+// 12 rather than 11 bits because a blob's perimeter, in decimated points,
+// scales as 1/decimation: the ~1200-point border of a 1080p tag at
+// decimation 2 becomes ~2400 at decimation 1, which overflowed the old
+// 2048-slot ceiling and silently took the unsorted fallback below - see the
+// host's local_sort_virtual_cap_ derivation, which only requests the larger
+// ceiling for the decimations that actually need it.
+const uint kLocalIndexBits = 12u;
 const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
 
 shared uint s_packed[kLocalCap];

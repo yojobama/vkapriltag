@@ -70,12 +70,19 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   if (config_.width % config_.decimation != 0 || config_.height % config_.decimation != 0) {
     throw std::runtime_error("width and height must each be evenly divisible by decimation");
   }
-  // QBPoint/IPoint pack the un-decimated pixel coordinate into 14 bits per
-  // axis (see common.glsl's PackXY) - two orders of magnitude past any
-  // realistic sensor, but a hard requirement for the packed coordinate to be
-  // lossless.
-  if (config_.width > 16383 || config_.height > 16383) {
-    throw std::runtime_error("width and height must each be <= 16383");
+  // QBPoint/IPoint pack a boundary coordinate into 14 bits per axis (see
+  // common.glsl's PackXY). That coordinate is the *doubled* decimated index
+  // (x2 = 2*decimated_x +/- 1, so boundaries land on half-integers), whose
+  // maximum is 2*width/decimation - not width. The two coincide only at
+  // decimation 2, which is why a bare `width <= 16383` test was right while
+  // decimation was hardcoded and is off by 2x at decimation 1. Checked
+  // against the real packed range so a lossy configuration is rejected up
+  // front instead of silently truncating coordinates.
+  const uint32_t max_packed_x = 2u * (config_.width / config_.decimation);
+  const uint32_t max_packed_y = 2u * (config_.height / config_.decimation);
+  if (max_packed_x > 16383 || max_packed_y > 16383) {
+    throw std::runtime_error(
+        "2*(width/decimation) and 2*(height/decimation) must each be <= 16383");
   }
 
   // --- Environment overrides. These must all be applied before any capacity
@@ -164,19 +171,32 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   // pattern), so it only needs to fit the shared-memory budget - not the
   // device's max workgroup invocation count. This lets blobs bigger than the
   // device can run as a single workgroup (e.g. a large tag's own border)
-  // still get properly angle-sorted instead of falling back to an unsorted
-  // identity copy. Hard-capped at 2048 regardless of the shared-memory
-  // budget: sort_points_local.comp packs the local sort index into the low
-  // 11 bits of its shared word (kLocalIndexBits), so 2048 slots is the most
-  // the packing itself can address, not merely a budget choice - this must
-  // stay in sync with that shader's kLocalIndexBits. On every real device
+  // still get properly angle-sorted instead of falling back to the unsorted
+  // identity copy in sort_points_local_body.glsl - a fallback that yields
+  // geometrically meaningless quads, since FitQuadForBlob consumes these
+  // points as an ordered walk around the perimeter.
+  //
+  // The ceiling has to scale with decimation. A blob's perimeter in
+  // decimated points goes as 1/decimation, so the ~1200-point border of a
+  // 1080p tag at decimation 2 is ~2400 points at decimation 1. 2048 slots
+  // (the old fixed ceiling) covered the former and silently mis-sorted the
+  // latter. Anchor on the value validated at decimation 2 and scale it, but
+  // never request less than that anchor: coarser decimation keeps exactly
+  // today's geometry - and therefore today's measured cost - while only
+  // decimation 1 pays for the larger shared array.
+  const uint32_t kCapAtDecimation2 = 2048u;
+  const uint32_t scaled_cap = (kCapAtDecimation2 * 2u) / config_.decimation;
+  // Hard-capped at 4096 regardless of the shared-memory budget:
+  // sort_points_local.comp packs the local sort index into the low 12 bits
+  // of its shared word (kLocalIndexBits), so 4096 slots is the most the
+  // packing itself can address, not merely a budget choice - this must stay
+  // in sync with that shader's kLocalIndexBits. On every real device
   // (Vulkan guarantees >= 16 KiB of shared memory, this device has 32 KiB)
-  // the /4u budget bound below is already looser than the 2048 index cap, so
-  // in practice this constant IS the limit. 2048 comfortably covers real tag
-  // borders (a 1920x1080 frame's largest observed tag border is ~1200
-  // points).
+  // the /4u budget bound is already looser than the 4096 index cap.
   local_sort_virtual_cap_ =
-      std::min(PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u)), 2048u);
+      std::min(std::max(scaled_cap, kCapAtDecimation2), 4096u);
+  local_sort_virtual_cap_ = std::min(
+      local_sort_virtual_cap_, PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u)));
 
   CreateBuffers();
   CreatePipelines();
