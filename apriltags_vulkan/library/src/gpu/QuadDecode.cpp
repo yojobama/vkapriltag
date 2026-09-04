@@ -490,17 +490,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   return result;
 }
 
-// Resolves the CPU tail's degree of parallelism: explicit config wins, then
-// APRILTAG_CPU_THREADS, then hardware_concurrency (WorkerPool's own default).
-unsigned ResolveThreadCount(uint32_t configured) {
-  if (configured > 0) return configured;
-  if (const char *t = std::getenv("APRILTAG_CPU_THREADS")) {
-    const long parsed = std::strtol(t, nullptr, 10);
-    if (parsed > 0) return static_cast<unsigned>(parsed);
-  }
-  return 0;
-}
-
 // Resolves quad_fit_method: explicit config wins, then APRILTAG_VK_QUADFIT.
 DetectorConfig::QuadFitMethod ResolveQuadFitMethod(DetectorConfig::QuadFitMethod configured) {
   if (const char *m = std::getenv("APRILTAG_VK_QUADFIT")) {
