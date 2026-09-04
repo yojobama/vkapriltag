@@ -64,8 +64,11 @@ constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     : ctx_(ctx), config_(config) {
-  if (config_.width % 2 != 0 || config_.height % 2 != 0) {
-    throw std::runtime_error("width and height must both be even");
+  if (config_.decimation == 0) {
+    throw std::runtime_error("decimation must be >= 1");
+  }
+  if (config_.width % config_.decimation != 0 || config_.height % config_.decimation != 0) {
+    throw std::runtime_error("width and height must each be evenly divisible by decimation");
   }
   // QBPoint/IPoint pack the un-decimated pixel coordinate into 14 bits per
   // axis (see common.glsl's PackXY) - two orders of magnitude past any
@@ -102,9 +105,9 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   }
   if (config_.min_tag_pixels > 0) {
     // Perimeter, in decimated-grid boundary points, of a square tag whose
-    // full-resolution side is min_tag_pixels, at this pipeline's fixed 2x
-    // decimation: 4 sides x (min_tag_pixels / 2) decimated pixels each.
-    const uint32_t derived_min_cluster = 2u * config_.min_tag_pixels;
+    // full-resolution side is min_tag_pixels, at this detector's decimation:
+    // 4 sides x (min_tag_pixels / decimation) decimated pixels each.
+    const uint32_t derived_min_cluster = 4u * (config_.min_tag_pixels / config_.decimation);
     config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, derived_min_cluster);
   }
 
@@ -114,10 +117,11 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   wg2d_ = vk::WorkgroupSize{caps.wg2d_x, caps.wg2d_y, 1};
   scan_wg_ = caps.scan_wg;
 
-  decimated_width_ = config_.width / 2;
-  decimated_height_ = config_.height / 2;
-  // Rounded up rather than floored: the input is only guaranteed even, not a
-  // multiple of 8, so decimated_width_/height_ need not be a multiple of 4.
+  decimated_width_ = config_.width / config_.decimation;
+  decimated_height_ = config_.height / config_.decimation;
+  // Rounded up rather than floored: width/height are only guaranteed
+  // divisible by decimation, not by a further factor of 4, so
+  // decimated_width_/height_ need not be a multiple of 4.
   // block_minmax.comp/threshold.comp handle the resulting ragged trailing
   // block explicitly (edge-clamped sampling / an explicit block_width push
   // constant) rather than assuming block_width_ * 4 == decimated_width_.
@@ -377,8 +381,17 @@ void GpuDetector::CreatePipelines() {
   // 2D so the shader recovers its (x, y) from gl_GlobalInvocationID.xy rather
   // than a runtime `%`/`/` by a push-constant width - see each shader's own
   // comment. Mali (Valhall) has no integer divide instruction.
+  // decimation is baked in as a specialization constant (id 3, right after
+  // the workgroup size's 0/1/2) rather than read from the push constant
+  // block: it is fixed for this detector's whole lifetime, so resolving it
+  // at pipeline-creation time lets the compiler fold `dx * decimation` into
+  // a shift when decimation is a power of two, exactly as the literal `2`
+  // it replaces already did - a runtime (push-constant) value would not get
+  // that treatment, and Mali (Valhall) has no integer divide instruction to
+  // fall back on.
   decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick("decimate", "decimate_u8")),
-                                     {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_);
+                                     {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_,
+                                     {config_.decimation});
   block_minmax_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("block_minmax", "block_minmax_u8")),
       {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_);
@@ -562,7 +575,14 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const auto t_upload1 = Clock::now();
 
   // Push constants shared across several stages.
-  struct { uint32_t w, h; } dims_pc{config_.width, config_.height};
+  // decimate_pl_'s only consumer of this: the decimated dimensions are
+  // already known host-side (decimated_width_/height_ are also this
+  // dispatch's own launch geometry, just below), so passing them directly
+  // avoids the shader recomputing width/decimation on every invocation -
+  // decimation is a specialization constant now, not a push constant, so
+  // that recomputation would otherwise be a genuine runtime divide instead
+  // of the free (compile-time-constant) one the literal `2` used to be.
+  struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
   struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
 

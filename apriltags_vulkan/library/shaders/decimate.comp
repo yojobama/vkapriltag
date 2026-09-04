@@ -1,7 +1,9 @@
 #version 450
-// Down-samples the full resolution grayscale image by simply keeping every
-// other row/column (matches CudaToGreyscaleAndDecimateHalide's decimation,
-// which copies rather than averages).
+// Down-samples the full resolution grayscale image by an integer factor
+// (kDecimation - GpuDetector::DetectorConfig::decimation), keeping one
+// representative pixel per kDecimation x kDecimation block (matches
+// CudaToGreyscaleAndDecimateHalide's decimation, which copies rather than
+// averages).
 //
 // The source image arrives PACKED, four 8-bit pixels per uint32 in raster
 // order, and is unpacked here. That keeps the upload at one byte per pixel
@@ -20,26 +22,29 @@
 // divide instruction, so that recovery used to cost a software divide
 // sequence per invocation, once per pixel.
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+// Fixed for this detector's whole lifetime, resolved at pipeline-creation
+// time - see GpuDetector.cpp's comment on why this is a specialization
+// constant rather than a push constant (a runtime divide/multiply by a
+// non-compile-time value on a device with no integer divide instruction).
+layout(constant_id = 3) const uint kDecimation = 2u;
 
 layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };
 layout(std430, binding = 1) writeonly buffer DecimatedImage { uint decimated[]; };
 
 layout(push_constant) uniform PushConstants {
-  uint width;
-  uint height;
+  uint decimated_width;
+  uint decimated_height;
 } pc;
 
 void main() {
-  uint decimated_width = pc.width / 2u;
-  uint decimated_height = pc.height / 2u;
   uint dx = gl_GlobalInvocationID.x;
   uint dy = gl_GlobalInvocationID.y;
-  if (dx >= decimated_width || dy >= decimated_height) return;
+  if (dx >= pc.decimated_width || dy >= pc.decimated_height) return;
 
-  uint sx = dx * 2u;
-  uint sy = dy * 2u;
+  uint sx = dx * kDecimation;
+  uint sy = dy * kDecimation;
 
-  uint linear = sy * pc.width + sx;
+  uint linear = sy * (pc.decimated_width * kDecimation) + sx;
   uint word = gray_packed[linear >> 2u];
-  decimated[dy * decimated_width + dx] = (word >> ((linear & 3u) * 8u)) & 0xFFu;
+  decimated[dy * pc.decimated_width + dx] = (word >> ((linear & 3u) * 8u)) & 0xFFu;
 }

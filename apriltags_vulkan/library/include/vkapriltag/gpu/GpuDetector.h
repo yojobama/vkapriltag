@@ -24,6 +24,25 @@ struct DetectorConfig {
   uint32_t width = 0;
   uint32_t height = 0;
 
+  // Integer downsampling factor applied before thresholding/labelling - 1
+  // disables decimation entirely (the full-resolution image is processed
+  // as-is), 2 is this pipeline's original fixed behaviour, 4 halves linear
+  // resolution again, etc. Matches upstream apriltag's `quad_decimate`,
+  // restricted to integers (this pipeline's decimate.comp always samples
+  // one representative pixel per NxN block - "copies rather than
+  // averages", matching CudaToGreyscaleAndDecimateHalide - it never
+  // implements upstream's separate 1.5x blended-average path).
+  //
+  // Fixed for the lifetime of a GpuDetector/QuadDecode pair: it is baked
+  // into decimate.comp's dispatch as a specialization constant (resolved
+  // at CreatePipelines() time, not read per-invocation), so choosing a
+  // value costs nothing beyond the pixel count that value implies - a
+  // smaller factor means more decimated pixels for every downstream stage
+  // to process, which is a real, unavoidable cost of the lower decimation,
+  // not overhead this field adds on top of it. `width`/`height` must each
+  // be evenly divisible by this value.
+  uint32_t decimation = 2;
+
   uint32_t min_white_black_diff = 5;
   uint32_t min_cluster_pixels = 24;
   uint32_t max_cluster_pixels = 100000;
@@ -35,7 +54,7 @@ struct DetectorConfig {
   // (default) disables this and leaves min_cluster_pixels as the only floor.
   // When set, GpuDetector raises min_cluster_pixels to whatever a
   // min_tag_pixels-wide square tag's boundary-point count would be at this
-  // pipeline's fixed 2x decimation (4 sides x min_tag_pixels/2 decimated
+  // detector's `decimation` (4 sides x min_tag_pixels/decimation decimated
   // pixels each), so undersized noise/text/foliage blobs never reach the
   // expensive per-blob CPU quad fit. Declaring this is strictly a recall/
   // throughput trade: tags smaller than it are guaranteed to be dropped.
