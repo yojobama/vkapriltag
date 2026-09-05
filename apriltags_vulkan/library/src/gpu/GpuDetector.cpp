@@ -923,6 +923,18 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
         last_profile_.gpu_stage_ms[s] = double(end.ticks - start.ticks) * ns_per_tick / 1.0e6;
       }
     }
+    // Gap g is between span g's end and span (g+1)'s start - see
+    // DetectProfile::gpu_gap_ms's comment for why this is worth computing
+    // separately from gpu_stage_ms itself.
+    for (uint32_t g = 0; g + 1 < kNumGpuStageSpans; ++g) {
+      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(g))];
+      const vk::QueryPool::Result &next_start =
+          results[SpanStart(static_cast<GpuStageSpan>(g + 1))];
+      if (end.available && next_start.available && next_start.ticks >= end.ticks) {
+        last_profile_.gpu_gap_ms[g] =
+            double(next_start.ticks - end.ticks) * ns_per_tick / 1.0e6;
+      }
+    }
     last_profile_.has_gpu_stage_breakdown = true;
   }
 

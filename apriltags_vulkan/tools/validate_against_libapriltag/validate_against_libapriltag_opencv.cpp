@@ -241,6 +241,23 @@ int main(int argc, char **argv) {
           gpu_span_total += profile.gpu_stage_ms[s];
         }
         std::cout << "    (sum of spans = " << gpu_span_total << " ms)" << std::endl;
+
+        double intra_submit_gap_total = 0.0;
+        double submit_boundary_gap_total = 0.0;
+        std::cout << "  GPU inter-span gaps (purely GPU-clock, no CPU/fence time):"
+            << std::endl;
+        for (size_t g = 0; g < profile.gpu_gap_ms.size(); ++g) {
+          const bool crosses_submit = apriltag_vulkan::GpuDetector::kGpuGapCrossesSubmit[g];
+          std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[g] << "->"
+              << apriltag_vulkan::GpuDetector::kGpuStageNames[g + 1] << "="
+              << profile.gpu_gap_ms[g] << " ms"
+              << (crosses_submit ? "  (submit boundary)" : "") << std::endl;
+          (crosses_submit ? submit_boundary_gap_total : intra_submit_gap_total) +=
+              profile.gpu_gap_ms[g];
+        }
+        std::cout << "    (intra-submit gap total = " << intra_submit_gap_total
+            << " ms, submit-boundary gap total = " << submit_boundary_gap_total << " ms)"
+            << std::endl;
       }
       // Host-side cost of driving the GPU - see DetectProfile's cpu_*_ms
       // comment for what the residual below is (and, importantly, what it
