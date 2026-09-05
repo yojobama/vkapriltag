@@ -87,17 +87,29 @@ struct DetectorConfig {
   double cos_critical_rad = 0.98;  // ~cos(11 degrees), matches typical apriltag default
 
   // Corner-seeding algorithm for QuadDecode's per-blob quad fit (CPU tail).
-  // kPeaks (default) is the exact port of the original windowed-error +
-  // 7-tap-filter + peak-detection + C(10,4) combinatorial search. kDp seeds
-  // 4 corners geometrically instead - the two mutually-farthest boundary
+  // kPeaks is the exact port of the original windowed-error + 7-tap-filter +
+  // peak-detection + C(10,4) combinatorial search. kDp (default) seeds 4
+  // corners geometrically instead - the two mutually-farthest boundary
   // points, plus the point of maximum perpendicular deviation on each
   // resulting arc - skipping the combinatorial search entirely, and falls
   // back to kPeaks per-blob whenever DP doesn't cleanly yield 4 points whose
   // segments pass the same max_line_fit_mse gate the combinatorial search
-  // uses. See QuadDecode.cpp's FitQuadForBlob/TryDpQuad.
+  // uses (measured ~8% of blobs at decimation 2). See QuadDecode.cpp's
+  // FitQuadForBlob/TryDpQuad.
+  //
+  // Made default after measuring both on the corpus at every decimation on
+  // both dev targets: identical decoded tag ID sets throughout, corner RMS
+  // differences confined to the third decimal place with no systematic
+  // direction (DP is sometimes better, sometimes worse, always well under
+  // 0.1 px) - i.e. two heuristics occasionally picking a different
+  // equally-valid candidate quad, not a quality regression. quad_decode is
+  // an algorithmic win (skips the O(C(10,4)) search entirely, not a
+  // constant-factor speedup), so it scales with how much weaker the CPU is:
+  // ~12% faster on RX 9060 XT but ~47% faster on Mali-G610
+  // (quad_decode median 2.99 -> 1.59 ms, pipeline_total 11.45 -> 10.14 ms).
   // Env override: APRILTAG_VK_QUADFIT=peaks|dp
   enum class QuadFitMethod { kPeaks, kDp };
-  QuadFitMethod quad_fit_method = QuadFitMethod::kPeaks;
+  QuadFitMethod quad_fit_method = QuadFitMethod::kDp;
 
   // Defensive caps (deliberately smaller than the CUDA implementation's
   // dense worst-case sizing, which would otherwise waste tens of MB with no
