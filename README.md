@@ -17,11 +17,15 @@ Detection is split across three stages, composed by the caller:
    on the GPU; the counts of surviving points/blobs are read back only where
    the next dispatch's size depends on them.
 2. **`QuadDecode`** — a CPU tail that turns `GpuDetector`'s per-blob boundary
-   points into fitted quad corners: windowed line-fit error, peak detection,
-   and a small combinatorial search over which points form the four sides.
-   Deliberately CPU: this only ever touches a few thousand candidate values
-   per frame, and is far simpler to get right as scalar C++ than as compute
-   shaders.
+   points into fitted quad corners. Two corner-seeding methods are available
+   (`DetectorConfig::quad_fit_method`): `kDp` (default) seeds corners
+   geometrically — mutually-farthest boundary points, then maximum
+   perpendicular deviation on each arc — falling back per-blob to `kPeaks`,
+   the original windowed line-fit error + peak detection + small
+   combinatorial search, whenever DP doesn't cleanly yield 4 valid corners
+   (measured ~8% of blobs). Deliberately CPU: this only ever touches a few
+   thousand candidate values per frame, and is far simpler to get right as
+   scalar C++ than as compute shaders.
 3. **`TagDecoder`** — wraps the unmodified, upstream `apriltag` C library's
    own per-family bit-sampling and hamming decode, fed the quads from step 2.
 
@@ -141,14 +145,25 @@ Measured on the two development targets, `colorImage.pgm` (1920x1080),
 | sort + line-fit moments | 1.70 ms | 0.11 ms |
 | readback copy | 0.19 ms | 0.02 ms |
 | *(unspanned GPU/driver overhead)* | *1.64 ms* | *0.51 ms* |
-| **GPU total** | **8.10 / 8.37 ms** | **1.25 / 1.29 ms** |
-| CPU `quad_decode` (combinatorial fit) | 2.71 / 2.91 ms | 0.86 / 0.94 ms |
-| CPU `tag_decode` (bit sampling + hamming) | 0.60 / 0.61 ms | 0.26 / 0.27 ms |
-| **Pipeline total** | **11.46 / 11.91 ms** | **2.49 / 2.56 ms** |
+| **GPU total** | **8.11 / 8.37 ms** | **1.28 / 1.29 ms** |
+| CPU `quad_decode` (DP corner seeding, default) | 1.58 / 1.91 ms | 0.65 / 0.82 ms |
+| CPU `tag_decode` (bit sampling + hamming) | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
+| **Pipeline total** | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
 
 Both runs: 5/5 corpus images match upstream `apriltag` on tag ID and
 corner position; `colorImage.pgm` decodes tag `554` with corner RMS
-0.1576 px on both.
+0.1577 px on both.
+
+`quad_decode` dropped from the previous 2.71/2.91 ms (Mali) once `kDp`
+became the default corner-seeding method: DP skips the combinatorial
+search's O(C(10,4)) cost entirely rather than shaving a constant factor
+off it, so the win scales with how much weaker the CPU is — ~47% on
+Mali-G610 against ~12% on the discrete card. `tag_decode` similarly
+dropped from 0.60/0.61 ms (Mali) once it was parallelized the same way
+`quad_decode` already was (see "Project layout" below /
+`TagDecoder`'s class comment) — both CPU-tail phases are now threaded via
+the same `WorkerPool`, controlled together by
+`DetectorConfig::cpu_threads` / `APRILTAG_CPU_THREADS`.
 
 The "unspanned" row is real GPU-side time no instrumented stage accounts
 for — mostly inter-dispatch pipeline barriers on Mali's tile-based
