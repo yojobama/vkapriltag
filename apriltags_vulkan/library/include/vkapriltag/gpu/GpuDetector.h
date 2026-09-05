@@ -236,6 +236,25 @@ class GpuDetector {
     bool has_gpu_stage_breakdown = false;
     std::array<double, 12> gpu_stage_ms = {};
 
+    // GPU-side gap between the END of named span i and the START of named
+    // span i+1 (11 gaps between 12 spans), computed from the SAME
+    // vkCmdWriteTimestamp pairs gpu_stage_ms already uses - no extra query
+    // pool slots. Unlike (cpu_submit_wait_ms - sum(gpu_stage_ms)) below,
+    // which mixes CPU-observed wait time with GPU time, this is purely
+    // GPU-clock-to-GPU-clock, so it directly attributes the "unspanned"
+    // residual to a specific location rather than only its total.
+    //
+    // 3 of these 11 gaps cross a submit boundary (Labelling->LabelFinalize,
+    // Boundary->HashGroup, Scatter->Sort - see Detect()'s "Submit N:"
+    // comments) and so include queue-submit/fence overhead on top of any
+    // GPU-side barrier cost; the other 8 are purely intra-submit
+    // inter-dispatch barriers. Comparing the two groups is what tells apart
+    // "submit round-trips are expensive" (already measured false - see
+    // cpu_submit_wait_ms's comment) from "per-barrier cost accumulates
+    // across many small dispatches" (the standing hypothesis this exists to
+    // test directly instead of by inference).
+    std::array<double, 11> gpu_gap_ms = {};
+
     // --- Host-side cost of driving the GPU, split out from the phase timers
     // above. The phase timers (threshold_label_ms etc.) are wall-clock and so
     // bundle four distinct things together: command recording, the queue
@@ -251,19 +270,32 @@ class GpuDetector {
     // ~1.5 ms, and it is worth recording what it is NOT, because the
     // intuitive readings were measured and disproved:
     //
-    //  - It is not per-submission latency. Dividing it by the submit count
-    //    suggested ~0.37 ms per submit, so the frame was restructured from 4
-    //    submissions to 3 (device-side dispatch sizing, so the host no longer
-    //    read a counter back mid-frame). That moved the residual by 0.05 ms,
-    //    not 0.37 - and the divided figure went UP, which is the signature of
-    //    a mostly-fixed cost being spread over fewer submissions. Reverted.
+    //  - It is not per-submission latency in the naive "divide by submit
+    //    count" sense. Dividing it by the submit count suggested ~0.37 ms
+    //    per submit, so the frame was restructured from 4 submissions to 3
+    //    (device-side dispatch sizing, so the host no longer read a counter
+    //    back mid-frame). That moved the residual by 0.05 ms, not 0.37 - and
+    //    the divided figure went UP, which is the signature of a
+    //    mostly-fixed cost being spread over fewer submissions. Reverted.
     //  - It is not the per-frame buffer clears. Those are ~2.3 MB of
     //    vkCmdFillBuffer and measure 0.08 ms (see kSpanClear).
-    //
-    // What remains is the ~25 inter-dispatch pipeline barriers, each forcing
-    // a cache flush/invalidate and pipeline drain on a tile-based GPU:
-    // roughly 0.05 ms apiece. Reducing barrier count or strength is the
-    // lever here; reducing submission count is not.
+    //  - It is NOT mostly inter-dispatch barriers, despite what this comment
+    //    used to claim. gpu_gap_ms (above) measures each of the 11 gaps
+    //    between named spans directly, GPU-clock to GPU-clock: the 8 gaps
+    //    that sit entirely inside one submit total ~0.04 ms combined on
+    //    Mali-G610 - noise, not the dominant cost. Nearly everything is at
+    //    the 3 gaps that cross a submit boundary, and even there the
+    //    GPU-clock-visible gap (~0.7 ms) is under half of this residual
+    //    (~1.5 ms) - the rest is CPU-side time no GPU timestamp can see at
+    //    all (fence-wait wake latency, host readback, driver submission
+    //    overhead), which is exactly why the submit-count reduction above
+    //    barely moved it: that experiment removed a submission but not the
+    //    surrounding fence-wait/readback machinery the remaining ones still
+    //    pay for. Reducing intra-submit dispatch/barrier count has almost
+    //    nothing left to give (~0.04 ms ceiling); any further reduction of
+    //    this residual has to come from removing a submit boundary's
+    //    fence-wait/readback cost outright, not from fusing shaders within
+    //    an existing submit.
     double cpu_begin_ms = 0.0;        // BeginCommands: ring fence wait + resets
     double cpu_submit_wait_ms = 0.0;  // EndCommandBuffer + QueueSubmit + WaitForFences
     double cpu_counter_read_ms = 0.0; // ReadCounterSlot invalidate + read
@@ -292,6 +324,25 @@ class GpuDetector {
                         // extents + line-fit payloads. Inside submit 4 but
                         // not compute, so it would otherwise land in the
                         // unattributed gap alongside genuine round-trip cost.
+  };
+
+  // Whether DetectProfile::gpu_gap_ms[g] (the gap after kGpuStageNames[g])
+  // crosses a queue-submit boundary - i.e. Detect()'s "Submit N:" comments
+  // place kGpuStageNames[g] and [g+1] in different submits, so that gap
+  // includes queue-submit/fence overhead on top of any GPU-side barrier
+  // cost, unlike the other 8 gaps (purely intra-submit).
+  static constexpr std::array<bool, 11> kGpuGapCrossesSubmit = {
+      false,  // clear -> threshold (submit 1)
+      false,  // threshold -> labelling (submit 1)
+      true,   // labelling -> label_finalize (submit 1 -> 2)
+      false,  // label_finalize -> boundary (submit 2)
+      true,   // boundary -> hash_group (submit 2 -> 3)
+      false,  // hash_group -> extents (submit 3)
+      false,  // extents -> select (submit 3)
+      false,  // select -> blob_scan (submit 3)
+      false,  // blob_scan -> scatter (submit 3)
+      true,   // scatter -> sort (submit 3 -> 4)
+      false,  // sort -> readback_copy (submit 4)
   };
 
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
