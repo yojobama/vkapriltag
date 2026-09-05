@@ -270,19 +270,32 @@ class GpuDetector {
     // ~1.5 ms, and it is worth recording what it is NOT, because the
     // intuitive readings were measured and disproved:
     //
-    //  - It is not per-submission latency. Dividing it by the submit count
-    //    suggested ~0.37 ms per submit, so the frame was restructured from 4
-    //    submissions to 3 (device-side dispatch sizing, so the host no longer
-    //    read a counter back mid-frame). That moved the residual by 0.05 ms,
-    //    not 0.37 - and the divided figure went UP, which is the signature of
-    //    a mostly-fixed cost being spread over fewer submissions. Reverted.
+    //  - It is not per-submission latency in the naive "divide by submit
+    //    count" sense. Dividing it by the submit count suggested ~0.37 ms
+    //    per submit, so the frame was restructured from 4 submissions to 3
+    //    (device-side dispatch sizing, so the host no longer read a counter
+    //    back mid-frame). That moved the residual by 0.05 ms, not 0.37 - and
+    //    the divided figure went UP, which is the signature of a
+    //    mostly-fixed cost being spread over fewer submissions. Reverted.
     //  - It is not the per-frame buffer clears. Those are ~2.3 MB of
     //    vkCmdFillBuffer and measure 0.08 ms (see kSpanClear).
-    //
-    // What remains is the ~25 inter-dispatch pipeline barriers, each forcing
-    // a cache flush/invalidate and pipeline drain on a tile-based GPU:
-    // roughly 0.05 ms apiece. Reducing barrier count or strength is the
-    // lever here; reducing submission count is not.
+    //  - It is NOT mostly inter-dispatch barriers, despite what this comment
+    //    used to claim. gpu_gap_ms (above) measures each of the 11 gaps
+    //    between named spans directly, GPU-clock to GPU-clock: the 8 gaps
+    //    that sit entirely inside one submit total ~0.04 ms combined on
+    //    Mali-G610 - noise, not the dominant cost. Nearly everything is at
+    //    the 3 gaps that cross a submit boundary, and even there the
+    //    GPU-clock-visible gap (~0.7 ms) is under half of this residual
+    //    (~1.5 ms) - the rest is CPU-side time no GPU timestamp can see at
+    //    all (fence-wait wake latency, host readback, driver submission
+    //    overhead), which is exactly why the submit-count reduction above
+    //    barely moved it: that experiment removed a submission but not the
+    //    surrounding fence-wait/readback machinery the remaining ones still
+    //    pay for. Reducing intra-submit dispatch/barrier count has almost
+    //    nothing left to give (~0.04 ms ceiling); any further reduction of
+    //    this residual has to come from removing a submit boundary's
+    //    fence-wait/readback cost outright, not from fusing shaders within
+    //    an existing submit.
     double cpu_begin_ms = 0.0;        // BeginCommands: ring fence wait + resets
     double cpu_submit_wait_ms = 0.0;  // EndCommandBuffer + QueueSubmit + WaitForFences
     double cpu_counter_read_ms = 0.0; // ReadCounterSlot invalidate + read
