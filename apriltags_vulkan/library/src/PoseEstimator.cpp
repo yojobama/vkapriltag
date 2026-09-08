@@ -272,7 +272,10 @@ void SolvePolyApprox(const double *p, int degree, double *roots, int *n_roots) {
   double p_der[5];
   for (int i = 0; i < degree; ++i) p_der[i] = (i + 1) * p[i + 1];
 
-  double der_roots[5];
+  // Zero-initialized: only [0, n_der_roots) is ever read below, which is
+  // exactly what the recursive call fills, but GCC cannot prove that across
+  // the recursion and warns. Five doubles cost nothing to clear.
+  double der_roots[5] = {};
   int n_der_roots = 0;
   SolvePolyApprox(p_der, degree - 1, der_roots, &n_der_roots);
 
