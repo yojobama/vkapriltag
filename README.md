@@ -36,9 +36,9 @@ Optionally, a fourth stage:
    camera intrinsics and the physical tag size. A rewrite of upstream's
    `apriltag_pose.c` (homography seed, orthogonal iteration, planar-pose
    ambiguity search) in allocation-free fixed-size arithmetic: same
-   algorithm and iteration counts, but ~60x faster, because upstream's
-   version is built on `matd_op()`, a runtime string-expression interpreter
-   that heap-allocates its way through ~1600 parsed expressions per pose.
+   algorithm, but ~60x faster, because upstream's version is built on
+   `matd_op()`, a runtime string-expression interpreter that heap-allocates
+   its way through ~1600 parsed expressions per pose.
    Verified against upstream at every stage of the algorithm — see
    [Verifying correctness](#verifying-correctness).
 
@@ -176,15 +176,28 @@ ground truth**, plus 8 deliberately degenerate geometries, plus real
 detections when `--data` is given. It exits non-zero on failure, so it
 works as a regression gate.
 
-Measured agreement with upstream: rotation within **2.4e-6 degrees**,
+Measured agreement with upstream: rotation within **5.2e-7 degrees**,
 translation within **3.8e-10** relative after refinement, and zero
-disagreements over which ambiguity branch wins. Absolute accuracy against
-the synthetic ground truth is *identical* to upstream's (≤ 0.0032 deg) —
-i.e. the rewrite tracks upstream some three orders of magnitude more
-closely than either tracks reality. The one deliberate divergence is
-precision in the seed's scale factor, where upstream uses single-precision
-`sqrtf`; that shows up as ~1.4e-7 at the seed and is washed out by
-iteration.
+disagreements over which ambiguity branch wins. On the real
+`colorImage.pgm` detection it is tighter still — 1.9e-13 deg and 2.7e-16.
+Absolute accuracy against the synthetic ground truth is *identical* to
+upstream's (≤ 0.0032 deg), i.e. the rewrite tracks upstream some four
+orders of magnitude more closely than either tracks reality. The one
+deliberate divergence is precision in the seed's scale factor, where
+upstream uses single-precision `sqrtf`; that shows up as ~1.4e-7 at the
+seed and is washed out by iteration.
+
+Iteration is also stopped once the pose stops moving, which upstream never
+does — it computes a per-step error and then never compares it.
+`DetectorConfig`-style tuning lives on the estimator itself: the default
+`convergence_tol` of 1e-8 is the loosest value measured to leave
+ground-truth accuracy *identical* to running all 50 iterations, and it
+takes **52–54% of the wall clock** off across the synthetic sweep. Setting
+it to 0 restores exact upstream iteration counts, which is the
+configuration the ladder above is verified against. The saving is
+scene-dependent: near-fronto-parallel tags are ill-conditioned enough that
+the iteration keeps twitching below the tolerance and still hits the
+50-iteration cap, saving nothing — including on `colorImage.pgm` itself.
 
 ## Performance
 
@@ -209,7 +222,7 @@ Measured on the two development targets, `colorImage.pgm` (1920x1080),
 | CPU `quad_decode` (DP corner seeding, default) | 1.58 / 1.91 ms | 0.65 / 0.82 ms |
 | CPU `tag_decode` (bit sampling + hamming) | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
 | **Pipeline total** | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
-| *(optional)* CPU `PoseEstimator`, per tag | *0.014 ms* | *0.013 ms* |
+| *(optional)* CPU `PoseEstimator`, per tag | *0.016 ms* | *0.012 ms* |
 
 Both runs: 5/5 corpus images match upstream `apriltag` on tag ID and
 corner position; `colorImage.pgm` decodes tag `554` with corner RMS
