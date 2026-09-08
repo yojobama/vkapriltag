@@ -202,48 +202,79 @@ the iteration keeps twitching below the tolerance and still hits the
 ## Performance
 
 Measured on the two development targets, `colorImage.pgm` (1920x1080),
-`APRILTAG_VK_MAX_POINTS=200000`, best/median of 25 iterations:
+`APRILTAG_VK_MAX_POINTS=200000`. **Every stage below is labelled with the
+processor it actually runs on** — the pipeline is not GPU-only, and the two
+tails and pose estimation are all CPU work:
 
-| Stage (GPU) | Mali-G610 (Orange Pi 5) | RX 9060 XT (discrete) |
-| --- | --- | --- |
-| clear (per-frame buffer zeroing) | 0.08 ms | ~0.00 ms |
-| threshold + decimate | 0.23 ms | 0.02 ms |
-| labelling | 1.55 ms | 0.20 ms |
-| label finalize | 0.49 ms | 0.05 ms |
-| boundary extraction | 0.81 ms | 0.03 ms |
-| hash grouping | 0.10 ms | 0.02 ms |
-| extents | 0.92 ms | 0.05 ms |
-| select + blob scan | 0.05 ms | 0.01 ms |
-| scatter | 0.19 ms | 0.02 ms |
-| sort + line-fit moments | 1.70 ms | 0.11 ms |
-| readback copy | 0.19 ms | 0.02 ms |
-| *(unspanned GPU/driver overhead)* | *1.64 ms* | *0.51 ms* |
-| **GPU total** | **8.11 / 8.37 ms** | **1.28 / 1.29 ms** |
-| CPU `quad_decode` (DP corner seeding, default) | 1.58 / 1.91 ms | 0.65 / 0.82 ms |
-| CPU `tag_decode` (bit sampling + hamming) | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
-| **Pipeline total** | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
-| *(optional)* CPU `PoseEstimator`, per tag | *0.016 ms* | *0.012 ms* |
+- **Orange Pi 5** — ARM Mali-G610 MP4 GPU, Rockchip RK3588 CPU
+  (4x Cortex-A76 + 4x Cortex-A55)
+- **Desktop** — AMD Radeon RX 9060 XT GPU, AMD Ryzen 5 5600X CPU (6 cores)
+
+Totals are best/median of 25 iterations; the per-stage GPU rows are single
+figures from one instrumented frame (`APRILTAG_VK_TIMESTAMPS=1`).
+
+| Stage | Runs on | Orange Pi 5 | Desktop |
+| --- | --- | --- | --- |
+| clear (per-frame buffer zeroing) | GPU | 0.08 ms | ~0.00 ms |
+| threshold + decimate | GPU | 0.23 ms | 0.02 ms |
+| labelling | GPU | 1.55 ms | 0.20 ms |
+| label finalize | GPU | 0.49 ms | 0.05 ms |
+| boundary extraction | GPU | 0.81 ms | 0.03 ms |
+| hash grouping | GPU | 0.10 ms | 0.02 ms |
+| extents | GPU | 0.92 ms | 0.05 ms |
+| select + blob scan | GPU | 0.05 ms | 0.01 ms |
+| scatter | GPU | 0.19 ms | 0.02 ms |
+| sort + line-fit moments | GPU | 1.70 ms | 0.11 ms |
+| readback copy | GPU | 0.19 ms | 0.02 ms |
+| *(unspanned: submit boundaries + host fence/readback, see below)* | both | *1.64 ms* | *0.51 ms* |
+| **GPU subtotal** (`GpuDetector`) | **GPU** | **8.11 / 8.37 ms** | **1.28 / 1.29 ms** |
+| `quad_decode` (DP corner seeding, default) | **CPU** | 1.58 / 1.91 ms | 0.65 / 0.82 ms |
+| `tag_decode` (bit sampling + hamming) | **CPU** | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
+| **Pipeline total** (GPU + both CPU tails) | GPU + CPU | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
+
+Pose is measured separately, since it is per detected tag rather than per
+frame and is not part of the pipeline total above. **It runs entirely on
+the CPU** — `library/include/vkapriltag/PoseEstimator.h` records why the
+GPU would be slower for this particular computation:
+
+| Stage | Runs on | Orange Pi 5 | Desktop |
+| --- | --- | --- | --- |
+| upstream `estimate_tag_pose`, per tag | CPU | 0.916 ms | 0.616 ms |
+| **`PoseEstimator`, per tag** | **CPU** | **0.016 ms** | **0.013 ms** |
+| speedup | | **58x** | **48x** |
+
+Both CPU tails and pose all run on the same `WorkerPool`, sized by
+`DetectorConfig::cpu_threads` / `APRILTAG_CPU_THREADS`, so on the Orange Pi
+they spread across all 8 RK3588 cores by default (measured 5.4x scaling for
+`quad_decode`).
 
 Both runs: 5/5 corpus images match upstream `apriltag` on tag ID and
 corner position; `colorImage.pgm` decodes tag `554` with corner RMS
 0.1577 px on both.
 
-`quad_decode` dropped from the previous 2.71/2.91 ms (Mali) once `kDp`
+`quad_decode` dropped from the previous 2.71/2.91 ms (RK3588) once `kDp`
 became the default corner-seeding method: DP skips the combinatorial
 search's O(C(10,4)) cost entirely rather than shaving a constant factor
-off it, so the win scales with how much weaker the CPU is — ~47% on
-Mali-G610 against ~12% on the discrete card. `tag_decode` similarly
-dropped from 0.60/0.61 ms (Mali) once it was parallelized the same way
-`quad_decode` already was (see "Project layout" below /
-`TagDecoder`'s class comment) — both CPU-tail phases are now threaded via
-the same `WorkerPool`, controlled together by
-`DetectorConfig::cpu_threads` / `APRILTAG_CPU_THREADS`.
+off it, so the win scales with how much weaker the CPU is — ~47% on the
+RK3588 against ~12% on the Ryzen. `tag_decode` similarly dropped from
+0.60/0.61 ms (RK3588) once it was parallelized the same way `quad_decode`
+already was; see `TagDecoder`'s class comment for why writing results by
+index rather than completion order is what makes that safe.
 
-The "unspanned" row is real GPU-side time no instrumented stage accounts
-for — mostly inter-dispatch pipeline barriers on Mali's tile-based
-architecture, not per-submission latency (measured: removing an entire
-queue submission moved it by 0.05 ms, not the ~0.4 ms a naive per-submit
-estimate would predict). See `apriltags_vulkan/OPTIMIZATION_NOTES.md` for
+The "unspanned" row is real time no instrumented stage accounts for, and
+what it is has been measured rather than guessed — twice, because the first
+answer was wrong. It is *not* per-submission latency in the naive sense:
+removing an entire queue submission moved it by 0.05 ms, not the ~0.4 ms
+dividing it by the submit count predicted. Nor is it inter-dispatch
+barriers, which is what this file previously claimed. Timing each gap
+between named spans on the GPU's own clock
+(`DetectProfile::gpu_gap_ms`) shows the 8 gaps that sit inside a single
+submission total ~0.04 ms — noise — while nearly everything lands at the 3
+gaps that cross a submit boundary, and over half of even that is host-side
+fence-wait and readback time no GPU timestamp can see. So reducing
+dispatch or barrier count has almost nothing left to give here; only
+removing a submit boundary's round trip would, and that was tried and
+reverted for too small a gain. See `apriltags_vulkan/OPTIMIZATION_NOTES.md` for
 the full history of how the pipeline got here — what was tried, what
 regressed and why (including two Mali-specific results: shared-memory
 tiling and subgroup-aggregated atomics both measured *slower* here despite
