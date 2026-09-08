@@ -624,7 +624,12 @@ int main(int argc, char **argv) {
         our_best = std::min(our_best, dt);
         our_total += dt;
       }
-      if (sink == 12345.6789) std::printf("");  // never true; defeats DCE
+      // Consume `sink` so the loop body cannot be discarded, without a
+      // zero-length printf (which warns under -Wformat-zero-length).
+      if (!std::isfinite(sink)) {
+        std::fprintf(stderr, "non-finite pose accumulated over timing loop\n");
+        return 1;
+      }
       std::printf("Timing over %d calls (single tag):\n", timing_iters);
       std::printf("  libapriltag estimate_tag_pose : best=%.5f ms  mean=%.5f ms\n", ref_best,
                   ref_total / timing_iters);
@@ -638,6 +643,79 @@ int main(int argc, char **argv) {
     apriltag_detector_destroy(td);
     teardown_tag_family(&tf, "tag36h11");
   }
+
+  // ---------------- EstimateAll: threaded batch path ----------------
+  //
+  // Distinct from everything above, which exercises the single-detection
+  // entry points. EstimateAll writes results by index rather than in
+  // completion order, so its output must be bit-identical to calling
+  // Estimate() serially - at any thread count. That is what is asserted
+  // here, since "it produced plausible poses" would not catch an
+  // index/ordering bug.
+  bool batch_ok = true;
+  {
+    // Reuse a spread of the synthetic sweep as a multi-tag frame.
+    std::vector<SynthCase> cases;
+    for (double d : {0.4, 0.8, 1.5, 3.0}) {
+      for (double tilt : {0.0, 20.0, 50.0}) {
+        for (double spin : {0.0, 30.0, 60.0}) {
+          SynthCase c = MakeSynthCase(intr, tagsize, d, tilt * kPi / 180.0,
+                                      spin * kPi / 180.0, 0.1 * d, -0.05 * d, "batch");
+          if (c.ok) cases.push_back(c);
+        }
+      }
+    }
+
+    std::vector<RefDetection> rds(cases.size());
+    std::vector<const apriltag_detection_t *> dets;
+    dets.reserve(cases.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+      FillRefDetection(&rds[i], cases[i].corners, cases[i].H);
+      rds[i].det.id = static_cast<int>(i);
+      dets.push_back(&rds[i].det);
+    }
+
+    // Serial reference: the single-detection path, one at a time.
+    std::vector<TagPose> serial(cases.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+      serial[i] = est.Estimate(cases[i].corners, cases[i].H);
+    }
+
+    for (uint32_t threads : {1u, 2u, 4u, 8u}) {
+      const PoseEstimator batched(intr, tagsize, threads);
+      std::vector<TagPose> out;
+      batched.EstimateAll(dets, out);
+      if (out.size() != cases.size()) {
+        std::printf("  EstimateAll(threads=%u): size %zu != %zu  FAIL\n", threads, out.size(),
+                    cases.size());
+        batch_ok = false;
+        continue;
+      }
+      int mismatches = 0;
+      for (size_t i = 0; i < cases.size(); ++i) {
+        if (out[i].valid != serial[i].valid) {
+          ++mismatches;
+          continue;
+        }
+        if (!out[i].valid) continue;
+        // Bit-identical is the requirement here, not "close": both sides run
+        // the same code on the same input, so any difference means the batch
+        // path mixed up results.
+        bool same = (out[i].error == serial[i].error);
+        for (int a = 0; a < 3 && same; ++a) {
+          if (out[i].t[a] != serial[i].t[a]) same = false;
+          for (int b = 0; b < 3 && same; ++b) {
+            if (out[i].R[a][b] != serial[i].R[a][b]) same = false;
+          }
+        }
+        if (!same) ++mismatches;
+      }
+      std::printf("  EstimateAll(threads=%u, %zu tags, pool=%u): %s\n", threads, cases.size(),
+                  batched.threads(), mismatches == 0 ? "bit-identical to serial" : "MISMATCH");
+      if (mismatches != 0) batch_ok = false;
+    }
+  }
+  std::printf("\n");
 
   // ---------------- verdict ----------------
   //
@@ -689,6 +767,8 @@ int main(int argc, char **argv) {
   std::printf("VERDICT\n");
   bool all_ok = SetOk(synth, "synthetic sweep", true);
   all_ok = SetOk(degen, "degenerate geometry", true) && all_ok;
+  std::printf("  %-22s %s\n", "EstimateAll batch", batch_ok ? "PASS" : "FAIL");
+  all_ok = all_ok && batch_ok;
   std::printf("  thresholds: rot < %.0e deg, |dt|/|t| < %.0e (seed %.0e), "
               "err_abs < 1e-12, err_rel < 1e-9\n",
               kMaxRotDeg, kMaxDtRelRefined, kMaxDtRelSeed);

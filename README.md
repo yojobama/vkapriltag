@@ -8,7 +8,8 @@ corner-for-corner) on a discrete AMD GPU as well.
 
 ## What this is
 
-Detection is split across three stages, composed by the caller:
+Detection is split across three stages, composed by the caller, plus an
+optional fourth for pose:
 
 1. **`GpuDetector`** — the Vulkan compute pipeline. Decimates the input
    frame, thresholds it, runs connected-component labelling, extracts and
@@ -29,6 +30,18 @@ Detection is split across three stages, composed by the caller:
 3. **`TagDecoder`** — wraps the unmodified, upstream `apriltag` C library's
    own per-family bit-sampling and hamming decode, fed the quads from step 2.
 
+Optionally, a fourth stage:
+
+4. **`PoseEstimator`** — 6-DoF tag pose from the four decoded corners, given
+   camera intrinsics and the physical tag size. A rewrite of upstream's
+   `apriltag_pose.c` (homography seed, orthogonal iteration, planar-pose
+   ambiguity search) in allocation-free fixed-size arithmetic: same
+   algorithm and iteration counts, but ~60x faster, because upstream's
+   version is built on `matd_op()`, a runtime string-expression interpreter
+   that heap-allocates its way through ~1600 parsed expressions per pose.
+   Verified against upstream at every stage of the algorithm — see
+   [Verifying correctness](#verifying-correctness).
+
 This is a port of [frc971's CUDA `GpuDetector`](https://github.com/Team766/apriltags_cuda)
 (itself built on AprilRobotics' `apriltag`) to Vulkan compute, so it runs
 on hardware without CUDA — the actual target being ARM Mali. Every stage's
@@ -41,8 +54,15 @@ This port intentionally does less than the CUDA original and upstream
 `apriltag`:
 
 - **`RefineEdges`** (camera-distortion-based edge refinement) is not ported.
-- **Pose estimation** (`apriltag_pose.h`) is not wired up — it needs a
-  calibrated camera matrix and tag size, which is out of scope here.
+- **No lens-distortion handling.** Intrinsics are assumed pinhole, so a
+  caller with a wide-angle lens should undistort the detection's corners
+  before estimating pose. The CUDA original's `UnDistort` path is not
+  ported either.
+- **Pose estimation needs calibration data.** `PoseEstimator` is available
+  but is not part of `Detect`: it requires camera intrinsics and the
+  physical tag size, which only the caller has. Note that translation
+  scales linearly with the tag size, so a 1% error there is a 1% range
+  error — larger than every other error source in the solver combined.
 - **Decimation must be set at detector creation.** `DetectorConfig::decimation`
   accepts any factor that divides the frame evenly (1, 2, 4, ...; default 2),
   but it is a specialization constant baked into the pipelines, so it is fixed
@@ -106,6 +126,20 @@ zarray_t *detections =
     tag_decoder.Decode(quads, gray_frame, width, height, config.reversed_border);
 ```
 
+For pose, additionally (once, at setup):
+
+```cpp
+#include "vkapriltag/PoseEstimator.h"
+
+apriltag_vulkan::PoseEstimator pose_estimator(
+    {.fx = fx, .fy = fy, .cx = cx, .cy = cy},  // pixels, from calibration
+    0.1651);                                    // tag border width, metres
+
+// Per frame, after tag_decoder.Decode:
+std::vector<apriltag_vulkan::TagPose> poses;
+pose_estimator.EstimateAll(detections, poses);  // threaded across detections
+```
+
 See `apps/apriltag_vulkan/main.cpp` for a complete example driving this from
 a V4L2 camera, and `library/include/vkapriltag/gpu/GpuDetector.h` for the
 rest of `DetectorConfig` (cluster-size floors, aspect/fill-ratio filters,
@@ -125,6 +159,32 @@ positions (RMS pixel error) between the two — not a visual/manual check.
 Pass `--iterations N` to additionally report steady-state timing (see
 below); a single iteration is dominated by cold-start costs (page faults,
 pipeline warm-up) and says little about per-frame throughput.
+
+Pose is verified by a second tool, against upstream `apriltag_pose.c`:
+
+```sh
+build/tools/apriltag_pose_validate                        # synthetic + degenerate
+build/tools/apriltag_pose_validate --data colorImage.pgm  # + real detections, + timing
+```
+
+Upstream exposes every stage of its pose algorithm publicly, so this
+compares at four levels rather than only the final answer — homography
+seed, orthogonal-iteration solution 1, the ambiguity-search solution 2,
+and the error-ranked pick — over a 420-case synthetic sweep (distance,
+tilt, in-plane rotation, off-axis translation) that also carries **known
+ground truth**, plus 8 deliberately degenerate geometries, plus real
+detections when `--data` is given. It exits non-zero on failure, so it
+works as a regression gate.
+
+Measured agreement with upstream: rotation within **2.4e-6 degrees**,
+translation within **3.8e-10** relative after refinement, and zero
+disagreements over which ambiguity branch wins. Absolute accuracy against
+the synthetic ground truth is *identical* to upstream's (≤ 0.0032 deg) —
+i.e. the rewrite tracks upstream some three orders of magnitude more
+closely than either tracks reality. The one deliberate divergence is
+precision in the seed's scale factor, where upstream uses single-precision
+`sqrtf`; that shows up as ~1.4e-7 at the seed and is washed out by
+iteration.
 
 ## Performance
 
@@ -149,6 +209,7 @@ Measured on the two development targets, `colorImage.pgm` (1920x1080),
 | CPU `quad_decode` (DP corner seeding, default) | 1.58 / 1.91 ms | 0.65 / 0.82 ms |
 | CPU `tag_decode` (bit sampling + hamming) | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
 | **Pipeline total** | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
+| *(optional)* CPU `PoseEstimator`, per tag | *0.014 ms* | *0.013 ms* |
 
 Both runs: 5/5 corpus images match upstream `apriltag` on tag ID and
 corner position; `colorImage.pgm` decodes tag `554` with corner RMS
@@ -180,7 +241,8 @@ shared-memory hardware), and the current list of remaining opportunities.
 
 ```
 apriltags_vulkan/
-  library/     the Vulkan compute pipeline + CPU tail (GpuDetector, QuadDecode, TagDecoder)
+  library/     the Vulkan compute pipeline + CPU tail (GpuDetector, QuadDecode,
+               TagDecoder, and the optional PoseEstimator)
     shaders/   GLSL compute shaders, compiled to SPIR-V at build time
     include/   public headers (vkapriltag::vkapriltag target)
   apps/        interactive V4L2 sample app (Linux)
