@@ -125,6 +125,12 @@ Delta Compare(const TagPose &ours, const matd_t *ref_R, const matd_t *ref_t, dou
 
 // Worst-case accumulator, so a single bad case cannot be averaged away.
 struct Worst {
+  // Explicit constructor rather than aggregate initialization: brace-init of
+  // just the name leaves the remaining members unmentioned, which GCC
+  // reports under -Wmissing-field-initializers even though the default
+  // member initializers below cover them.
+  explicit Worst(const char *n) : name(n) {}
+
   const char *name = "";
   double rot_deg = 0.0;
   double dt_rel = 0.0;
