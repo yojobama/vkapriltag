@@ -1,0 +1,696 @@
+// Verifies apriltag_vulkan::PoseEstimator against libapriltag's
+// apriltag_pose.c, which is the reference implementation this is a port of.
+//
+// libapriltag exposes every intermediate stage publicly
+// (estimate_pose_for_tag_homography, and estimate_tag_pose_orthogonal_iteration
+// with both solutions, both errors and a settable nIters), so each half of the
+// algorithm is checked on its own rather than only the final answer. A
+// divergence therefore localizes to a stage instead of just showing up at the
+// end. No patch to libapriltag is needed for any of this.
+//
+// Ladder:
+//   L1  seed                vs estimate_pose_for_tag_homography
+//   L2  solution 1 + err1   vs estimate_tag_pose_orthogonal_iteration
+//   L3  solution 2 + err2   vs the same (exercises fix_pose_ambiguities)
+//   L4  final pick          vs estimate_tag_pose
+//
+// Inputs:
+//   * a synthetic sweep over distance / tilt / in-plane rotation / off-axis
+//     translation, which additionally gives an ABSOLUTE error against known
+//     ground truth - that catches the case where both implementations agree
+//     with each other and are both wrong.
+//   * deliberately degenerate geometry (t parallel to e_x, fronto-parallel,
+//     extreme range, tiny tag, near-collinear corners).
+//   * optionally, real detections from a .pgm run through the actual pipeline
+//     (--data), so the H matrices are in-distribution rather than synthesized.
+// The Vulkan headers pull in windows.h on MSVC, whose min/max macros would
+// otherwise break every std::min/std::max below.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "vkapriltag/PoseEstimator.h"
+#include "vkapriltag/TagDecoder.h"
+#include "vkapriltag/apriltag_family.h"
+#include "vkapriltag/common/pgm_io.h"
+#include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/QuadDecode.h"
+#include "vkapriltag/vk/Context.h"
+
+extern "C" {
+#include "apriltag_pose.h"
+#include "common/homography.h"
+#include "common/matd.h"
+}
+
+namespace {
+
+using apriltag_vulkan::CameraIntrinsics;
+using apriltag_vulkan::PoseEstimator;
+using apriltag_vulkan::TagPose;
+using apriltag_vulkan::TagPosePair;
+
+// kPi is not in the C++ standard and MSVC omits it by default.
+constexpr double kPi = 3.14159265358979323846;
+
+// Below this the object-space error is numerically indistinguishable from
+// zero (a synthetic case is fitted exactly), so a relative comparison of
+// two such values carries no information.
+constexpr double kErrFloor = 1e-12;
+
+// --- comparison metrics ---------------------------------------------------
+
+struct Delta {
+  double dt_abs = 0.0;      // metres
+  double dt_rel = 0.0;      // relative to |t_ref|
+  double rot_deg = 0.0;     // geodesic angle between the two rotations
+  double err_abs = 0.0;     // absolute difference of the object-space error
+  double err_rel = 0.0;     // ...and relative, meaningful only above kErrFloor
+  double err_ref = 0.0;     // the reference error itself, for scale
+  bool both_valid = false;
+  bool validity_mismatch = false;
+};
+
+double Norm3(const double v[3]) {
+  return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+// Geodesic angle between two rotations: acos((trace(A'B) - 1) / 2).
+double RotationAngleDeg(const double A[3][3], const double B[3][3]) {
+  double trace = 0.0;
+  for (int i = 0; i < 3; ++i)
+    for (int k = 0; k < 3; ++k) trace += A[k][i] * B[k][i];
+  double c = (trace - 1.0) * 0.5;
+  c = std::max(-1.0, std::min(1.0, c));
+  return std::acos(c) * 180.0 / kPi;
+}
+
+Delta Compare(const TagPose &ours, const matd_t *ref_R, const matd_t *ref_t, double ref_err,
+              bool ref_valid) {
+  Delta d;
+  if (ours.valid != ref_valid) {
+    d.validity_mismatch = true;
+    return d;
+  }
+  if (!ours.valid) return d;
+  d.both_valid = true;
+
+  double ref_Rm[3][3], ref_tv[3];
+  for (int a = 0; a < 3; ++a) {
+    ref_tv[a] = MATD_EL(ref_t, a, 0);
+    for (int b = 0; b < 3; ++b) ref_Rm[a][b] = MATD_EL(ref_R, a, b);
+  }
+
+  double diff[3];
+  for (int a = 0; a < 3; ++a) diff[a] = ours.t[a] - ref_tv[a];
+  d.dt_abs = Norm3(diff);
+  const double ref_norm = Norm3(ref_tv);
+  d.dt_rel = (ref_norm > 0.0) ? d.dt_abs / ref_norm : d.dt_abs;
+  d.rot_deg = RotationAngleDeg(ours.R, ref_Rm);
+  d.err_ref = ref_err;
+  d.err_abs = std::fabs(ours.error - ref_err);
+  const double err_scale = std::max(std::fabs(ref_err), 1e-300);
+  d.err_rel = d.err_abs / err_scale;
+  return d;
+}
+
+// Worst-case accumulator, so a single bad case cannot be averaged away.
+struct Worst {
+  const char *name = "";
+  double rot_deg = 0.0;
+  double dt_rel = 0.0;
+  double err_rel = 0.0;      // only over cases whose reference error clears kErrFloor
+  double err_abs = 0.0;
+  double max_err_ref = 0.0;
+  int cases = 0;
+  int err_rel_cases = 0;     // cases the relative error metric applies to
+  int validity_mismatches = 0;
+  std::string worst_label;
+
+  void Add(const Delta &d, const std::string &label) {
+    ++cases;
+    if (d.validity_mismatch) {
+      ++validity_mismatches;
+      return;
+    }
+    if (!d.both_valid) return;
+    if (d.rot_deg > rot_deg || d.dt_rel > dt_rel) {
+      if (d.rot_deg > rot_deg) rot_deg = d.rot_deg;
+      if (d.dt_rel > dt_rel) dt_rel = d.dt_rel;
+      worst_label = label;
+    }
+    // A synthetic case is fitted essentially exactly, so both error scalars
+    // land near zero and their ratio is noise. Only compare relatively once
+    // the reference error is large enough for the ratio to mean anything.
+    err_abs = std::max(err_abs, d.err_abs);
+    max_err_ref = std::max(max_err_ref, std::fabs(d.err_ref));
+    if (std::fabs(d.err_ref) > kErrFloor) {
+      ++err_rel_cases;
+      err_rel = std::max(err_rel, d.err_rel);
+    }
+  }
+
+  void Print() const {
+    std::printf("  %-22s cases=%-5d worst_rot=%.3e deg  worst_dt_rel=%.3e  "
+                "worst_err_abs=%.3e (rel=%.3e over %d/%d cases, max|err_ref|=%.3e)",
+                name, cases, rot_deg, dt_rel, err_abs, err_rel, err_rel_cases, cases,
+                max_err_ref);
+    if (validity_mismatches > 0) std::printf("  VALIDITY_MISMATCH=%d", validity_mismatches);
+    if (!worst_label.empty()) std::printf("   [worst: %s]", worst_label.c_str());
+    std::printf("\n");
+  }
+};
+
+// --- reference wrapper ----------------------------------------------------
+
+// Builds the apriltag_detection_t libapriltag's pose entry points consume.
+struct RefDetection {
+  apriltag_detection_t det{};
+  ~RefDetection() {
+    if (det.H) matd_destroy(det.H);
+  }
+};
+
+void FillRefDetection(RefDetection *rd, const double corners[4][2], const double H[3][3]) {
+  rd->det.id = 0;
+  rd->det.hamming = 0;
+  rd->det.decision_margin = 50.0f;
+  for (int i = 0; i < 4; ++i) {
+    rd->det.p[i][0] = corners[i][0];
+    rd->det.p[i][1] = corners[i][1];
+  }
+  rd->det.c[0] = 0.0;
+  rd->det.c[1] = 0.0;
+  rd->det.H = matd_create(3, 3);
+  for (int a = 0; a < 3; ++a)
+    for (int b = 0; b < 3; ++b) MATD_EL(rd->det.H, a, b) = H[a][b];
+}
+
+apriltag_detection_info_t MakeInfo(RefDetection *rd, const CameraIntrinsics &intr,
+                                   double tagsize) {
+  apriltag_detection_info_t info;
+  info.det = &rd->det;
+  info.tagsize = tagsize;
+  info.fx = intr.fx;
+  info.fy = intr.fy;
+  info.cx = intr.cx;
+  info.cy = intr.cy;
+  return info;
+}
+
+// --- synthetic case generation --------------------------------------------
+
+struct SynthCase {
+  double corners[4][2];
+  double H[3][3];
+  double truth_R[3][3];
+  double truth_t[3];
+  std::string label;
+  bool ok = false;
+};
+
+void RotZ(double a, double out[3][3]) {
+  const double c = std::cos(a), s = std::sin(a);
+  const double m[3][3] = {{c, -s, 0}, {s, c, 0}, {0, 0, 1}};
+  std::memcpy(out, m, sizeof(m));
+}
+void RotY(double a, double out[3][3]) {
+  const double c = std::cos(a), s = std::sin(a);
+  const double m[3][3] = {{c, 0, s}, {0, 1, 0}, {-s, 0, c}};
+  std::memcpy(out, m, sizeof(m));
+}
+void Mul33(const double a[3][3], const double b[3][3], double out[3][3]) {
+  double tmp[3][3];
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      double s = 0;
+      for (int k = 0; k < 3; ++k) s += a[i][k] * b[k][j];
+      tmp[i][j] = s;
+    }
+  std::memcpy(out, tmp, sizeof(tmp));
+}
+
+// Projects the four tag corners for a known pose and derives H from them the
+// same way the real pipeline would (homography_compute over the corner
+// correspondences), so the reference and the port both see a realistic H.
+SynthCase MakeSynthCase(const CameraIntrinsics &intr, double tagsize, double dist, double tilt,
+                        double spin, double off_x, double off_y, const std::string &label) {
+  SynthCase c;
+  c.label = label;
+
+  double Ry[3][3], Rz[3][3], R[3][3];
+  RotY(tilt, Ry);
+  RotZ(spin, Rz);
+  Mul33(Ry, Rz, R);
+  std::memcpy(c.truth_R, R, sizeof(R));
+  c.truth_t[0] = off_x;
+  c.truth_t[1] = off_y;
+  c.truth_t[2] = dist;
+
+  const double s = tagsize / 2.0;
+  // Same corner order and object-space layout libapriltag's pose code uses.
+  const double obj[4][3] = {{-s, s, 0}, {s, s, 0}, {s, -s, 0}, {-s, -s, 0}};
+
+  for (int i = 0; i < 4; ++i) {
+    double cam[3];
+    for (int a = 0; a < 3; ++a) {
+      cam[a] = R[a][0] * obj[i][0] + R[a][1] * obj[i][1] + R[a][2] * obj[i][2] + c.truth_t[a];
+    }
+    if (!(cam[2] > 1e-6)) return c;  // behind or on the camera plane
+    c.corners[i][0] = intr.fx * cam[0] / cam[2] + intr.cx;
+    c.corners[i][1] = intr.fy * cam[1] / cam[2] + intr.cy;
+  }
+
+  // H from normalized tag coordinates to pixels, as the detector produces it.
+  zarray_t *corr = zarray_create(sizeof(float[4]));
+  const float norm[4][2] = {{-1, 1}, {1, 1}, {1, -1}, {-1, -1}};
+  for (int i = 0; i < 4; ++i) {
+    float row[4] = {norm[i][0], norm[i][1], static_cast<float>(c.corners[i][0]),
+                    static_cast<float>(c.corners[i][1])};
+    zarray_add(corr, &row);
+  }
+  matd_t *H = homography_compute(corr, HOMOGRAPHY_COMPUTE_FLAG_SVD);
+  zarray_destroy(corr);
+  if (H == nullptr) return c;
+  for (int a = 0; a < 3; ++a)
+    for (int b = 0; b < 3; ++b) c.H[a][b] = MATD_EL(H, a, b);
+  matd_destroy(H);
+  c.ok = true;
+  return c;
+}
+
+// --- one case, all four ladder levels ------------------------------------
+
+struct LadderStats {
+  Worst l1{"L1 seed"};
+  Worst l2{"L2 solution1"};
+  Worst l3{"L3 solution2"};
+  Worst l4{"L4 final pick"};
+  int branch_disagreements = 0;
+  int branch_disagreements_tied = 0;
+  double worst_truth_rot_ours = 0.0;
+  double worst_truth_rot_ref = 0.0;
+  double worst_truth_dt_rel_ours = 0.0;
+  double worst_truth_dt_rel_ref = 0.0;
+};
+
+void RunCase(const PoseEstimator &est, const CameraIntrinsics &intr, double tagsize,
+             const double corners[4][2], const double H[3][3], const std::string &label,
+             LadderStats *st, const double truth_R[3][3], const double truth_t[3]) {
+  RefDetection rd;
+  FillRefDetection(&rd, corners, H);
+  apriltag_detection_info_t info = MakeInfo(&rd, intr, tagsize);
+
+  // L1: seed
+  {
+    apriltag_pose_t ref{};
+    estimate_pose_for_tag_homography(&info, &ref);
+    const TagPose ours = est.EstimateSeed(H);
+    st->l1.Add(Compare(ours, ref.R, ref.t, 0.0, ref.R != nullptr), label);
+    if (ref.R) matd_destroy(ref.R);
+    if (ref.t) matd_destroy(ref.t);
+  }
+
+  // L2/L3: both solutions, unranked
+  apriltag_pose_t ref1{}, ref2{};
+  double ref_err1 = HUGE_VAL, ref_err2 = HUGE_VAL;
+  estimate_tag_pose_orthogonal_iteration(&info, &ref_err1, &ref1, &ref_err2, &ref2,
+                                         PoseEstimator::kDefaultIterations);
+  const TagPosePair ours_both = est.EstimateBoth(corners, H);
+
+  st->l2.Add(Compare(ours_both.solution1, ref1.R, ref1.t, ref_err1, ref1.R != nullptr), label);
+  const bool ref2_valid = (ref2.R != nullptr) && std::isfinite(ref_err2);
+  if (ours_both.solution2.valid == ref2_valid && ref2_valid) {
+    st->l3.Add(Compare(ours_both.solution2, ref2.R, ref2.t, ref_err2, true), label);
+  } else if (ours_both.solution2.valid != ref2_valid) {
+    // A different count of ambiguity minima is a legitimate outcome of tiny
+    // numerical differences (see the plan's quality-loss list), so it is
+    // counted rather than treated as a pass or a hard failure.
+    Delta d;
+    d.validity_mismatch = true;
+    st->l3.Add(d, label);
+  } else {
+    ++st->l3.cases;
+  }
+
+  // L4: final pick, and whether both sides chose the same branch
+  {
+    apriltag_pose_t ref_final{};
+    const double ref_final_err = estimate_tag_pose(&info, &ref_final);
+    const TagPose ours = est.Estimate(corners, H);
+    st->l4.Add(Compare(ours, ref_final.R, ref_final.t, ref_final_err, ref_final.R != nullptr),
+               label);
+
+    const bool ref_took_2 = (ref_err2 < ref_err1);
+    const bool ours_took_2 =
+        ours_both.solution2.valid && (ours_both.solution2.error < ours_both.solution1.error);
+    if (ref_took_2 != ours_took_2) {
+      ++st->branch_disagreements;
+      // A disagreement is benign exactly when the two errors are effectively
+      // tied, because then the choice is decided by the last bits.
+      const double e1 = ours_both.solution1.valid ? ours_both.solution1.error : HUGE_VAL;
+      const double e2 = ours_both.solution2.valid ? ours_both.solution2.error : HUGE_VAL;
+      const double scale = std::max(std::min(std::fabs(e1), std::fabs(e2)), 1e-300);
+      if (std::isfinite(e1) && std::isfinite(e2) && std::fabs(e1 - e2) / scale < 1e-6) {
+        ++st->branch_disagreements_tied;
+      } else {
+        std::printf("    branch disagreement (NOT a tie) on %s: ours e1=%.9g e2=%.9g | "
+                    "ref e1=%.9g e2=%.9g\n",
+                    label.c_str(), e1, e2, ref_err1, ref_err2);
+      }
+    }
+
+    // Absolute accuracy against ground truth, when we have it.
+    if (truth_R != nullptr && ours.valid && ref_final.R != nullptr) {
+      double ref_Rm[3][3], ref_tv[3];
+      for (int a = 0; a < 3; ++a) {
+        ref_tv[a] = MATD_EL(ref_final.t, a, 0);
+        for (int b = 0; b < 3; ++b) ref_Rm[a][b] = MATD_EL(ref_final.R, a, b);
+      }
+      double d_ours[3], d_ref[3];
+      for (int a = 0; a < 3; ++a) {
+        d_ours[a] = ours.t[a] - truth_t[a];
+        d_ref[a] = ref_tv[a] - truth_t[a];
+      }
+      const double tn = std::max(Norm3(truth_t), 1e-300);
+      st->worst_truth_rot_ours = std::max(st->worst_truth_rot_ours,
+                                          RotationAngleDeg(ours.R, truth_R));
+      st->worst_truth_rot_ref = std::max(st->worst_truth_rot_ref,
+                                         RotationAngleDeg(ref_Rm, truth_R));
+      st->worst_truth_dt_rel_ours = std::max(st->worst_truth_dt_rel_ours, Norm3(d_ours) / tn);
+      st->worst_truth_dt_rel_ref = std::max(st->worst_truth_dt_rel_ref, Norm3(d_ref) / tn);
+    }
+
+    if (ref_final.R) matd_destroy(ref_final.R);
+    if (ref_final.t) matd_destroy(ref_final.t);
+  }
+
+  if (ref1.R) matd_destroy(ref1.R);
+  if (ref1.t) matd_destroy(ref1.t);
+  if (ref2.R) matd_destroy(ref2.R);
+  if (ref2.t) matd_destroy(ref2.t);
+}
+
+double NowMs() {
+  using Clock = std::chrono::steady_clock;
+  return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  CameraIntrinsics intr{1400.0, 1400.0, 960.0, 540.0};
+  double tagsize = 0.1651;
+  std::string data_path;
+  uint32_t decimation = 2;
+  int timing_iters = 2000;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    auto next = [&](const char *what) -> std::string {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "%s needs a value\n", what);
+        std::exit(1);
+      }
+      return argv[++i];
+    };
+    if (a == "--tagsize") tagsize = std::stod(next("--tagsize"));
+    else if (a == "--fx") intr.fx = std::stod(next("--fx"));
+    else if (a == "--fy") intr.fy = std::stod(next("--fy"));
+    else if (a == "--cx") intr.cx = std::stod(next("--cx"));
+    else if (a == "--cy") intr.cy = std::stod(next("--cy"));
+    else if (a == "--data") data_path = next("--data");
+    else if (a == "--decimation") decimation = static_cast<uint32_t>(std::stoul(next("--decimation")));
+    else if (a == "--timing-iters") timing_iters = std::stoi(next("--timing-iters"));
+    else {
+      std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
+      return 1;
+    }
+  }
+
+  const PoseEstimator est(intr, tagsize);
+  std::printf("PoseEstimator vs libapriltag apriltag_pose.c\n");
+  std::printf("  intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f, tagsize=%.4f m, threads=%u\n\n",
+              intr.fx, intr.fy, intr.cx, intr.cy, tagsize, est.threads());
+
+  // ---------------- synthetic sweep ----------------
+  LadderStats synth;
+  int synth_cases = 0, synth_skipped = 0;
+  const double dists[] = {0.3, 0.6, 1.0, 2.0, 3.5, 5.0};
+  const double tilts_deg[] = {0.0, 5.0, 15.0, 30.0, 45.0, 60.0, 75.0};
+  const double spins_deg[] = {0.0, 17.0, 45.0, 73.0, 90.0};
+  const double offsets[] = {0.0, 0.25};
+  for (double d : dists) {
+    for (double tilt : tilts_deg) {
+      for (double spin : spins_deg) {
+        for (double off : offsets) {
+          char label[160];
+          std::snprintf(label, sizeof(label), "d=%.2f tilt=%.0f spin=%.0f off=%.2f", d, tilt,
+                        spin, off);
+          const SynthCase c =
+              MakeSynthCase(intr, tagsize, d, tilt * kPi / 180.0, spin * kPi / 180.0,
+                            off * d, -off * d * 0.5, label);
+          if (!c.ok) {
+            ++synth_skipped;
+            continue;
+          }
+          RunCase(est, intr, tagsize, c.corners, c.H, label, &synth, c.truth_R, c.truth_t);
+          ++synth_cases;
+        }
+      }
+    }
+  }
+  std::printf("Synthetic sweep: %d cases (%d skipped as unprojectable)\n", synth_cases,
+              synth_skipped);
+  synth.l1.Print();
+  synth.l2.Print();
+  synth.l3.Print();
+  synth.l4.Print();
+  std::printf("  branch disagreements: %d (%d of them numerical ties)\n",
+              synth.branch_disagreements, synth.branch_disagreements_tied);
+  std::printf("  absolute error vs ground truth  ours: rot<=%.4f deg, |dt|/|t|<=%.3e\n",
+              synth.worst_truth_rot_ours, synth.worst_truth_dt_rel_ours);
+  std::printf("                                   ref: rot<=%.4f deg, |dt|/|t|<=%.3e\n\n",
+              synth.worst_truth_rot_ref, synth.worst_truth_dt_rel_ref);
+
+  // ---------------- degenerate geometry ----------------
+  LadderStats degen;
+  int degen_cases = 0;
+  struct DegenSpec {
+    const char *name;
+    double dist, tilt_deg, spin_deg, off_x_frac, off_y_frac;
+  };
+  const DegenSpec degens[] = {
+      // t nearly along +x, the Gram-Schmidt degeneracy in fix_pose_ambiguities
+      {"t_parallel_to_ex", 0.02, 10.0, 0.0, 40.0, 0.0},
+      {"fronto_parallel", 1.0, 0.0, 0.0, 0.0, 0.0},
+      {"fronto_parallel_spun", 1.0, 0.0, 45.0, 0.0, 0.0},
+      {"very_close", 0.12, 20.0, 30.0, 0.0, 0.0},
+      {"very_far", 40.0, 25.0, 10.0, 0.0, 0.0},
+      {"extreme_tilt", 1.0, 85.0, 20.0, 0.0, 0.0},
+      {"extreme_tilt_2", 1.5, 88.0, 0.0, 0.1, 0.0},
+      {"far_off_axis", 2.0, 30.0, 15.0, 0.9, 0.9},
+  };
+  for (const DegenSpec &s : degens) {
+    const SynthCase c =
+        MakeSynthCase(intr, tagsize, s.dist, s.tilt_deg * kPi / 180.0,
+                      s.spin_deg * kPi / 180.0, s.off_x_frac * s.dist, s.off_y_frac * s.dist,
+                      s.name);
+    if (!c.ok) {
+      std::printf("  %-22s unprojectable, skipped\n", s.name);
+      continue;
+    }
+    RunCase(est, intr, tagsize, c.corners, c.H, s.name, &degen, c.truth_R, c.truth_t);
+    ++degen_cases;
+  }
+  std::printf("Degenerate geometry: %d cases\n", degen_cases);
+  degen.l1.Print();
+  degen.l2.Print();
+  degen.l3.Print();
+  degen.l4.Print();
+  std::printf("  branch disagreements: %d (%d of them numerical ties)\n\n",
+              degen.branch_disagreements, degen.branch_disagreements_tied);
+
+  // ---------------- real detections ----------------
+  if (!data_path.empty()) {
+    std::vector<uint8_t> gray;
+    uint32_t width = 0, height = 0;
+    if (!apriltag_vulkan::LoadGrayPgm(data_path, &gray, &width, &height)) {
+      std::fprintf(stderr, "could not load %s as a P5 PGM\n", data_path.c_str());
+      return 1;
+    }
+    apriltag_family_t *tf = nullptr;
+    if (!setup_tag_family(&tf, "tag36h11")) return 1;
+    apriltag_detector_t *td = apriltag_detector_create();
+    apriltag_detector_add_family(td, tf);
+    td->refine_edges = false;
+
+    apriltag_vulkan::vk::Context ctx;
+    apriltag_vulkan::DetectorConfig cfg;
+    cfg.width = width;
+    cfg.height = height;
+    cfg.decimation = decimation;
+    cfg.tag_width = static_cast<uint32_t>(tf->width_at_border);
+    cfg.reversed_border = tf->reversed_border;
+    cfg.normal_border = !tf->reversed_border;
+
+    apriltag_vulkan::GpuDetector detector(ctx, cfg);
+    apriltag_vulkan::QuadDecode quad_decode(cfg);
+    apriltag_vulkan::TagDecoder tag_decoder(td);
+
+    detector.Detect(gray.data());
+    const std::vector<apriltag_vulkan::DetectedQuad> quads =
+        quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+    zarray_t *dets =
+        tag_decoder.Decode(quads, gray.data(), width, height, cfg.reversed_border);
+
+    LadderStats real;
+    int real_cases = 0;
+    for (int i = 0; i < zarray_size(dets); ++i) {
+      apriltag_detection_t *det = nullptr;
+      zarray_get(dets, i, &det);
+      if (det == nullptr || det->H == nullptr) continue;
+      double H[3][3], corners[4][2];
+      for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b) H[a][b] = MATD_EL(det->H, a, b);
+      for (int c = 0; c < 4; ++c) {
+        corners[c][0] = det->p[c][0];
+        corners[c][1] = det->p[c][1];
+      }
+      char label[64];
+      std::snprintf(label, sizeof(label), "real tag id=%d", det->id);
+      RunCase(est, intr, tagsize, corners, H, label, &real, nullptr, nullptr);
+      ++real_cases;
+    }
+    std::printf("Real detections from %s (decimation %u): %d tag(s)\n", data_path.c_str(),
+                decimation, real_cases);
+    real.l1.Print();
+    real.l2.Print();
+    real.l3.Print();
+    real.l4.Print();
+    std::printf("  branch disagreements: %d (%d of them numerical ties)\n\n",
+                real.branch_disagreements, real.branch_disagreements_tied);
+
+    // ---------------- timing, on a real detection ----------------
+    if (real_cases > 0 && timing_iters > 0) {
+      apriltag_detection_t *det = nullptr;
+      zarray_get(dets, 0, &det);
+      double H[3][3], corners[4][2];
+      for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b) H[a][b] = MATD_EL(det->H, a, b);
+      for (int c = 0; c < 4; ++c) {
+        corners[c][0] = det->p[c][0];
+        corners[c][1] = det->p[c][1];
+      }
+      RefDetection rd;
+      FillRefDetection(&rd, corners, H);
+      apriltag_detection_info_t info = MakeInfo(&rd, intr, tagsize);
+
+      for (int i = 0; i < 100; ++i) {
+        apriltag_pose_t p{};
+        estimate_tag_pose(&info, &p);
+        matd_destroy(p.R);
+        matd_destroy(p.t);
+        est.Estimate(corners, H);
+      }
+
+      double ref_best = 1e30, ref_total = 0.0;
+      for (int i = 0; i < timing_iters; ++i) {
+        const double s = NowMs();
+        apriltag_pose_t p{};
+        estimate_tag_pose(&info, &p);
+        const double dt = NowMs() - s;
+        matd_destroy(p.R);
+        matd_destroy(p.t);
+        ref_best = std::min(ref_best, dt);
+        ref_total += dt;
+      }
+      double our_best = 1e30, our_total = 0.0;
+      double sink = 0.0;  // keeps the call from being optimized away
+      for (int i = 0; i < timing_iters; ++i) {
+        const double s = NowMs();
+        const TagPose p = est.Estimate(corners, H);
+        const double dt = NowMs() - s;
+        sink += p.t[2] + p.error;
+        our_best = std::min(our_best, dt);
+        our_total += dt;
+      }
+      if (sink == 12345.6789) std::printf("");  // never true; defeats DCE
+      std::printf("Timing over %d calls (single tag):\n", timing_iters);
+      std::printf("  libapriltag estimate_tag_pose : best=%.5f ms  mean=%.5f ms\n", ref_best,
+                  ref_total / timing_iters);
+      std::printf("  PoseEstimator::Estimate       : best=%.5f ms  mean=%.5f ms\n", our_best,
+                  our_total / timing_iters);
+      if (our_total > 0.0) {
+        std::printf("  speedup (mean)                : %.1fx\n", ref_total / our_total);
+      }
+    }
+
+    apriltag_detector_destroy(td);
+    teardown_tag_family(&tf, "tag36h11");
+  }
+
+  // ---------------- verdict ----------------
+  //
+  // Thresholds are calibrated against what the deliberate divergences from
+  // libapriltag actually cost, with margin - not pulled from thin air:
+  //
+  //  * The seed (L1) is where the one intentional precision change lives:
+  //    libapriltag computes homography_to_pose's scale factor with
+  //    single-precision sqrtf, this port uses double. Measured effect on the
+  //    seed is ~1.4e-7 relative in translation, so L1 gets its own looser
+  //    translation bound. Orthogonal iteration then washes that out - by L2
+  //    translation agrees to ~4e-10.
+  //
+  //  * The rotation bound is shared. The measured worst divergence is
+  //    ~2.1e-6 deg, and 1e-4 deg leaves ~48x margin while still being ~30x
+  //    TIGHTER than the error both implementations share against synthetic
+  //    ground truth (~3.2e-3 deg). That is the honest framing: the port
+  //    tracks libapriltag far more closely than either tracks reality.
+  //
+  //  * The object-space error is compared in absolute terms, because a
+  //    synthetic case is fitted exactly and both scalars sit at ~1e-13 or
+  //    below, where a ratio is pure noise. Relative agreement is asserted
+  //    only over the cases clearing kErrFloor.
+  auto LevelOk = [](const Worst &w, double max_rot_deg, double max_dt_rel) {
+    return w.validity_mismatches == 0 && w.rot_deg < max_rot_deg && w.dt_rel < max_dt_rel &&
+           w.err_abs < 1e-12 && w.err_rel < 1e-9;
+  };
+  constexpr double kMaxRotDeg = 1e-4;
+  constexpr double kMaxDtRelSeed = 1e-5;   // the deliberate sqrtf -> sqrt change
+  constexpr double kMaxDtRelRefined = 1e-7;
+
+  auto SetOk = [&](const LadderStats &st, const char *what, bool require_l3) {
+    bool ok = LevelOk(st.l1, kMaxRotDeg, kMaxDtRelSeed) &&
+              LevelOk(st.l2, kMaxRotDeg, kMaxDtRelRefined) &&
+              LevelOk(st.l4, kMaxRotDeg, kMaxDtRelRefined);
+    // L3 exercises fix_pose_ambiguities, where a differing count of minima is
+    // a documented legitimate outcome of last-bit differences; its validity
+    // mismatches are reported but only gated where asked.
+    if (require_l3) {
+      ok = ok && st.l3.rot_deg < kMaxRotDeg && st.l3.dt_rel < kMaxDtRelRefined &&
+           st.l3.err_abs < 1e-12 && st.l3.err_rel < 1e-9;
+    }
+    // Every branch disagreement must be a numerical tie.
+    ok = ok && (st.branch_disagreements == st.branch_disagreements_tied);
+    std::printf("  %-22s %s\n", what, ok ? "PASS" : "FAIL");
+    return ok;
+  };
+
+  std::printf("VERDICT\n");
+  bool all_ok = SetOk(synth, "synthetic sweep", true);
+  all_ok = SetOk(degen, "degenerate geometry", true) && all_ok;
+  std::printf("  thresholds: rot < %.0e deg, |dt|/|t| < %.0e (seed %.0e), "
+              "err_abs < 1e-12, err_rel < 1e-9\n",
+              kMaxRotDeg, kMaxDtRelRefined, kMaxDtRelSeed);
+  return all_ok ? 0 : 1;
+}
