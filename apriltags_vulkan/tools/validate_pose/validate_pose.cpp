@@ -84,14 +84,34 @@ double Norm3(const double v[3]) {
   return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
-// Geodesic angle between two rotations: acos((trace(A'B) - 1) / 2).
+// Geodesic angle between two rotations, from the axis-angle form of
+// D = A'B: atan2(|axis|, cos-part).
+//
+// NOT acos((trace(D) - 1) / 2), which is the textbook formula and is useless
+// here. acos has an infinite derivative at 1, so for two nearly-identical
+// rotations - exactly the case this tool spends its time measuring - a
+// single-ULP error in the trace becomes ~4e-8 rad, i.e. ~2.4e-6 deg of
+// phantom difference. That put a hard noise floor under every rotation
+// number, visible as a nonzero angle when comparing a solver against
+// ITSELF. The atan2 form below is well conditioned at both ends and reports
+// a true zero for identical input.
 double RotationAngleDeg(const double A[3][3], const double B[3][3]) {
-  double trace = 0.0;
-  for (int i = 0; i < 3; ++i)
-    for (int k = 0; k < 3; ++k) trace += A[k][i] * B[k][i];
-  double c = (trace - 1.0) * 0.5;
-  c = std::max(-1.0, std::min(1.0, c));
-  return std::acos(c) * 180.0 / kPi;
+  // D = A' * B
+  double D[3][3];
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      double s = 0.0;
+      for (int k = 0; k < 3; ++k) s += A[k][i] * B[k][j];
+      D[i][j] = s;
+    }
+  }
+  // The skew part carries sin(theta) * axis; the trace carries cos(theta).
+  const double ax = D[2][1] - D[1][2];
+  const double ay = D[0][2] - D[2][0];
+  const double az = D[1][0] - D[0][1];
+  const double sin_scaled = std::sqrt(ax * ax + ay * ay + az * az) * 0.5;
+  const double cos_scaled = (D[0][0] + D[1][1] + D[2][2] - 1.0) * 0.5;
+  return std::atan2(sin_scaled, cos_scaled) * 180.0 / kPi;
 }
 
 Delta Compare(const TagPose &ours, const matd_t *ref_R, const matd_t *ref_t, double ref_err,
@@ -443,7 +463,10 @@ int main(int argc, char **argv) {
     }
   }
 
-  const PoseEstimator est(intr, tagsize);
+  // convergence_tol = 0: libapriltag always runs its full iteration count,
+  // so the ladder below compares like with like. The early exit is a
+  // deliberate deviation and is measured separately, further down.
+  const PoseEstimator est(intr, tagsize, 0, 0.0);
   std::printf("PoseEstimator vs libapriltag apriltag_pose.c\n");
   std::printf("  intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f, tagsize=%.4f m, threads=%u\n\n",
               intr.fx, intr.fy, intr.cx, intr.cy, tagsize, est.threads());
@@ -620,8 +643,13 @@ int main(int argc, char **argv) {
         ref_best = std::min(ref_best, dt);
         ref_total += dt;
       }
+      // Both configurations: `est` runs the full iteration count (the
+      // libapriltag-parity setting the ladder above verifies), `early_est`
+      // uses the default convergence tolerance. The gap between those two
+      // rows is exactly what the early exit buys.
+      const PoseEstimator early_est(intr, tagsize, 1);
       double our_best = 1e30, our_total = 0.0;
-      double sink = 0.0;  // keeps the call from being optimized away
+      double sink = 0.0;  // keeps the calls from being optimized away
       for (int i = 0; i < timing_iters; ++i) {
         const double s = NowMs();
         const TagPose p = est.Estimate(corners, H);
@@ -630,20 +658,33 @@ int main(int argc, char **argv) {
         our_best = std::min(our_best, dt);
         our_total += dt;
       }
+      double early_best = 1e30, early_total = 0.0;
+      for (int i = 0; i < timing_iters; ++i) {
+        const double s = NowMs();
+        const TagPose p = early_est.Estimate(corners, H);
+        const double dt = NowMs() - s;
+        sink += p.t[2] + p.error;
+        early_best = std::min(early_best, dt);
+        early_total += dt;
+      }
       // Consume `sink` so the loop body cannot be discarded, without a
       // zero-length printf (which warns under -Wformat-zero-length).
       if (!std::isfinite(sink)) {
         std::fprintf(stderr, "non-finite pose accumulated over timing loop\n");
         return 1;
       }
+      const TagPosePair early_pair = early_est.EstimateBoth(corners, H);
       std::printf("Timing over %d calls (single tag):\n", timing_iters);
-      std::printf("  libapriltag estimate_tag_pose : best=%.5f ms  mean=%.5f ms\n", ref_best,
-                  ref_total / timing_iters);
-      std::printf("  PoseEstimator::Estimate       : best=%.5f ms  mean=%.5f ms\n", our_best,
-                  our_total / timing_iters);
-      if (our_total > 0.0) {
-        std::printf("  speedup (mean)                : %.1fx\n", ref_total / our_total);
-      }
+      std::printf("  libapriltag estimate_tag_pose      : best=%.5f ms  mean=%.5f ms\n",
+                  ref_best, ref_total / timing_iters);
+      std::printf("  PoseEstimator, fixed %2d iterations : best=%.5f ms  mean=%.5f ms  (%.1fx)\n",
+                  PoseEstimator::kDefaultIterations, our_best, our_total / timing_iters,
+                  our_total > 0.0 ? ref_total / our_total : 0.0);
+      std::printf("  PoseEstimator, early exit %.0e    : best=%.5f ms  mean=%.5f ms  (%.1fx)"
+                  "   [%d + %d iterations used]\n",
+                  early_est.convergence_tol(), early_best, early_total / timing_iters,
+                  early_total > 0.0 ? ref_total / early_total : 0.0,
+                  early_pair.solution1.iterations, early_pair.solution2.iterations);
     }
 
     apriltag_detector_destroy(td);
@@ -682,9 +723,12 @@ int main(int argc, char **argv) {
     }
 
     // Serial reference: the single-detection path, one at a time.
+    // Serial reference in the SHIPPING configuration (default tolerance),
+    // single-threaded, so this isolates the batching from everything else.
+    const PoseEstimator serial_est(intr, tagsize, 1);
     std::vector<TagPose> serial(cases.size());
     for (size_t i = 0; i < cases.size(); ++i) {
-      serial[i] = est.Estimate(cases[i].corners, cases[i].H);
+      serial[i] = serial_est.Estimate(cases[i].corners, cases[i].H);
     }
 
     for (uint32_t threads : {1u, 2u, 4u, 8u}) {
@@ -719,6 +763,190 @@ int main(int argc, char **argv) {
       std::printf("  EstimateAll(threads=%u, %zu tags, pool=%u): %s\n", threads, cases.size(),
                   batched.threads(), mismatches == 0 ? "bit-identical to serial" : "MISMATCH");
       if (mismatches != 0) batch_ok = false;
+    }
+  }
+  std::printf("\n");
+
+  // ---------------- early exit (Phase B) ----------------
+  //
+  // The convergence early exit is NOT part of the libapriltag port -
+  // libapriltag always runs its full 50 steps - so libapriltag is the wrong
+  // oracle for it. It is checked two ways instead:
+  //
+  //   1. against the fixed-iteration solver (convergence_tol = 0), which is
+  //      the configuration verified against libapriltag, and
+  //   2. against synthetic ground truth, because agreeing with the
+  //      fixed-iteration solver would mean nothing if both had drifted.
+  //
+  // The tolerance is swept rather than assumed, so the default is chosen from
+  // the measured iterations/accuracy tradeoff instead of guessed.
+  bool early_ok = true;
+  {
+    const PoseEstimator exact(intr, tagsize, 1, 0.0);  // fixed 50 steps
+
+    // Ground-truth accuracy of the fixed-iteration solver, which is the bar
+    // the early exit must not fall below.
+    double base_truth_rot = 0.0, base_truth_dt = 0.0;
+
+    struct Row {
+      double tol;
+      double rot_vs_fixed, dt_vs_fixed;
+      double truth_rot, truth_dt;
+      long iters;
+      int max_iters, pick_flips, capped;
+      double ms;  // wall clock over the whole case set, best of a few passes
+    };
+    std::vector<Row> rows;
+    const double tols[] = {0.0, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4};
+
+    const double dists2[] = {0.3, 0.6, 1.0, 2.0, 3.5, 5.0};
+    const double tilts2[] = {0.0, 5.0, 15.0, 30.0, 45.0, 60.0, 75.0};
+    const double spins2[] = {0.0, 17.0, 45.0, 73.0, 90.0};
+
+    std::vector<SynthCase> cases;
+    for (double d : dists2)
+      for (double tl : tilts2)
+        for (double sp : spins2) {
+          char label[160];
+          std::snprintf(label, sizeof(label), "d=%.2f tilt=%.0f spin=%.0f", d, tl, sp);
+          SynthCase c = MakeSynthCase(intr, tagsize, d, tl * kPi / 180.0, sp * kPi / 180.0,
+                                      0.1 * d, -0.05 * d, label);
+          if (c.ok) cases.push_back(c);
+        }
+
+    // Fixed-iteration reference results, computed once.
+    std::vector<TagPose> ref(cases.size());
+    std::vector<bool> ref_pick2(cases.size(), false);
+    for (size_t i = 0; i < cases.size(); ++i) {
+      ref[i] = exact.Estimate(cases[i].corners, cases[i].H);
+      const TagPosePair b = exact.EstimateBoth(cases[i].corners, cases[i].H);
+      ref_pick2[i] = b.solution2.valid && b.solution2.error < b.solution1.error;
+      if (!ref[i].valid) continue;
+      const double tn = std::max(Norm3(cases[i].truth_t), 1e-300);
+      double d3[3];
+      for (int a = 0; a < 3; ++a) d3[a] = ref[i].t[a] - cases[i].truth_t[a];
+      base_truth_rot = std::max(base_truth_rot, RotationAngleDeg(ref[i].R, cases[i].truth_R));
+      base_truth_dt = std::max(base_truth_dt, Norm3(d3) / tn);
+    }
+
+    for (double tol : tols) {
+      const PoseEstimator est_t(intr, tagsize, 1, tol);
+      Row r{tol, 0, 0, 0, 0, 0, 0, 0, 0, 0.0};
+      // Wall clock over the whole case set. Iteration count is only a proxy
+      // for cost - the seed, the per-point F precompute and the ambiguity
+      // search (with its quartic solve) are fixed overhead the early exit
+      // cannot touch - so measure the thing that matters directly.
+      {
+        double best_ms = 1e30, sink = 0.0;
+        for (int pass = 0; pass < 5; ++pass) {
+          const double t0 = NowMs();
+          for (const SynthCase &c : cases) {
+            const TagPose p = est_t.Estimate(c.corners, c.H);
+            sink += p.t[2] + p.error;
+          }
+          const double dt = NowMs() - t0;
+          if (dt < best_ms) best_ms = dt;
+        }
+        if (!std::isfinite(sink)) return 1;
+        r.ms = best_ms;
+      }
+      for (size_t i = 0; i < cases.size(); ++i) {
+        const TagPose p = est_t.Estimate(cases[i].corners, cases[i].H);
+        if (!p.valid || !ref[i].valid) {
+          if (p.valid != ref[i].valid) early_ok = false;
+          continue;
+        }
+        r.rot_vs_fixed = std::max(r.rot_vs_fixed, RotationAngleDeg(p.R, ref[i].R));
+        double dd[3];
+        for (int a = 0; a < 3; ++a) dd[a] = p.t[a] - ref[i].t[a];
+        r.dt_vs_fixed = std::max(r.dt_vs_fixed, Norm3(dd) / std::max(Norm3(ref[i].t), 1e-300));
+
+        const double tn = std::max(Norm3(cases[i].truth_t), 1e-300);
+        double d3[3];
+        for (int a = 0; a < 3; ++a) d3[a] = p.t[a] - cases[i].truth_t[a];
+        r.truth_rot = std::max(r.truth_rot, RotationAngleDeg(p.R, cases[i].truth_R));
+        r.truth_dt = std::max(r.truth_dt, Norm3(d3) / tn);
+
+        const TagPosePair b = est_t.EstimateBoth(cases[i].corners, cases[i].H);
+        r.iters += b.solution1.iterations + b.solution2.iterations;
+        r.max_iters = std::max(r.max_iters, b.solution1.iterations);
+        r.max_iters = std::max(r.max_iters, b.solution2.iterations);
+        if (b.solution1.iterations >= PoseEstimator::kDefaultIterations) ++r.capped;
+        const bool pick2 = b.solution2.valid && b.solution2.error < b.solution1.error;
+        if (pick2 != ref_pick2[i]) ++r.pick_flips;
+      }
+      rows.push_back(r);
+    }
+
+    std::printf("Early exit tolerance sweep over %zu synthetic cases\n", cases.size());
+    std::printf("  fixed-iteration accuracy vs ground truth: rot<=%.6f deg, |dt|/|t|<=%.3e\n",
+                base_truth_rot, base_truth_dt);
+    std::printf("  %-9s %-12s %-11s %-13s %-11s %-8s %-7s %-7s %s\n", "tol", "rot_vs_fix",
+                "dt_vs_fix", "truth_rot", "truth_dt", "iters", "worst", "capped", "ms/set");
+    const long base_iters = rows.empty() ? 0 : rows[0].iters;
+    for (const Row &r : rows) {
+      char tolbuf[16];
+      if (r.tol == 0.0) {
+        std::snprintf(tolbuf, sizeof(tolbuf), "off");
+      } else {
+        std::snprintf(tolbuf, sizeof(tolbuf), "%.0e", r.tol);
+      }
+      std::printf("  %-9s %-12.3e %-11.3e %-13.6f %-11.3e %-8ld %-7d %-7d %.3f\n", tolbuf,
+                  r.rot_vs_fixed, r.dt_vs_fixed, r.truth_rot, r.truth_dt, r.iters, r.max_iters,
+                  r.capped, r.ms);
+      (void)base_iters;
+    }
+    if (base_iters > 0) {
+      std::printf("  iterations saved vs off:");
+      for (const Row &r : rows) {
+        if (r.tol == 0.0) continue;
+        std::printf("  %.0e:%.0f%%", r.tol, 100.0 * (1.0 - double(r.iters) / double(base_iters)));
+      }
+      std::printf("\n");
+    }
+    const double base_ms = rows.empty() ? 0.0 : rows[0].ms;
+    if (base_ms > 0.0) {
+      std::printf("  WALL CLOCK saved vs off:");
+      for (const Row &r : rows) {
+        if (r.tol == 0.0) continue;
+        std::printf("  %.0e:%.0f%%", r.tol, 100.0 * (1.0 - r.ms / base_ms));
+      }
+      std::printf("   (iterations are only a proxy; this is the real figure)\n");
+    }
+
+    // Gate on the DEFAULT tolerance only, and gate it on the right thing.
+    //
+    // Deviating from the fixed-iteration solver by roughly the tolerance is
+    // what a tolerance MEANS, so a fixed absolute bound on that deviation
+    // would just be a restatement of the tolerance. Two bounds that actually
+    // carry information instead:
+    //
+    //   1. Accuracy against ground truth must not regress at all. This is
+    //      the one that matters to a caller, and it is why "early exit and
+    //      fixed iteration agree" would be insufficient on its own - they
+    //      could agree and both have drifted.
+    //   2. The deviation from the fixed solver must stay an order of
+    //      magnitude below the accuracy limit the input itself imposes.
+    //      Being closer to the fixed solver than the fixed solver is to
+    //      reality means the early exit cannot be what limits the answer.
+    //
+    // Plus: the deviation must scale with the tolerance rather than exceed
+    // it wildly, which catches an exit criterion that fires too early.
+    for (const Row &r : rows) {
+      if (r.tol != PoseEstimator::kDefaultConvergenceTol) continue;
+      const bool truth_not_worse = r.truth_rot <= base_truth_rot + 1e-9 &&
+                                   r.truth_dt <= base_truth_dt * (1.0 + 1e-6) + 1e-12;
+      const bool far_below_accuracy_limit =
+          r.rot_vs_fixed < base_truth_rot * 0.1 && r.dt_vs_fixed < base_truth_dt * 0.1;
+      // Translation deviation is dimensionless-relative, same units as the
+      // tolerance, so it should land within a small multiple of it.
+      const bool consistent_with_tol = r.dt_vs_fixed < r.tol * 100.0;
+      early_ok = early_ok && truth_not_worse && far_below_accuracy_limit &&
+                 consistent_with_tol && r.pick_flips == 0;
+      std::printf("  default tol %.0e: truth_not_worse=%d far_below_limit=%d "
+                  "consistent_with_tol=%d pick_flips=%d\n",
+                  r.tol, truth_not_worse ? 1 : 0, far_below_accuracy_limit ? 1 : 0,
+                  consistent_with_tol ? 1 : 0, r.pick_flips);
     }
   }
   std::printf("\n");
@@ -774,7 +1002,8 @@ int main(int argc, char **argv) {
   bool all_ok = SetOk(synth, "synthetic sweep", true);
   all_ok = SetOk(degen, "degenerate geometry", true) && all_ok;
   std::printf("  %-22s %s\n", "EstimateAll batch", batch_ok ? "PASS" : "FAIL");
-  all_ok = all_ok && batch_ok;
+  std::printf("  %-22s %s\n", "early exit", early_ok ? "PASS" : "FAIL");
+  all_ok = all_ok && batch_ok && early_ok;
   std::printf("  thresholds: rot < %.0e deg, |dt|/|t| < %.0e (seed %.0e), "
               "err_abs < 1e-12, err_rel < 1e-9\n",
               kMaxRotDeg, kMaxDtRelRefined, kMaxDtRelSeed);

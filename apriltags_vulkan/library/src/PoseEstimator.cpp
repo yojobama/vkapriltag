@@ -346,7 +346,8 @@ void CalculateF(const Vec3 v, Mat3 out) {
 // orthogonal_iteration with n_points fixed at 4.
 //
 // R and t are in/out: R must hold the initial guess. Returns the object-space
-// error after the final step.
+// error after the final step, and writes the number of steps actually run to
+// `steps_run`.
 //
 // Differences from libapriltag's structure, both pure hoisting with no change
 // to the arithmetic performed:
@@ -355,7 +356,13 @@ void CalculateF(const Vec3 v, Mat3 out) {
 //   - R*p_j is computed once per point per iteration and reused by the
 //     translation, rotation and error steps; libapriltag's expression
 //     structure recomputes it three times.
-double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_steps) {
+//
+// Plus one deliberate behavioural change when `tol > 0`: stop once the pose
+// stops moving, rather than always running the full n_steps as libapriltag
+// does. See PoseEstimator::kDefaultConvergenceTol for why the test is on the
+// pose rather than on the error.
+double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_steps, double tol,
+                           int *steps_run) {
   Vec3 p_mean = {0.0, 0.0, 0.0};
   for (int i = 0; i < kN; ++i)
     for (int k = 0; k < 3; ++k) p_mean[k] += p[i][k];
@@ -383,10 +390,17 @@ double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_s
   Mat3 M1, M1_inv;
   for (int a = 0; a < 3; ++a)
     for (int b = 0; b < 3; ++b) M1[a][b] = ((a == b) ? 1.0 : 0.0) - avg_F[a][b] / kN;
-  if (!Mat3Inverse(M1, M1_inv)) return HUGE_VAL;
+  if (!Mat3Inverse(M1, M1_inv)) {
+    if (steps_run != nullptr) *steps_run = 0;
+    return HUGE_VAL;
+  }
 
   double error = HUGE_VAL;
-  for (int step = 0; step < n_steps; ++step) {
+  Mat3 R_prev;
+  Vec3 t_prev = {0.0, 0.0, 0.0};
+  bool have_prev = false;
+  int step = 0;
+  for (; step < n_steps; ++step) {
     Vec3 Rp[kN];
     for (int j = 0; j < kN; ++j) Mat3MulVec(R, p[j], Rp[j]);
 
@@ -436,7 +450,44 @@ double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_s
       Mat3MulVec(F_minus_I[j], sum, e);
       error += Vec3Dot(e, e);
     }
+
+    // Converged when neither the rotation nor the translation moved this
+    // step. Compared against the PREVIOUS step's pose, so the first step
+    // always runs (there is nothing to compare it against, and solution 2
+    // enters with t unset).
+    if (tol > 0.0 && have_prev) {
+      // Written without std::max deliberately: this is a library source, and
+      // on MSVC windows.h's min/max macros (pulled in transitively) would
+      // break those calls unless every consumer happens to define NOMINMAX.
+      double dR = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+          const double d = std::fabs(R[a][b] - R_prev[a][b]);
+          if (d > dR) dR = d;
+        }
+      }
+      double dt = 0.0;
+      double t_norm = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        const double d = std::fabs(t[a] - t_prev[a]);
+        if (d > dt) dt = d;
+        const double m = std::fabs(t[a]);
+        if (m > t_norm) t_norm = m;
+      }
+      // R is orthonormal so its entries are O(1) and an absolute bound is
+      // already scale-free; t is in metres, so bound it relatively (falling
+      // back to absolute for a pose at the origin).
+      const double dt_rel = (t_norm > 0.0) ? dt / t_norm : dt;
+      if (dR < tol && dt_rel < tol) {
+        ++step;  // count the step that established convergence
+        break;
+      }
+    }
+    Mat3Copy(R, R_prev);
+    for (int a = 0; a < 3; ++a) t_prev[a] = t[a];
+    have_prev = true;
   }
+  if (steps_run != nullptr) *steps_run = step;
   return error;
 }
 
@@ -690,9 +741,11 @@ bool HomographyToPose(const double H[3][3], double fx, double fy, double cx, dou
 
 }  // namespace
 
-PoseEstimator::PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32_t cpu_threads)
+PoseEstimator::PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32_t cpu_threads,
+                             double convergence_tol)
     : intrinsics_(intrinsics),
       tagsize_(tagsize),
+      convergence_tol_(convergence_tol > 0.0 ? convergence_tol : 0.0),
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads))) {}
 
 TagPose PoseEstimator::EstimateSeed(const double H[3][3]) const {
@@ -743,9 +796,11 @@ TagPosePair PoseEstimator::EstimateBoth(const double corners[4][2], const double
     t1[a] = seed.t[a];
     for (int b = 0; b < 3; ++b) R1[a][b] = seed.R[a][b];
   }
-  const double err1 = OrthogonalIteration(v, p, t1, R1, iterations);
+  int steps1 = 0;
+  const double err1 = OrthogonalIteration(v, p, t1, R1, iterations, convergence_tol_, &steps1);
   if (std::isfinite(err1)) {
     out.solution1.error = err1;
+    out.solution1.iterations = steps1;
     out.solution1.valid = true;
     for (int a = 0; a < 3; ++a) {
       out.solution1.t[a] = t1[a];
@@ -758,9 +813,11 @@ TagPosePair PoseEstimator::EstimateBoth(const double corners[4][2], const double
   Mat3 R2;
   if (FixPoseAmbiguities(v, p, t1, R1, R2)) {
     Vec3 t2 = {0.0, 0.0, 0.0};
-    const double err2 = OrthogonalIteration(v, p, t2, R2, iterations);
+    int steps2 = 0;
+    const double err2 = OrthogonalIteration(v, p, t2, R2, iterations, convergence_tol_, &steps2);
     if (std::isfinite(err2)) {
       out.solution2.error = err2;
+      out.solution2.iterations = steps2;
       out.solution2.valid = true;
       for (int a = 0; a < 3; ++a) {
         out.solution2.t[a] = t2[a];

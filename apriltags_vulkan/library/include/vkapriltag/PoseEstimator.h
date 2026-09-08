@@ -38,6 +38,11 @@ struct TagPose {
   double t[3] = {};
   double error = 0.0;
   bool valid = false;
+  // Orthogonal-iteration steps actually run. Equal to the iteration cap when
+  // early exit is disabled (see PoseEstimator's convergence_tol), and
+  // otherwise however many it took to stop moving - typically far fewer, and
+  // input-dependent.
+  int iterations = 0;
 };
 
 // Both candidate solutions of the planar-pose ambiguity, before the caller
@@ -78,8 +83,46 @@ struct TagPosePair {
 class PoseEstimator {
  public:
   // libapriltag's estimate_tag_pose uses 50; kept identical so results are
-  // comparable to it.
+  // comparable to it. With early exit enabled this is a cap, not a count.
   static constexpr int kDefaultIterations = 50;
+
+  // Orthogonal iteration stops once the pose stops moving: the relative
+  // change in translation and the largest elementwise change in the rotation
+  // both fall below this. libapriltag has no such test at all - it always
+  // runs its full 50 steps, having computed a per-step error it never
+  // compares - so this is a deliberate improvement rather than part of the
+  // port, and it makes the iteration count input-dependent.
+  //
+  // The test is on the POSE, not on the error, and that distinction is
+  // load-bearing. Near a minimum the error is quadratically flat in the
+  // pose, so an error-delta threshold of 1e-12 can be satisfied while the
+  // pose is still ~1e-6 from converged. Testing what the caller actually
+  // consumes avoids that trap entirely.
+  //
+  // The default is chosen from a measured sweep, not assumed - see
+  // tools/validate_pose, which prints this table over 210 synthetic poses
+  // and compares every tolerance both against the fixed-iteration solver and
+  // against known ground truth:
+  //
+  //   tol     rot vs fixed   |dt|/|t| vs fixed   truth rot   truth |dt|/|t|   iters saved
+  //   off     0              0                   0.006098    2.598e-06        -
+  //   1e-12   2.7e-10 deg    1.4e-12             0.006098    2.598e-06        20%
+  //   1e-10   1.7e-07 deg    1.7e-10             0.006098    2.598e-06        33%
+  //   1e-08   2.8e-05 deg    2.2e-08             0.006098    2.598e-06        62%
+  //   1e-06   2.2e-03 deg    2.5e-06             0.006578    4.752e-06        90%
+  //   1e-04   3.6e-03 deg    7.9e-06             0.006578    8.008e-06        96%
+  //
+  // 1e-8 is the last row whose accuracy against ground truth is IDENTICAL to
+  // running all 50 iterations, and it saves 62% of them. 1e-6 buys more
+  // iterations but is where real accuracy starts to go: worst rotation error
+  // rises and worst translation error nearly doubles. Tighter than 1e-8 just
+  // spends iterations to chase digits that the input's own corner noise
+  // (~2.6e-06 relative, the `truth` columns) makes meaningless - 1e-8 already
+  // sits ~260x below that floor.
+  //
+  // Pass 0 to disable early exit and always run the full iteration count,
+  // which is the configuration verified for exact libapriltag parity.
+  static constexpr double kDefaultConvergenceTol = 1e-8;
 
   // `tagsize` is the full width of the tag's black border, in metres - the
   // same quantity libapriltag's apriltag_detection_info_t::tagsize takes.
@@ -91,7 +134,10 @@ class PoseEstimator {
   // APRILTAG_CPU_THREADS via ResolveThreadCount - the same resolution
   // QuadDecode and TagDecoder use, so the env var means one thing across
   // every CPU-tail phase.
-  PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32_t cpu_threads = 0);
+  // `convergence_tol` is the early-exit threshold described above; 0 disables
+  // early exit.
+  PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32_t cpu_threads = 0,
+                double convergence_tol = kDefaultConvergenceTol);
 
   PoseEstimator(const PoseEstimator &) = delete;
   PoseEstimator &operator=(const PoseEstimator &) = delete;
@@ -125,11 +171,13 @@ class PoseEstimator {
 
   const CameraIntrinsics &intrinsics() const { return intrinsics_; }
   double tagsize() const { return tagsize_; }
+  double convergence_tol() const { return convergence_tol_; }
   unsigned threads() const { return pool_->threads(); }
 
  private:
   CameraIntrinsics intrinsics_;
   double tagsize_ = 0.0;
+  double convergence_tol_ = kDefaultConvergenceTol;
   std::unique_ptr<WorkerPool> pool_;
 };
 
