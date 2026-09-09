@@ -1,12 +1,16 @@
-// Shared body for blob_diff.comp / blob_diff_u8.comp / blob_diff_subgroup.
-// comp / blob_diff_u8_subgroup.comp. The four differ only in Thresholded's
-// element type (uint vs uint8_t, A8's storageBuffer8BitAccess axis) and
-// whether append() aggregates its counter increment across the subgroup
-// (M2's subgroup-ballot axis) - orthogonal choices, so this file is
-// parametrized by both instead of duplicating the whole shader four times.
-// The wrapper #including this declares Thresholded's binding, a
-// THRESHOLDED_AT(i) accessor macro, and (if aggregating) the subgroup
-// extensions, before this point.
+// Shared body for blob_diff.comp / blob_diff_subgroup.comp. The two differ
+// only in whether append() aggregates its counter increment across the
+// subgroup (the subgroup-ballot axis), so this file is parametrized by that
+// instead of duplicating the whole shader. The wrapper #including this
+// declares the subgroup extensions (if aggregating) before this point.
+//
+// There used to be four variants: the storageBuffer8BitAccess axis crossed
+// with the ballot axis, because this shader read `thresholded` directly and
+// so had to know its element width. It no longer reads it at all -
+// label_pixels.comp folds the three-valued threshold into the spare high
+// bits of the same parent[] word it already rewrites (see common.glsl's
+// PixelLabel/PixelThreshCode) - so the 8-bit axis moved there and the four
+// variants here collapsed back to two.
 //
 // Computes up to 4 QuadBoundaryPoint candidates per interior pixel, one per
 // diamond-shaped neighbor connection (E, SE, S, SW), and appends the valid
@@ -20,11 +24,13 @@
 // with the same atomic counter compaction already used removes the dense
 // array, its traffic, and that whole second pass.
 //
-// Every read here is now spatially local. The blob identity and the
-// "big enough to matter" test both come from parent[] (repurposed in place
-// by label_pixels.comp - see its comment), which replaced six random gathers
-// into blob_size[] per interior pixel plus two more per emitted point into
-// root_dense_id[].
+// Every read here is now spatially local, and there are six of them rather
+// than twelve. The blob identity, the "big enough to matter" test AND the
+// pixel's threshold value all come from one parent[] word (repurposed in
+// place by label_pixels.comp - see its comment): first that replaced six
+// random gathers into blob_size[] per interior pixel plus two more per
+// emitted point into root_dense_id[], then it absorbed the parallel
+// thresholded[] stencil as well.
 //
 // Ordering: the append order is nondeterministic (it depends on atomic
 // arrival order). Nothing depends on it - the points are immediately grouped
@@ -44,10 +50,10 @@
 // shaders, at up to 4 appends per interior pixel.
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
-layout(std430, binding = 1) readonly buffer Parent { uint parent[]; };
-layout(std430, binding = 2) writeonly buffer Compacted { uint compacted[]; };
-layout(std430, binding = 3) buffer Counter { uint counter; };
-layout(std430, binding = 4) writeonly buffer Keys { uvec2 keys[]; };
+layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
+layout(std430, binding = 1) writeonly buffer Compacted { uint compacted[]; };
+layout(std430, binding = 2) buffer Counter { uint counter; };
+layout(std430, binding = 3) writeonly buffer Keys { uvec2 keys[]; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -123,11 +129,20 @@ void main() {
   uint y = oy + 1u;
 
   uint idx = x + y * pc.width;
-  uint v0 = uint(THRESHOLDED_AT(idx));
-  uint l0 = parent[idx];
+  uint w0 = parent[idx];
+  uint c0 = PixelThreshCode(w0);
+  uint l0 = PixelLabel(w0);
 
   // Ambiguous pixel, or a blob too small to matter: contributes nothing.
-  if (v0 == 127u || l0 == 0u) return;
+  //
+  // The c0 == 1u half is in fact already implied by l0 == 0u whenever
+  // min_cluster_pixels >= 2 (the default is 24): uf_init only joins
+  // left-neighbours with v != 127 and uf_merge only unions down-edges with
+  // v != 127, so nothing ever points at an ambiguous pixel and it never
+  // points elsewhere - its component is exactly itself, size 1. Kept
+  // explicit anyway so this stays an identity-preserving rewrite even at
+  // min_cluster_pixels == 1.
+  if (c0 == 1u || l0 == 0u) return;
 
   // Neighbor samples. The dispatch covers interior pixels only
   // (x in [1, width-1), y in [1, height-1)), so all five are in range.
@@ -137,17 +152,23 @@ void main() {
   uint idxSW = idx + pc.width - 1u;
   uint idxW = idx - 1u;
 
-  uint vE = uint(THRESHOLDED_AT(idxE));
-  uint vSE = uint(THRESHOLDED_AT(idxSE));
-  uint vS = uint(THRESHOLDED_AT(idxS));
-  uint vSW = uint(THRESHOLDED_AT(idxSW));
-  uint vW = uint(THRESHOLDED_AT(idxW));
+  uint wE = parent[idxE];
+  uint wSE = parent[idxSE];
+  uint wS = parent[idxS];
+  uint wSW = parent[idxSW];
+  uint wW = parent[idxW];
 
-  uint lE = parent[idxE];
-  uint lSE = parent[idxSE];
-  uint lS = parent[idxS];
-  uint lSW = parent[idxSW];
-  uint lW = parent[idxW];
+  uint cE = PixelThreshCode(wE);
+  uint cSE = PixelThreshCode(wSE);
+  uint cS = PixelThreshCode(wS);
+  uint cSW = PixelThreshCode(wSW);
+  uint cW = PixelThreshCode(wW);
+
+  uint lE = PixelLabel(wE);
+  uint lSE = PixelLabel(wSE);
+  uint lS = PixelLabel(wS);
+  uint lSW = PixelLabel(wSW);
+  uint lW = PixelLabel(wW);
 
   uint rep0 = l0 - 1u;
 
@@ -157,23 +178,34 @@ void main() {
   // South) diagonal connection, so skip emitting it. Folded into wantSW as
   // a value, not an early return before append() calls 1-3 have all run -
   // see append()'s own comment on why every call site is unconditional.
-  bool sw_is_duplicate = vW != 127u && vS != 127u && vS != vW && x != 1u &&
+  // (Equality on codes rather than on 0/127/255 values - preserved by any
+  // injective mapping, see common.glsl.)
+  bool sw_is_duplicate = cW != 1u && cS != 1u && cS != cW && x != 1u &&
                          lW != 0u && lS != 0u;
 
   // Connections 0 (E), 1 (SE), 2 (S), 3 (SW): emit a point if the two pixels
   // straddle a black/white boundary. All four append() calls are reached by
   // every thread that got this far, unconditionally - only want* varies.
-  bool wantE = (v0 + vE == 255u) && lE != 0u;
-  bool wantSE = (v0 + vSE == 255u) && lSE != 0u;
-  bool wantS = (v0 + vS == 255u) && lS != 0u;
-  bool wantSW = !sw_is_duplicate && (v0 + vSW == 255u) && lSW != 0u;
+  //
+  // `v0 + vN == 255u` becomes `c0 + cN == 2u`: c0 is in {0, 2} here (the
+  // c0 == 1 case returned above), so c0 + cN == 2 forces cN = 2 - c0 and the
+  // (1, 1) collision that would otherwise alias an ambiguous pair is
+  // unreachable. See common.glsl.
+  bool wantE = (c0 + cE == 2u) && lE != 0u;
+  bool wantSE = (c0 + cSE == 2u) && lSE != 0u;
+  bool wantS = (c0 + cS == 2u) && lS != 0u;
+  bool wantSW = !sw_is_duplicate && (c0 + cSW == 2u) && lSW != 0u;
 
-  int gSE = (vSE > v0) ? 1 : -1;
-  int gSWx = (vSW > v0) ? -1 : 1;
-  int gSWy = (vSW > v0) ? 1 : -1;
+  // Gradient signs: (vN > v0) becomes (cN > c0) because the code mapping is
+  // monotonic. These three are computed unconditionally and consumed only
+  // where the matching want* holds, and monotonicity makes them identical
+  // bit patterns even where unused.
+  int gSE = (cSE > c0) ? 1 : -1;
+  int gSWx = (cSW > c0) ? -1 : 1;
+  int gSWy = (cSW > c0) ? 1 : -1;
 
-  append(wantE, rep0, lE - 1u, x * 2u + 1u, y * 2u, (vE > v0) ? 1 : -1, 0);
+  append(wantE, rep0, lE - 1u, x * 2u + 1u, y * 2u, (cE > c0) ? 1 : -1, 0);
   append(wantSE, rep0, lSE - 1u, x * 2u + 1u, y * 2u + 1u, gSE, gSE);
-  append(wantS, rep0, lS - 1u, x * 2u, y * 2u + 1u, 0, (vS > v0) ? 1 : -1);
+  append(wantS, rep0, lS - 1u, x * 2u, y * 2u + 1u, 0, (cS > c0) ? 1 : -1);
   append(wantSW, rep0, lSW - 1u, x * 2u - 1u, y * 2u + 1u, gSWx, gSWy);
 }

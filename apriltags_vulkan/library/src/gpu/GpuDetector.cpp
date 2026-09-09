@@ -85,6 +85,18 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     throw std::runtime_error(
         "2*(width/decimation) and 2*(height/decimation) must each be <= 16383");
   }
+  // label_pixels.comp packs `1 + root` into the low 30 bits of parent[] and
+  // the pixel's threshold code into the top 2 (see common.glsl). The check
+  // above already implies this - it bounds the decimated grid at 8191x8191 =
+  // 67,092,481 pixels, under 2^26 - so this is executable documentation of
+  // the coupling rather than a reachable failure, and it will fire first if
+  // the packing above is ever widened.
+  if (VkDeviceSize(config_.width / config_.decimation) *
+          (config_.height / config_.decimation) >=
+      (1u << 30)) {
+    throw std::runtime_error(
+        "decimated pixel count must be < 2^30 to fit label_pixels.comp's packed label");
+  }
 
   // --- Environment overrides. These must all be applied before any capacity
   // or launch geometry is derived from the config. ---
@@ -360,9 +372,11 @@ void GpuDetector::CreatePipelines() {
   // storageBuffer8BitAccess, else the 32-bit-per-pixel fallback every other
   // device uses - see decimate_u8.comp's comment. Covers every consumer of
   // decimated_buf_ (decimate/block_minmax/sort_points_local) and
-  // thresholded_buf_ (threshold/uf_init/uf_merge/blob_diff) - the two
+  // thresholded_buf_ (threshold/uf_init/uf_merge/label_pixels) - the two
   // switch together (threshold(_u8).comp reads the former and writes the
   // latter in one dispatch, so they can't vary independently).
+  // blob_diff is no longer on that list: it reads the threshold out of
+  // parent[]'s spare bits instead (see common.glsl).
   const bool u8 = ctx_.caps().has_8bit_storage;
   auto pick = [u8](const char *base_name, const char *u8_name) {
     return u8 ? u8_name : base_name;
@@ -437,19 +451,20 @@ void GpuDetector::CreatePipelines() {
   uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick_sg("uf_final", "uf_final_subgroup")),
                                      {parent_buf_.get(), blob_size_buf_.get()}, 12, wg1d_);
 
-  // Four-way choice: blob_diff_body.glsl is parametrized on both the u8 and
-  // subgroup axes (it's the one shader affected by both - see its own
-  // comment), so pick/pick_sg alone don't cover it.
-  const char *blob_diff_shader = u8 ? (subgroup ? "blob_diff_u8_subgroup" : "blob_diff_u8")
-                                    : (subgroup ? "blob_diff_subgroup" : "blob_diff");
+  // Two-way now, not four: blob_diff used to be parametrized on the u8 axis
+  // as well, because it read thresholded_buf_ directly. label_pixels.comp
+  // folds the threshold into the parent[] word instead (see common.glsl), so
+  // blob_diff has no thresholded binding at all and the u8 axis moved to
+  // label_pixels - where it costs 2 variants instead of doubling 2 into 4.
   blob_diff_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(blob_diff_shader),
-      {thresholded_buf_.get(), parent_buf_.get(), qbp_compacted_buf_.get(),
-       qbp_counter_buf_.get(), qbp_keys_buf_.get()},
+      ctx_, ShaderPath(pick_sg("blob_diff", "blob_diff_subgroup")),
+      {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
+       qbp_keys_buf_.get()},
       12, wg2d_);
 
   label_pixels_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("label_pixels"), {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
+      ctx_, ShaderPath(pick("label_pixels", "label_pixels_u8")),
+      {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()}, 8, wg1d_);
 
   init_extents_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4, wg1d_);

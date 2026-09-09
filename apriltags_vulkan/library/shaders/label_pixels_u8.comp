@@ -1,0 +1,14 @@
+#version 450
+// Identical to label_pixels.comp except Thresholded is uint8_t per pixel
+// instead of uint - see decimate_u8.comp's comment on why that variant
+// exists. Parent stays uint32: it carries a packed (label, threshold code)
+// word, see common.glsl.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+
+layout(std430, binding = 2) readonly buffer Thresholded { uint8_t thresholded[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
+
+#include "label_pixels_body.glsl"
