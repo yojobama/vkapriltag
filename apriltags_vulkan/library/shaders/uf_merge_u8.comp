@@ -64,10 +64,11 @@ void main() {
 
   bool merged = false;
   if (i < total) {
-    uint y = i / pc.width;
     uint v = uint(thresholded[i]);
     if (v != 127u) {
-      if (y + 1u < pc.height && uint(thresholded[i + pc.width]) == v) {
+      // See uf_merge.comp: `i + pc.width < total` is the same in-range test
+      // as `(i / pc.width) + 1u < pc.height` without the integer division.
+      if (i + pc.width < total && uint(thresholded[i + pc.width]) == v) {
         if (doUnion(i, i + pc.width)) merged = true;
       }
     }

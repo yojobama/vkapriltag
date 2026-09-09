@@ -79,10 +79,16 @@ void main() {
 
   bool merged = false;
   if (i < total) {
-    uint y = i / pc.width;
     uint v = thresholded[i];
     if (v != 127u) {
-      if (y + 1u < pc.height && thresholded[i + pc.width] == v) {
+      // "the pixel below is in range" was `(i / pc.width) + 1u < pc.height`,
+      // which is exactly `i + pc.width < total` given i < total: dividing by
+      // width to recover y only to compare y+1 against height is the same
+      // test one integer division more expensively. Neither Mali (Valhall)
+      // nor the desktop parts have an integer divide instruction, so that
+      // was a multi-instruction sequence per invocation across every pixel
+      // of every merge pass.
+      if (i + pc.width < total && thresholded[i + pc.width] == v) {
         if (doUnion(i, i + pc.width)) merged = true;
       }
     }
