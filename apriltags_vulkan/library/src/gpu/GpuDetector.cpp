@@ -708,15 +708,17 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // compacted count is the number every later stage is sized by.
   // ------------------------------------------------------------------
   cmd = BeginTimedCommands();
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelFinalize));
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
   uf_final_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
   // Fold blob identity and the min-size test into one spatially-local value
   // per pixel, so blob_diff.comp does no random gathers at all. See
   // label_pixels.comp.
   struct { uint32_t count, min_blob; } label_pc{pixels, config_.min_cluster_pixels};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelPixels));
   label_pixels_pl_.Dispatch1D(cmd, pixels, &label_pc);
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelFinalize));
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelPixels));
 
   // blob_diff appends valid boundary points (with their sort keys) directly
   // into the compacted buffer, so there is no dense intermediate array and no
