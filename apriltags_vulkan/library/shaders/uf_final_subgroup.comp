@@ -45,6 +45,10 @@ layout(std430, binding = 1) buffer BlobSize { uint blob_size[]; };
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
+  // Declared so both variants share one 12-byte push range, but unused
+  // here: this variant is deliberately not saturating (see the atomicAdd
+  // below).
+  uint min_blob_pixels;
 } pc;
 
 void main() {
@@ -62,6 +66,25 @@ void main() {
     uvec4 sameKeyMask = subgroupBallot(sameKey);
 
     if (gl_SubgroupInvocationID == leaderLane) {
+      // Deliberately NOT saturating, unlike uf_final.comp. The guard there
+      // (skip the atomic once blob_size[r] has reached the floor) is a large
+      // win precisely because it removes CONTENTION - and this variant has
+      // already removed that contention by aggregating a whole subgroup's
+      // same-key lanes into one atomicAdd. Adding the guard on top buys
+      // nothing and costs a dependent load of a location other subgroups are
+      // concurrently updating, right before the atomic. Measured, uf_final
+      // span over 12 runs of 6 iterations on an MX230 (min):
+      //
+      //   aggregated, unguarded (this)      0.2478 ms
+      //   aggregated + saturating guard     0.4024 ms   <- +62%
+      //   scalar + saturating guard         0.0809 ms
+      //
+      // So the guard belongs in the scalar variant only. Note the third row
+      // also beats this one by 3x on that device, i.e. saturation is a
+      // strictly better answer to the contention than aggregation is - see
+      // OPTIMIZATION_NOTES.md; retiring this variant is not done here
+      // because the aggregation was measured a win on an RX 9060 XT, which
+      // is not available to re-test.
       atomicAdd(blob_size[leaderKey], PopCount128(sameKeyMask));
     }
     remaining = AndNot128(remaining, sameKeyMask);

@@ -435,7 +435,7 @@ void GpuDetector::CreatePipelines() {
   uf_compress_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("uf_compress"), {parent_buf_.get()}, 8, wg1d_);
   uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick_sg("uf_final", "uf_final_subgroup")),
-                                     {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
+                                     {parent_buf_.get(), blob_size_buf_.get()}, 12, wg1d_);
 
   // Four-way choice: blob_diff_body.glsl is parametrized on both the u8 and
   // subgroup axes (it's the one shader affected by both - see its own
@@ -710,8 +710,15 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // compacted count is the number every later stage is sized by.
   // ------------------------------------------------------------------
   cmd = BeginTimedCommands();
+  // uf_final needs the min-size floor too, to saturate its counter at the
+  // same threshold label_pixels tests against (see uf_final.comp), so it
+  // can't share dwdh_pc with uf_init/uf_merge/uf_compress. The floor is
+  // deliberately the same value label_pc carries below - they must stay
+  // equal or the saturation stops matching the predicate.
+  struct { uint32_t dw, dh, min_blob; } uf_final_pc{decimated_width_, decimated_height_,
+                                                    config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
-  uf_final_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
+  uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
   // Fold blob identity and the min-size test into one spatially-local value
