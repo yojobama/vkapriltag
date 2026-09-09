@@ -98,6 +98,15 @@ void main() {
       atomicMax(extents[leaderKey].max_x, redMaxX);
       atomicMax(extents[leaderKey].max_y, redMaxY);
       atomicAdd(extents[leaderKey].count, redCount);
+      // Deliberately NOT guarded on != 0, unlike reduce_extents_hash.comp.
+      // There, gx or gy is structurally zero for about half of all points
+      // (E emits (+/-1, 0), S emits (0, +/-1)), so the guard skips a real
+      // atomic often. Here the values are already reduced across a whole
+      // subgroup, so a sum of exactly zero is uncommon - the guard almost
+      // never fires and always costs a test. Measured, extents span, min
+      // over 12 runs of 6 iterations on an MX230: 0.2816 unguarded against
+      // 0.2919 guarded, i.e. +3.7% for nothing. Same shape as the split in
+      // uf_final.comp/uf_final_subgroup.comp.
       atomicAdd(extents[leaderKey].gx_sum, redGxSum);
       atomicAdd(extents[leaderKey].gy_sum, redGySum);
       atomicAdd(extents[leaderKey].pxgx_plus_pygy_sum, redPxgxPygy);
