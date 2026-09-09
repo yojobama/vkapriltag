@@ -39,6 +39,13 @@ enum class MemoryKind {
   // BAR. Falls back to plain DeviceLocal when unavailable, so callers must
   // check host_visible() and keep a staging path for the fallback.
   DeviceLocalMapped,
+
+  // DEVICE_LOCAL and host-visible, preferring HOST_CACHED, for buffers a
+  // shader writes and the HOST reads. Falls back to plain DeviceLocal when
+  // no such type exists (any discrete GPU without resizable BAR), so
+  // callers must check host_visible() AND host_cached() and keep a staging
+  // path for the fallback.
+  DeviceLocalReadback,
 };
 
 // A Vulkan buffer plus its memory allocation. Host-visible allocations are
@@ -75,10 +82,21 @@ class Buffer {
   void Write(const void *src, VkDeviceSize bytes, VkDeviceSize offset = 0);
   void Read(void *dst, VkDeviceSize bytes, VkDeviceSize offset = 0) const;
 
+  // Makes a range of the mapping visible to the host without copying out of
+  // it - for a caller reading `mapped()` in place. No-op on coherent memory.
+  void InvalidateRange(VkDeviceSize offset, VkDeviceSize bytes) const;
+
   // True unless this buffer's memory type is HOST_VISIBLE without
   // HOST_COHERENT (only possible for MemoryKind::HostVisibleCached, and only
   // when the device has no memory type that is both).
   bool coherent() const { return coherent_; }
+
+  // True when the selected memory type is HOST_CACHED. Load-bearing for any
+  // caller that wants to READ through the mapping instead of staging: an
+  // uncached mapping is fine to write through and dramatically slower to
+  // read through, so a zero-copy readback path must be conditional on this,
+  // not merely on host_visible(). See MemoryKind::DeviceLocalReadback.
+  bool host_cached() const { return host_cached_; }
 
   // --- Record-only helpers. No submission, no allocation. ---
 
@@ -103,6 +121,7 @@ class Buffer {
   VkDeviceSize size_ = 0;
   void *mapped_ = nullptr;
   bool coherent_ = true;
+  bool host_cached_ = false;
   VkDeviceSize non_coherent_atom_size_ = 1;
 };
 

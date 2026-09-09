@@ -296,7 +296,24 @@ void GpuDetector::CreateBuffers() {
   index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
   blob_point_offsets_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 4);
 
-  line_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
+  // The one buffer big enough for its readback path to matter: ~1.6 MB per
+  // frame at 1080p. It used to be plain DeviceLocal, copied on-device into
+  // readback_staging_ and then memcpy'd again into a std::vector - two full
+  // copies of the same bytes on a unified-memory part. Asking for
+  // device-local + host-visible + cached lets QuadDecode read it in place.
+  //
+  // Conditional on the memory type that actually came back being CACHED, not
+  // merely host-visible: reading 1.6 MB through an uncached mapping is much
+  // slower than the copy it would replace (Buffer.h records a measured 4x on
+  // Mali for exactly that mistake). Discrete parts without resizable BAR
+  // fall back to DeviceLocal and keep the staging path.
+  {
+    vk::Buffer b(ctx_, VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint), kSsboUsage,
+                 vk::MemoryKind::DeviceLocalReadback);
+    device_bytes_ += b.size();
+    line_fit_points_buf_ = std::move(b);
+  }
+  linefit_direct_read_ = line_fit_points_buf_.host_visible() && line_fit_points_buf_.host_cached();
 
   // Open-addressing table for the (rep0, rep1) grouping, sized to
   // max_raw_blobs itself (previously 4x, for a 25% worst-case load factor -
@@ -890,7 +907,10 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (extents_bytes > 0) {
     selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);
   }
-  if (linefit_bytes > 0) {
+  // Skipped entirely on parts where the line-fit buffer is itself
+  // host-visible and cached: QuadDecode reads it in place instead. See
+  // CreateBuffers.
+  if (linefit_bytes > 0 && !linefit_direct_read_) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanReadbackCopy));
@@ -906,12 +926,28 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Host-side copies out of the persistently mapped readback buffer.
   // ------------------------------------------------------------------
   last_selected_extents.resize(num_selected_blobs);
-  last_line_fit_points.resize(num_points);
   if (extents_bytes > 0) {
     readback_staging_.Read(last_selected_extents.data(), extents_bytes, 0);
   }
-  if (linefit_bytes > 0) {
-    readback_staging_.Read(last_line_fit_points.data(), linefit_bytes, linefit_offset);
+  if (linefit_direct_read_) {
+    // Zero copies: the shader wrote these bytes straight into host-visible,
+    // host-cached device memory, so hand QuadDecode a view of them. Valid
+    // until the next Detect() overwrites the buffer.
+    //
+    // The mapping is coherent on every type seen so far, but invalidate when
+    // it isn't - Buffer::Read() would have done this, and skipping the copy
+    // must not also skip the invalidate.
+    if (!line_fit_points_buf_.coherent()) {
+      line_fit_points_buf_.InvalidateRange(0, linefit_bytes);
+    }
+    last_line_fit_points = std::span<const RawLineFitPoint>(
+        static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), num_points);
+  } else {
+    linefit_scratch_.resize(num_points);
+    if (linefit_bytes > 0) {
+      readback_staging_.Read(linefit_scratch_.data(), linefit_bytes, linefit_offset);
+    }
+    last_line_fit_points = std::span<const RawLineFitPoint>(linefit_scratch_);
   }
   const auto t_end = Clock::now();
 
@@ -979,6 +1015,11 @@ std::string GpuDetector::DescribeSizing() const {
   }
   os << ", device memory " << (device_bytes_ / (1024 * 1024)) << " MiB";
   os << ", gray upload " << (gray_direct_write_ ? "direct (unified memory)" : "staged");
+  // Worth logging next to the upload path: whether the line-fit readback
+  // avoided its copies depends on a HOST_CACHED memory type existing, which
+  // varies by driver even among unified-memory parts, so a run that silently
+  // took the staging path would otherwise be indistinguishable.
+  os << ", linefit readback " << (linefit_direct_read_ ? "direct (host-cached)" : "staged");
   return os.str();
 }
 

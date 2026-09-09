@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "vkapriltag/common/WorkerPool.h"
@@ -36,8 +37,16 @@ class QuadDecode {
   // returns the resulting quads' corners in full-resolution pixel
   // coordinates (matching the original un-decimated input image passed to
   // GpuDetector::Detect()).
-  std::vector<DetectedQuad> Decode(const std::vector<MinMaxExtentsGpu> &selected_extents,
-                                   const std::vector<RawLineFitPoint> &line_fit_points) const;
+  // Takes a span, so GpuDetector can hand over a view straight into
+  // host-visible device memory on parts that support it rather than a copy -
+  // see GpuDetector::last_line_fit_points.
+  //
+  // The former `selected_extents` first parameter is gone. It was never read:
+  // everything the fit needs is already folded into each point's blob_index
+  // and the run structure of the array, and the body ended in
+  // `(void)selected_extents;`. GpuDetector::last_selected_extents is still
+  // populated for callers that want it.
+  std::vector<DetectedQuad> Decode(std::span<const RawLineFitPoint> line_fit_points) const;
 
   unsigned threads() const { return pool_->threads(); }
 

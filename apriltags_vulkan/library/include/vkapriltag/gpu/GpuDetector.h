@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <span>
 #include <vector>
 
 #include "vkapriltag/gpu/Types.h"
@@ -494,6 +495,12 @@ class GpuDetector {
   vk::Buffer readback_staging_;
   VkDeviceSize readback_capacity_ = 0;
   bool gray_direct_write_ = false;
+  // True when line_fit_points_buf_ landed on a host-visible, HOST_CACHED
+  // memory type, so its readback needs neither the on-device copy into
+  // readback_staging_ nor a memcpy out of it. See CreateBuffers.
+  bool linefit_direct_read_ = false;
+  // Backs last_line_fit_points only on the staging path.
+  std::vector<RawLineFitPoint> linefit_scratch_;
 
   // Scan chain for the per-blob point-offset assignment (sized to
   // config_.max_blobs). The hash table's raw-blob numbering no longer needs
@@ -582,7 +589,19 @@ class GpuDetector {
   // Readback results exposed for QuadDecode after Detect() runs the GPU
   // pipeline; sized to the actual (not capacity) counts for the frame.
   std::vector<MinMaxExtentsGpu> last_selected_extents;
-  std::vector<RawLineFitPoint> last_line_fit_points;
+
+  // A VIEW, not a container, and only valid until the next Detect().
+  //
+  // On a part whose device-local memory can be host-visible and HOST_CACHED
+  // (integrated/unified, or a discrete card with resizable BAR) this points
+  // straight into the buffer the shader wrote, so the ~1.6 MB of line-fit
+  // records at 1080p costs zero copies instead of two - a device-to-staging
+  // vkCmdCopyBuffer plus a memcpy into a vector. Everywhere else it views an
+  // internal scratch vector filled from the staging buffer exactly as before.
+  //
+  // Deliberately a span rather than a vector, so the zero-copy case cannot
+  // be silently undone by a caller that expects to own the storage.
+  std::span<const RawLineFitPoint> last_line_fit_points;
 };
 
 }  // namespace apriltag_vulkan
