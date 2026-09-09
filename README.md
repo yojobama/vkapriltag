@@ -284,6 +284,18 @@ tiling and subgroup-aggregated atomics both measured *slower* here despite
 helping on the discrete card, because Valhall has no dedicated
 shared-memory hardware), and the current list of remaining opportunities.
 
+The tables above are the Orange Pi 5 and Desktop figures and are **not**
+affected by the later GPU-agnostic pass, which was measured on different
+hardware (an Intel Iris Plus G7 iGPU and an NVIDIA MX230) and has not been
+run on either target above. Its own numbers, and the six changes it landed
+against the four it measured and rejected, live in their own clearly-labelled
+section at the end of `OPTIMIZATION_NOTES.md`. The one result there worth
+knowing before touching these shaders: subgroup aggregation and a cheap
+early-out are alternative answers to atomic contention, and applying both is
+worse than either — so `uf_final` and `reduce_extents_hash` now carry a guard
+in their scalar variants that is deliberately absent from their
+subgroup-aggregated ones.
+
 ## Project layout
 
 ```

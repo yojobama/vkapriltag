@@ -439,18 +439,17 @@ upload 0.22.
    measured. See "Measured and rejected" for why the readback version of this
    is a wash and indirect dispatch is not.
 
-4. **Pack `thresholded_buf_` and `decimated_buf_` to one byte per pixel.**
-   Both store a `uint` per pixel today: `thresholded` holds only 0/127/255,
-   and `decimated` holds a `uint8` grayscale value. `thresholded` is streamed
-   by `uf_merge` (twice) and `blob_diff`, `decimated` by `threshold` and
-   `compute_line_fit_points`. Roughly 6 MB per frame, so ~0.4 ms — but it
-   costs pack/unpack ALU in four shaders and no 8-bit storage extension is
-   available, so it has to be done by hand. Estimated, not measured.
+4. ~~**Pack `thresholded_buf_` and `decimated_buf_` to one byte per pixel.**~~
+   **Done**, and the premise here was stale: it claimed "no 8-bit storage
+   extension is available", but `VK_KHR_8bit_storage` is core as of Vulkan
+   1.2 and the tree now carries `_u8` variants of every consumer, selected at
+   runtime from `DeviceCaps::has_8bit_storage` with the 32-bit path as the
+   fallback. `blob_diff` dropped off the consumer list entirely — see the
+   GPU-agnostic pass below, which folds the threshold into `parent[]`.
 
-5. **`uf_final`'s blob-size histogram** is 518400 random `atomicAdd`s with
-   heavy contention on large blobs. Only the `>= min_cluster_pixels`
-   predicate is ever consumed, so a saturating or hierarchical count would do.
-   Part of the 1.71 ms boundary stage; not separately measured.
+5. ~~**`uf_final`'s blob-size histogram**~~ **Done** — see "A4a" in the
+   GPU-agnostic pass below. The saturating form is exact, not approximate,
+   because the count itself has no reader.
 
 ## Pipeline caching (startup latency, not per-frame)
 
@@ -518,3 +517,234 @@ make -j8
 APRILTAG_VK_MAX_POINTS=200000 \
   ./tools/apriltag_vulkan_validate --pgm colorImage.pgm --iterations 25
 ```
+
+---
+
+# A second pass: GPU-agnostic optimizations
+
+Everything above was measured on the Mali-G610 deployment target (and
+cross-checked on an RX 9060 XT). **This section was not.** It was measured on:
+
+- **Intel Iris Plus G7** (i7-1065G7, integrated, unified memory, 8-bit
+  storage present, subgroup variants disabled by the integrated-GPU exclusion)
+- **NVIDIA MX230** (Pascal GP108, discrete, ~512 KB L2, subgroup variants
+  enabled)
+
+No figure in this section belongs in the Mali tables above, and none of it has
+been run on Mali. The two devices between them do cover both memory
+topologies and both sides of the subgroup switch, so every code path here is
+exercised somewhere - but "unmeasured on the tuning target" applies to all of
+it.
+
+Test image `grayimage.pgm` (1280x800), default config. Per-span figures are
+min over 12-15 runs of 6 iterations, because the value the validate tool
+prints comes from a **single** instrumented frame and is far noisier than the
+best-of-25 totals beside it.
+
+## The bar, and what "bit-identical" means here
+
+Every change in this pass had to show a measured win on at least one of the
+two GPUs, and to leave output bit-identical. That second condition turned out
+to be stronger than expected: ten repeat runs of the baseline were
+byte-identical on every counter *and* on the corner RMS to six figures, so the
+`theta_key` tie nondeterminism the "Behavioural changes" section warns about
+does not manifest on this frame. Every step below therefore holds
+`boundary_points`, `raw_blobs`, `selected_blobs`, `points`,
+`candidate_quads`, `hash_probe_drops`, `uf_iterations`, the decoded ID set and
+the corner RMS exactly constant, at decimations 1/2/4, with and without 8-bit
+storage and subgroups, plus 5/5 on the generated corpus.
+
+Two harness fixes were needed first: the OpenCV validate variant always
+returned 0 (so the only variant supporting corpus mode could not gate
+anything), and `kSpanLabelFinalize` bracketed `uf_final` and `label_pixels`
+together - which nets out exactly the two changes that move them in opposite
+directions. The span count also lived as four independent hardcoded literals
+with the enum's own count sizing none of them; there is now one
+`kNumGpuStages` and a `static_assert`.
+
+## Summary
+
+| Item | Change | Intel | MX230 |
+| --- | --- | --- | --- |
+| A5 | `uf_merge`: drop the per-pixel integer divide | labelling flat | labelling -1.0% |
+| A6 | interleave the two hash-key arrays into one `uvec2` | boundary -13% | flat |
+| A4a | `uf_final`: saturating counter, not a histogram | uf_final **-59%** | (scalar -55%) |
+| A3 | fold the threshold value into `parent[]`'s spare bits | boundary **-33%** | boundary -4% |
+| A8-lite | skip the provably no-op atomics in the extents reduction | extents -2.6% | (scalar -3.3%) |
+| A2 | read the line-fit records in place where the memory type allows | readback_copy **-60%** | flat (fallback) |
+
+`pipeline_total` best over the series: Intel **9.02 -> 8.03 ms**, MX230
+**4.14 -> 4.23 ms**. The MX230 figure sits inside that device's own
+run-to-run spread (its totals wandered 3.79-4.25 ms across steps with no
+relation to what changed), so the honest reading is: a solid ~11% on the
+integrated part, nothing measurable on the discrete one. That asymmetry is the
+theme.
+
+Two of these also **reduce** the shader corpus. A3 retired
+`blob_diff_u8.comp` and `blob_diff_u8_subgroup.comp` - `blob_diff` was
+parametrized on the 8-bit axis crossed with the ballot axis purely because it
+read `thresholded` directly, and it no longer reads it at all - moving that
+axis to `label_pixels`, where it costs two variants instead of doubling two
+into four.
+
+## The finding that generalizes: contention relief does not compose
+
+Two independent items here (A4a, A8-lite) both helped the **scalar** shader
+variant and **hurt** the subgroup-aggregated one, for the same reason. This is
+the most transferable result in this pass.
+
+Subgroup aggregation and a cheap early-out are alternative answers to the same
+problem - too many contended atomics. Applying both is worse than either,
+because aggregation has already collapsed the atomics to roughly one per
+distinct key per subgroup, so the guard almost never fires and always costs a
+test (and, for A4a, a dependent load of a location other subgroups are
+concurrently updating). `uf_final` span on the MX230, min of 12:
+
+| | ms |
+| --- | --- |
+| scalar, unconditional (was) | 0.1812 |
+| scalar + saturating guard | **0.0809** |
+| aggregated, unconditional (was) | 0.2478 |
+| aggregated + saturating guard | 0.4024 |
+
+So both guards apply to the scalar variants only, and the aggregated variants
+keep their unconditional atomics with the numbers recorded inline. Since
+integrated parts take the scalar path - Mali included - the wins land on the
+path that matters for the deployment target.
+
+Worth flagging because it contradicts a claim in the tree: **scalar +
+saturating (0.0809) beats aggregated (0.2478) by 3x on the MX230, and
+scalar-unconditional already beat aggregated there (0.1812)**. The comment in
+`GpuDetector::CreatePipelines()` calling subgroup aggregation "a small but
+real and repeatable win" on discrete GPUs was measured on an RX 9060 XT and
+does not hold on this much smaller Pascal part. Retiring
+`uf_final_subgroup.comp` is *not* done - that hardware is not available to
+re-test, and this file is full of platform-specific inversions - but the case
+for it is now on record.
+
+## Measured and rejected
+
+**A1: collapse the four queue submissions.** Not attempted, because it
+already was. `bcfa3dc` merged the boundary+grouping submissions via
+device-side indirect dispatch (4 -> 3, verified bit-identical), `ecaeaae`
+reverted it, and `f436eb3` records why: removing a whole submission moved the
+unspanned residual by **0.05 ms**, not the ~0.37 ms that dividing the residual
+by submit count predicted. Going to a single submit would plausibly buy
+0.1-0.15 ms for a lot of device-side-sizing machinery. The reverted commit is
+on record if that judgement ever changes.
+
+**A11: precompute the per-pixel gradient weight `W`.**
+`sort_points_local`'s `ComputeLineFitPoint` takes four taps into the decimated
+image per boundary point, and visits points in *angular* order around each
+blob's perimeter, so they are scattered. `W` is a pure function of the image
+at `(ix, iy)`, so it was hoisted into `threshold.comp` - which already sweeps
+the same image coalesced - leaving one gather per point instead of four. That
+also deleted `sort_points_local_u8.comp`, since the shader stopped reading the
+decimated image at all. **Clear regression on both devices:**
+
+| | threshold | sort | net |
+| --- | --- | --- | --- |
+| MX230 | 0.135 -> 0.175 (+29%) | 0.134 -> 0.130 (-3%) | **+0.036 ms** |
+| Intel | 0.250 -> 0.338 (+35%) | 0.425 -> 0.417 (-2%) | **+0.080 ms** |
+
+The flaw is the ratio of work: `sort_points_local` needs `W` at ~17000 point
+locations, and the precompute produces it for all 256000 pixels - a 15x
+overcompute, plus a 1 MB buffer to write and read back. And the four taps it
+replaced were nearly free: removing three of four bought only 2-3%, because
+the decimated image is 256 KB at this resolution and simply lives in L2.
+
+**A7: back the decimated image with a tiled image and `texelFetch`.** Dropped
+on A11's evidence rather than on speculation. A design pass established that
+after A3 the *only* genuinely layout-sensitive consumer left is exactly this
+gradient gather: `uf_merge`/`uf_init` are dispatched 1D over the linear index,
+so a workgroup reads its own row and the row below as two perfectly coalesced
+streams and the row stride costs nothing; `block_minmax`'s 4x4 windows are
+disjoint, so global traffic is one read per pixel regardless of layout; and
+`decimate`/`threshold` are pure raster sweeps that an optimally-tiled layout
+would make *worse*. A11 then measured that one remaining gather to be worth
+2-3%. A read-only tiled replica - which is the portable form, since `R8_UINT`
+`STORAGE_IMAGE` is not mandatory but `SAMPLED_IMAGE | TRANSFER_DST` is, so it
+would be filled by `vkCmdCopyBufferToImage` and only ever sampled - would add
+a per-frame copy to chase less than that. Not worth a `vk::Image` abstraction
+plus a descriptor-layer change.
+
+**A8: pack `gx_sum` and `gy_sum` into one 32-bit `atomicAdd`.** The field
+widths do not exist. `reduce_extents_hash` runs *before* `select_blobs`, so it
+accumulates over raw blobs with no size filter - `max_cluster_pixels` (default
+100000) is applied later and does not bound it - and a single raw blob can own
+up to `qbp_capacity_` points (2,061,616 dense at 1080p/decimation 2). A biased
+sum then needs ~19-22 bits per field, so two cannot share a word; 16/16 fails
+too. Silent overflow in the border-polarity term would surface as an
+occasionally undetected tag on an untested scene, in exchange for 1 of 8
+atomics. A 64-bit `atomicAdd` has the width but needs
+`VK_KHR_shader_atomic_int64`, which is not core. The zero-guard subset
+(A8-lite) shipped instead.
+
+**A9: drop the bitonic network's barriers for sub-subgroup stages.** Bounded
+before building: an intentionally-incorrect build with **all** bitonic
+`barrier()` calls removed measured `sort` at 0.1198 against 0.1321 on the
+MX230, and 0.3989 against 0.4205 on Intel - a ceiling of 9% and 5% of a small
+span, or 0.012/0.022 ms. A9 could capture at most the ~75% of stages with
+`j < subgroupSize`, and would depend on local invocation indices mapping to
+subgroup lanes contiguously - not guaranteed without
+`VK_EXT_subgroup_size_control`'s full-subgroup guarantee, and Intel picks
+SIMD8/16/32 per shader, so the threshold would have to be a runtime
+`gl_SubgroupSize` branch. Not worth a portability assumption for 0.01-0.02 ms.
+
+**A10: separable 3x3 min/max in `block_filter`.** Also bounded first:
+reducing the 3x3 window to 1x1 (incorrect) put the *entire* cost of that
+gather at 0.030 ms on Intel and 0.015 ms on the MX230. Separable saves 3 of 9
+loads, so ~1/3 of that, while adding a dispatch, a barrier and an intermediate
+buffer's write+read - and on Intel a trivial pass over 16000 elements costs
+about as much as the 0.010 ms it would save. Cannot win.
+
+## A note on method
+
+Three of those rejections were settled by building a deliberately **incorrect**
+shader to bound the payoff before writing the correct one: removing all the
+barriers, shrinking a window to 1x1, forcing a guard to never fire. Each took
+one build and a few minutes, and each killed a change that would otherwise
+have taken an afternoon to write and then revert. Worth doing first whenever
+the mechanism is "this access is expensive" - on this pipeline the answer was
+repeatedly that it is not, because the working set at 1280x800 with 8-bit
+storage fits in L2. Re-measure at 1080p and decimation 1 before trusting that
+on a real target.
+
+One trap worth naming: the obvious cheap A/B for A4a was to leave the guard
+in and set the floor unreachably high so it never fires. That is **not** a
+proxy for the original code - it measures load-plus-atomic where the original
+was atomic-only, and on Intel it read 3.22 ms against the true baseline's
+0.74 ms. The guard has to actually be compiled out.
+
+## Where the time goes now
+
+Single instrumented frame, `grayimage.pgm` at 1280x800, default config:
+
+| Stage | Intel Iris Plus | MX230 |
+| --- | --- | --- |
+| clear | 0.418 | 0.039 |
+| threshold + decimate | 0.265 | 0.136 |
+| labelling | 1.355 | 1.208 |
+| uf_final | 0.344 | 0.251 |
+| label_pixels | 0.075 | 0.082 |
+| boundary | 0.211 | 0.201 |
+| hash_group | 0.189 | 0.056 |
+| extents | 2.027 | 0.284 |
+| select | 0.020 | 0.005 |
+| blob_scan | 0.086 | 0.023 |
+| scatter | 0.237 | 0.053 |
+| sort + line-fit | 0.525 | 0.131 |
+| readback_copy | 0.034 | 0.098 |
+| **sum of spans** | **5.787** | **2.567** |
+| GPU total (best/median of 25) | 7.47 / 8.25 | 3.79 / 4.06 |
+| `quad_decode` (CPU) | 0.37 / 0.47 | 0.29 / 0.40 |
+| `tag_decode` (CPU) | 0.10 / 0.17 | 0.09 / 0.14 |
+| **pipeline_total** | **8.03 / 9.04** | **4.23 / 4.58** |
+
+The obvious next target on the Intel part is **`extents` at 2.03 ms** - 35% of
+its whole frame, and 7x what the same stage costs on the MX230. An outlier
+that large is more likely a driver or access-pattern pathology specific to
+that part than anything about the algorithm, and it is also the noisiest span
+there (min 1.80-1.90 across repeats, excursions past 4 ms). Nothing in this
+pass explains it; it was not chased because the deployment target is not an
+Intel iGPU.
