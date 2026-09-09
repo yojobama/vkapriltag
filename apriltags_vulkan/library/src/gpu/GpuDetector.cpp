@@ -269,10 +269,12 @@ void GpuDetector::CreateBuffers() {
   // C++ mirror struct exists since nothing on the host ever reads one back.
   qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(uint32_t));
   qbp_counter_buf_ = ssbo(4);
-  // Only the grouping hash reads these now, so they are sized to the actual
-  // point capacity rather than the power of two a bitonic network needed.
-  qbp_keys_hi_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
-  qbp_keys_lo_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
+  // Only the grouping hash reads this now, so it is sized to the actual point
+  // capacity rather than the power of two a bitonic network needed. One
+  // interleaved uvec2 per point rather than two parallel uint arrays: the
+  // hash's probe loop compares a whole (rep0, rep1) key, so split arrays cost
+  // two random gathers into two separate buffers per probe. Same total bytes.
+  qbp_keys_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 8);
 
   extents_buf_ = ssbo(VkDeviceSize(config_.max_raw_blobs) * sizeof(MinMaxExtentsGpu));
   selected_extents_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu));
@@ -443,7 +445,7 @@ void GpuDetector::CreatePipelines() {
   blob_diff_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(blob_diff_shader),
       {thresholded_buf_.get(), parent_buf_.get(), qbp_compacted_buf_.get(),
-       qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get()},
+       qbp_counter_buf_.get(), qbp_keys_buf_.get()},
       12, wg2d_);
 
   label_pixels_pl_ = vk::ComputePipeline(
@@ -498,7 +500,7 @@ void GpuDetector::CreatePipelines() {
 
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
-      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), hash_owner_buf_.get(),
+      {qbp_keys_buf_.get(), hash_owner_buf_.get(),
        point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
        hash_drop_counter_buf_.get()},
       12, wg1d_);

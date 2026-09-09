@@ -32,13 +32,19 @@
 // 1-based - so this is a strict replacement, not an approximation.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer KeysHi { uint keys_hi[]; };
-layout(std430, binding = 1) readonly buffer KeysLo { uint keys_lo[]; };
-layout(std430, binding = 2) buffer HashOwner { uint hash_owner[]; };
-layout(std430, binding = 3) writeonly buffer PointSlot { uint point_slot[]; };
-layout(std430, binding = 4) writeonly buffer SlotDense { uint slot_dense[]; };
-layout(std430, binding = 5) buffer RawBlobCounter { uint raw_blob_counter; };
-layout(std430, binding = 6) buffer DropCounter { uint drop_counter; };
+// One uvec2 per point rather than two parallel uint arrays: the probe loop
+// below compares a candidate slot's whole (rep0, rep1) key, so split arrays
+// meant two random gathers into two separate ~800 KB buffers - two cache
+// lines - for every probe iteration. std430 gives a uvec2 array stride 8 and
+// alignment 8, and the descriptor is bound at offset 0, so this is a single
+// naturally-aligned 8-byte load instead. blob_diff.comp's append() likewise
+// does one 8-byte store where it did two scattered 4-byte ones.
+layout(std430, binding = 0) readonly buffer Keys { uvec2 keys[]; };
+layout(std430, binding = 1) buffer HashOwner { uint hash_owner[]; };
+layout(std430, binding = 2) writeonly buffer PointSlot { uint point_slot[]; };
+layout(std430, binding = 3) writeonly buffer SlotDense { uint slot_dense[]; };
+layout(std430, binding = 4) buffer RawBlobCounter { uint raw_blob_counter; };
+layout(std430, binding = 5) buffer DropCounter { uint drop_counter; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -50,12 +56,11 @@ void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= pc.count) return;
 
-  uint k0 = keys_hi[i];
-  uint k1 = keys_lo[i];
+  uvec2 k = keys[i];
 
   // 64 -> 32 bit mix (murmur-style finalizer). The keys are dense small ids,
   // so a plain xor/shift would cluster badly under linear probing.
-  uint h = k0 * 0x9E3779B1u + k1 * 0x85EBCA6Bu;
+  uint h = k.x * 0x9E3779B1u + k.y * 0x85EBCA6Bu;
   h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
   h &= pc.table_mask;
 
@@ -72,7 +77,7 @@ void main() {
       owner = (prev == 0u) ? (i + 1u) : prev;
     }
     uint o = owner - 1u;
-    if (keys_hi[o] == k0 && keys_lo[o] == k1) {
+    if (keys[o] == k) {
       point_slot[i] = h;
       return;
     }

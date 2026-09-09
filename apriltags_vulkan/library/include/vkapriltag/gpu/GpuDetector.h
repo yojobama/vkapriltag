@@ -449,7 +449,7 @@ class GpuDetector {
   // it as a per-pixel label rather than a raw union-find parent.
   vk::Buffer parent_buf_, blob_size_buf_, uf_changed_buf_;
   vk::Buffer qbp_compacted_buf_, qbp_counter_buf_;
-  vk::Buffer qbp_keys_hi_buf_, qbp_keys_lo_buf_;
+  vk::Buffer qbp_keys_buf_;
   vk::Buffer extents_buf_;
   vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
   vk::Buffer index_points_buf_;

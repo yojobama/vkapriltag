@@ -47,8 +47,7 @@ layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y
 layout(std430, binding = 1) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 2) writeonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 3) buffer Counter { uint counter; };
-layout(std430, binding = 4) writeonly buffer KeysHi { uint keys_hi[]; };
-layout(std430, binding = 5) writeonly buffer KeysLo { uint keys_lo[]; };
+layout(std430, binding = 4) writeonly buffer Keys { uvec2 keys[]; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -107,9 +106,10 @@ void append(bool want_append, uint rep_a, uint rep_b, uint px, uint py, int gx, 
   compacted[pos] = PackQBPoint(px, py, gx, gy);
 
   // Re-read by hash_group.comp when it compares a probed slot's claimant
-  // against this point.
-  keys_hi[pos] = min(rep_a, rep_b);
-  keys_lo[pos] = max(rep_a, rep_b);
+  // against this point. One interleaved uvec2 rather than two parallel uint
+  // arrays, so this is a single 8-byte store and hash_group's probe
+  // comparison is a single 8-byte load - see hash_group.comp's Keys comment.
+  keys[pos] = uvec2(min(rep_a, rep_b), max(rep_a, rep_b));
 }
 
 void main() {
