@@ -8,8 +8,13 @@ WorkerPool::WorkerPool(unsigned threads) {
   if (total == 0) total = 1;
 
   workers_.reserve(total - 1);
+  // Slot 0 is reserved for ParallelFor's calling thread (see WorkerPool.h);
+  // pool workers get 1, 2, ... - captured by value here, not read from any
+  // thread_local, so each worker thread knows its own fixed slot with no
+  // per-thread storage of any kind.
   for (unsigned i = 0; i + 1 < total; ++i) {
-    workers_.emplace_back([this] { WorkerMain(); });
+    const unsigned slot = i + 1;
+    workers_.emplace_back([this, slot] { WorkerMain(slot); });
   }
 }
 
@@ -25,21 +30,21 @@ WorkerPool::~WorkerPool() {
   }
 }
 
-void WorkerPool::DrainBatch() {
+void WorkerPool::DrainBatch(unsigned slot) {
   // fn_ and count_ are guaranteed stable for the whole batch: ParallelFor does
   // not clear them until every participant has left this function.
-  const std::function<void(size_t)> *fn = fn_;
+  const std::function<void(size_t, unsigned)> *fn = fn_;
   if (fn == nullptr) return;
   const size_t count = count_;
 
   for (;;) {
     const size_t i = next_.fetch_add(1, std::memory_order_relaxed);
     if (i >= count) break;
-    (*fn)(i);
+    (*fn)(i, slot);
   }
 }
 
-void WorkerPool::WorkerMain() {
+void WorkerPool::WorkerMain(unsigned slot) {
   uint64_t seen = 0;
   for (;;) {
     {
@@ -49,7 +54,7 @@ void WorkerPool::WorkerMain() {
       seen = generation_;
     }
 
-    DrainBatch();
+    DrainBatch(slot);
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -58,13 +63,13 @@ void WorkerPool::WorkerMain() {
   }
 }
 
-void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t)> &fn) {
+void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn) {
   if (count == 0) return;
 
   // Not worth waking anyone for a single item, and this is also the
-  // single-threaded configuration's only path.
+  // single-threaded configuration's only path. Slot 0: the calling thread.
   if (workers_.empty() || count == 1) {
-    for (size_t i = 0; i < count; ++i) fn(i);
+    for (size_t i = 0; i < count; ++i) fn(i, 0);
     return;
   }
 
@@ -78,8 +83,9 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t)> &fn
   }
   batch_ready_.notify_all();
 
-  // The calling thread takes a share of the work rather than blocking idle.
-  DrainBatch();
+  // The calling thread takes a share of the work rather than blocking idle,
+  // as slot 0 (see WorkerPool.h).
+  DrainBatch(0);
 
   {
     std::unique_lock<std::mutex> lock(mutex_);
