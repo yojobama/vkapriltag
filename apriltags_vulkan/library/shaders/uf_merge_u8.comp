@@ -1,0 +1,83 @@
+#version 450
+// Identical to uf_merge.comp except Thresholded is uint8_t per pixel instead
+// of uint - see decimate_u8.comp's comment. Parent stays uint32 (union-find
+// indices routinely exceed 255).
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Parent { uint parent[]; };
+layout(std430, binding = 1) readonly buffer Thresholded { uint8_t thresholded[]; };
+layout(std430, binding = 2) buffer Changed { uint changed_flag; };
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+} pc;
+
+shared uint wg_changed;
+
+uint find(uint n) {
+  uint p = parent[n];
+  while (p != n) {
+    n = p;
+    p = parent[n];
+  }
+  return n;
+}
+
+// Returns true if the two elements were in distinct components (i.e. this
+// call performed real work and the labelling has not converged yet).
+bool doUnion(uint a, uint b) {
+  bool merged = false;
+  bool done = false;
+  while (!done) {
+    a = find(a);
+    b = find(b);
+    if (a < b) {
+      uint old = atomicMin(parent[b], a);
+      done = (old == b);
+      merged = true;
+      b = old;
+    } else if (b < a) {
+      uint old = atomicMin(parent[a], b);
+      done = (old == a);
+      merged = true;
+      a = old;
+    } else {
+      done = true;
+    }
+  }
+  return merged;
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint total = pc.width * pc.height;
+
+  // NOTE: every invocation must reach both barriers below, so the bounds and
+  // "ambiguous pixel" tests select work rather than returning early.
+  if (gl_LocalInvocationID.x == 0u) wg_changed = 0u;
+  memoryBarrierShared();
+  barrier();
+
+  bool merged = false;
+  if (i < total) {
+    uint y = i / pc.width;
+    uint v = uint(thresholded[i]);
+    if (v != 127u) {
+      if (y + 1u < pc.height && uint(thresholded[i + pc.width]) == v) {
+        if (doUnion(i, i + pc.width)) merged = true;
+      }
+    }
+  }
+
+  if (merged) atomicOr(wg_changed, 1u);
+  memoryBarrierShared();
+  barrier();
+
+  if (gl_LocalInvocationID.x == 0u && wg_changed != 0u) {
+    atomicOr(changed_flag, 1u);
+  }
+}

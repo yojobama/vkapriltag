@@ -1,0 +1,34 @@
+#version 450
+// Builds a VkDispatchIndirectCommand (groupCountX/Y/Z) from a device-side
+// count, so init_extents.comp / select_blobs.comp can be dispatched over the
+// frame's actual raw blob count instead of the worst-case max_raw_blobs -
+// the count (raw_blob_counter_buf_, populated by hash_group.comp's winning
+// CAS threads) only exists on the device at this point in the frame, so
+// avoiding a host round-trip to read it back means building the dispatch
+// arguments here instead.
+//
+// Single invocation: negligible cost next to the traffic it saves
+// downstream (both consumers were previously dispatched over the full
+// max_raw_blobs capacity - 65536 by default, against a couple hundred to a
+// couple thousand real raw blobs on a typical frame).
+//
+// groupCountX is rounded UP to the next whole workgroup, so the last
+// partial group may cover a few indices past the real count - harmless,
+// since both consumers already bounds-check every invocation against
+// max_raw_blobs (a compile/record-time-known push constant, unchanged by
+// this) before touching any buffer; this shader only has to get "large
+// enough to cover the count", not exact.
+layout(local_size_x_id = 0, local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Count { uint count; };
+layout(std430, binding = 1) writeonly buffer IndirectArgs { uint args[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint workgroup_size;
+} pc;
+
+void main() {
+  args[0] = (count + pc.workgroup_size - 1u) / pc.workgroup_size;
+  args[1] = 1u;
+  args[2] = 1u;
+}

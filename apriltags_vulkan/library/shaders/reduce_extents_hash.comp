@@ -1,19 +1,19 @@
 #version 450
 // reduce_extents.comp, keyed off the hash slot instead of off a run in a
-// sorted array. Identical arithmetic; the only differences are where the raw
-// blob index comes from, and that `starting_offset` is no longer meaningful
-// (there is no sorted array to offset into - scatter_index_points.comp places
-// each point with a per-blob cursor instead).
+// sorted array. Identical arithmetic; the only difference is where the raw
+// blob index comes from - there is no sorted array to offset into,
+// scatter_index_points.comp places each point with a per-blob cursor
+// instead, and MinMaxExtentsGpu no longer even carries a starting_offset
+// field (see common.glsl).
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer Compacted { QBPoint compacted[]; };
+layout(std430, binding = 0) readonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
-layout(std430, binding = 3) readonly buffer HashOwner { uint hash_owner[]; };
-layout(std430, binding = 4) buffer Extents { MinMaxExtentsGpu extents[]; };
+layout(std430, binding = 3) buffer Extents { MinMaxExtentsGpu extents[]; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -31,14 +31,7 @@ void main() {
   if (bi == 0u || bi > pc.max_raw_blobs) return;
   bi -= 1u;
 
-  QBPoint p = compacted[i];
-  if (p.valid == 0u) return;
-
-  if (hash_owner[slot] == i + 1u) {
-    extents[bi].starting_offset = 0u;
-    extents[bi].rep0 = p.rep0;
-    extents[bi].rep1 = p.rep1;
-  }
+  QBPoint p = UnpackQBPoint(compacted[i]);
 
   int x = int(p.x);
   int y = int(p.y);

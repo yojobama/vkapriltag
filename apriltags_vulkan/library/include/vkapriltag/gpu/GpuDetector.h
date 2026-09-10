@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -11,6 +12,7 @@
 #include "vkapriltag/vk/Buffer.h"
 #include "vkapriltag/vk/ComputePipeline.h"
 #include "vkapriltag/vk/Context.h"
+#include "vkapriltag/vk/QueryPool.h"
 
 namespace apriltag_vulkan {
 
@@ -21,6 +23,25 @@ namespace apriltag_vulkan {
 struct DetectorConfig {
   uint32_t width = 0;
   uint32_t height = 0;
+
+  // Integer downsampling factor applied before thresholding/labelling - 1
+  // disables decimation entirely (the full-resolution image is processed
+  // as-is), 2 is this pipeline's original fixed behaviour, 4 halves linear
+  // resolution again, etc. Matches upstream apriltag's `quad_decimate`,
+  // restricted to integers (this pipeline's decimate.comp always samples
+  // one representative pixel per NxN block - "copies rather than
+  // averages", matching CudaToGreyscaleAndDecimateHalide - it never
+  // implements upstream's separate 1.5x blended-average path).
+  //
+  // Fixed for the lifetime of a GpuDetector/QuadDecode pair: it is baked
+  // into decimate.comp's dispatch as a specialization constant (resolved
+  // at CreatePipelines() time, not read per-invocation), so choosing a
+  // value costs nothing beyond the pixel count that value implies - a
+  // smaller factor means more decimated pixels for every downstream stage
+  // to process, which is a real, unavoidable cost of the lower decimation,
+  // not overhead this field adds on top of it. `width`/`height` must each
+  // be evenly divisible by this value.
+  uint32_t decimation = 2;
 
   uint32_t min_white_black_diff = 5;
   uint32_t min_cluster_pixels = 24;
@@ -33,7 +54,7 @@ struct DetectorConfig {
   // (default) disables this and leaves min_cluster_pixels as the only floor.
   // When set, GpuDetector raises min_cluster_pixels to whatever a
   // min_tag_pixels-wide square tag's boundary-point count would be at this
-  // pipeline's fixed 2x decimation (4 sides x min_tag_pixels/2 decimated
+  // detector's `decimation` (4 sides x min_tag_pixels/decimation decimated
   // pixels each), so undersized noise/text/foliage blobs never reach the
   // expensive per-blob CPU quad fit. Declaring this is strictly a recall/
   // throughput trade: tags smaller than it are guaranteed to be dropped.
@@ -64,6 +85,31 @@ struct DetectorConfig {
 
   float max_line_fit_mse = 10.0f;
   double cos_critical_rad = 0.98;  // ~cos(11 degrees), matches typical apriltag default
+
+  // Corner-seeding algorithm for QuadDecode's per-blob quad fit (CPU tail).
+  // kPeaks is the exact port of the original windowed-error + 7-tap-filter +
+  // peak-detection + C(10,4) combinatorial search. kDp (default) seeds 4
+  // corners geometrically instead - the two mutually-farthest boundary
+  // points, plus the point of maximum perpendicular deviation on each
+  // resulting arc - skipping the combinatorial search entirely, and falls
+  // back to kPeaks per-blob whenever DP doesn't cleanly yield 4 points whose
+  // segments pass the same max_line_fit_mse gate the combinatorial search
+  // uses (measured ~8% of blobs at decimation 2). See QuadDecode.cpp's
+  // FitQuadForBlob/TryDpQuad.
+  //
+  // Made default after measuring both on the corpus at every decimation on
+  // both dev targets: identical decoded tag ID sets throughout, corner RMS
+  // differences confined to the third decimal place with no systematic
+  // direction (DP is sometimes better, sometimes worse, always well under
+  // 0.1 px) - i.e. two heuristics occasionally picking a different
+  // equally-valid candidate quad, not a quality regression. quad_decode is
+  // an algorithmic win (skips the O(C(10,4)) search entirely, not a
+  // constant-factor speedup), so it scales with how much weaker the CPU is:
+  // ~12% faster on RX 9060 XT but ~47% faster on Mali-G610
+  // (quad_decode median 2.99 -> 1.59 ms, pipeline_total 11.45 -> 10.14 ms).
+  // Env override: APRILTAG_VK_QUADFIT=peaks|dp
+  enum class QuadFitMethod { kPeaks, kDp };
+  QuadFitMethod quad_fit_method = QuadFitMethod::kDp;
 
   // Defensive caps (deliberately smaller than the CUDA implementation's
   // dense worst-case sizing, which would otherwise waste tens of MB with no
@@ -151,9 +197,152 @@ class GpuDetector {
     // Work actually dispatched, which is the interesting part.
     uint32_t boundary_points = 0;     // compacted QBPoints this frame
     uint32_t raw_blobs = 0;           // distinct (rep0, rep1) pairs this frame
+    // Boundary points hash_group.comp couldn't place within max_probes probes
+    // (see its comment) - i.e. dropped, not grouped into any blob. 0 for
+    // every real scene at the current table sizing; watch this if
+    // max_raw_blobs / the hash table sizing is ever tightened further.
+    uint32_t hash_probe_drops = 0;
+    // Selected blobs whose point count exceeded sort_points_local's per-blob
+    // capacity (local_sort_virtual_cap_) and so came back in their original,
+    // unsorted order. Unlike a merely imprecise fit this is a silent total
+    // failure for those candidates: QuadDecode walks these points as an
+    // ordered perimeter, so an unsorted blob fits a meaningless quad rather
+    // than a slightly worse one.
+    //
+    // Nonzero is normal and not by itself a problem - a 1080p scene yields a
+    // handful of large background structures that pass select_blobs.comp's
+    // shape filters and exceed any sane per-blob capacity (measured: 4 at
+    // decimation 2, 3 at decimation 1, 1 at decimation 4). Those fit junk
+    // quads that harmlessly fail to decode. What this counter is for is the
+    // case where an *expected tag* goes missing: a tag's own border landing
+    // here cannot be detected at all, and that failure is otherwise
+    // invisible. If a tag is missing and this is nonzero, the capacity is
+    // the first thing to suspect - that is precisely how decimation 1 was
+    // broken, its ~2400-point tag border overflowing a 2048-slot ceiling.
+    uint32_t oversized_sort_blobs = 0;
     uint32_t uf_iterations = 0;       // labelling passes until convergence
     uint32_t submits = 0;             // queue submissions this frame
     bool uf_converged = true;         // false if max_uf_iterations was hit
+
+    // Per-shader-group GPU timing, from vkCmdWriteTimestamp pairs bracketing
+    // each named span - finer than the four submission-level phases above.
+    // Populated only when vk::DeviceCaps::timestamps_supported is true;
+    // gpu_stage_ms[i] is 0 for a span this frame's control flow skipped
+    // entirely (e.g. the boundary-point stages when qbp_count == 0). See
+    // GpuDetector::kGpuStageNames for what each index means. This is
+    // diagnostic only - printed by the validate tool behind
+    // APRILTAG_VK_TIMESTAMPS=1 - and costs nothing when timestamps aren't
+    // supported or the pool wasn't constructed.
+    bool has_gpu_stage_breakdown = false;
+    std::array<double, 12> gpu_stage_ms = {};
+
+    // GPU-side gap between the END of named span i and the START of named
+    // span i+1 (11 gaps between 12 spans), computed from the SAME
+    // vkCmdWriteTimestamp pairs gpu_stage_ms already uses - no extra query
+    // pool slots. Unlike (cpu_submit_wait_ms - sum(gpu_stage_ms)) below,
+    // which mixes CPU-observed wait time with GPU time, this is purely
+    // GPU-clock-to-GPU-clock, so it directly attributes the "unspanned"
+    // residual to a specific location rather than only its total.
+    //
+    // 3 of these 11 gaps cross a submit boundary (Labelling->LabelFinalize,
+    // Boundary->HashGroup, Scatter->Sort - see Detect()'s "Submit N:"
+    // comments) and so include queue-submit/fence overhead on top of any
+    // GPU-side barrier cost; the other 8 are purely intra-submit
+    // inter-dispatch barriers. Comparing the two groups is what tells apart
+    // "submit round-trips are expensive" (already measured false - see
+    // cpu_submit_wait_ms's comment) from "per-barrier cost accumulates
+    // across many small dispatches" (the standing hypothesis this exists to
+    // test directly instead of by inference).
+    std::array<double, 11> gpu_gap_ms = {};
+
+    // --- Host-side cost of driving the GPU, split out from the phase timers
+    // above. The phase timers (threshold_label_ms etc.) are wall-clock and so
+    // bundle four distinct things together: command recording, the queue
+    // submit, the blocking fence wait (which spans the GPU's actual
+    // execution), and the counter readbacks between submits. gpu_stage_ms
+    // measures only the third of those, and only the parts inside a named
+    // span - so `sum(gpu_stage_ms)` being well under `gpu_ms` says the
+    // difference is host-side, but not which part. These three say which.
+    //
+    // cpu_submit_wait_ms INCLUDES the GPU execution it waits on, so
+    // (cpu_submit_wait_ms - sum(gpu_stage_ms)) is the frame's GPU-side time
+    // that no span accounts for. At 1080p on Mali-G610 that residual is
+    // ~1.5 ms, and it is worth recording what it is NOT, because the
+    // intuitive readings were measured and disproved:
+    //
+    //  - It is not per-submission latency in the naive "divide by submit
+    //    count" sense. Dividing it by the submit count suggested ~0.37 ms
+    //    per submit, so the frame was restructured from 4 submissions to 3
+    //    (device-side dispatch sizing, so the host no longer read a counter
+    //    back mid-frame). That moved the residual by 0.05 ms, not 0.37 - and
+    //    the divided figure went UP, which is the signature of a
+    //    mostly-fixed cost being spread over fewer submissions. Reverted.
+    //  - It is not the per-frame buffer clears. Those are ~2.3 MB of
+    //    vkCmdFillBuffer and measure 0.08 ms (see kSpanClear).
+    //  - It is NOT mostly inter-dispatch barriers, despite what this comment
+    //    used to claim. gpu_gap_ms (above) measures each of the 11 gaps
+    //    between named spans directly, GPU-clock to GPU-clock: the 8 gaps
+    //    that sit entirely inside one submit total ~0.04 ms combined on
+    //    Mali-G610 - noise, not the dominant cost. Nearly everything is at
+    //    the 3 gaps that cross a submit boundary, and even there the
+    //    GPU-clock-visible gap (~0.7 ms) is under half of this residual
+    //    (~1.5 ms) - the rest is CPU-side time no GPU timestamp can see at
+    //    all (fence-wait wake latency, host readback, driver submission
+    //    overhead), which is exactly why the submit-count reduction above
+    //    barely moved it: that experiment removed a submission but not the
+    //    surrounding fence-wait/readback machinery the remaining ones still
+    //    pay for. Reducing intra-submit dispatch/barrier count has almost
+    //    nothing left to give (~0.04 ms ceiling); any further reduction of
+    //    this residual has to come from removing a submit boundary's
+    //    fence-wait/readback cost outright, not from fusing shaders within
+    //    an existing submit.
+    double cpu_begin_ms = 0.0;        // BeginCommands: ring fence wait + resets
+    double cpu_submit_wait_ms = 0.0;  // EndCommandBuffer + QueueSubmit + WaitForFences
+    double cpu_counter_read_ms = 0.0; // ReadCounterSlot invalidate + read
+  };
+
+  // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
+  // vkCmdWriteTimestamp pair (start, end) recorded around the named group of
+  // dispatches - see the kSpan* constants and their use in Detect().
+  static constexpr std::array<const char *, 12> kGpuStageNames = {
+      "clear",          // the per-frame vkCmdFillBuffer set + the gray upload
+                        // copy. ~2.3 MB of fills at 1080p, and outside every
+                        // other span, so it was landing in the unattributed
+                        // gap that the submit-count reduction failed to move.
+      "threshold",      // decimate + block_minmax + block_filter + threshold
+      "labelling",      // uf_init + uf_compress + the uf_merge/uf_compress loop
+      "label_finalize", // uf_final + label_pixels
+      "boundary",       // blob_diff (append + compaction)
+      "hash_group",     // hash_group.comp (also assigns dense raw blob ids)
+      "extents",        // init_extents.comp + reduce_extents_hash.comp
+      "select",         // select_blobs.comp
+      "blob_scan",      // extract_blob_counts.comp + its scan chain
+      "scatter",        // scatter_index_points.comp
+      "sort",           // sort_points_local.comp - fused with the line-fit
+                        // moment computation, see its own comment
+      "readback_copy",  // the device->staging vkCmdCopyBuffer pair for the
+                        // extents + line-fit payloads. Inside submit 4 but
+                        // not compute, so it would otherwise land in the
+                        // unattributed gap alongside genuine round-trip cost.
+  };
+
+  // Whether DetectProfile::gpu_gap_ms[g] (the gap after kGpuStageNames[g])
+  // crosses a queue-submit boundary - i.e. Detect()'s "Submit N:" comments
+  // place kGpuStageNames[g] and [g+1] in different submits, so that gap
+  // includes queue-submit/fence overhead on top of any GPU-side barrier
+  // cost, unlike the other 8 gaps (purely intra-submit).
+  static constexpr std::array<bool, 11> kGpuGapCrossesSubmit = {
+      false,  // clear -> threshold (submit 1)
+      false,  // threshold -> labelling (submit 1)
+      true,   // labelling -> label_finalize (submit 1 -> 2)
+      false,  // label_finalize -> boundary (submit 2)
+      true,   // boundary -> hash_group (submit 2 -> 3)
+      false,  // hash_group -> extents (submit 3)
+      false,  // extents -> select (submit 3)
+      false,  // select -> blob_scan (submit 3)
+      false,  // blob_scan -> scatter (submit 3)
+      true,   // scatter -> sort (submit 3 -> 4)
+      false,  // sort -> readback_copy (submit 4)
   };
 
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
@@ -194,7 +383,19 @@ class GpuDetector {
   // Copies a device counter into the shared counter staging buffer and reads
   // it back after the submission retires.
   void RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &counter, uint32_t slot);
-  uint32_t ReadCounterSlot(uint32_t slot) const;
+  // Non-const because it accumulates its own cost into last_profile_ (the
+  // counter readback is a real per-submission cost on a device where the
+  // staging buffer is non-coherent and needs an invalidate - see
+  // MemoryKind::HostVisibleCached).
+  uint32_t ReadCounterSlot(uint32_t slot);
+
+  // ctx_.BeginCommands() / ctx_.SubmitAndWait() with the host-side cost
+  // accumulated into last_profile_ (see DetectProfile::cpu_*_ms). Detect()
+  // uses these rather than calling the Context methods directly, so the
+  // per-submission overhead is attributed rather than silently folded into
+  // whichever wall-clock phase happened to contain it.
+  VkCommandBuffer BeginTimedCommands();
+  void SubmitTimedAndWait(VkCommandBuffer cmd);
 
   // Grows the readback staging buffer if needed (never shrinks, so steady
   // state performs no allocation).
@@ -223,31 +424,48 @@ class GpuDetector {
   vk::Buffer gray_buf_, decimated_buf_;
   vk::Buffer minmax_unfiltered_buf_, minmax_filtered_buf_;
   vk::Buffer thresholded_buf_;
+  // parent_buf_ is repurposed after labelling converges: label_pixels.comp
+  // overwrites each entry in place with "1 + union-find root, or 0 if the
+  // blob is too small" (see that shader's comment), so blob_diff.comp reads
+  // it as a per-pixel label rather than a raw union-find parent.
   vk::Buffer parent_buf_, blob_size_buf_, uf_changed_buf_;
   vk::Buffer qbp_compacted_buf_, qbp_counter_buf_;
   vk::Buffer qbp_keys_hi_buf_, qbp_keys_lo_buf_;
   vk::Buffer extents_buf_;
   vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
-  // Per-pixel "1 + union-find root, or 0 if the blob is too small" (see
-  // label_pixels.comp). Sized to `pixels`.
-  vk::Buffer pixel_label_buf_;
-  vk::Buffer index_points_buf_, index_points_counter_buf_;
-  vk::Buffer index_points_sorted_buf_;
+  vk::Buffer index_points_buf_;
   // Inclusive scan of each selected blob's point count (see
   // extract_blob_counts.comp), sized to config_.max_blobs. Gives
   // rewrite_index_points.comp / sort_points_local.comp each blob's base
-  // offset into index_points_buf_/index_points_sorted_buf_.
+  // offset into index_points_buf_.
   vk::Buffer blob_point_offsets_buf_;
+  // Written directly by sort_points_local.comp, fused with the angular
+  // sort - see that shader's comment. No intermediate sorted-IPoint buffer.
   vk::Buffer line_fit_points_buf_;
 
   // --- Hash grouping (replaces the global (rep0, rep1) sort) ---
   // hash_owner_buf_[slot] is 0 when free, else 1 + the index of the boundary
   // point that claimed the slot. point_slot_buf_[i] is point i's slot.
-  // slot_dense_buf_ is mark_slots.comp's 0/1 flags, scanned in place into a
-  // 1-based raw blob id. blob_cursor_buf_ is one output cursor per selected
-  // blob for scatter_index_points.comp.
+  // slot_dense_buf_[slot] is a 1-based raw blob id, assigned directly by
+  // hash_group.comp's winning atomicCompSwap thread (see its comment) - no
+  // separate mark+scan pass. raw_blob_counter_buf_ is that assignment's
+  // shared atomic counter; its value after hash_group.comp runs is the
+  // frame's raw blob count. blob_cursor_buf_ is one output cursor per
+  // selected blob for scatter_index_points.comp.
   vk::Buffer hash_owner_buf_, point_slot_buf_, slot_dense_buf_, blob_cursor_buf_;
+  vk::Buffer raw_blob_counter_buf_;
+  // Points hash_group.comp couldn't place within max_probes - see
+  // DetectProfile::hash_probe_drops.
+  vk::Buffer hash_drop_counter_buf_;
+  // Blobs sort_points_local.comp had to pass through unsorted - see
+  // DetectProfile::oversized_sort_blobs.
+  vk::Buffer oversized_sort_counter_buf_;
   uint32_t hash_table_size_ = 0;
+
+  // VkDispatchIndirectCommand built on-device from raw_blob_counter_buf_ by
+  // build_indirect_args_pl_, so init_extents_pl_ / select_blobs_pl_ dispatch
+  // over the frame's actual raw blob count instead of max_raw_blobs.
+  vk::Buffer indirect_args_buf_;
 
   // --- Host-visible staging, allocated once and permanently mapped ---
   // upload_staging_ is unused on unified-memory devices, where gray_buf_ is
@@ -258,9 +476,9 @@ class GpuDetector {
   VkDeviceSize readback_capacity_ = 0;
   bool gray_direct_write_ = false;
 
-  // Scan chains for the root-dense-id assignment (sized to `pixels`) and the
-  // per-blob point-offset assignment (sized to config_.max_blobs).
-  ScanChain slot_scan_chain_;
+  // Scan chain for the per-blob point-offset assignment (sized to
+  // config_.max_blobs). The hash table's raw-blob numbering no longer needs
+  // one - see raw_blob_counter_buf_.
   ScanChain blob_scan_chain_;
   // Largest point count sort_points_local.comp can sort in shared memory for
   // one blob (a power of two, derived from device limits at construction).
@@ -284,12 +502,11 @@ class GpuDetector {
   vk::ComputePipeline init_extents_pl_;
   vk::ComputePipeline label_pixels_pl_;
   vk::ComputePipeline select_blobs_pl_;
+  // Builds indirect_args_buf_ from raw_blob_counter_buf_ - see that buffer's
+  // comment.
+  vk::ComputePipeline build_indirect_args_pl_;
 
-  vk::ComputePipeline compute_line_fit_points_pl_;
-  vk::ComputePipeline hash_group_pl_, mark_slots_pl_, reduce_extents_hash_pl_,
-      scatter_index_points_pl_;
-  std::vector<vk::ComputePipeline> slot_scan_block_pls_;
-  std::vector<vk::ComputePipeline> slot_scan_add_offsets_pls_;
+  vk::ComputePipeline hash_group_pl_, reduce_extents_hash_pl_, scatter_index_points_pl_;
 
 
   // Per-blob point base-offset assignment (extract_blob_counts.comp + an
@@ -306,6 +523,33 @@ class GpuDetector {
   // Seeds the first labelling chunk, so steady-state video converges in one
   // chunk plus one verification rather than rediscovering the count each frame.
   uint32_t last_uf_iterations_ = 0;
+
+  // --- GPU timestamp profiling (see kGpuStageNames) ---
+  // Two timestamps (start, end) per named span; kGpuStageNames.size() spans.
+  // Constructed only when caps().timestamps_supported and
+  // APRILTAG_VK_TIMESTAMPS=1 are both set, so a normal run allocates nothing
+  // and every WriteTimestamp() call below is a no-op (QueryPool::valid() ==
+  // false).
+  vk::QueryPool timestamp_pool_;
+  bool timestamps_enabled_ = false;
+  enum GpuStageSpan {
+    kSpanClear = 0,
+    kSpanThreshold,
+    kSpanLabelling,
+    kSpanLabelFinalize,
+    kSpanBoundary,
+    kSpanHashGroup,
+    kSpanExtents,
+    kSpanSelect,
+    kSpanBlobScan,
+    kSpanScatter,
+    kSpanSort,
+    kSpanReadbackCopy,
+    kNumGpuStageSpans,
+  };
+  // WriteTimestamp() index for a span's start/end - 2 slots per span.
+  static constexpr uint32_t SpanStart(GpuStageSpan s) { return static_cast<uint32_t>(s) * 2; }
+  static constexpr uint32_t SpanEnd(GpuStageSpan s) { return static_cast<uint32_t>(s) * 2 + 1; }
 
  public:
   // Readback results exposed for QuadDecode after Detect() runs the GPU

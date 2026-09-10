@@ -41,10 +41,23 @@ class QuadDecode {
 
   unsigned threads() const { return pool_->threads(); }
 
+  // Per-blob outcome of the item-3 DP corner-seeding path (config.
+  // quad_fit_method == kDp), from the most recent Decode() call. Meaningless
+  // (both 0) when quad_fit_method is kPeaks. A high fallback rate
+  // (fallbacks/attempts) means DP is spending its own cost without saving
+  // the combinatorial search's, since the caller falls all the way through
+  // to it anyway.
+  struct DpStats {
+    uint32_t attempts = 0;
+    uint32_t fallbacks = 0;
+  };
+  DpStats last_dp_stats() const { return last_dp_stats_; }
+
  private:
   DetectorConfig config_;
   // unique_ptr so a const Decode() can still hand work to the (stateful) pool.
   std::unique_ptr<WorkerPool> pool_;
+  mutable DpStats last_dp_stats_;
 };
 
 }  // namespace apriltag_vulkan

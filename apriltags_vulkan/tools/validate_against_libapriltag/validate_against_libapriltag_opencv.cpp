@@ -63,6 +63,10 @@ int main(int argc, char **argv) {
   // (GPU + quad_decode + tag_decode) is timed per iteration, not just
   // Detect(), since CPU-tail changes are invisible to a GPU-only timer.
   int iterations = 1;
+  // Matches DetectorConfig::decimation's default. Kept in sync with
+  // td_ref->quad_decimate below so "verified against unmodified upstream
+  // apriltag" stays true at every tested decimation factor, not just 2.
+  uint32_t decimation = 2;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -78,6 +82,8 @@ int main(int argc, char **argv) {
       iterations = std::max(1, std::stoi(next("--iterations")));
     } else if (arg == "--csv") {
       csv_path = next("--csv");
+    } else if (arg == "--decimation") {
+      decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
     } else if (arg == "--pipelined") {
       pipelined = true;
     } else {
@@ -88,7 +94,7 @@ int main(int argc, char **argv) {
 
   if (load_path.empty()) {
     std::cerr << "Usage: apriltag_vulkan_validate --data <FileName> [--family tag36h11] "
-                 "[--iterations N] [--csv path.csv] [--pipelined]"
+                 "[--iterations N] [--csv path.csv] [--decimation N] [--pipelined]"
              << std::endl;
     return 1;
   }
@@ -109,8 +115,8 @@ int main(int argc, char **argv) {
             std::cerr << "Failed to load Image: " << entry.path().string() << std::endl;
             continue;
         }
-        else if (img.cols % 8 != 0 || img.rows % 8 != 0) {
-            std::cerr << "Skipping Image (dimensions not multiple of 8): " << entry.path().string() << std::endl;
+        else if (img.cols % 2 != 0 || img.rows % 2 != 0) {
+            std::cerr << "Skipping Image (dimensions not even): " << entry.path().string() << std::endl;
             continue;
         }
         files.push_back(entry.path().string());
@@ -123,6 +129,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::cout << "------------------------------------------------------------" << std::endl;
   for (const std::string& file : files) {
       cv::Mat image = cv::imread(file, cv::IMREAD_GRAYSCALE);
       if (image.empty()) {
@@ -145,6 +152,7 @@ int main(int argc, char **argv) {
       apriltag_vulkan::DetectorConfig config;
       config.width = width;
       config.height = height;
+      config.decimation = decimation;
       config.tag_width = static_cast<uint32_t>(tf->width_at_border);
       config.reversed_border = tf->reversed_border;
       config.normal_border = !tf->reversed_border;
@@ -168,6 +176,7 @@ int main(int argc, char **argv) {
       // dangling by the time it's read.
       std::unique_ptr<apriltag_vulkan::TagDecoder> owned_tag_decoder;
       std::unique_ptr<apriltag_vulkan::PipelinedDetector> owned_pdetector;
+      std::unique_ptr<apriltag_vulkan::GpuDetector> owned_detector;
 
       if (pipelined) {
         // Frame N+1's GPU stage runs concurrently with frame N's CPU tail.
@@ -232,7 +241,8 @@ int main(int argc, char **argv) {
         PrintStats("Detect() call (GPU stage + prev-tail join-wait)", metrics.gpu_total_ms,
                    iterations);
       } else {
-        apriltag_vulkan::GpuDetector detector(ctx, config);
+        owned_detector = std::make_unique<apriltag_vulkan::GpuDetector>(ctx, config);
+        apriltag_vulkan::GpuDetector &detector = *owned_detector;
         apriltag_vulkan::QuadDecode quad_decode(config);
         owned_tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(td_ours);
         apriltag_vulkan::TagDecoder &tag_decoder = *owned_tag_decoder;
@@ -276,6 +286,11 @@ int main(int argc, char **argv) {
         metrics.points = profile.points;
         metrics.uf_iterations = profile.uf_iterations;
         metrics.uf_converged = profile.uf_converged;
+        {
+          const apriltag_vulkan::QuadDecode::DpStats dp_stats = quad_decode.last_dp_stats();
+          metrics.dp_attempts = dp_stats.attempts;
+          metrics.dp_fallbacks = dp_stats.fallbacks;
+        }
 
         std::cout << quads.size() << " candidate quad(s) from the Vulkan pipeline." << std::endl;
         std::cout << detector.DescribeSizing() << std::endl;
@@ -287,17 +302,73 @@ int main(int argc, char **argv) {
             << " ms)" << std::endl;
         std::cout << "  work: boundary_points=" << profile.boundary_points
             << ", raw_blobs=" << profile.raw_blobs
+            << (profile.hash_probe_drops > 0
+                    ? (" (" + std::to_string(profile.hash_probe_drops) + " HASH DROPS)")
+                    : std::string())
             << ", uf_iterations=" << profile.uf_iterations
             << (profile.uf_converged ? "" : " (HIT LIMIT)")
             << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs
-            << ", points=" << profile.points << std::endl;
+            << ", points=" << profile.points
+            << (profile.oversized_sort_blobs > 0
+                    ? (", oversized_unsorted=" +
+                       std::to_string(profile.oversized_sort_blobs))
+                    : std::string())
+            << std::endl;
         std::cout << "  bytes: upload=" << profile.upload_bytes
             << ", readback=" << profile.readback_bytes << std::endl;
+        double gpu_span_total = 0.0;
+        if (profile.has_gpu_stage_breakdown) {
+          std::cout << "  GPU stage breakdown (last iteration, APRILTAG_VK_TIMESTAMPS=1):"
+              << std::endl;
+          for (size_t s = 0; s < apriltag_vulkan::GpuDetector::kGpuStageNames.size(); ++s) {
+            std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[s] << "="
+                << profile.gpu_stage_ms[s] << " ms" << std::endl;
+            gpu_span_total += profile.gpu_stage_ms[s];
+          }
+          std::cout << "    (sum of spans = " << gpu_span_total << " ms)" << std::endl;
+
+          double intra_submit_gap_total = 0.0;
+          double submit_boundary_gap_total = 0.0;
+          std::cout << "  GPU inter-span gaps (purely GPU-clock, no CPU/fence time):"
+              << std::endl;
+          for (size_t g = 0; g < profile.gpu_gap_ms.size(); ++g) {
+            const bool crosses_submit = apriltag_vulkan::GpuDetector::kGpuGapCrossesSubmit[g];
+            std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[g] << "->"
+                << apriltag_vulkan::GpuDetector::kGpuStageNames[g + 1] << "="
+                << profile.gpu_gap_ms[g] << " ms"
+                << (crosses_submit ? "  (submit boundary)" : "") << std::endl;
+            (crosses_submit ? submit_boundary_gap_total : intra_submit_gap_total) +=
+                profile.gpu_gap_ms[g];
+          }
+          std::cout << "    (intra-submit gap total = " << intra_submit_gap_total
+              << " ms, submit-boundary gap total = " << submit_boundary_gap_total << " ms)"
+              << std::endl;
+        }
+        // Host-side cost of driving the GPU - see DetectProfile's cpu_*_ms
+        // comment for what the residual below is (and, importantly, what it
+        // is not).
+        std::cout << "  Host-side submission cost (last iteration): begin="
+            << profile.cpu_begin_ms << " ms, submit+wait=" << profile.cpu_submit_wait_ms
+            << " ms, counter_reads=" << profile.cpu_counter_read_ms << " ms, over "
+            << profile.submits << " submit(s)" << std::endl;
+        if (profile.has_gpu_stage_breakdown) {
+          // Deliberately NOT divided by the submit count: that reading
+          // ("cost per round trip") was tested by removing a submission and
+          // disproved - see DetectProfile's cpu_*_ms comment. This is GPU-side
+          // time no span covers, dominated by inter-dispatch barriers.
+          std::cout << "    unspanned GPU time (submit+wait minus spans) = "
+              << (profile.cpu_submit_wait_ms - gpu_span_total) << " ms" << std::endl;
+        }
         std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
         PrintStats("GPU total", metrics.gpu_total_ms, iterations);
         PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
         PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
         PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
+        if (metrics.dp_attempts > 0) {
+          std::cout << "DP corner seeding: " << metrics.dp_fallbacks << "/" << metrics.dp_attempts
+              << " blobs fell back to the combinatorial search ("
+              << (100.0 * metrics.dp_fallbacks / metrics.dp_attempts) << "%)" << std::endl;
+        }
       }
 
       std::cout << "--- Our detections ---" << std::endl;
@@ -307,7 +378,7 @@ int main(int argc, char **argv) {
 
       apriltag_detector_t* td_ref = apriltag_detector_create();
       apriltag_detector_add_family(td_ref, tf);
-      td_ref->quad_decimate = 2.0;
+      td_ref->quad_decimate = static_cast<float>(decimation);
       td_ref->nthreads = 1;
 
       image_u8_t im{
@@ -350,6 +421,7 @@ int main(int argc, char **argv) {
       }
 
       if (!csv_path.empty()) AppendCsvRow(csv_path, metrics);
+	  std::cout << "------------------------------------------------------------" << std::endl;
     }
 
     std::cout << "Final Results: " << match << " matches, " << mismatch << " mismatches." << std::endl;

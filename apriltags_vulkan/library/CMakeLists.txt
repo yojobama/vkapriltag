@@ -45,40 +45,85 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
 
 set(SHADER_SOURCES
   shaders/decimate.comp
+  shaders/decimate_u8.comp
   shaders/block_minmax.comp
+  shaders/block_minmax_u8.comp
   shaders/block_filter.comp
   shaders/threshold.comp
+  shaders/threshold_u8.comp
   shaders/uf_init.comp
+  shaders/uf_init_u8.comp
   shaders/uf_merge.comp
+  shaders/uf_merge_u8.comp
   shaders/uf_compress.comp
   shaders/uf_final.comp
+  shaders/uf_final_subgroup.comp
   shaders/label_pixels.comp
   shaders/blob_diff.comp
+  shaders/blob_diff_u8.comp
+  shaders/blob_diff_subgroup.comp
+  shaders/blob_diff_u8_subgroup.comp
   shaders/scan_block.comp
   shaders/scan_add_offsets.comp
   shaders/init_extents.comp
   shaders/select_blobs.comp
   shaders/extract_blob_counts.comp
   shaders/sort_points_local.comp
-  shaders/compute_line_fit_points.comp
+  shaders/sort_points_local_u8.comp
   shaders/hash_group.comp
-  shaders/mark_slots.comp
+  shaders/build_indirect_args.comp
   shaders/reduce_extents_hash.comp
+  shaders/reduce_extents_hash_subgroup.comp
   shaders/scatter_index_points.comp
 )
 
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)
 
+# ---------------------------------------------------------------------------
+# Compile the SPIR-V corpus into the library, so a deployed binary needs
+# nothing on disk beside it. This is what makes the library usable from a
+# context with no install prefix at all - most concretely a JNI shared object
+# extracted from a jar, which is how PhotonVision consumes native code. Turn
+# it off to fall back to loading .spv files from SHADER_DIR at runtime; the
+# selection happens at runtime via vk::HasEmbeddedShaders(), so both paths
+# stay compiled and exercised.
+# ---------------------------------------------------------------------------
+option(VKAPRILTAG_EMBED_SHADERS "Compile the SPIR-V corpus into the library" ON)
+
+set(EMBEDDED_SHADERS_CPP ${CMAKE_CURRENT_BINARY_DIR}/embedded_shaders.cpp)
+set(GENERATE_EMBEDDED_SHADERS_SCRIPT
+  ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/GenerateEmbeddedShaders.cmake)
+
+# '|'-joined: a ';'-separated list would be split into separate arguments on
+# the way through -D.
+string(REPLACE ";" "|" SHADER_SPIRV_BINARIES_ARG "${SHADER_SPIRV_BINARIES}")
+
+add_custom_command(
+  OUTPUT ${EMBEDDED_SHADERS_CPP}
+  COMMAND ${CMAKE_COMMAND}
+          "-DSPV_FILES=${SHADER_SPIRV_BINARIES_ARG}"
+          "-DOUTPUT=${EMBEDDED_SHADERS_CPP}"
+          "-DEMBED=${VKAPRILTAG_EMBED_SHADERS}"
+          -P ${GENERATE_EMBEDDED_SHADERS_SCRIPT}
+  DEPENDS ${SHADER_SPIRV_BINARIES} ${GENERATE_EMBEDDED_SHADERS_SCRIPT}
+  COMMENT "Embedding SPIR-V corpus into libvkapriltag"
+  VERBATIM
+)
+
 add_library(vkapriltag STATIC
+  ${EMBEDDED_SHADERS_CPP}
   src/vk/Context.cpp
   src/vk/Buffer.cpp
   src/vk/Shader.cpp
   src/vk/ComputePipeline.cpp
+  src/vk/PipelineCache.cpp
+  src/vk/QueryPool.cpp
   src/gpu/GpuDetector.cpp
   src/gpu/QuadDecode.cpp
   src/apriltag_family.cpp
   src/TagDecoder.cpp
   src/PipelinedDetector.cpp
+  src/PoseEstimator.cpp
   src/common/pgm_io.cpp
   src/common/WorkerPool.cpp
 )

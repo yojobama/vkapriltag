@@ -54,6 +54,10 @@ int main(int argc, char **argv) {
   // (GPU + quad_decode + tag_decode) is timed per iteration, not just
   // Detect(), since CPU-tail changes are invisible to a GPU-only timer.
   int iterations = 1;
+  // Matches DetectorConfig::decimation's default. Kept in sync with
+  // td_ref->quad_decimate below so "verified against unmodified upstream
+  // apriltag" stays true at every tested decimation factor, not just 2.
+  uint32_t decimation = 2;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -69,6 +73,8 @@ int main(int argc, char **argv) {
       iterations = std::max(1, std::stoi(next("--iterations")));
     } else if (arg == "--csv") {
       csv_path = next("--csv");
+    } else if (arg == "--decimation") {
+      decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -77,7 +83,7 @@ int main(int argc, char **argv) {
 
   if (pgm_path.empty()) {
     std::cerr << "Usage: apriltag_vulkan_validate --pgm <file.pgm> [--family tag36h11] "
-                 "[--iterations N] [--csv path.csv]"
+                 "[--iterations N] [--csv path.csv] [--decimation N]"
              << std::endl;
     return 1;
   }
@@ -106,6 +112,7 @@ int main(int argc, char **argv) {
     apriltag_vulkan::DetectorConfig config;
     config.width = width;
     config.height = height;
+    config.decimation = decimation;
     config.tag_width = static_cast<uint32_t>(tf->width_at_border);
     config.reversed_border = tf->reversed_border;
     config.normal_border = !tf->reversed_border;
@@ -167,6 +174,11 @@ int main(int argc, char **argv) {
     metrics.points = profile.points;
     metrics.uf_iterations = profile.uf_iterations;
     metrics.uf_converged = profile.uf_converged;
+    {
+      const apriltag_vulkan::QuadDecode::DpStats dp_stats = quad_decode.last_dp_stats();
+      metrics.dp_attempts = dp_stats.attempts;
+      metrics.dp_fallbacks = dp_stats.fallbacks;
+    }
 
     std::cout << quads.size() << " candidate quad(s) from the Vulkan pipeline." << std::endl;
     std::cout << detector.DescribeSizing() << std::endl;
@@ -189,6 +201,11 @@ int main(int argc, char **argv) {
     PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
     PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
     PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
+    if (metrics.dp_attempts > 0) {
+      std::cout << "DP corner seeding: " << metrics.dp_fallbacks << "/" << metrics.dp_attempts
+                << " blobs fell back to the combinatorial search ("
+                << (100.0 * metrics.dp_fallbacks / metrics.dp_attempts) << "%)" << std::endl;
+    }
 
     std::cout << "--- Our detections ---" << std::endl;
     print_detections(ours);
@@ -202,7 +219,7 @@ int main(int argc, char **argv) {
     // run independently on the exact same pixels. ---
     apriltag_detector_t *td_ref = apriltag_detector_create();
     apriltag_detector_add_family(td_ref, tf);
-    td_ref->quad_decimate = 2.0;
+    td_ref->quad_decimate = static_cast<float>(decimation);
     td_ref->nthreads = 1;
 
     image_u8_t im{

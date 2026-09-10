@@ -53,7 +53,7 @@ class ComputePipeline {
   // starting at 3 (right after the workgroup size's 0/1/2), for shaders that
   // need an additional device-derived compile-time constant (e.g. a shared
   // memory array length decoupled from the workgroup's thread count).
-  ComputePipeline(const Context &ctx, const std::string &spv_path,
+  ComputePipeline(const Context &ctx, const ShaderSource &shader_source,
                   const std::vector<VkBuffer> &buffers, uint32_t push_constant_bytes,
                   WorkgroupSize workgroup_size,
                   std::vector<uint32_t> extra_specialization_constants = {});
@@ -81,6 +81,17 @@ class ComputePipeline {
                    const void *push_constants,
                    BarrierKind barrier = BarrierKind::Compute) const;
 
+  // Like DispatchRaw, but the group counts are read from a VkDispatchIndirect
+  // Command (3 consecutive uint32s: x, y, z) at `offset` in `indirect_buffer`,
+  // rather than supplied by the host - see build_indirect_args.comp. The
+  // buffer must have been created with VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+  // and its write must already be ordered against this call with
+  // IndirectDispatchBarrier (a plain Compute-kind Barrier is not enough -
+  // see that method's comment).
+  void DispatchIndirect(VkCommandBuffer cmd, VkBuffer indirect_buffer, VkDeviceSize offset,
+                        const void *push_constants,
+                        BarrierKind barrier = BarrierKind::Compute) const;
+
   // Inserts a standalone buffer memory barrier.
   static void Barrier(VkCommandBuffer cmd, BarrierKind kind = BarrierKind::Compute);
 
@@ -88,6 +99,13 @@ class ComputePipeline {
   // Required before waiting on a fence and reading a readback buffer: a fence
   // alone does not make device writes host-visible in the Vulkan memory model.
   static void HostReadBarrier(VkCommandBuffer cmd);
+
+  // Makes a preceding compute shader's write to an indirect-dispatch argument
+  // buffer visible to a later DispatchIndirect call. vkCmdDispatchIndirect
+  // reads at the DRAW_INDIRECT pipeline stage, which BarrierKind::Compute's
+  // compute-to-compute barrier does not cover - this is the dedicated
+  // compute-to-indirect-read barrier that does.
+  static void IndirectDispatchBarrier(VkCommandBuffer cmd);
 
  private:
   void Destroy();

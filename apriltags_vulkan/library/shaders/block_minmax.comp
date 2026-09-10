@@ -10,15 +10,24 @@ layout(std430, binding = 1) writeonly buffer UnfilteredMinMax { uint minmax_unfi
 layout(push_constant) uniform PushConstants {
   uint decimated_width;
   uint decimated_height;
+  uint block_width;
+  uint block_height;
 } pc;
 
+// decimated_width_/height_ need not be a multiple of 4 (only the original
+// image's width/height are guaranteed even), so the last block column/row
+// can be ragged. Edge-clamp rather than bounds-check-and-skip: a 4x4 min/max
+// window that runs past the real image just repeats the edge pixel, which is
+// a standard, harmless way to extend a min/max filter past the image border.
 uint sampleAt(uint x, uint y) {
+  x = min(x, pc.decimated_width - 1u);
+  y = min(y, pc.decimated_height - 1u);
   return decimated[y * pc.decimated_width + x];
 }
 
 void main() {
-  uint bw = pc.decimated_width / 4u;
-  uint bh = pc.decimated_height / 4u;
+  uint bw = pc.block_width;
+  uint bh = pc.block_height;
   uint bx = gl_GlobalInvocationID.x;
   uint by = gl_GlobalInvocationID.y;
   if (bx >= bw || by >= bh) return;

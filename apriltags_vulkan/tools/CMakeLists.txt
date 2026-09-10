@@ -34,3 +34,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 install(TARGETS apriltag_vulkan_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Pose verification: compares PoseEstimator against libapriltag's
+# apriltag_pose.c at every stage of the algorithm, over a synthetic sweep with
+# known ground truth, deliberately degenerate geometry, and (with --data)
+# real detections. Needs no OpenCV - it loads PGMs via the library's own
+# pgm_io, so it builds and runs identically on both dev machines.
+add_executable(apriltag_pose_validate validate_pose/validate_pose.cpp)
+target_link_libraries(apriltag_pose_validate PRIVATE vkapriltag::vkapriltag)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(apriltag_pose_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+install(TARGETS apriltag_pose_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

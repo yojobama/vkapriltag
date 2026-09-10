@@ -1,0 +1,107 @@
+#version 450
+// Subgroup-aggregated variant of reduce_extents_hash.comp, selected at
+// runtime (GpuDetector::ShaderPath) when the device's subgroup exposes
+// BALLOT, ARITHMETIC and SHUFFLE in COMPUTE (ARITHMETIC beyond what
+// uf_final_subgroup.comp needs, since this shader reduces per-point VALUES,
+// not just counts; SHUFFLE for the same runtime-lane-index reason
+// uf_final_subgroup.comp needs it - see its comment on subgroupBroadcast
+// vs. subgroupShuffle). The scalar version issues 8 atomics per boundary
+// point keyed by raw blob index (~1.27M at 1080p); this reduces all 8
+// across every lane in the subgroup that shares a key before touching
+// memory at all.
+//
+// "Reduce by key" without a partition/match-any extension (this device
+// doesn't report one): peel one key off the subgroup's "still valid, not
+// yet processed" ballot per iteration - elect its first lane as leader,
+// mask in only the lanes sharing that key, reduce each of the 8 quantities
+// across exactly that subset by substituting the identity element
+// (INT_MAX/INT_MIN/0 as appropriate) for every non-matching lane before
+// calling subgroupMin/subgroupMax/subgroupAdd, then have the leader alone
+// issue the 8 atomics with the reduced values. Terminates in at most
+// popcount(valid lanes) iterations - one for the common case where the
+// whole subgroup shares a key, same as an unaggregated pass in the worst
+// case (every lane a different key), so this cannot regress.
+//
+// Unlike uf_final.comp's raster-order-correlated pixels, boundary points
+// here are indexed by blob_diff.comp's atomic append order - not obviously
+// key-correlated across a subgroup the way horizontal image runs are. This
+// is measured, not assumed: see OPTIMIZATION_NOTES.md for what the sweep
+// found.
+// The "remaining"/"valid" ballots are tracked as a full uvec4 (see
+// subgroup_ballot128.glsl) - subgroup size can exceed 32 (this device's
+// RX 9060 XT reports 64), so a single uint is not always wide enough.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "common.glsl"
+#include "subgroup_ballot128.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Compacted { uint compacted[]; };
+layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
+layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
+layout(std430, binding = 3) buffer Extents { MinMaxExtentsGpu extents[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint count;
+  uint max_raw_blobs;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  bool is_active = i < pc.count;
+
+  // bi stays 0xFFFFFFFFu (never a valid dense-minus-1 index) for every lane
+  // that is out of range, unmatched, or dropped - the same sentinel value
+  // hash_group.comp's point_slot[] itself uses.
+  uint bi = 0xFFFFFFFFu;
+  int x = 0, y = 0, gx = 0, gy = 0;
+  if (is_active) {
+    uint slot = point_slot[i];
+    if (slot != 0xFFFFFFFFu) {
+      uint bi_raw = slot_dense[slot];
+      if (bi_raw != 0u && bi_raw <= pc.max_raw_blobs) {
+        bi = bi_raw - 1u;
+        QBPoint p = UnpackQBPoint(compacted[i]);
+        x = int(p.x);
+        y = int(p.y);
+        gx = p.gx;
+        gy = p.gy;
+      }
+    }
+  }
+  bool valid = (bi != 0xFFFFFFFFu);
+
+  uvec4 remaining = subgroupBallot(valid);
+
+  while (AnyBits128(remaining)) {
+    uint leaderLane = FindLSB128(remaining);
+    uint leaderKey = subgroupShuffle(bi, leaderLane);
+    bool sameKey = valid && (bi == leaderKey);
+    uvec4 sameKeyMask = subgroupBallot(sameKey);
+
+    int redMinX = subgroupMin(sameKey ? x : 0x7FFFFFFF);
+    int redMinY = subgroupMin(sameKey ? y : 0x7FFFFFFF);
+    int redMaxX = subgroupMax(sameKey ? x : (-2147483647));
+    int redMaxY = subgroupMax(sameKey ? y : (-2147483647));
+    int redGxSum = subgroupAdd(sameKey ? gx : 0);
+    int redGySum = subgroupAdd(sameKey ? gy : 0);
+    int redPxgxPygy = subgroupAdd(sameKey ? (x * gx + y * gy) : 0);
+    uint redCount = PopCount128(sameKeyMask);
+
+    if (gl_SubgroupInvocationID == leaderLane) {
+      atomicMin(extents[leaderKey].min_x, redMinX);
+      atomicMin(extents[leaderKey].min_y, redMinY);
+      atomicMax(extents[leaderKey].max_x, redMaxX);
+      atomicMax(extents[leaderKey].max_y, redMaxY);
+      atomicAdd(extents[leaderKey].count, redCount);
+      atomicAdd(extents[leaderKey].gx_sum, redGxSum);
+      atomicAdd(extents[leaderKey].gy_sum, redGySum);
+      atomicAdd(extents[leaderKey].pxgx_plus_pygy_sum, redPxgxPygy);
+    }
+    remaining = AndNot128(remaining, sameKeyMask);
+  }
+}

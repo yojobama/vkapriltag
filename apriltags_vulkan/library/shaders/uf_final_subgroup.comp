@@ -1,0 +1,69 @@
+#version 450
+// Subgroup-aggregated variant of uf_final.comp, selected at runtime
+// (GpuDetector::ShaderPath) when the device's subgroup exposes BALLOT and
+// SHUFFLE in COMPUTE (checked alongside BASIC, which Vulkan 1.1 already
+// guarantees everywhere). uf_final.comp's plain atomicAdd per pixel is
+// 518400 random read-modify-writes at 1080p, heavily contended on any blob
+// bigger than a few pixels - every pixel of a large tag border or
+// background region targets the same blob_size[] slot.
+//
+// "Warp-aggregated atomics" (the standard CUDA/GPU idiom for this): instead
+// of one atomic per lane, elect one leader per distinct key present in the
+// subgroup and have it issue a single atomicAdd for the whole group of
+// lanes sharing that key. This only needs ballot + a runtime-indexed lane
+// lookup (subgroupShuffle - NOT subgroupBroadcast, whose id operand must be
+// a compile-time constant per the SPIR-V spec, not just "dynamically
+// uniform") + a plain bitCount - no subgroupPartition/match-any extension,
+// which this device doesn't report anyway. The loop below peels one key off
+// the "remaining"
+// ballot per iteration; for the common case (a horizontal run inside one
+// blob spanning the whole subgroup) that is exactly one iteration, i.e. one
+// atomic for however many lanes matched instead of one per lane. Worst case
+// (every lane a different key) is the same number of atomics the plain
+// version already paid, so this cannot regress, only aggregate.
+//
+// Must not return early before the subgroup ops: control flow reconvergence
+// for subgroup built-ins is well-defined but this avoids depending on it,
+// matching uf_merge.comp's own comment on the same issue. Only pixels this
+// pass actually covers (i < total) parcipate in the ballot at all -
+// `is_active` gates that, not an early return.
+//
+// The "remaining" ballot is tracked as a full uvec4 (see
+// subgroup_ballot128.glsl) - subgroup size can exceed 32 (this device's
+// RX 9060 XT reports 64), so a single uint is not always wide enough.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "subgroup_ballot128.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
+layout(std430, binding = 1) buffer BlobSize { uint blob_size[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint total = pc.width * pc.height;
+  bool is_active = i < total;
+  uint key = is_active ? parent[i] : 0u;
+
+  uvec4 remaining = subgroupBallot(is_active);
+
+  while (AnyBits128(remaining)) {
+    uint leaderLane = FindLSB128(remaining);
+    uint leaderKey = subgroupShuffle(key, leaderLane);
+    bool sameKey = is_active && (key == leaderKey);
+    uvec4 sameKeyMask = subgroupBallot(sameKey);
+
+    if (gl_SubgroupInvocationID == leaderLane) {
+      atomicAdd(blob_size[leaderKey], PopCount128(sameKeyMask));
+    }
+    remaining = AndNot128(remaining, sameKeyMask);
+  }
+}

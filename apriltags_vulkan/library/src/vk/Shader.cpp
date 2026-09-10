@@ -22,13 +22,26 @@ std::vector<char> ReadFile(const std::string &path) {
 }
 }  // namespace
 
-Shader::Shader(VkDevice device, const std::string &spv_path) : device_(device) {
-  std::vector<char> code = ReadFile(spv_path);
-
+Shader::Shader(VkDevice device, const ShaderSource &source) : device_(device) {
   VkShaderModuleCreateInfo create_info{};
   create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-  create_info.codeSize = code.size();
-  create_info.pCode = reinterpret_cast<const uint32_t *>(code.data());
+
+  // Kept alive until vkCreateShaderModule returns; unused for embedded
+  // sources, which point straight at rodata.
+  std::vector<char> file_contents;
+
+  if (source.embedded()) {
+    create_info.codeSize = source.bytes;
+    create_info.pCode = source.code;
+  } else {
+    file_contents = ReadFile(source.path);
+    create_info.codeSize = file_contents.size();
+    create_info.pCode = reinterpret_cast<const uint32_t *>(file_contents.data());
+  }
+
+  if (create_info.codeSize == 0 || create_info.codeSize % 4 != 0) {
+    throw std::runtime_error("Shader SPIR-V size is not a nonzero multiple of 4: " + source.label);
+  }
 
   CheckVk(vkCreateShaderModule(device_, &create_info, nullptr, &module_),
           "vkCreateShaderModule");

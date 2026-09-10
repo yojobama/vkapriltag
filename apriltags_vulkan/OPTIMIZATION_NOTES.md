@@ -267,6 +267,64 @@ round trip and its command recording cost about what the traffic does. The
 avoids the round trip; it just needs the count passed to the shaders through a
 binding rather than a push constant, since push constants are host-side.
 
+**Pipelining the CPU tail behind the next frame's GPU stage.** Implemented as
+`PipelinedDetector`: a 1-deep double-buffered handoff so frame N+1's GPU stage
+(`GpuDetector::Detect`) runs on a background thread's tail work for frame N
+(`QuadDecode` + `TagDecoder`) concurrently, instead of the strictly serial
+`Detect -> Decode -> Decode` every caller used before. `GpuDetector::Detect()`
+is already fully synchronous (four `SubmitAndWait`s, host copies complete
+before it returns), so no device buffer needed double-buffering — only two
+host-side things did: `last_selected_extents`/`last_line_fit_points` (copied
+out before the tail runs, since the next `Detect()` overwrites them) and the
+raw grayscale frame `TagDecoder` samples from (double-buffered, since the
+caller may start capturing the next frame into the same buffer while the tail
+is still reading it). Verified race-free — a ThreadSanitizer build ran 300
+pipelined frames across the full corpus with zero reported races, and every
+frame decoded identically to the serial path in both a normal and a TSan
+build (5/5 corpus matches, corner RMS bit-identical).
+
+It is nonetheless a **clear throughput regression on the Mali-G610/RK3588**,
+at every corpus scale, confirmed after ruling out two obvious confounds:
+
+| image | serial `pipeline_total` (median) | pipelined throughput/frame |
+| --- | --- | --- |
+| 320x200 | 2.30 ms | 2.31 ms |
+| 480x304 | 4.46 ms | 4.32 ms |
+| 640x400 | 3.14 ms | 3.55 ms |
+| 960x600 | 7.21 ms | 6.38 ms |
+| 1280x800 | 6.77 ms | 8.18 ms |
+
+Two of five scales look flat-to-slightly-better; the largest (1280x800, the
+most representative of real deployment) is **21% worse**. The GPU stage
+*itself* measured slower when run concurrently with the previous frame's tail
+(`gpu_ms_median` 5.70 -> 7.84 ms at 1280x800) — the regression is not
+overhead from spawning a thread per frame (measured separately at 0.087 ms
+average spawn+join on this device, negligible against multi-millisecond
+frames).
+
+Ruled out:
+- **DRAM controller governor.** `dmc_ondemand` was still active at 528 MHz of
+  a 2112 MHz maximum (see the deployment note above) — pinning it to
+  `performance` and re-measuring changed nothing material (serial 6.71 ms vs.
+  pipelined 8.05 ms at 1280x800, essentially the same gap).
+- **`QuadDecode`'s WorkerPool oversubscribing the 4xA76+4xA55 cores** while
+  the main thread also needs CPU time to service the GPU driver's fence wait.
+  Sweeping `APRILTAG_CPU_THREADS` from 1 to 8 found a shallow minimum at 6
+  threads (8.03 ms) — still worse than serial's 6.77 ms at every thread
+  count tested.
+
+Working theory (not independently confirmed): this SoC has unified CPU/GPU
+memory over a shared LPDDR bus, and/or a Vulkan driver whose
+`vkWaitForFences` does not yield the CPU cheaply while blocked. Either way,
+running CPU-heavy work concurrently with a GPU submission is not free the way
+it would be on a discrete card with its own VRAM and an otherwise-idle CPU
+during the wait — the same class of platform-specific result as the
+tile-local union-find rejection below. `PipelinedDetector` and its
+`--pipelined` validate-tool flag are kept in the tree (branch
+`PipelineCpuTail`, not merged) since the mechanism itself is correct and
+might pay off on different hardware or once the tail is small enough that
+contention no longer dominates; do not enable it by default on this target.
+
 **Tile-local union-find in shared memory.** The obvious answer to a stage
 bound on dependent global loads is to move the pointer chasing into shared
 memory: one workgroup per tile, resolve every component that fits inside the
@@ -356,14 +414,13 @@ Where the 16.1 ms now goes: CPU `quad_decode` 3.7, sort+group 3.01, linefit
 3.05, threshold+label 2.59, boundary 1.73, readback 1.09, tag_decode 0.66,
 upload 0.22.
 
-1. **Overlap the CPU tail with the next frame's GPU work.** `quad_decode` +
-   `tag_decode` is 4.4 ms of the 16.1 — now the single largest item — and it
-   runs strictly after the GPU finishes. Double-buffering the detector so frame N's CPU tail runs during
-   frame N+1's GPU pipeline hides essentially all of it — about 25% of
-   end-to-end latency for no algorithmic change. This is an application-level
-   change (`main.cpp` and the detector's buffer set), not a shader one, and is
-   almost certainly the best remaining ratio of win to risk. (Deferred by
-   request; not attempted here.)
+1. ~~**Overlap the CPU tail with the next frame's GPU work.**~~ **Attempted and
+   rejected — see "Measured and rejected" below.** It regresses throughput
+   ~20-25% on this hardware. The claim below that this "hides essentially all
+   of it — about 25% of end-to-end latency" was also wrong on its own terms
+   even setting the regression aside: pipelining raises *throughput*, not
+   per-frame *latency* (frame N's result is returned one frame later); the
+   two are easy to conflate but are not the same claim.
 
 2. **Further work on labelling — but not the obvious kinds.** The stage is
    now 2.59 ms, of which 0.86 ms is decimate + threshold and ~1.7 ms is the
@@ -394,6 +451,64 @@ upload 0.22.
    heavy contention on large blobs. Only the `>= min_cluster_pixels`
    predicate is ever consumed, so a saturating or hierarchical count would do.
    Part of the 1.71 ms boundary stage; not separately measured.
+
+## Pipeline caching (startup latency, not per-frame)
+
+Everything above is steady-state per-frame time. Separately,
+`GpuDetector::CreatePipelines()` builds ~30 `VkPipeline`s (plus a
+capacity-dependent number of scan-chain stages) once at construction, and
+until now every one of those was a full SPIR-V -> ISA compile with
+`vkCreatePipelineCache`'s cache argument hardcoded to `VK_NULL_HANDLE` - i.e.
+no caching at all, on every process start.
+
+`vk::Context` now owns a `vk::PipelineCache` (`library/src/vk/PipelineCache.
+cpp`) that persists a `VkPipelineCache` to disk across runs and hands it to
+every `vk::ComputePipeline`'s `vkCreateComputePipelines` call. The on-disk
+file is keyed to `vendorID`/`deviceID`/`pipelineCacheUUID` (so a driver
+update or a different GPU never gets fed stale data - the spec defines
+`pipelineCacheUUID` to change exactly when compiled pipeline data would stop
+being valid) plus an FNV-1a hash of the compiled `.spv` corpus (so a shader
+rebuild during development doesn't feed the driver last week's binaries
+either). `GpuDetector` flushes it right after `CreatePipelines()` rather than
+relying solely on `~Context()`, since a camera-loop binary is more often
+killed than shut down cleanly. Disable with `APRILTAG_VK_PIPELINE_CACHE=0`;
+override the cache directory with `APRILTAG_VK_CACHE_DIR=<path>` (default:
+`%LOCALAPPDATA%\vkapriltag` / `$XDG_CACHE_HOME/vkapriltag`).
+
+Measured on the Windows desktop dev box (AMD Radeon RX 9060 XT, Vulkan
+1.4.349) with a throwaway harness that just constructs `Context` +
+`GpuDetector` and exits, timing `CreatePipelines()`:
+
+| run                                             | `CreatePipelines()` |
+|--------------------------------------------------|---------------------:|
+| truly cold (no app cache, no prior driver cache)  |            240.7 ms |
+| warm (app cache hit)                              |             16.6 ms |
+
+A ~14x reduction on this GPU. Two things worth knowing before generalizing
+that number:
+
+* AMD's own driver keeps a persistent shader cache underneath ours. Once
+  *anything* had compiled these shaders on this machine, even runs with
+  `APRILTAG_VK_PIPELINE_CACHE=0` came back at ~18 ms - the driver-level cache
+  alone was already doing most of the work here. The 240 ms number is only
+  visible on the very first compile a machine ever does. This doesn't make
+  the app-level cache redundant: it's the layer that's actually there on
+  drivers with no such cache of their own (Mesa/Panfrost on the Orange Pi
+  target above is the case that matters), and it's unaffected by whatever a
+  given driver does or doesn't do underneath it.
+* This targets pipeline *creation*, not first-dispatch latency. Some drivers
+  defer final codegen to first use, so a residual first-frame cost can
+  survive a warm pipeline cache. Not measured here; a follow-up would be a
+  throwaway warm-up dispatch during construction, only if profiling on the
+  actual Mali target shows it's still worth shaving.
+* A warm run makes zero writes to the cache file (checked via mtime): saving
+  is skipped whenever the retrieved cache data hashes the same as what was
+  loaded, so steady-state use touches the filesystem only on the first run
+  after a shader rebuild or driver update.
+* Feeding the driver a corrupted or hand-edited cache file falls back
+  cleanly to an empty cache and a fresh compile (verified by truncating a
+  cache file to garbage bytes) - a bad cache can slow a run back down to
+  the cold-path cost, but never breaks detection.
 
 ## Reproducing
 

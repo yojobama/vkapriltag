@@ -18,9 +18,21 @@ enum class MemoryKind {
   DeviceLocal,
 
   // Host staging memory: HOST_VISIBLE | HOST_COHERENT, additionally
-  // HOST_CACHED when the driver offers it (a large win for readback, since
-  // reading back through uncached memory is punishingly slow).
+  // HOST_CACHED when the driver offers it as well. Use this for host WRITES
+  // (upload staging): a plain memcpy needs no flush precisely because it's
+  // coherent, and upload is not read-sensitive to cache state.
   HostVisible,
+
+  // Host staging memory for host READS (readback/counter staging):
+  // HOST_VISIBLE required, HOST_CACHED preferred, COHERENT NOT required.
+  // Some devices (e.g. Mali-G610 on the Orange Pi 5) expose no memory type
+  // that is both COHERENT and CACHED - asking HostVisible's required set for
+  // both silently falls through to an uncached type, which measured 4x
+  // slower for a 1.5 MB per-frame readback on that device. Reading through
+  // this kind requires an explicit invalidate, which Buffer::Read() does
+  // automatically when the buffer's selected memory type isn't coherent -
+  // see Buffer::coherent_.
+  HostVisibleCached,
 
   // DEVICE_LOCAL and host-visible at once. Exists on unified-memory parts
   // (Mali and other integrated GPUs) and on discrete cards with resizable
@@ -55,10 +67,18 @@ class Buffer {
   void *mapped() const { return mapped_; }
   bool host_visible() const { return mapped_ != nullptr; }
 
-  // Host-side access to mapped memory. Both are plain memcpy: the memory is
-  // always allocated HOST_COHERENT, so no explicit flush/invalidate is needed.
+  // Host-side access to mapped memory. Both are a plain memcpy, transparently
+  // wrapped in vkFlushMappedMemoryRanges (Write) / vkInvalidateMappedMemoryRanges
+  // (Read) when the buffer's actual memory type isn't HOST_COHERENT - see
+  // MemoryKind::HostVisibleCached. Coherent memory (every other kind) pays
+  // nothing extra: coherent() short-circuits both calls.
   void Write(const void *src, VkDeviceSize bytes, VkDeviceSize offset = 0);
   void Read(void *dst, VkDeviceSize bytes, VkDeviceSize offset = 0) const;
+
+  // True unless this buffer's memory type is HOST_VISIBLE without
+  // HOST_COHERENT (only possible for MemoryKind::HostVisibleCached, and only
+  // when the device has no memory type that is both).
+  bool coherent() const { return coherent_; }
 
   // --- Record-only helpers. No submission, no allocation. ---
 
@@ -82,6 +102,8 @@ class Buffer {
   VkDeviceMemory memory_ = VK_NULL_HANDLE;
   VkDeviceSize size_ = 0;
   void *mapped_ = nullptr;
+  bool coherent_ = true;
+  VkDeviceSize non_coherent_atom_size_ = 1;
 };
 
 }  // namespace apriltag_vulkan::vk
