@@ -312,18 +312,19 @@ FitQuadResult TryDpQuad(const DetectorConfig &config, const std::vector<RawLineF
 // whole run for every one of the several hundred blobs in a frame.
 FitQuadResult FitQuadForBlob(const DetectorConfig &config,
                             const std::vector<RawLineFitPoint> &points, size_t begin,
-                            size_t end) {
+                            size_t end, QuadFitScratch &scratch) {
   FitQuadResult result;
   const size_t total_points = end - begin;
   if (total_points < 4) return result;
 
-  // Scratch reused across every blob this thread fits. FitQuadForBlob is
-  // called once per blob (several hundred per frame) and used to heap-allocate
-  // four vectors each time; the buffers only ever grow.
-  thread_local std::vector<LineFitMoments> cs;
-  thread_local std::vector<double> error;
-  thread_local std::vector<double> filtered;
-  thread_local std::vector<std::pair<double, uint32_t>> peaks;
+  // scratch is reused across every blob this SLOT fits (see QuadFitScratch's
+  // comment in QuadDecode.h for why this is slot-indexed rather than
+  // thread_local). FitQuadForBlob is called once per blob (several hundred
+  // per frame); these buffers only ever grow.
+  std::vector<LineFitMoments> &cs = scratch.cs;
+  std::vector<double> &error = scratch.error;
+  std::vector<double> &filtered = scratch.filtered;
+  std::vector<std::pair<double, uint32_t>> &peaks = scratch.peaks;
   cs.resize(total_points);
   error.resize(total_points);
   filtered.resize(total_points);
@@ -504,7 +505,8 @@ DetectorConfig::QuadFitMethod ResolveQuadFitMethod(DetectorConfig::QuadFitMethod
 
 QuadDecode::QuadDecode(const DetectorConfig &config)
     : config_(config),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads))) {
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads))),
+      scratch_(pool_->threads()) {
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
 }
 
@@ -535,8 +537,9 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
   // tail's time goes. Each entry is written by exactly one task, so no
   // synchronization is needed beyond the pool's own.
   std::vector<FitQuadResult> per_span(spans.size());
-  pool_->ParallelFor(spans.size(), [&](size_t s) {
-    per_span[s] = FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end);
+  pool_->ParallelFor(spans.size(), [&](size_t s, unsigned slot) {
+    per_span[s] =
+        FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
   });
 
   last_dp_stats_ = DpStats{};

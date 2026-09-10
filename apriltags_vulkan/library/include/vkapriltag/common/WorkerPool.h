@@ -34,19 +34,36 @@ class WorkerPool {
   WorkerPool(const WorkerPool &) = delete;
   WorkerPool &operator=(const WorkerPool &) = delete;
 
-  // Invokes fn(i) exactly once for every i in [0, count), on an unspecified
-  // thread, and returns only once all of them have completed. fn must be safe
-  // to call concurrently for distinct i.
-  void ParallelFor(size_t count, const std::function<void(size_t)> &fn);
+  // Invokes fn(i, slot) exactly once for every i in [0, count), on an
+  // unspecified thread, and returns only once all of them have completed. fn
+  // must be safe to call concurrently for distinct i.
+  //
+  // `slot` is a value in [0, threads()) that is FIXED for the lifetime of
+  // whichever thread is calling fn - 0 is always the calling (ParallelFor's
+  // caller's) thread, and each pool worker thread keeps the same nonzero
+  // slot across every batch it ever participates in. This exists so a
+  // caller whose per-item work wants cheap, race-free per-thread scratch
+  // state can index a `std::vector` sized to `threads()` by `slot`, instead
+  // of using a C++11 `thread_local` - which is unsafe here: this library is
+  // always loaded via dlopen() when used from a JNI shim (that's what JNI's
+  // System.load() does), and a fresh, dlopen()'d module's `thread_local`
+  // variables are not safely accessible from a freshly spawned pthread on
+  // every platform - observed as an immediate SIGBUS (BUS_ADRALN) the first
+  // time a pool worker thread touched one, on an aarch64/glibc target, even
+  // with no concurrent access to it at all (see QuadDecode.cpp's history for
+  // the scratch buffers this replaced). Prefer `slot`-indexed scratch over
+  // `thread_local` for exactly this reason in any code that runs on these
+  // worker threads.
+  void ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn);
 
   unsigned threads() const { return 1 + static_cast<unsigned>(workers_.size()); }
 
  private:
-  void WorkerMain();
+  void WorkerMain(unsigned slot);
   // Claims indices until the current batch is exhausted. Shared by the
   // workers and the calling thread, so the caller also does a share of the
   // work instead of blocking idle.
-  void DrainBatch();
+  void DrainBatch(unsigned slot);
 
   std::vector<std::thread> workers_;
 
@@ -54,7 +71,7 @@ class WorkerPool {
   std::condition_variable batch_ready_;
   std::condition_variable batch_done_;
 
-  const std::function<void(size_t)> *fn_ = nullptr;
+  const std::function<void(size_t, unsigned)> *fn_ = nullptr;
   size_t count_ = 0;
   std::atomic<size_t> next_{0};
   size_t outstanding_ = 0;  // workers still inside the current batch

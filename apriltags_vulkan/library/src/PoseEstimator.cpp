@@ -840,7 +840,7 @@ TagPose PoseEstimator::Estimate(const double corners[4][2], const double H[3][3]
 void PoseEstimator::EstimateAll(const std::vector<const apriltag_detection_t *> &detections,
                                 std::vector<TagPose> &out) const {
   out.assign(detections.size(), TagPose{});
-  pool_->ParallelFor(detections.size(), [&](size_t i) {
+  pool_->ParallelFor(detections.size(), [&](size_t i, unsigned /*slot*/) {
     const apriltag_detection_t *det = detections[i];
     if (det == nullptr || det->H == nullptr) return;
     double H[3][3];

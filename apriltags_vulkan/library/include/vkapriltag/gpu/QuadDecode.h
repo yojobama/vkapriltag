@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "vkapriltag/common/WorkerPool.h"
@@ -8,6 +9,25 @@
 #include "vkapriltag/gpu/Types.h"
 
 namespace apriltag_vulkan {
+
+// Per-blob-fit scratch for QuadDecode's peaks-based fit path, reused across
+// calls instead of heap-allocated fresh each time. One instance per
+// WorkerPool slot (see WorkerPool.h), indexed by the `slot` ParallelFor hands
+// each task - NOT `thread_local`: this library is always loaded via dlopen()
+// when used from a JNI shim, and a fresh dlopen()'d module's thread_local
+// variables are not safely accessible from a freshly spawned pthread on
+// every platform (observed: an immediate SIGBUS the first time a pool worker
+// thread touched one, on an aarch64/glibc target, with no concurrent access
+// at all). Slot-indexed scratch avoids the whole class of problem while
+// keeping the same "allocate once, reuse every call" performance property.
+// A free struct (not nested in QuadDecode) so QuadDecode.cpp's file-local
+// FitQuadForBlob can use it without needing member access.
+struct QuadFitScratch {
+  std::vector<LineFitMoments> cs;
+  std::vector<double> error;
+  std::vector<double> filtered;
+  std::vector<std::pair<double, uint32_t>> peaks;
+};
 
 // CPU tail of the detector pipeline. GpuDetector::Detect() only computes,
 // per selected blob, its perimeter point count/bounding box (extents) and
@@ -57,6 +77,8 @@ class QuadDecode {
   DetectorConfig config_;
   // unique_ptr so a const Decode() can still hand work to the (stateful) pool.
   std::unique_ptr<WorkerPool> pool_;
+  // Sized to pool_->threads() at construction time; see QuadFitScratch.
+  mutable std::vector<QuadFitScratch> scratch_;
   mutable DpStats last_dp_stats_;
 };
 

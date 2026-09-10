@@ -87,7 +87,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
   // merge loop below is bounded the same way and never looks at them.
   for (size_t i = 0; i < quads.size(); ++i) ResetScratch(per_quad_[i]);
 
-  pool_->ParallelFor(quads.size(), [&](size_t i) {
+  pool_->ParallelFor(quads.size(), [&](size_t i, unsigned /*slot*/) {
     const DetectedQuad &q = quads[i];
     struct quad quad_original;
     for (int k = 0; k < 4; ++k) {
