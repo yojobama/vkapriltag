@@ -60,6 +60,11 @@ int main(int argc, char **argv) {
   // td_ref->quad_decimate below so "verified against unmodified upstream
   // apriltag" stays true at every tested decimation factor, not just 2.
   uint32_t decimation = 2;
+  // 0 = leave DetectorConfig's default. Exposed because a frame that
+  // overflows max_blobs detects a different set of tags every run, so raising
+  // it until selected_blob_drops reads zero is the way to confirm that is what
+  // a nondeterministic result is caused by.
+  uint32_t max_blobs = 0;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -77,6 +82,8 @@ int main(int argc, char **argv) {
       csv_path = next("--csv");
     } else if (arg == "--decimation") {
       decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
+    } else if (arg == "--max-blobs") {
+      max_blobs = static_cast<uint32_t>(std::max(1, std::stoi(next("--max-blobs"))));
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -144,6 +151,7 @@ int main(int argc, char **argv) {
       config.width = width;
       config.height = height;
       config.decimation = decimation;
+      if (max_blobs > 0) config.max_blobs = max_blobs;
       config.tag_width = static_cast<uint32_t>(tf->width_at_border);
       config.reversed_border = tf->reversed_border;
       config.normal_border = !tf->reversed_border;
@@ -222,6 +230,10 @@ int main(int argc, char **argv) {
                   : std::string())
           << ", uf_iterations=" << profile.uf_iterations
           << (profile.uf_converged ? "" : " (HIT LIMIT)")
+          << (profile.selected_blob_drops > 0
+                  ? (" (" + std::to_string(profile.selected_blob_drops) +
+                     " BLOBS DROPPED - max_blobs exceeded, detections are NOT reproducible)")
+                  : std::string())
           << ", submits=" << profile.submits << ", blobs=" << profile.selected_blobs
           << ", points=" << profile.points
           << (profile.oversized_sort_blobs > 0

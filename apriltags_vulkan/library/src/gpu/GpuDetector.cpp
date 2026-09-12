@@ -826,8 +826,14 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
   const uint32_t num_raw_blobs = (qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0;
   const uint32_t hash_probe_drops = (qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0;
-  const uint32_t num_selected_blobs =
-      std::min(ReadCounterSlot(kSlotSelectedCount), config_.max_blobs);
+  // The counter select_blobs.comp incremented is the number of blobs that
+  // PASSED the filters, which can exceed max_blobs; the shader drops the
+  // overflow (`if (pos >= pc.max_blobs) return;`) to stay inside the output
+  // buffer. Keep the unclamped value so the drop is reported rather than
+  // silently absorbed by the std::min below - see selected_blob_drops.
+  const uint32_t qualifying_blobs = ReadCounterSlot(kSlotSelectedCount);
+  const uint32_t num_selected_blobs = std::min(qualifying_blobs, config_.max_blobs);
+  const uint32_t selected_blob_drops = qualifying_blobs - num_selected_blobs;
   const uint32_t num_points =
       (qbp_count > 0) ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_) : 0;
   const auto t_sort_group = Clock::now();
@@ -905,6 +911,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.boundary_points = qbp_count;
   last_profile_.raw_blobs = num_raw_blobs;
   last_profile_.hash_probe_drops = hash_probe_drops;
+  last_profile_.selected_blob_drops = selected_blob_drops;
   last_profile_.oversized_sort_blobs = oversized_sort_blobs;
   last_profile_.uf_iterations = uf_iterations;
   last_profile_.uf_converged = converged;

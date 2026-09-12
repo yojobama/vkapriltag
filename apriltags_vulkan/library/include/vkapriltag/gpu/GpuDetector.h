@@ -202,6 +202,25 @@ class GpuDetector {
     // every real scene at the current table sizing; watch this if
     // max_raw_blobs / the hash table sizing is ever tightened further.
     uint32_t hash_probe_drops = 0;
+    // Blobs that passed every filter in select_blobs.comp but found no slot,
+    // because more than DetectorConfig::max_blobs candidates qualified. Two
+    // things make this worse than a simple "too many tags" cap:
+    //
+    //   * WHICH blobs are dropped is decided by the order an atomicAdd hands
+    //     out slots, i.e. by GPU scheduling - so a frame that overflows is
+    //     NOT REPRODUCIBLE. The same image detects a different set of tags
+    //     from run to run. (Measured: a 4032x3024 frame at decimation 1
+    //     yields ~2048+ qualifying blobs against the 2048 default and
+    //     returns 3 or 4 tags depending on the run.)
+    //   * max_blobs does not scale with image area or decimation, while the
+    //     blob count goes as area/decimation^2 - so the margin silently
+    //     shrinks as either grows. Contrast local_sort_virtual_cap_, which
+    //     scales deliberately for exactly this reason.
+    //
+    // Nonzero here means the frame's detections are order-dependent: raise
+    // DetectorConfig::max_blobs (it costs max_blobs * sizeof(MinMaxExtentsGpu)
+    // plus a scan chain) until it reads zero.
+    uint32_t selected_blob_drops = 0;
     // Selected blobs whose point count exceeded sort_points_local's per-blob
     // capacity (local_sort_virtual_cap_) and so came back in their original,
     // unsorted order. Unlike a merely imprecise fit this is a silent total
