@@ -23,8 +23,18 @@ namespace apriltag_vulkan {
 // homography-refined set of corners (not just the raw geometric quad
 // corners QuadDecode computed). This exactly mirrors what
 // GpuDetector::DecodeTags()/QuadDecodeTask() do in the original CUDA
-// implementation (apriltag_detect.cu), minus RefineEdges (camera-distortion
-// based edge refinement - out of scope, see README.md).
+// implementation (apriltag_detect.cu).
+//
+// If `td->refine_edges` is set, each quad also gets upstream's own
+// gradient-based edge refinement (apriltag.c's refine_edges, exposed
+// non-static by the same patch) run on it immediately before
+// quad_decode_index - the same order and the same per-quad task upstream's
+// own quad_decode_task uses. This calls upstream's actual compiled function,
+// not a reimplementation, so there is nothing to keep in sync and nothing to
+// verify beyond "does it get called with the right inputs": no numerical
+// divergence is possible. `td->refine_edges` defaults to false and every
+// caller in this repo sets it explicitly - turning it on is the caller's
+// choice, not this class's.
 //
 // Scope: this stops at apriltag_detection_t (2D detection). Pose estimation
 // (apriltag_pose.h, which additionally requires a calibrated camera
@@ -45,11 +55,20 @@ class TagDecoder {
  public:
   // `td` must already have the desired tag family(-ies) added via
   // apriltag_detector_add_family(); TagDecoder does not own `td`.
+  // `decimation` must match whatever DetectorConfig::decimation the GPU
+  // pipeline that produced this frame's quads was configured with. It is
+  // used only if `td->refine_edges` is set: upstream's refine_edges()
+  // computes its per-edge search radius from td->quad_decimate, which
+  // TagDecoder has no other way of learning (the actual decimation is a GPU
+  // pipeline concern QuadDecode/GpuDetector own, not td). This constructor
+  // sets td->quad_decimate = decimation once, on `td`'s behalf, for that
+  // reason - it does not read td->quad_decimate for anything else, since
+  // quad_decode_index/quad_decode never touch that field.
   // `cpu_threads` is the total degree of parallelism (see WorkerPool); 0
   // selects hardware_concurrency, overridable via APRILTAG_CPU_THREADS (see
   // ResolveThreadCount) - the same resolution QuadDecode uses, so the env var
   // affects both CPU-tail phases identically.
-  explicit TagDecoder(apriltag_detector_t *td, uint32_t cpu_threads = 0);
+  explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0);
   ~TagDecoder();
 
   TagDecoder(const TagDecoder &) = delete;

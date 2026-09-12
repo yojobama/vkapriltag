@@ -80,9 +80,7 @@ int main(int argc, char **argv) {
   // matching this port's fixed 2x GPU decimation.
   apriltag_detector_t *td = apriltag_detector_create();
   apriltag_detector_add_family(td, tf);
-  td->refine_edges = false;  // RefineEdges (camera-distortion based) is not ported.
-
-  apriltag_vulkan::TagDecoder tag_decoder(td);
+  td->refine_edges = false;  // Off by default; flip to true to enable it.
 
   try {
     apriltag_vulkan::vk::Context ctx;
@@ -93,6 +91,11 @@ int main(int argc, char **argv) {
     config.tag_width = static_cast<uint32_t>(tf->width_at_border);
     config.reversed_border = tf->reversed_border;
     config.normal_border = !tf->reversed_border;
+
+    // decimation must match config.decimation - see TagDecoder's constructor
+    // comment - so this is constructed here, after config exists, rather
+    // than alongside `td` above.
+    apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation);
 
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);

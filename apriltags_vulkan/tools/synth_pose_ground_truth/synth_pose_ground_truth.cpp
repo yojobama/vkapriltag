@@ -427,7 +427,7 @@ int main(int argc, char **argv) {
     apriltag_detector_t *td_ours = apriltag_detector_create();
     apriltag_detector_add_family(td_ours, tf);
     td_ours->refine_edges = false;  // RefineEdges is not ported - see README.md.
-    apriltag_vulkan::TagDecoder tag_decoder(td_ours);
+    apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
 
     apriltag_detector_t *td_ref = apriltag_detector_create();
     apriltag_detector_add_family(td_ref, tf);

@@ -192,14 +192,13 @@ int main(int argc, char **argv) {
   double fx_override = 0.0, fy_override = 0.0, cx_override = -1.0, cy_override = -1.0;
   bool verbose = false;
   // libapriltag defaults refine_edges to ON, and vkapriltag does not implement
-  // RefineEdges at all (README, "Scope reductions"). Leaving the reference at
-  // its default therefore compares a detector that refines its corners against
-  // one that cannot, which is a real end-to-end difference but NOT a
-  // vkapriltag defect - and it is the single largest corner-level asymmetry
-  // between the two sides. Default to matching the port (off) so the number
-  // this tool reports isolates the pipeline, and expose the flag so the cost
-  // of the unported feature can be measured on its own.
+  // RefineEdges by default, though TagDecoder now supports it - see
+  // --our-refine-edges below. Leaving both off is the apples-to-apples
+  // comparison this tool defaults to; --ref-refine-edges alone measures the
+  // cost of a real asymmetry (reference refining, ours not); both on is the
+  // actual shipping-vs-shipping comparison.
   bool ref_refine_edges = false;
+  bool our_refine_edges = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -227,6 +226,8 @@ int main(int argc, char **argv) {
       verbose = true;
     } else if (arg == "--ref-refine-edges") {
       ref_refine_edges = (std::stoi(next("--ref-refine-edges")) != 0);
+    } else if (arg == "--our-refine-edges") {
+      our_refine_edges = (std::stoi(next("--our-refine-edges")) != 0);
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -235,7 +236,8 @@ int main(int argc, char **argv) {
 
   if (load_path.empty()) {
     std::cerr << "Usage: apriltag_pose_e2e_validate --data <dir-or-file> [--family tag36h11] "
-                 "[--decimation N] [--tagsize M] [--fx F --fy F --cx C --cy C]"
+                 "[--decimation N] [--tagsize M] [--fx F --fy F --cx C --cy C] "
+                 "[--ref-refine-edges 0|1] [--our-refine-edges 0|1]"
               << std::endl;
     return 1;
   }
@@ -307,7 +309,7 @@ int main(int argc, char **argv) {
     // ---------------- vkapriltag pipeline: detection ----------------
     apriltag_detector_t *td_ours = apriltag_detector_create();
     apriltag_detector_add_family(td_ours, tf);
-    td_ours->refine_edges = false;  // RefineEdges is not ported - see README.md.
+    td_ours->refine_edges = our_refine_edges;
 
     apriltag_vulkan::DetectorConfig config;
     config.width = width;
@@ -320,7 +322,7 @@ int main(int argc, char **argv) {
     apriltag_vulkan::vk::Context ctx;
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);
-    apriltag_vulkan::TagDecoder tag_decoder(td_ours);
+    apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
 
     detector.Detect(image.data);
     std::vector<apriltag_vulkan::DetectedQuad> quads =

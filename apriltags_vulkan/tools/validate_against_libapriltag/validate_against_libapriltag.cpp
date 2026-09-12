@@ -106,7 +106,11 @@ int main(int argc, char **argv) {
     // --- Our pipeline: Vulkan GPU detector + CPU QuadDecode + TagDecoder ---
     apriltag_detector_t *td_ours = apriltag_detector_create();
     apriltag_detector_add_family(td_ours, tf);
-    td_ours->refine_edges = false;  // RefineEdges is not ported - see README.md.
+    // td_ref below is never told otherwise, so it runs in upstream's own
+    // default config (refine_edges = true, apriltag.c) - matching that here
+    // is what this tool's own header comment promises: verification against
+    // the actual official outputs, not a handicapped comparison.
+    td_ours->refine_edges = true;
 
     apriltag_vulkan::vk::Context ctx;
     apriltag_vulkan::DetectorConfig config;
@@ -119,7 +123,7 @@ int main(int argc, char **argv) {
 
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);
-    apriltag_vulkan::TagDecoder tag_decoder(td_ours);
+    apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
 
     ImageMetrics metrics;
     metrics.file = pgm_path;

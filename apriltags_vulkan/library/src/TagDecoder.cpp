@@ -11,6 +11,11 @@ extern "C" {
 void quad_decode_index(apriltag_detector_t *td, struct quad *quad_original, image_u8_t *im,
                        image_u8_t *im_samples, zarray_t *detections);
 void reconcile_detections(zarray_t *detections, zarray_t *poly0, zarray_t *poly1);
+// Same patch, same treatment: upstream's own gradient-based corner
+// refinement (apriltag.c), run optionally (see TagDecoder's constructor
+// comment) immediately before quad_decode_index, mirroring
+// apriltag_detector_detect()'s own quad_decode_task ordering.
+void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct quad *quad);
 }
 
 namespace apriltag_vulkan {
@@ -41,8 +46,12 @@ void ResetScratch(zarray_t *scratch) { zarray_truncate(scratch, 0); }
 
 }  // namespace
 
-TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t cpu_threads)
+TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads)
     : td_(td), pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads))) {
+  // See the constructor's header comment: refine_edges() (called below, if
+  // td_->refine_edges is set) reads td_->quad_decimate for its search
+  // radius, and this is the only place that value can come from.
+  td_->quad_decimate = static_cast<float>(decimation);
   poly0_ = g2d_polygon_create_zeros(4);
   poly1_ = g2d_polygon_create_zeros(4);
   detections_ = zarray_create(sizeof(apriltag_detection_t *));
@@ -97,6 +106,16 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     quad_original.reversed_border = reversed_border;
     quad_original.H = nullptr;
     quad_original.Hinv = nullptr;
+
+    // Same order upstream's own quad_decode_task uses: refine (if enabled)
+    // before decode. refine_edges only reads td_->quad_decimate (set once,
+    // before this ParallelFor starts) and td_->refine_edges/mutex-free
+    // fields, and only ever writes to quad_original (this task's own stack
+    // local) - safe to call concurrently across quads, same as
+    // quad_decode_index below.
+    if (td_->refine_edges) {
+      refine_edges(td_, &im, &quad_original);
+    }
 
     // quad_decode_index appends any successful decode(s) (one per matching
     // tag family) to per_quad_[i]; it computes quad->H/Hinv itself.

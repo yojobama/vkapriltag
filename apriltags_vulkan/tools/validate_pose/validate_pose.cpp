@@ -574,7 +574,7 @@ int main(int argc, char **argv) {
 
     apriltag_vulkan::GpuDetector detector(ctx, cfg);
     apriltag_vulkan::QuadDecode quad_decode(cfg);
-    apriltag_vulkan::TagDecoder tag_decoder(td);
+    apriltag_vulkan::TagDecoder tag_decoder(td, decimation);
 
     detector.Detect(gray.data());
     const std::vector<apriltag_vulkan::DetectedQuad> quads =
