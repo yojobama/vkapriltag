@@ -29,10 +29,6 @@ jobs:
   parity-gate:
     runs-on: ubuntu-latest
     env:
-      # decimate.comp point-samples rather than box-filters (see
-      # QuadDecode.cpp's corner-mapping comment), so it needs nothing else
-      # here - lavapipe just has to exist and report a device.
-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
       # The pipeline refuses a CPU/software Vulkan device by default
       # (vk/Context.cpp) since it is 50-500x slower than real hardware -
       # this is the documented escape hatch for exactly this CI use case.
@@ -48,14 +44,42 @@ jobs:
             libvulkan-dev glslang-tools mesa-vulkan-drivers vulkan-tools \
             libopencv-dev
 
+      - name: Locate the lavapipe ICD and point the loader at it
+        # Deliberately NOT a hardcoded path: a first attempt at this
+        # workflow hardcoded /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        # (matching Ubuntu's published package file list for
+        # mesa-vulkan-drivers) and it failed on the actual ubuntu-latest
+        # runner - "Failed to open JSON file", i.e. the file was not at that
+        # path for whatever mesa-vulkan-drivers version/channel that runner
+        # actually resolved (dpkg reported the package installed
+        # successfully; the file layout just did not match what
+        # packages.ubuntu.com's "noble" listing showed - most likely a
+        # noble-updates version with a different layout). Rather than guess
+        # again, find whatever got installed and use that, so a future Mesa
+        # packaging change breaks this the same self-diagnosing way instead
+        # of silently.
+        run: |
+          echo "Files mesa-vulkan-drivers actually installed under vulkan/icd.d:"
+          dpkg -L mesa-vulkan-drivers | grep icd.d || echo "  (none reported by dpkg)"
+          echo "Broader search of the standard ICD directories:"
+          find /usr/share/vulkan /etc/vulkan -iname '*.json' 2>/dev/null
+
+          icd=$(find /usr/share/vulkan/icd.d /etc/vulkan/icd.d -iname '*lvp*.json' 2>/dev/null | head -n1)
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD json found under the standard search paths - see the file listing above"
+            exit 1
+          fi
+          echo "Using ICD: $icd"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+
       - name: Verify the software Vulkan device is visible
-        # Fails here, clearly, if the ICD path/package ever changes on
-        # ubuntu-latest - rather than failing confusingly inside
+        # Fails here, clearly, if the discovered ICD still doesn't work -
+        # rather than failing confusingly inside
         # apriltag_synth_ground_truth's own Vulkan setup later.
         run: |
           vulkaninfo --summary
           vulkaninfo --summary | grep -q "deviceType.*CPU" || \
-            (echo "::error::no CPU/software Vulkan device found - check VK_ICD_FILENAMES and mesa-vulkan-drivers" && exit 1)
+            (echo "::error::no CPU/software Vulkan device found even with VK_ICD_FILENAMES=$VK_ICD_FILENAMES" && exit 1)
 
       - name: Configure
         run: cmake -B build -S apriltags_vulkan -DCMAKE_BUILD_TYPE=Release
