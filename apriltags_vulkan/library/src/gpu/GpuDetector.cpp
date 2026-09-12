@@ -127,6 +127,42 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
 
   decimated_width_ = config_.width / config_.decimation;
   decimated_height_ = config_.height / config_.decimation;
+
+  // Resolve max_blobs == 0 ("auto") to a ceiling that tracks the frame,
+  // because the number of blobs a frame produces does. It goes as the
+  // DECIMATED pixel count - area/decimation^2 - so a flat ceiling silently
+  // loses its margin as either the sensor grows or decimation is lowered,
+  // and overflowing it is not a graceful degradation: select_blobs.comp
+  // discards the excess in atomicAdd order, so the frame's detections stop
+  // being reproducible (see DetectProfile::selected_blob_drops).
+  //
+  // Anchored on 1080p at decimation 2 - the configuration the old flat 2048
+  // was chosen and validated against - so every frame at or below that size
+  // resolves to exactly 2048 and keeps today's measured cost bit for bit.
+  // Only larger sensors or finer decimation ask for more.
+  //
+  // The headroom this leaves is deliberate and cheap. Blob density is
+  // scene-dependent (texture produces blobs; a flat wall does not), so the
+  // linear-in-pixels estimate has to sit well above the typical case for the
+  // atypical one to still fit - measured, a 12 MP frame at decimation 2
+  // qualifies 1878 blobs against the 12042 this resolves to. The cost of
+  // that slack is one dispatch and one scan over the capacity
+  // (extract_blob_counts + RunInclusiveScan; the per-frame READBACK is sized
+  // by the actual count, not this), measured at +2.2 us for a 24x capacity
+  // increase - 0.06% of a 3.6 ms frame. Silent irreproducibility is not
+  // worth trading for microseconds.
+  //
+  // Clamped to max_raw_blobs: a selected blob is always a subset of the raw
+  // blobs, so capacity beyond that can never be reached.
+  if (config_.max_blobs == 0) {
+    constexpr uint64_t kAnchorDecimatedPx = 1920ull * 1080ull / 4ull;  // 1080p at decimation 2
+    constexpr uint64_t kAnchorMaxBlobs = 2048ull;
+    const uint64_t decimated_px =
+        uint64_t(decimated_width_) * uint64_t(decimated_height_);
+    const uint64_t scaled = kAnchorMaxBlobs * decimated_px / kAnchorDecimatedPx;
+    config_.max_blobs = static_cast<uint32_t>(
+        std::min<uint64_t>(std::max<uint64_t>(scaled, kAnchorMaxBlobs), config_.max_raw_blobs));
+  }
   // Rounded up rather than floored: width/height are only guaranteed
   // divisible by decimation, not by a further factor of 4, so
   // decimated_width_/height_ need not be a multiple of 4.
@@ -958,6 +994,7 @@ std::string GpuDetector::DescribeSizing() const {
   if (config_.max_boundary_points > 0 && qbp_capacity_ < dense_qbp_count_) {
     os << " (capped from dense " << dense_qbp_count_ << ")";
   }
+  os << ", blob capacity " << config_.max_blobs;
   os << ", device memory " << (device_bytes_ / (1024 * 1024)) << " MiB";
   os << ", gray upload " << (gray_direct_write_ ? "direct (unified memory)" : "staged");
   return os.str();

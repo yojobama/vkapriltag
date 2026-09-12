@@ -115,7 +115,16 @@ struct DetectorConfig {
   // dense worst-case sizing, which would otherwise waste tens of MB with no
   // real-world benefit; both are generous for realistic scenes).
   uint32_t max_raw_blobs = 65536;
-  uint32_t max_blobs = 2048;
+  // Ceiling on blobs that survive selection. 0 means "size it from the
+  // frame": the blob count goes as decimated area, so this scales with
+  // width*height/decimation^2, anchored so 1080p at decimation 2 resolves to
+  // the 2048 this used to be fixed at, and clamped to max_raw_blobs. See the
+  // derivation in GpuDetector's constructor.
+  //
+  // Set it explicitly only to pin a specific budget; a value that is too
+  // small does not degrade gracefully, it makes the frame's detections
+  // depend on GPU scheduling order (DetectProfile::selected_blob_drops).
+  uint32_t max_blobs = 0;
 
   // Upper bound on boundary/index points kept per frame.
   //
