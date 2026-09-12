@@ -1,0 +1,80 @@
+name: vkapriltag parity gate
+
+# Builds the Vulkan-compute AprilTag pipeline and runs
+# apriltag_synth_ground_truth as a regression gate: it renders tag36h11 at
+# known poses, runs stock libapriltag and this port independently, and fails
+# (non-zero exit - see its own VERDICT section) if the measured delta
+# between them exceeds a threshold. See
+# apriltags_vulkan/tools/synth_pose_ground_truth/synth_pose_ground_truth.cpp.
+#
+# GitHub-hosted runners have no GPU, so this runs on Mesa's software Vulkan
+# implementation (lavapipe/llvmpipe) instead of real hardware. Confirmed
+# separately (not assumed) that lavapipe reports every feature this pipeline
+# needs (shaderFloat64, storageBuffer8BitAccess, subgroup ballot+arithmetic)
+# and reproduces bit-identical output to real AMD/Mali hardware for this
+# tool - see the commit that added this workflow for the numbers.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apriltags_vulkan/**"
+      - ".github/workflows/vkapriltag-parity.yml"
+  pull_request:
+    paths:
+      - "apriltags_vulkan/**"
+      - ".github/workflows/vkapriltag-parity.yml"
+
+jobs:
+  parity-gate:
+    runs-on: ubuntu-latest
+    env:
+      # decimate.comp point-samples rather than box-filters (see
+      # QuadDecode.cpp's corner-mapping comment), so it needs nothing else
+      # here - lavapipe just has to exist and report a device.
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      # The pipeline refuses a CPU/software Vulkan device by default
+      # (vk/Context.cpp) since it is 50-500x slower than real hardware -
+      # this is the documented escape hatch for exactly this CI use case.
+      APRILTAG_VK_ALLOW_CPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and Vulkan dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential \
+            libvulkan-dev glslang-tools mesa-vulkan-drivers vulkan-tools \
+            libopencv-dev
+
+      - name: Verify the software Vulkan device is visible
+        # Fails here, clearly, if the ICD path/package ever changes on
+        # ubuntu-latest - rather than failing confusingly inside
+        # apriltag_synth_ground_truth's own Vulkan setup later.
+        run: |
+          vulkaninfo --summary
+          vulkaninfo --summary | grep -q "deviceType.*CPU" || \
+            (echo "::error::no CPU/software Vulkan device found - check VK_ICD_FILENAMES and mesa-vulkan-drivers" && exit 1)
+
+      - name: Configure
+        run: cmake -B build -S apriltags_vulkan -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Run libapriltag-vs-vkapriltag parity gate
+        id: gate
+        run: |
+          set -o pipefail
+          ./build/tools/apriltag_synth_ground_truth | tee gate_output.txt
+
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          {
+            echo "## libapriltag vs vkapriltag parity"
+            echo '```'
+            cat gate_output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
