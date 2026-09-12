@@ -21,6 +21,22 @@ if (OpenCV_FOUND)
     target_compile_options(make_corpus PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
   install(TARGETS make_corpus RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+  # End-to-end pose validation: independently runs the stock libapriltag
+  # pipeline (apriltag_detector_detect + estimate_tag_pose) and the full
+  # vkapriltag pipeline (GpuDetector -> QuadDecode -> TagDecoder ->
+  # PoseEstimator) on the same raw image, matches detections by tag ID, and
+  # reports the 6-DoF pose delta between the two - unlike tools/validate_pose,
+  # which feeds one shared H into both pose solvers. Needs OpenCV for
+  # directory/image loading, same as apriltag_vulkan_validate above.
+  add_executable(apriltag_pose_e2e_validate
+          validate_pose_e2e/validate_pose_e2e.cpp
+  )
+  target_link_libraries(apriltag_pose_e2e_validate PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(apriltag_pose_e2e_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  install(TARGETS apriltag_pose_e2e_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 else()
   message(STATUS "Building validation tool without OpenCV (using pgm)")
   add_executable(apriltag_vulkan_validate
