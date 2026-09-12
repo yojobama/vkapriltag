@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
-project(ApriltagVulkan VERSION 1.0.0 LANGUAGES C CXX)
+project(ApriltagVulkan VERSION 1.4.0 LANGUAGES C CXX)
 
 # The fetched apriltag library's own CMakeLists.txt declares a very old
 # cmake_minimum_required(); this policy floor lets modern CMake configure it
