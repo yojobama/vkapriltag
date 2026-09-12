@@ -624,28 +624,31 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
     }
     if (reject) continue;
 
-    // AdjustPixelCenters, generalized from the fixed-2x-decimation original:
-    // pixel = (c - 0.5) * decimation + 0.5. The two 0.5 offsets have
-    // different origins and neither scales with decimation:
-    //   - the leading "- 0.5" undoes a constant +1 shift ComputeLineFitPoint
-    //     (sort_points_local_body.glsl) applies to every point's x2/y2
-    //     before any moment is accumulated - that shift happens entirely
-    //     within the DECIMATED grid's own index space, so it is exactly
-    //     half a DECIMATED pixel regardless of how coarse that grid is.
-    //   - the trailing "+ 0.5" converts from a pixel-INDEX coordinate (0 at
-    //     the first pixel) to the caller's pixel-CENTER convention, applied
-    //     AFTER scaling to full resolution - so it is exactly half a
-    //     FULL-RESOLUTION pixel, independent of decimation.
-    // Sanity check: at decimation=1 (no downsampling), the formula must
-    // reduce to the identity (corners[] is already in full-resolution
-    // units) - (c - 0.5) * 1 + 0.5 = c, confirming both constants are right
-    // where they are. Verified empirically against upstream apriltag's own
-    // (integer) quad_decimate at 1x/2x/4x - see apriltag_vulkan_validate.
+    // Decimated grid -> full-resolution pixels: a plain scale, matching
+    // upstream apriltag.c exactly (`q->p[j][0] *= td->quad_decimate`).
+    //
+    // There is deliberately NO pixel-center adjustment here. decimate.comp
+    // POINT-SAMPLES the top-left pixel of each block (sx = dx * kDecimation),
+    // which is also what upstream's image_u8_decimate does for an integer
+    // factor, so decimated index c corresponds to full-resolution index c*d
+    // and nothing else needs correcting. A "(c - 0.5) * d + 0.5" form would
+    // be right for an AREA/box decimation, whose output pixel represents the
+    // block's centre rather than its first sample - but that is not the
+    // filter either implementation uses.
+    //
+    // This previously carried that centre-adjusting form, which is short by
+    // exactly (d-1)/2 full-resolution pixels: a systematic corner bias of
+    // 0 at d=1, -0.5 at d=2 (the default!), -1.5 at d=4, reproduced exactly
+    // in measurement. It survived because the existing corner check reports
+    // RMS without gating on it, and because the bias is invisible at d=1.
+    // tools/validate_pose_e2e prints the mean SIGNED corner offset per tag
+    // for this reason: a constant offset is a convention bug, and only a
+    // signed statistic can tell it apart from zero-mean corner noise.
     const double decimation = static_cast<double>(config_.decimation);
     DetectedQuad out;
     for (int i = 0; i < 4; ++i) {
-      out.p[i][0] = (corners[i][0] - 0.5) * decimation + 0.5;
-      out.p[i][1] = (corners[i][1] - 0.5) * decimation + 0.5;
+      out.p[i][0] = corners[i][0] * decimation;
+      out.p[i][1] = corners[i][1] * decimation;
     }
     output.push_back(out);
   }
