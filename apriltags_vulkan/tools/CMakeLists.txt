@@ -37,6 +37,21 @@ if (OpenCV_FOUND)
     target_compile_options(apriltag_pose_e2e_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
   install(TARGETS apriltag_pose_e2e_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+  # Ground truth for the above: renders a tag at a CHOSEN, known 6-DoF pose
+  # (from the family's own bit_x/bit_y/codes tables, so the render is exactly
+  # what the decoder itself checks) and compares both pipelines against that
+  # known pose, not just against each other - answering "which side is
+  # actually closer to correct", which validate_pose_e2e's mutual-only delta
+  # cannot. Needs OpenCV (getPerspectiveTransform/warpPerspective).
+  add_executable(apriltag_synth_ground_truth
+          synth_pose_ground_truth/synth_pose_ground_truth.cpp
+  )
+  target_link_libraries(apriltag_synth_ground_truth PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(apriltag_synth_ground_truth PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  install(TARGETS apriltag_synth_ground_truth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 else()
   message(STATUS "Building validation tool without OpenCV (using pgm)")
   add_executable(apriltag_vulkan_validate
