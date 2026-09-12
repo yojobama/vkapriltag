@@ -29,6 +29,10 @@ optional fourth for pose:
    scalar C++ than as compute shaders.
 3. **`TagDecoder`** — wraps the unmodified, upstream `apriltag` C library's
    own per-family bit-sampling and hamming decode, fed the quads from step 2.
+   Optionally (`apriltag_detector_t::refine_edges`, off by default) also runs
+   upstream's own gradient-based corner refinement on each quad first, in the
+   same per-quad task and the same order `apriltag_detector_detect()` uses
+   internally — calling upstream's actual code, not a reimplementation.
 
 Optionally, a fourth stage:
 
@@ -53,7 +57,6 @@ development, not just at the end: see [Verifying correctness](#verifying-correct
 This port intentionally does less than the CUDA original and upstream
 `apriltag`:
 
-- **`RefineEdges`** (camera-distortion-based edge refinement) is not ported.
 - **No lens-distortion handling.** Intrinsics are assumed pinhole, so a
   caller with a wide-angle lens should undistort the detection's corners
   before estimating pose. The CUDA original's `UnDistort` path is not
@@ -116,7 +119,11 @@ config.normal_border = !tf->reversed_border;
 
 apriltag_vulkan::GpuDetector detector(ctx, config);
 apriltag_vulkan::QuadDecode quad_decode(config);
-apriltag_vulkan::TagDecoder tag_decoder(td);  // apriltag_detector_t*, families already added
+// td: apriltag_detector_t*, families already added. The decimation argument
+// must match config.decimation - see TagDecoder's constructor comment - it's
+// needed only if td->refine_edges is set (off by default; flip it on to run
+// upstream's own gradient-based corner refinement before decode).
+apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation);
 
 // Per frame:
 detector.Detect(gray_frame);  // tightly packed 8-bit grayscale, width*height bytes
@@ -148,17 +155,40 @@ capacity caps, etc. — all have working defaults).
 ## Verifying correctness
 
 ```sh
-build/tools/apriltag_vulkan_validate --data apriltags_vulkan/corpus --family tag36h11
+build/tools/apriltag_vulkan_validate --data path/to/your/images --family tag36h11
 ```
 
-`--data` accepts either a single image or a directory (the tracked
-`corpus/` directory holds a small multi-scale set). For every image, the
-tool runs this pipeline and the unmodified upstream `apriltag_detector_detect()`
-side by side and compares **both** the decoded tag ID set and the corner
-positions (RMS pixel error) between the two — not a visual/manual check.
-Pass `--iterations N` to additionally report steady-state timing (see
-below); a single iteration is dominated by cold-start costs (page faults,
-pipeline warm-up) and says little about per-frame throughput.
+`--data` accepts either a single image or a directory, in whatever format
+OpenCV can load (falls back to PGM-only without OpenCV — see Requirements).
+No test images ship with the repo: supply your own, or generate a
+resolution-swept set from one source image with `tools/make_corpus`
+(`corpus/` itself is gitignored, since it's local/machine-specific — see
+`apriltags_vulkan/.gitignore`). For every image, the tool runs this pipeline
+and the unmodified upstream `apriltag_detector_detect()` side by side and
+compares **both** the decoded tag ID set and the corner positions (RMS pixel
+error) between the two — not a visual/manual check. Pass `--iterations N` to
+additionally report steady-state timing (see below); a single iteration is
+dominated by cold-start costs (page faults, pipeline warm-up) and says
+little about per-frame throughput.
+
+Two further tools go beyond per-detection corner/ID agreement to the actual
+6-DoF pose:
+
+- **`apriltag_pose_e2e_validate --data <dir-or-file>`** runs stock
+  libapriltag (detect + `estimate_tag_pose`) and this port (full pipeline +
+  `PoseEstimator`) independently end to end on the same image — real
+  detection differences (corner localization) flow into the comparison, not
+  just the pose solver in isolation. `--ref-refine-edges` / `--our-refine-edges`
+  toggle `refine_edges` on either side, so the cost of leaving it off
+  asymmetrically (or the effect of turning it on for both) can be measured
+  rather than assumed.
+- **`apriltag_synth_ground_truth`** renders a tag at a *chosen, known* 6-DoF
+  pose — built from the tag family's own bit tables, so the render is
+  exactly what the decoder itself checks, not a guessed printed-tag
+  convention — and compares both pipelines against that known pose, not just
+  against each other. This is what can actually say *which* side (if either)
+  is closer to correct when the two disagree, which a real photograph (no
+  known true pose) cannot.
 
 Pose is verified by a second tool, against upstream `apriltag_pose.c`:
 
@@ -166,6 +196,10 @@ Pose is verified by a second tool, against upstream `apriltag_pose.c`:
 build/tools/apriltag_pose_validate                        # synthetic + degenerate
 build/tools/apriltag_pose_validate --data colorImage.pgm  # + real detections, + timing
 ```
+
+(`colorImage.pgm` here and below names the specific real single-tag capture
+these numbers were measured against on the two development machines — it
+isn't shipped with the repo; substitute your own PGM.)
 
 Upstream exposes every stage of its pose algorithm publicly, so this
 compares at four levels rather than only the final answer — homography
@@ -201,8 +235,8 @@ the iteration keeps twitching below the tolerance and still hits the
 
 ## Performance
 
-Measured on the two development targets, `colorImage.pgm` (1920x1080),
-`APRILTAG_VK_MAX_POINTS=200000`. **Every stage below is labelled with the
+Measured on the two development targets, `colorImage.pgm` (1920x1080, not
+shipped — see above), `APRILTAG_VK_MAX_POINTS=200000`. **Every stage below is labelled with the
 processor it actually runs on** — the pipeline is not GPU-only, and the two
 tails and pose estimation are all CPU work:
 
@@ -248,9 +282,15 @@ Both CPU tails and pose all run on the same `WorkerPool`, sized by
 they spread across all 8 RK3588 cores by default (measured 5.4x scaling for
 `quad_decode`).
 
-Both runs: 5/5 corpus images match upstream `apriltag` on tag ID and
-corner position; `colorImage.pgm` decodes tag `554` with corner RMS
-0.1577 px on both.
+Both runs: `colorImage.pgm` matches upstream `apriltag` on tag ID and
+decodes tag `554` with corner RMS 0.0004 px on both, with `refine_edges` on
+both sides (`apriltag_vulkan_validate` compares against upstream's actual
+default configuration — see [Verifying correctness](#verifying-correctness)).
+That comparison isn't guaranteed to match on every possible image: a quad
+this port's own corner-fitting proposes but upstream's differently-designed
+quad-finder never generates a candidate for has nothing on the reference
+side to compare against, which shows up as an ID-set "mismatch" even when
+every tag both sides do find agrees to sub-pixel precision.
 
 `quad_decode` dropped from the previous 2.71/2.91 ms (RK3588) once `kDp`
 became the default corner-seeding method: DP skips the combinatorial
@@ -290,9 +330,9 @@ apriltags_vulkan/
     shaders/   GLSL compute shaders, compiled to SPIR-V at build time
     include/   public headers (vkapriltag::vkapriltag target)
   apps/        interactive V4L2 sample app (Linux)
-  tools/       libapriltag cross-validation tool, corpus generator
+  tools/       validation tools (ID/corner, end-to-end pose, synthetic
+               ground truth, pose solver) and the corpus generator
   cmake/       the upstream apriltag patch, shader-embedding machinery
-  corpus/      tracked multi-scale validation images
   OPTIMIZATION_NOTES.md   detailed performance history and rejected approaches
 ```
 
@@ -301,5 +341,5 @@ apriltags_vulkan/
 Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for
 attribution: this project is based on frc971's `apriltags_cuda` and
 includes software derived from AprilRobotics' `apriltag` (fetched at build
-time as an unmodified dependency, patched only to expose two internal entry
-points — see `cmake/patches/`).
+time as an unmodified dependency, patched only to expose three internal
+entry points — see `cmake/patches/`).
