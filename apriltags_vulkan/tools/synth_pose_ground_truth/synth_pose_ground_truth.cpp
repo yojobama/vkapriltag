@@ -335,6 +335,15 @@ Stat3 Summarize(std::vector<double> v) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  // RenderFrame's cv::randn() draws from OpenCV's default global RNG. Two
+  // runs this session (real AMD hardware, then Mesa lavapipe) produced
+  // bit-identical output, so this is already deterministic in practice - but
+  // this tool now gates CI (see the VERDICT section below), and a gate
+  // should not depend on an implicit default that could change across
+  // OpenCV versions. Fix the seed explicitly so reproducibility is a stated
+  // property, not an accident of the current default.
+  cv::theRNG() = cv::RNG(0x5eed);
+
   std::string family_name = "tag36h11";
   int width = 1280, height = 800;
   double tagsize = 0.1651;
@@ -573,6 +582,7 @@ int main(int argc, char **argv) {
               "mean/worst");
   int total_cases = 0, total_both_ok = 0;
   std::vector<double> all_lib_rot, all_vk_rot, all_mutual_rot;
+  std::vector<double> all_lib_dt, all_vk_dt, all_mutual_dt;
   for (const Bucket &b : buckets) {
     total_cases += b.both_ok + std::max(b.lib_missed, b.vk_missed);
     total_both_ok += b.both_ok;
@@ -592,21 +602,72 @@ int main(int argc, char **argv) {
     all_lib_rot.insert(all_lib_rot.end(), b.lib_rot.begin(), b.lib_rot.end());
     all_vk_rot.insert(all_vk_rot.end(), b.vk_rot.begin(), b.vk_rot.end());
     all_mutual_rot.insert(all_mutual_rot.end(), b.mutual_rot.begin(), b.mutual_rot.end());
+    all_lib_dt.insert(all_lib_dt.end(), b.lib_dt.begin(), b.lib_dt.end());
+    all_vk_dt.insert(all_vk_dt.end(), b.vk_dt.begin(), b.vk_dt.end());
+    all_mutual_dt.insert(all_mutual_dt.end(), b.mutual_dt.begin(), b.mutual_dt.end());
   }
   std::printf("============================================================\n");
   std::printf("Cases: %d generated, %d both sides decoded and produced a valid pose\n",
               total_cases, total_both_ok);
-  if (!all_lib_rot.empty()) {
-    const Stat3 lr = Summarize(all_lib_rot), vr = Summarize(all_vk_rot), mr = Summarize(all_mutual_rot);
-    std::printf("Overall rotation error vs GROUND TRUTH (deg): libapriltag mean=%.4f worst=%.4f | "
-                "vkapriltag mean=%.4f worst=%.4f\n",
-                lr.mean, lr.worst, vr.mean, vr.worst);
-    std::printf("Overall mutual rotation delta (deg, libapriltag vs vkapriltag): mean=%.4f "
-                "worst=%.4f\n",
-                mr.mean, mr.worst);
-    std::printf("Interpretation: if lib and vk error-vs-truth are close and both far below the "
-                "mutual delta's worst case, the worst mutual deltas are pose-ambiguity branch "
-                "flips (see validate_pose_e2e), not either side being systematically wrong.\n");
+
+  // ---------------- VERDICT ----------------
+  //
+  // Styled after tools/validate_pose/validate_pose.cpp's own VERDICT block:
+  // named checks, PASS/FAIL, non-zero exit on any failure - this is what
+  // lets a CI workflow gate on "did libapriltag and vkapriltag diverge",
+  // not just print numbers for a human to eyeball.
+  //
+  // Every threshold below gates on the MEAN, deliberately, never the worst
+  // case. The worst mutual delta is dominated by legitimate pose-ambiguity
+  // branch flips at small/oblique tag sizes (measured up to ~124 deg here -
+  // see this file's header comment and validate_pose_e2e's branch-flip
+  // tracking) - a real, expected property of the geometry, not a bug.
+  // Gating on it would make this CI job flaky on entirely correct code.
+  bool all_ok = true;
+  if (all_lib_rot.empty()) {
+    std::printf("VERDICT: FAIL (no cases both sides decoded and produced a valid pose)\n");
+    return 1;
   }
-  return 0;
+  const Stat3 lr = Summarize(all_lib_rot), vr = Summarize(all_vk_rot), mr = Summarize(all_mutual_rot);
+  const Stat3 ld = Summarize(all_lib_dt), vd = Summarize(all_vk_dt), md = Summarize(all_mutual_dt);
+  std::printf("Overall rotation error vs GROUND TRUTH (deg): libapriltag mean=%.4f worst=%.4f | "
+              "vkapriltag mean=%.4f worst=%.4f\n",
+              lr.mean, lr.worst, vr.mean, vr.worst);
+  std::printf("Overall translation error vs GROUND TRUTH (rel |t|): libapriltag mean=%.4f "
+              "worst=%.4f | vkapriltag mean=%.4f worst=%.4f\n",
+              ld.mean, ld.worst, vd.mean, vd.worst);
+  std::printf("Overall mutual rotation delta (deg, libapriltag vs vkapriltag): mean=%.4f "
+              "worst=%.4f\n",
+              mr.mean, mr.worst);
+  std::printf("Overall mutual translation delta (rel |t|, libapriltag vs vkapriltag): mean=%.4f "
+              "worst=%.4f\n",
+              md.mean, md.worst);
+  std::printf("Interpretation: if lib and vk error-vs-truth are close and both far below the "
+              "mutual delta's worst case, the worst mutual deltas are pose-ambiguity branch "
+              "flips (see validate_pose_e2e), not either side being systematically wrong.\n");
+
+  auto Check = [&](const char *name, bool ok, const std::string &detail) {
+    std::printf("  %-32s %s  (%s)\n", name, ok ? "PASS" : "FAIL", detail.c_str());
+    all_ok = all_ok && ok;
+  };
+
+  std::printf("VERDICT\n");
+  {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "%d/%d, floor=550", total_both_ok, total_cases);
+    Check("decode+pose rate", total_both_ok >= 550, buf);
+
+    std::snprintf(buf, sizeof(buf), "mean=%.4f deg, limit=8.0 deg", mr.mean);
+    Check("mutual rotation (mean)", mr.mean <= 8.0, buf);
+
+    std::snprintf(buf, sizeof(buf), "mean=%.4f, limit=0.01", md.mean);
+    Check("mutual translation (mean, rel |t|)", md.mean <= 0.01, buf);
+
+    const double symmetry = std::fabs(vr.mean - lr.mean);
+    std::snprintf(buf, sizeof(buf), "|%.4f - %.4f| = %.4f deg, limit=2.0 deg", vr.mean, lr.mean,
+                 symmetry);
+    Check("lib/vk symmetry (mean rot vs truth)", symmetry <= 2.0, buf);
+  }
+  std::printf("  %s\n", all_ok ? "ALL CHECKS PASS" : "AT LEAST ONE CHECK FAILED");
+  return all_ok ? 0 : 1;
 }
