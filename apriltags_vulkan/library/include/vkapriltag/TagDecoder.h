@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "vkapriltag/RefineEdges.h"
 #include "vkapriltag/common/WorkerPool.h"
 #include "vkapriltag/gpu/GpuDetector.h"
 
@@ -29,12 +30,17 @@ namespace apriltag_vulkan {
 // gradient-based edge refinement (apriltag.c's refine_edges, exposed
 // non-static by the same patch) run on it immediately before
 // quad_decode_index - the same order and the same per-quad task upstream's
-// own quad_decode_task uses. This calls upstream's actual compiled function,
-// not a reimplementation, so there is nothing to keep in sync and nothing to
-// verify beyond "does it get called with the right inputs": no numerical
-// divergence is possible. `td->refine_edges` defaults to false and every
+// own quad_decode_task uses. `td->refine_edges` defaults to false and every
 // caller in this repo sets it explicitly - turning it on is the caller's
 // choice, not this class's.
+//
+// Which implementation of that refinement runs is RefineEdgesMethod's
+// (RefineEdges.h) decision. kUpstream calls upstream's actual compiled
+// function, so nothing can diverge; the other two are reimplementations that
+// do have to be kept in sync with apriltag.c's refine_edges, and are the
+// reason this file no longer gets to claim divergence is impossible. They
+// exist because that function measured as the single largest cost in the
+// whole pipeline - see RefineEdgesMethod.
 //
 // Scope: this stops at apriltag_detection_t (2D detection). Pose estimation
 // (apriltag_pose.h, which additionally requires a calibrated camera
@@ -68,7 +74,11 @@ class TagDecoder {
   // selects hardware_concurrency, overridable via APRILTAG_CPU_THREADS (see
   // ResolveThreadCount) - the same resolution QuadDecode uses, so the env var
   // affects both CPU-tail phases identically.
-  explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0);
+  // `refine_method` selects the edge-refinement implementation, and is
+  // overridable at runtime via APRILTAG_VK_REFINE - see
+  // ResolveRefineEdgesMethod. Only consulted when `td->refine_edges` is set.
+  explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0,
+                      RefineEdgesMethod refine_method = RefineEdgesMethod::kExact);
   ~TagDecoder();
 
   TagDecoder(const TagDecoder &) = delete;
@@ -90,6 +100,7 @@ class TagDecoder {
  private:
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
+  RefineEdgesMethod refine_method_;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;

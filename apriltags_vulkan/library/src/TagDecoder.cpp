@@ -46,8 +46,11 @@ void ResetScratch(zarray_t *scratch) { zarray_truncate(scratch, 0); }
 
 }  // namespace
 
-TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads)
-    : td_(td), pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads))) {
+TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads,
+                       RefineEdgesMethod refine_method)
+    : td_(td),
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads))),
+      refine_method_(ResolveRefineEdgesMethod(refine_method)) {
   // See the constructor's header comment: refine_edges() (called below, if
   // td_->refine_edges is set) reads td_->quad_decimate for its search
   // radius, and this is the only place that value can come from.
@@ -114,7 +117,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     // local) - safe to call concurrently across quads, same as
     // quad_decode_index below.
     if (td_->refine_edges) {
-      refine_edges(td_, &im, &quad_original);
+      RefineEdges(refine_method_, td_, &im, &quad_original);
     }
 
     // quad_decode_index appends any successful decode(s) (one per matching
