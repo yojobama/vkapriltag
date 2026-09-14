@@ -12,6 +12,7 @@
 #include <vector>
 #include <filesystem>
 
+#include "vkapriltag/FramePipeline.h"
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/apriltag_family.h"
 #include "vkapriltag/gpu/GpuDetector.h"
@@ -65,6 +66,11 @@ int main(int argc, char **argv) {
   // it until selected_blob_drops reads zero is the way to confirm that is what
   // a nondeterministic result is caused by.
   uint32_t max_blobs = 0;
+  // Run the frame-pipelined path (FramePipeline) instead of the serial
+  // Detect -> QuadDecode -> TagDecoder chain, so the two can be A/B'd from one
+  // binary. Throughput-only: per-iteration timings below stop being a
+  // breakdown, since the GPU pass and the CPU tail deliberately overlap.
+  bool pipelined = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -84,6 +90,8 @@ int main(int argc, char **argv) {
       decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
     } else if (arg == "--max-blobs") {
       max_blobs = static_cast<uint32_t>(std::max(1, std::stoi(next("--max-blobs"))));
+    } else if (arg == "--pipelined") {
+      pipelined = true;
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -180,6 +188,33 @@ int main(int argc, char **argv) {
       apriltag_vulkan::GpuDetector::DetectProfile profile;
       std::vector<apriltag_vulkan::DetectedQuad> quads;
 
+      if (pipelined) {
+        // Pushing the same buffer every iteration is safe here only because
+        // both consumers read it: the GPU pass copies it into its staging
+        // buffer and TagDecoder samples it. A live camera must alternate two
+        // buffers - see FramePipeline::Push.
+        apriltag_vulkan::FramePipeline pipe(detector, quad_decode, tag_decoder);
+        for (int it = 0; it < iterations; ++it) {
+          const auto t0 = std::chrono::steady_clock::now();
+          zarray_t *done = pipe.Push(image.data, width, height, config.reversed_border);
+          const auto t1 = std::chrono::steady_clock::now();
+          // Wall time per pushed frame - the throughput number. It is NOT
+          // comparable to the serial path's per-stage breakdown, which is why
+          // the three stage vectors stay empty in this mode.
+          pipeline_totals.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+          if (done != nullptr) {
+            ours = done;
+            profile = pipe.last_profile();
+            gpu_totals.push_back(profile.total_ms);
+          }
+        }
+        if (zarray_t *tail = pipe.Flush()) {
+          ours = tail;
+          profile = pipe.last_profile();
+          gpu_totals.push_back(profile.total_ms);
+        }
+        quads = pipe.last_quads();
+      } else {
       for (int it = 0; it < iterations; ++it) {
           const auto t0 = std::chrono::steady_clock::now();
           detector.Detect(image.data);
@@ -200,6 +235,7 @@ int main(int argc, char **argv) {
 
           pipeline_totals.push_back(
               std::chrono::duration<double, std::milli>(t_dec1 - t0).count());
+      }
       }
 
       metrics.gpu_total_ms = ComputeStats(gpu_totals);
