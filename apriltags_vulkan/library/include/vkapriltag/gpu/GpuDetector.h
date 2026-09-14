@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <span>
 #include <vector>
 
 #include "vkapriltag/gpu/Types.h"
@@ -186,6 +187,17 @@ struct DetectedQuad {
 // calling DeviceRadixSort.
 class GpuDetector {
  public:
+  // Number of named GPU timestamp spans. Single source of truth for the four
+  // things that must agree about it: DetectProfile::gpu_stage_ms,
+  // DetectProfile::gpu_gap_ms (one fewer - gaps sit BETWEEN spans),
+  // kGpuStageNames and kGpuGapCrossesSubmit. These were four independent
+  // hardcoded literals, with the private GpuStageSpan enum's own
+  // kNumGpuStageSpans a fifth that sized none of them - so adding or
+  // splitting a span meant editing five places with nothing detecting a
+  // miss. A static_assert next to the enum now ties that last one in too.
+  static constexpr size_t kNumGpuStages = 13;
+  static constexpr size_t kNumGpuGaps = kNumGpuStages - 1;
+
   struct DetectProfile {
     // Wall-clock, host side.
     double upload_ms = 0.0;
@@ -262,17 +274,17 @@ class GpuDetector {
     // APRILTAG_VK_TIMESTAMPS=1 - and costs nothing when timestamps aren't
     // supported or the pool wasn't constructed.
     bool has_gpu_stage_breakdown = false;
-    std::array<double, 12> gpu_stage_ms = {};
+    std::array<double, kNumGpuStages> gpu_stage_ms = {};
 
     // GPU-side gap between the END of named span i and the START of named
-    // span i+1 (11 gaps between 12 spans), computed from the SAME
+    // span i+1 (kNumGpuGaps gaps between kNumGpuStages spans), computed from the SAME
     // vkCmdWriteTimestamp pairs gpu_stage_ms already uses - no extra query
     // pool slots. Unlike (cpu_submit_wait_ms - sum(gpu_stage_ms)) below,
     // which mixes CPU-observed wait time with GPU time, this is purely
     // GPU-clock-to-GPU-clock, so it directly attributes the "unspanned"
     // residual to a specific location rather than only its total.
     //
-    // 3 of these 11 gaps cross a submit boundary (Labelling->LabelFinalize,
+    // 3 of these gaps cross a submit boundary (Labelling->UfFinal,
     // Boundary->HashGroup, Scatter->Sort - see Detect()'s "Submit N:"
     // comments) and so include queue-submit/fence overhead on top of any
     // GPU-side barrier cost; the other 8 are purely intra-submit
@@ -281,7 +293,7 @@ class GpuDetector {
     // cpu_submit_wait_ms's comment) from "per-barrier cost accumulates
     // across many small dispatches" (the standing hypothesis this exists to
     // test directly instead of by inference).
-    std::array<double, 11> gpu_gap_ms = {};
+    std::array<double, kNumGpuGaps> gpu_gap_ms = {};
 
     // --- Host-side cost of driving the GPU, split out from the phase timers
     // above. The phase timers (threshold_label_ms etc.) are wall-clock and so
@@ -332,14 +344,21 @@ class GpuDetector {
   // Names for DetectProfile::gpu_stage_ms, in index order. Each entry is one
   // vkCmdWriteTimestamp pair (start, end) recorded around the named group of
   // dispatches - see the kSpan* constants and their use in Detect().
-  static constexpr std::array<const char *, 12> kGpuStageNames = {
+  static constexpr std::array<const char *, kNumGpuStages> kGpuStageNames = {
       "clear",          // the per-frame vkCmdFillBuffer set + the gray upload
                         // copy. ~2.3 MB of fills at 1080p, and outside every
                         // other span, so it was landing in the unattributed
                         // gap that the submit-count reduction failed to move.
       "threshold",      // decimate + block_minmax + block_filter + threshold
       "labelling",      // uf_init + uf_compress + the uf_merge/uf_compress loop
-      "label_finalize", // uf_final + label_pixels
+      "uf_final",       // uf_final.comp - the per-blob pixel-count histogram
+      "label_pixels",   // label_pixels.comp - folds blob identity and the
+                        // min-size test into one per-pixel word. Split from
+                        // uf_final (they shared a "label_finalize" span)
+                        // because optimizations to the two move in opposite
+                        // directions: work removed from uf_final's atomics
+                        // versus work added to label_pixels, which a shared
+                        // span nets out to nothing visible.
       "boundary",       // blob_diff (append + compaction)
       "hash_group",     // hash_group.comp (also assigns dense raw blob ids)
       "extents",        // init_extents.comp + reduce_extents_hash.comp
@@ -359,11 +378,12 @@ class GpuDetector {
   // place kGpuStageNames[g] and [g+1] in different submits, so that gap
   // includes queue-submit/fence overhead on top of any GPU-side barrier
   // cost, unlike the other 8 gaps (purely intra-submit).
-  static constexpr std::array<bool, 11> kGpuGapCrossesSubmit = {
+  static constexpr std::array<bool, kNumGpuGaps> kGpuGapCrossesSubmit = {
       false,  // clear -> threshold (submit 1)
       false,  // threshold -> labelling (submit 1)
-      true,   // labelling -> label_finalize (submit 1 -> 2)
-      false,  // label_finalize -> boundary (submit 2)
+      true,   // labelling -> uf_final (submit 1 -> 2)
+      false,  // uf_final -> label_pixels (submit 2)
+      false,  // label_pixels -> boundary (submit 2)
       true,   // boundary -> hash_group (submit 2 -> 3)
       false,  // hash_group -> extents (submit 3)
       false,  // extents -> select (submit 3)
@@ -458,7 +478,7 @@ class GpuDetector {
   // it as a per-pixel label rather than a raw union-find parent.
   vk::Buffer parent_buf_, blob_size_buf_, uf_changed_buf_;
   vk::Buffer qbp_compacted_buf_, qbp_counter_buf_;
-  vk::Buffer qbp_keys_hi_buf_, qbp_keys_lo_buf_;
+  vk::Buffer qbp_keys_buf_;
   vk::Buffer extents_buf_;
   vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
   vk::Buffer index_points_buf_;
@@ -503,6 +523,12 @@ class GpuDetector {
   vk::Buffer readback_staging_;
   VkDeviceSize readback_capacity_ = 0;
   bool gray_direct_write_ = false;
+  // True when line_fit_points_buf_ landed on a host-visible, HOST_CACHED
+  // memory type, so its readback needs neither the on-device copy into
+  // readback_staging_ nor a memcpy out of it. See CreateBuffers.
+  bool linefit_direct_read_ = false;
+  // Backs last_line_fit_points only on the staging path.
+  std::vector<RawLineFitPoint> linefit_scratch_;
 
   // Scan chain for the per-blob point-offset assignment (sized to
   // config_.max_blobs). The hash table's raw-blob numbering no longer needs
@@ -564,7 +590,8 @@ class GpuDetector {
     kSpanClear = 0,
     kSpanThreshold,
     kSpanLabelling,
-    kSpanLabelFinalize,
+    kSpanUfFinal,
+    kSpanLabelPixels,
     kSpanBoundary,
     kSpanHashGroup,
     kSpanExtents,
@@ -575,6 +602,13 @@ class GpuDetector {
     kSpanReadbackCopy,
     kNumGpuStageSpans,
   };
+  // The enum sizes the query pool; kNumGpuStages sizes the profile arrays and
+  // the two name/submit tables. They describe the same set of spans, so a
+  // change to one that misses the other is a bug - previously a silent
+  // out-of-range read, now a build failure.
+  static_assert(static_cast<size_t>(kNumGpuStageSpans) == kNumGpuStages,
+                "GpuStageSpan and kNumGpuStages disagree about the span count");
+
   // WriteTimestamp() index for a span's start/end - 2 slots per span.
   static constexpr uint32_t SpanStart(GpuStageSpan s) { return static_cast<uint32_t>(s) * 2; }
   static constexpr uint32_t SpanEnd(GpuStageSpan s) { return static_cast<uint32_t>(s) * 2 + 1; }
@@ -583,7 +617,19 @@ class GpuDetector {
   // Readback results exposed for QuadDecode after Detect() runs the GPU
   // pipeline; sized to the actual (not capacity) counts for the frame.
   std::vector<MinMaxExtentsGpu> last_selected_extents;
-  std::vector<RawLineFitPoint> last_line_fit_points;
+
+  // A VIEW, not a container, and only valid until the next Detect().
+  //
+  // On a part whose device-local memory can be host-visible and HOST_CACHED
+  // (integrated/unified, or a discrete card with resizable BAR) this points
+  // straight into the buffer the shader wrote, so the ~1.6 MB of line-fit
+  // records at 1080p costs zero copies instead of two - a device-to-staging
+  // vkCmdCopyBuffer plus a memcpy into a vector. Everywhere else it views an
+  // internal scratch vector filled from the staging buffer exactly as before.
+  //
+  // Deliberately a span rather than a vector, so the zero-copy case cannot
+  // be silently undone by a caller that expects to own the storage.
+  std::span<const RawLineFitPoint> last_line_fit_points;
 };
 
 }  // namespace apriltag_vulkan

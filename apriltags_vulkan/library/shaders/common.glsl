@@ -17,6 +17,49 @@ uint PackXY(uint x, uint y) {
 uint UnpackX(uint xy) { return xy & 0x3FFFu; }
 uint UnpackY(uint xy) { return (xy >> 14u) & 0x3FFFu; }
 
+// --- The per-pixel word label_pixels.comp writes into parent[] ---
+//
+// label_pixels.comp rewrites parent[] in place after the union find has
+// converged (see its comment). It packs two things into that one word:
+//
+//   bits [0:29]  label: 0 when the pixel has no usable blob (ambiguous, or
+//                its blob is below min_cluster_pixels), else 1 + the
+//                union-find root's decimated pixel index.
+//   bits [30:31] code:  the three-valued threshold at this pixel, as
+//                0 = black (0), 1 = ambiguous (127), 2 = white (255).
+//
+// blob_diff.comp then needs only SIX loads per interior pixel, from one
+// array, where it previously took twelve from two - it read both
+// thresholded[n] and parent[n] at the pixel and each of its five
+// neighbours. Folding the threshold into the word label_pixels already
+// writes costs that shader one extra sequential read and saves blob_diff
+// six random-ish streams.
+//
+// LABEL BIT BUDGET. GpuDetector's constructor rejects any configuration
+// with 2*(width/decimation) > 16383, so the decimated grid is at most
+// 8191x8191 = 67,092,481 pixels, which is under 2^26 (67,108,864). So
+// label needs at most 26 bits in the worst configuration the constructor
+// accepts - 1080p at decimation 1 is 21 bits, at decimation 2 is 20 - and
+// 30 are allocated. The host asserts this too; see CreateBuffers.
+//
+// THE CODE MAPPING IS MONOTONIC, which is what makes blob_diff's rewritten
+// tests identity-preserving rather than merely equivalent:
+//   * the boundary test v0 + vN == 255 becomes c0 + cN == 2. With c0 in
+//     {0,2} (c0 == 1 returns early), c0 + cN == 2 forces cN = 2 - c0, so
+//     the (1,1) collision is unreachable.
+//   * the gradient sign (vN > v0) becomes (cN > c0) by monotonicity - and
+//     blob_diff computes some of those signs unconditionally, consuming
+//     them only where the matching want* holds, so monotonicity means they
+//     are identical bit patterns even where unused.
+//   * the SW dedup test is pure equality, preserved by any injective map.
+const uint kPixelLabelBits = 30u;
+const uint kPixelLabelMask = (1u << kPixelLabelBits) - 1u;
+
+// 0/127/255 -> 0/1/2, branch-free and monotonic.
+uint PackThreshCode(uint v) { return (v + 1u) >> 7u; }
+uint PixelLabel(uint word) { return word & kPixelLabelMask; }
+uint PixelThreshCode(uint word) { return word >> kPixelLabelBits; }
+
 // A "boundary candidate point" - produced once per pixel-pair that straddles
 // a black/white threshold boundary. Mirrors frc971::apriltag::
 // QuadBoundaryPoint, packed into a single uint32 rather than a multi-field

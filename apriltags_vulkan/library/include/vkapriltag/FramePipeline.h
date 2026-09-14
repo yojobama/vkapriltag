@@ -73,6 +73,12 @@ class FramePipeline {
   // Candidate quads for that same completed frame.
   const std::vector<DetectedQuad> &last_quads() const { return quads_; }
 
+  // Selected blob extents for that same completed frame. QuadDecode no longer
+  // takes these, but GpuDetector still populates them and the detector's own
+  // copy already belongs to the frame in flight by the time a caller could
+  // look, so the completed frame's are kept here.
+  const std::vector<MinMaxExtentsGpu> &last_selected_extents() const { return done_extents_; }
+
  private:
   void WorkerLoop();
   // Blocks until the in-flight GPU pass finishes, then swaps its results into
@@ -108,9 +114,10 @@ class FramePipeline {
   uint32_t done_width_ = 0, done_height_ = 0;
   bool done_reversed_border_ = false;
 
-  // Swapped (never moved) with the detector's vectors, so the two buffers
-  // ping-pong and keep their capacity - Detect() would otherwise reallocate
-  // both every frame, which this library goes out of its way to avoid.
+  // Extents are swapped (never moved) with the detector's vector, so the two
+  // buffers ping-pong and keep their capacity - Detect() would otherwise
+  // reallocate every frame, which this library goes out of its way to avoid.
+  // Points must be copied instead; see HarvestInFlight.
   std::vector<MinMaxExtentsGpu> done_extents_;
   std::vector<RawLineFitPoint> done_points_;
   GpuDetector::DetectProfile done_profile_{};

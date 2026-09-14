@@ -85,6 +85,18 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     throw std::runtime_error(
         "2*(width/decimation) and 2*(height/decimation) must each be <= 16383");
   }
+  // label_pixels.comp packs `1 + root` into the low 30 bits of parent[] and
+  // the pixel's threshold code into the top 2 (see common.glsl). The check
+  // above already implies this - it bounds the decimated grid at 8191x8191 =
+  // 67,092,481 pixels, under 2^26 - so this is executable documentation of
+  // the coupling rather than a reachable failure, and it will fire first if
+  // the packing above is ever widened.
+  if (VkDeviceSize(config_.width / config_.decimation) *
+          (config_.height / config_.decimation) >=
+      (1u << 30)) {
+    throw std::runtime_error(
+        "decimated pixel count must be < 2^30 to fit label_pixels.comp's packed label");
+  }
 
   // --- Environment overrides. These must all be applied before any capacity
   // or launch geometry is derived from the config. ---
@@ -305,10 +317,12 @@ void GpuDetector::CreateBuffers() {
   // C++ mirror struct exists since nothing on the host ever reads one back.
   qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(uint32_t));
   qbp_counter_buf_ = ssbo(4);
-  // Only the grouping hash reads these now, so they are sized to the actual
-  // point capacity rather than the power of two a bitonic network needed.
-  qbp_keys_hi_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
-  qbp_keys_lo_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
+  // Only the grouping hash reads this now, so it is sized to the actual point
+  // capacity rather than the power of two a bitonic network needed. One
+  // interleaved uvec2 per point rather than two parallel uint arrays: the
+  // hash's probe loop compares a whole (rep0, rep1) key, so split arrays cost
+  // two random gathers into two separate buffers per probe. Same total bytes.
+  qbp_keys_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 8);
 
   extents_buf_ = ssbo(VkDeviceSize(config_.max_raw_blobs) * sizeof(MinMaxExtentsGpu));
   selected_extents_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu));
@@ -318,7 +332,24 @@ void GpuDetector::CreateBuffers() {
   index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
   blob_point_offsets_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 4);
 
-  line_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
+  // The one buffer big enough for its readback path to matter: ~1.6 MB per
+  // frame at 1080p. It used to be plain DeviceLocal, copied on-device into
+  // readback_staging_ and then memcpy'd again into a std::vector - two full
+  // copies of the same bytes on a unified-memory part. Asking for
+  // device-local + host-visible + cached lets QuadDecode read it in place.
+  //
+  // Conditional on the memory type that actually came back being CACHED, not
+  // merely host-visible: reading 1.6 MB through an uncached mapping is much
+  // slower than the copy it would replace (Buffer.h records a measured 4x on
+  // Mali for exactly that mistake). Discrete parts without resizable BAR
+  // fall back to DeviceLocal and keep the staging path.
+  {
+    vk::Buffer b(ctx_, VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint), kSsboUsage,
+                 vk::MemoryKind::DeviceLocalReadback);
+    device_bytes_ += b.size();
+    line_fit_points_buf_ = std::move(b);
+  }
+  linefit_direct_read_ = line_fit_points_buf_.host_visible() && line_fit_points_buf_.host_cached();
 
   // Open-addressing table for the (rep0, rep1) grouping, sized to
   // max_raw_blobs itself (previously 4x, for a 25% worst-case load factor -
@@ -394,9 +425,11 @@ void GpuDetector::CreatePipelines() {
   // storageBuffer8BitAccess, else the 32-bit-per-pixel fallback every other
   // device uses - see decimate_u8.comp's comment. Covers every consumer of
   // decimated_buf_ (decimate/block_minmax/sort_points_local) and
-  // thresholded_buf_ (threshold/uf_init/uf_merge/blob_diff) - the two
+  // thresholded_buf_ (threshold/uf_init/uf_merge/label_pixels) - the two
   // switch together (threshold(_u8).comp reads the former and writes the
   // latter in one dispatch, so they can't vary independently).
+  // blob_diff is no longer on that list: it reads the threshold out of
+  // parent[]'s spare bits instead (see common.glsl).
   const bool u8 = ctx_.caps().has_8bit_storage;
   auto pick = [u8](const char *base_name, const char *u8_name) {
     return u8 ? u8_name : base_name;
@@ -469,21 +502,22 @@ void GpuDetector::CreatePipelines() {
   uf_compress_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("uf_compress"), {parent_buf_.get()}, 8, wg1d_);
   uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick_sg("uf_final", "uf_final_subgroup")),
-                                     {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
+                                     {parent_buf_.get(), blob_size_buf_.get()}, 12, wg1d_);
 
-  // Four-way choice: blob_diff_body.glsl is parametrized on both the u8 and
-  // subgroup axes (it's the one shader affected by both - see its own
-  // comment), so pick/pick_sg alone don't cover it.
-  const char *blob_diff_shader = u8 ? (subgroup ? "blob_diff_u8_subgroup" : "blob_diff_u8")
-                                    : (subgroup ? "blob_diff_subgroup" : "blob_diff");
+  // Two-way now, not four: blob_diff used to be parametrized on the u8 axis
+  // as well, because it read thresholded_buf_ directly. label_pixels.comp
+  // folds the threshold into the parent[] word instead (see common.glsl), so
+  // blob_diff has no thresholded binding at all and the u8 axis moved to
+  // label_pixels - where it costs 2 variants instead of doubling 2 into 4.
   blob_diff_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(blob_diff_shader),
-      {thresholded_buf_.get(), parent_buf_.get(), qbp_compacted_buf_.get(),
-       qbp_counter_buf_.get(), qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get()},
+      ctx_, ShaderPath(pick_sg("blob_diff", "blob_diff_subgroup")),
+      {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
+       qbp_keys_buf_.get()},
       12, wg2d_);
 
   label_pixels_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("label_pixels"), {parent_buf_.get(), blob_size_buf_.get()}, 8, wg1d_);
+      ctx_, ShaderPath(pick("label_pixels", "label_pixels_u8")),
+      {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()}, 8, wg1d_);
 
   init_extents_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4, wg1d_);
@@ -534,7 +568,7 @@ void GpuDetector::CreatePipelines() {
 
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
-      {qbp_keys_hi_buf_.get(), qbp_keys_lo_buf_.get(), hash_owner_buf_.get(),
+      {qbp_keys_buf_.get(), hash_owner_buf_.get(),
        point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
        hash_drop_counter_buf_.get()},
       12, wg1d_);
@@ -744,15 +778,24 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // compacted count is the number every later stage is sized by.
   // ------------------------------------------------------------------
   cmd = BeginTimedCommands();
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelFinalize));
-  uf_final_pl_.Dispatch1D(cmd, pixels, &dwdh_pc);
+  // uf_final needs the min-size floor too, to saturate its counter at the
+  // same threshold label_pixels tests against (see uf_final.comp), so it
+  // can't share dwdh_pc with uf_init/uf_merge/uf_compress. The floor is
+  // deliberately the same value label_pc carries below - they must stay
+  // equal or the saturation stops matching the predicate.
+  struct { uint32_t dw, dh, min_blob; } uf_final_pc{decimated_width_, decimated_height_,
+                                                    config_.min_cluster_pixels};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
+  uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
   // Fold blob identity and the min-size test into one spatially-local value
   // per pixel, so blob_diff.comp does no random gathers at all. See
   // label_pixels.comp.
   struct { uint32_t count, min_blob; } label_pc{pixels, config_.min_cluster_pixels};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelPixels));
   label_pixels_pl_.Dispatch1D(cmd, pixels, &label_pc);
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelFinalize));
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelPixels));
 
   // blob_diff appends valid boundary points (with their sort keys) directly
   // into the compacted buffer, so there is no dense intermediate array and no
@@ -906,7 +949,10 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (extents_bytes > 0) {
     selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);
   }
-  if (linefit_bytes > 0) {
+  // Skipped entirely on parts where the line-fit buffer is itself
+  // host-visible and cached: QuadDecode reads it in place instead. See
+  // CreateBuffers.
+  if (linefit_bytes > 0 && !linefit_direct_read_) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanReadbackCopy));
@@ -922,12 +968,28 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Host-side copies out of the persistently mapped readback buffer.
   // ------------------------------------------------------------------
   last_selected_extents.resize(num_selected_blobs);
-  last_line_fit_points.resize(num_points);
   if (extents_bytes > 0) {
     readback_staging_.Read(last_selected_extents.data(), extents_bytes, 0);
   }
-  if (linefit_bytes > 0) {
-    readback_staging_.Read(last_line_fit_points.data(), linefit_bytes, linefit_offset);
+  if (linefit_direct_read_) {
+    // Zero copies: the shader wrote these bytes straight into host-visible,
+    // host-cached device memory, so hand QuadDecode a view of them. Valid
+    // until the next Detect() overwrites the buffer.
+    //
+    // The mapping is coherent on every type seen so far, but invalidate when
+    // it isn't - Buffer::Read() would have done this, and skipping the copy
+    // must not also skip the invalidate.
+    if (!line_fit_points_buf_.coherent()) {
+      line_fit_points_buf_.InvalidateRange(0, linefit_bytes);
+    }
+    last_line_fit_points = std::span<const RawLineFitPoint>(
+        static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), num_points);
+  } else {
+    linefit_scratch_.resize(num_points);
+    if (linefit_bytes > 0) {
+      readback_staging_.Read(linefit_scratch_.data(), linefit_bytes, linefit_offset);
+    }
+    last_line_fit_points = std::span<const RawLineFitPoint>(linefit_scratch_);
   }
   const auto t_end = Clock::now();
 
@@ -997,6 +1059,11 @@ std::string GpuDetector::DescribeSizing() const {
   os << ", blob capacity " << config_.max_blobs;
   os << ", device memory " << (device_bytes_ / (1024 * 1024)) << " MiB";
   os << ", gray upload " << (gray_direct_write_ ? "direct (unified memory)" : "staged");
+  // Worth logging next to the upload path: whether the line-fit readback
+  // avoided its copies depends on a HOST_CACHED memory type existing, which
+  // varies by driver even among unified-memory parts, so a run that silently
+  // took the staging path would otherwise be indistinguishable.
+  os << ", linefit readback " << (linefit_direct_read_ ? "direct (host-cached)" : "staged");
   return os.str();
 }
 

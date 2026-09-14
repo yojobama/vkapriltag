@@ -578,7 +578,7 @@ int main(int argc, char **argv) {
 
     detector.Detect(gray.data());
     const std::vector<apriltag_vulkan::DetectedQuad> quads =
-        quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+        quad_decode.Decode(detector.last_line_fit_points);
     zarray_t *dets =
         tag_decoder.Decode(quads, gray.data(), width, height, cfg.reversed_border);
 

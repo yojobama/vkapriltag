@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
       gpu_totals.push_back(profile.total_ms);
 
       const auto t_quad0 = std::chrono::steady_clock::now();
-      quads = quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+      quads = quad_decode.Decode(detector.last_line_fit_points);
       const auto t_quad1 = std::chrono::steady_clock::now();
       quad_decode_totals.push_back(
           std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());

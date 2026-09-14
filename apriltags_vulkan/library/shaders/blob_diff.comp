@@ -1,13 +1,12 @@
 #version 450
-// 32-bit-per-pixel Thresholded, scalar (non-aggregated) counter - the
-// always-safe default. See blob_diff_body.glsl for the shader itself and
-// blob_diff_u8.comp / blob_diff_subgroup.comp / blob_diff_u8_subgroup.comp
-// for the variants GpuDetector picks on devices with storageBuffer8BitAccess
-// and/or subgroup ballot in COMPUTE.
+// Scalar (non-aggregated) append counter - the always-safe default. See
+// blob_diff_body.glsl for the shader itself, and blob_diff_subgroup.comp for
+// the variant GpuDetector picks on devices with subgroup ballot in COMPUTE.
+//
+// No Thresholded binding: label_pixels.comp folds the threshold value into
+// the parent[] word this shader already reads (see common.glsl), which is
+// what retired the former blob_diff_u8* variants.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
-
-layout(std430, binding = 0) readonly buffer Thresholded { uint thresholded[]; };
-#define THRESHOLDED_AT(i) (thresholded[(i)])
 
 #include "blob_diff_body.glsl"

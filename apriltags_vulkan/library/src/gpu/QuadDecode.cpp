@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <span>
 #include <string>
 
 namespace apriltag_vulkan {
@@ -166,7 +167,7 @@ struct Point2 {
   double x, y;
 };
 
-Point2 PointAt(const std::vector<RawLineFitPoint> &points, size_t begin, size_t idx) {
+Point2 PointAt(std::span<const RawLineFitPoint> points, size_t begin, size_t idx) {
   const RawLineFitPoint &p = points[begin + idx];
   return {static_cast<double>(p.x2), static_cast<double>(p.y2)};
 }
@@ -197,7 +198,7 @@ double ScaledPerpDistSq(Point2 a, Point2 b, Point2 p) {
 // diameter line (a triangle or a rounded blob would still produce SOME
 // max-distance point on each arc, just an unconvincing one). The caller
 // falls back to the peaks-based combinatorial search in every failure case.
-bool FindDpCornerIndices(const std::vector<RawLineFitPoint> &points, size_t begin, size_t n,
+bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, size_t n,
                          uint32_t out_indices[4]) {
   if (n < 8) return false;
 
@@ -279,7 +280,7 @@ bool FindDpCornerIndices(const std::vector<RawLineFitPoint> &points, size_t begi
 // outright, or the resulting 4 segments don't pass the same
 // max_line_fit_mse gate the combinatorial search applies to every candidate
 // segment - both cases mean "fall back to peaks", handled by the caller.
-FitQuadResult TryDpQuad(const DetectorConfig &config, const std::vector<RawLineFitPoint> &points,
+FitQuadResult TryDpQuad(const DetectorConfig &config, std::span<const RawLineFitPoint> points,
                         size_t begin, size_t total_points,
                         const std::vector<LineFitMoments> &cs) {
   FitQuadResult result;
@@ -311,7 +312,7 @@ FitQuadResult TryDpQuad(const DetectorConfig &config, const std::vector<RawLineF
 // fresh std::vector per blob, which is a heap allocation and a copy of the
 // whole run for every one of the several hundred blobs in a frame.
 FitQuadResult FitQuadForBlob(const DetectorConfig &config,
-                            const std::vector<RawLineFitPoint> &points, size_t begin,
+                            std::span<const RawLineFitPoint> points, size_t begin,
                             size_t end, QuadFitScratch &scratch) {
   FitQuadResult result;
   const size_t total_points = end - begin;
@@ -510,8 +511,8 @@ QuadDecode::QuadDecode(const DetectorConfig &config)
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
 }
 
-std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu> &selected_extents,
-                                             const std::vector<RawLineFitPoint> &line_fit_points) const {
+std::vector<DetectedQuad> QuadDecode::Decode(
+    std::span<const RawLineFitPoint> line_fit_points) const {
   std::vector<DetectedQuad> output;
 
   // Group line_fit_points into contiguous per-blob spans (the array is
@@ -653,7 +654,6 @@ std::vector<DetectedQuad> QuadDecode::Decode(const std::vector<MinMaxExtentsGpu>
     output.push_back(out);
   }
 
-  (void)selected_extents;  // Not needed beyond what's already folded into blob_index grouping.
   return output;
 }
 

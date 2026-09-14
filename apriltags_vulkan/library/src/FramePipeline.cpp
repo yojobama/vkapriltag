@@ -75,7 +75,16 @@ void FramePipeline::HarvestInFlight() {
 
   // Safe without the lock: the worker is idle, so nothing else touches these.
   std::swap(done_extents_, detector_.last_selected_extents);
-  std::swap(done_points_, detector_.last_line_fit_points);
+  // last_line_fit_points is a non-owning span - either straight into the
+  // host-visible readback buffer, or over the detector's linefit_scratch_ -
+  // and the next Detect() overwrites whichever it is. A swap cannot take
+  // ownership of a view, so the pipelined path has to copy, which is exactly
+  // the copy the in-place readback exists to avoid. assign() keeps the
+  // capacity, so it is a memcpy and not an allocation after the first frame.
+  // Serial callers still get the zero-copy path; this cost is the price of
+  // overlapping, and it is far smaller than the CPU tail it hides.
+  done_points_.assign(detector_.last_line_fit_points.begin(),
+                      detector_.last_line_fit_points.end());
   done_profile_ = detector_.last_profile();
   done_frame_ = flight_frame_;
   done_width_ = flight_width_;
@@ -86,7 +95,7 @@ void FramePipeline::HarvestInFlight() {
 
 zarray_t *FramePipeline::DecodeHarvested() {
   if (!have_done_) return nullptr;
-  quads_ = quad_decode_.Decode(done_extents_, done_points_);
+  quads_ = quad_decode_.Decode(done_points_);
   return tag_decoder_.Decode(quads_, done_frame_, done_width_, done_height_,
                              done_reversed_border_);
 }

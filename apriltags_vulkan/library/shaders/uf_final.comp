@@ -1,9 +1,43 @@
 #version 450
-// Computes the pixel count of each blob (indexed by root label) using
-// atomics.  Mirrors the "blob size computed in parallel using atomics" side
-// effect of the CUDA BKE labeling implementation.  Must run after the union
-// find has fully converged (last uf_compress pass) and after
-// union_markers_size has been zero-initialized.
+// Saturating per-blob pixel counter, indexed by root label. Must run after
+// the union find has fully converged (last uf_compress pass) and after
+// blob_size has been zero-initialized.
+//
+// This was a faithful histogram - one unconditional atomicAdd per pixel,
+// 518400 of them at 1080p - and the contention was worst exactly where it
+// hurt most: every pixel of a large tag border or background region targets
+// the same blob_size[] slot. But blob_size[] has exactly ONE reader,
+// label_pixels.comp, and it only ever asks `blob_size[r] >= min_blob_pixels`.
+// The count itself is never consumed. So once a blob has reached the floor,
+// every further increment is provably unobservable, and skipping it after a
+// plain non-atomic read turns the contended case into a cache-hot load.
+//
+// The THRESHOLDED PREDICATE STAYS EXACTLY CORRECT - not merely conservative.
+// Let S(r) be the true pixel count of root r and M = min_blob_pixels.
+// blob_size[r] only ever increments, at most S(r) times, from 0. Then:
+//
+//   S(r) >= M  =>  final >= M:  either nothing skipped, so final = S(r) >= M;
+//     or some thread skipped, which means it read a value >= M, and the
+//     counter never decreases, so final >= M.
+//   S(r) <  M  =>  final <  M:  the counter never exceeds S(r) < M, so no
+//     load can ever return >= M, so no thread skips, so final = S(r).
+//
+// The STORED VALUE becomes an underestimate for blobs above the floor. That
+// is fine because nothing reads it - but it does mean this array is now a
+// saturating counter, NOT a histogram: do not add a second reader that wants
+// the true size without reverting this.
+//
+// The plain read races with other invocations' atomicAdd, which Vulkan's
+// memory model calls a data race. Deliberately NOT marked coherent/volatile,
+// and that is a correctness argument rather than an oversight: a stale load
+// can only return some previously-written value, and every written value is
+// <= S(r). So a stale read is always an UNDERESTIMATE, which costs an
+// unnecessary atomicAdd and never a wrong answer - both directions of the
+// proof above go through unchanged. Marking the buffer coherent would force
+// the load past L1 on every pixel, defeating the entire point, to buy a
+// freshness this shader does not need. (The codebase already relies on a
+// plain non-atomic read of a concurrently-atomically-updated location:
+// hash_group.comp reads hash_owner[h] that way and uses it as an index.)
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
@@ -12,11 +46,17 @@ layout(std430, binding = 1) buffer BlobSize { uint blob_size[]; };
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
+  // Must equal label_pixels.comp's min_blob_pixels. If the two ever differ,
+  // this shader saturates at a different threshold than the one actually
+  // tested, and the predicate stops being exact.
+  uint min_blob_pixels;
 } pc;
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
   uint total = pc.width * pc.height;
   if (i >= total) return;
-  atomicAdd(blob_size[parent[i]], 1u);
+  uint r = parent[i];
+  if (blob_size[r] >= pc.min_blob_pixels) return;
+  atomicAdd(blob_size[r], 1u);
 }

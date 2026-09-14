@@ -37,6 +37,17 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
       return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
               0, true};
+    case MemoryKind::DeviceLocalReadback:
+      // Shader-written memory the HOST then READS, on parts where that can
+      // skip a staging copy entirely. COHERENT is not required and CACHED is
+      // strongly preferred, for the reason HostVisibleCached documents: an
+      // uncached mapping is fine to write through and terrible to read
+      // through. The caller MUST check host_cached() and keep a staging path
+      // - taking this path on an uncached type would replace a fast
+      // device-to-device copy plus a cached memcpy with an uncached read,
+      // which is slower, not faster.
+      return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+              static_cast<VkMemoryPropertyFlags>(VK_MEMORY_PROPERTY_HOST_CACHED_BIT), true};
   }
   return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false};
 }
@@ -62,7 +73,8 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
   // DeviceLocalMapped is a best-effort request: discrete GPUs without a
   // resizable BAR have no such memory type, so fall back to plain
   // device-local and let the caller stage through a separate host buffer.
-  if (type_index == UINT32_MAX && kind == MemoryKind::DeviceLocalMapped) {
+  if (type_index == UINT32_MAX &&
+      (kind == MemoryKind::DeviceLocalMapped || kind == MemoryKind::DeviceLocalReadback)) {
     request = RequestFor(ctx, MemoryKind::DeviceLocal);
     type_index = ctx.FindMemoryType(mem_reqs.memoryTypeBits, request.required, request.preferred);
   }
@@ -83,6 +95,7 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
   if (request.map) {
     CheckVk(vkMapMemory(device_, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_), "vkMapMemory");
     coherent_ = (ctx.MemoryTypeFlags(type_index) & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    host_cached_ = (ctx.MemoryTypeFlags(type_index) & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
     non_coherent_atom_size_ = ctx.caps().non_coherent_atom_size;
   }
 }
@@ -108,6 +121,7 @@ Buffer::Buffer(Buffer &&other) noexcept
       size_(other.size_),
       mapped_(other.mapped_),
       coherent_(other.coherent_),
+      host_cached_(other.host_cached_),
       non_coherent_atom_size_(other.non_coherent_atom_size_) {
   other.buffer_ = VK_NULL_HANDLE;
   other.memory_ = VK_NULL_HANDLE;
@@ -124,6 +138,7 @@ Buffer &Buffer::operator=(Buffer &&other) noexcept {
     size_ = other.size_;
     mapped_ = other.mapped_;
     coherent_ = other.coherent_;
+    host_cached_ = other.host_cached_;
     non_coherent_atom_size_ = other.non_coherent_atom_size_;
     other.buffer_ = VK_NULL_HANDLE;
     other.memory_ = VK_NULL_HANDLE;
@@ -182,6 +197,23 @@ void Buffer::Read(void *dst, VkDeviceSize bytes, VkDeviceSize offset) const {
     vkInvalidateMappedMemoryRanges(device_, 1, &range);
   }
   std::memcpy(dst, static_cast<const uint8_t *>(mapped_) + offset, static_cast<size_t>(bytes));
+}
+
+void Buffer::InvalidateRange(VkDeviceSize offset, VkDeviceSize bytes) const {
+  // Read()'s invalidate, without the copy - for a caller reading the mapping
+  // in place rather than memcpy'ing out of it. A no-op on coherent memory,
+  // exactly as Read()'s is.
+  if (mapped_ == nullptr) {
+    throw std::runtime_error("Buffer::InvalidateRange on a buffer that is not host visible");
+  }
+  if (offset + bytes > size_) {
+    throw std::runtime_error("Buffer::InvalidateRange out of range");
+  }
+  if (!coherent_ && bytes > 0) {
+    VkMappedMemoryRange range =
+        AlignedRange(memory_, offset, bytes, non_coherent_atom_size_, size_);
+    vkInvalidateMappedMemoryRanges(device_, 1, &range);
+  }
 }
 
 void Buffer::RecordCopyFrom(VkCommandBuffer cmd, const Buffer &src, VkDeviceSize bytes,

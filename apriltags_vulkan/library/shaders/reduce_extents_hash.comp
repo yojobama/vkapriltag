@@ -40,7 +40,13 @@ void main() {
   atomicMax(extents[bi].max_x, x);
   atomicMax(extents[bi].max_y, y);
   atomicAdd(extents[bi].count, 1u);
-  atomicAdd(extents[bi].gx_sum, p.gx);
-  atomicAdd(extents[bi].gy_sum, p.gy);
+  // gx and gy are STRUCTURALLY zero for two of the four connection types -
+  // blob_diff_body.glsl emits E as (+/-1, 0) and S as (0, +/-1), only the
+  // SE/SW diagonals carry both - so roughly half these points would issue an
+  // atomic read-modify-write to add nothing. Adding 0 is the identity, so
+  // skipping it is provably bit-identical, and unlike a saturating guard this
+  // tests a value already in a register rather than loading one.
+  if (p.gx != 0) atomicAdd(extents[bi].gx_sum, p.gx);
+  if (p.gy != 0) atomicAdd(extents[bi].gy_sum, p.gy);
   atomicAdd(extents[bi].pxgx_plus_pygy_sum, x * p.gx + y * p.gy);
 }

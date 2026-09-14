@@ -222,7 +222,7 @@ int main(int argc, char **argv) {
           gpu_totals.push_back(profile.total_ms);
 
           const auto t_quad0 = std::chrono::steady_clock::now();
-          quads = quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+          quads = quad_decode.Decode(detector.last_line_fit_points);
           const auto t_quad1 = std::chrono::steady_clock::now();
           quad_decode_totals.push_back(
               std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());
@@ -391,5 +391,16 @@ int main(int argc, char **argv) {
     }
 
     std::cout << "Final Results: " << match << " matches, " << mismatch << " mismatches." << std::endl;
+
+  // Exit non-zero on any mismatch, matching the PGM-only variant, so this can
+  // gate a scripted run rather than only being read by a human. Zero images
+  // validated is also a failure: a mistyped --data path or a directory whose
+  // every image was skipped (unloadable, or odd dimensions) would otherwise
+  // report success having checked nothing at all.
+  if (mismatch > 0) return 1;
+  if (match == 0) {
+    std::cerr << "No images were validated - nothing to compare against libapriltag." << std::endl;
+    return 1;
+  }
   return 0;
 }
