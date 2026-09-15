@@ -30,9 +30,14 @@ optional fourth for pose:
 3. **`TagDecoder`** — wraps the unmodified, upstream `apriltag` C library's
    own per-family bit-sampling and hamming decode, fed the quads from step 2.
    Optionally (`apriltag_detector_t::refine_edges`, off by default) also runs
-   upstream's own gradient-based corner refinement on each quad first, in the
-   same per-quad task and the same order `apriltag_detector_detect()` uses
-   internally — calling upstream's actual code, not a reimplementation.
+   gradient-based corner refinement on each quad first, in the same per-quad
+   task and the same order `apriltag_detector_detect()` uses internally.
+   Which implementation runs is `APRILTAG_VK_REFINE`'s choice: `exact` (the
+   default) is bit-identical to upstream *by construction* but drops the libm
+   `modf()` call from the inner loop, worth 25% of this stage on ARM; `fast`
+   additionally narrows the innermost sampling loop to float; `upstream` calls
+   upstream's actual compiled function, so any suspected corner-accuracy
+   regression can be isolated with one environment variable.
 
 Optionally, a fourth stage:
 
@@ -45,6 +50,14 @@ Optionally, a fourth stage:
    its way through ~1600 parsed expressions per pose.
    Verified against upstream at every stage of the algorithm — see
    [Verifying correctness](#verifying-correctness).
+
+For continuous capture there is also **`FramePipeline`**, which composes the
+three detection stages and overlaps frame N's GPU pass with frame N-1's CPU
+tail, making a frame cost `max(GPU, CPU)` instead of the sum. It is a
+throughput optimization, not a latency one — detections arrive one `Push()`
+later, and it needs two frame buffers — so the stages stay independently
+usable for callers that must act on the newest frame immediately. See
+[Performance](#performance).
 
 This is a port of [frc971's CUDA `GpuDetector`](https://github.com/Team766/apriltags_cuda)
 (itself built on AprilRobotics' `apriltag`) to Vulkan compute, so it runs
@@ -277,6 +290,16 @@ GPU would be slower for this particular computation:
 | **`PoseEstimator`, per tag** | **CPU** | **0.016 ms** | **0.013 ms** |
 | speedup | | **58x** | **48x** |
 
+`FramePipeline` (see [What this is](#what-this-is)) overlaps the GPU row with
+the two CPU rows instead of running them in sequence. Measured separately, on
+`grayimage.pgm` (1280x800, decimation 2 — **not** the same conditions as the
+table above, so compare only within this paragraph): a serial frame costs
+5.00 ms on the Orange Pi and 1.04 ms on the desktop, against **3.52 ms** and
+**0.78 ms** pipelined. The gain is resolution-dependent — at 640x400 on the Pi
+it measures neutral, because the two sides are close enough in size that the
+overlap is cancelled by contention for the shared LPDDR bus. Re-measure at
+your deployment resolution rather than assuming.
+
 Both CPU tails and pose all run on the same `WorkerPool`, sized by
 `DetectorConfig::cpu_threads` / `APRILTAG_CPU_THREADS`, so on the Orange Pi
 they spread across all 8 RK3588 cores by default (measured 5.4x scaling for
@@ -314,18 +337,25 @@ gaps that cross a submit boundary, and over half of even that is host-side
 fence-wait and readback time no GPU timestamp can see. So reducing
 dispatch or barrier count has almost nothing left to give here; only
 removing a submit boundary's round trip would, and that was tried and
-reverted for too small a gain. See `apriltags_vulkan/OPTIMIZATION_NOTES.md` for
+reverted for too small a gain. A standalone benchmark since put a number on
+why: an empty `vkQueueSubmit` + `vkWaitForFences` round trip is **19 us on
+the Mali** and **42 us on the RX 9060 XT** — the embedded part is the cheaper
+of the two, having no PCIe hop — so all four of a frame's submits are ~1.5%
+of a Mali frame. See `apriltags_vulkan/OPTIMIZATION_NOTES.md` for
 the full history of how the pipeline got here — what was tried, what
 regressed and why (including two Mali-specific results: shared-memory
 tiling and subgroup-aggregated atomics both measured *slower* here despite
 helping on the discrete card, because Valhall has no dedicated
 shared-memory hardware), and the current list of remaining opportunities.
 
-The tables above are the Orange Pi 5 and Desktop figures and are **not**
-affected by the later GPU-agnostic pass, which was measured on different
-hardware (an Intel Iris Plus G7 iGPU and an NVIDIA MX230) and has not been
-run on either target above. Its own numbers, and the six changes it landed
-against the four it measured and rejected, live in their own clearly-labelled
+The tables above predate the GPU-agnostic pass, which was originally measured
+on different hardware (an Intel Iris Plus G7 iGPU and an NVIDIA MX230). It has
+since been measured on the Orange Pi as well: **-10.5%** wall clock serially
+(n=20, interleaved), but only **-1.9%** with `FramePipeline` enabled, because
+pipelining has to copy the line-fit records that pass's in-place readback
+exists to avoid. Zero-copy readback and frame pipelining are in tension and do
+not compound. Its numbers, and the six changes it landed against the four it
+measured and rejected, live in their own clearly-labelled
 section at the end of `OPTIMIZATION_NOTES.md`. The one result there worth
 knowing before touching these shaders: subgroup aggregation and a cheap
 early-out are alternative answers to atomic contention, and applying both is
@@ -338,7 +368,8 @@ subgroup-aggregated ones.
 ```
 apriltags_vulkan/
   library/     the Vulkan compute pipeline + CPU tail (GpuDetector, QuadDecode,
-               TagDecoder, and the optional PoseEstimator)
+               TagDecoder, the optional PoseEstimator, and FramePipeline for
+               overlapping the GPU pass with the previous frame's CPU tail)
     shaders/   GLSL compute shaders, compiled to SPIR-V at build time
     include/   public headers (vkapriltag::vkapriltag target)
   apps/        interactive V4L2 sample app (Linux)
@@ -346,6 +377,7 @@ apriltags_vulkan/
                ground truth, pose solver) and the corpus generator
   cmake/       the upstream apriltag patch, shader-embedding machinery
   OPTIMIZATION_NOTES.md   detailed performance history and rejected approaches
+  PERFORMANCE.md          how to configure, run and measure it per device
 ```
 
 ## License
