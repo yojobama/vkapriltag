@@ -65,6 +65,12 @@
 #include "vkapriltag/vk/Context.h"
 
 #include <opencv2/opencv.hpp>
+// OpenCV 5 moved getPerspectiveTransform() out of imgproc into a new
+// geometry module that opencv.hpp does not pull in on its own; older
+// versions have no such header, so pull it in only where it exists.
+#if __has_include(<opencv2/geometry.hpp>)
+#include <opencv2/geometry.hpp>
+#endif
 
 extern "C" {
 #include "apriltag.h"

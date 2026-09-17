@@ -23,13 +23,33 @@ find_package(Threads REQUIRED)
 # ---------------------------------------------------------------------------
 include(FetchContent)
 set(APRILTAG_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-decode-steps.patch)
+# common/pthreads_cross.{h,c} assume any _WIN32 target has no real pthread.h
+# and needs its own CRITICAL_SECTION/CONDITION_VARIABLE-based emulation of
+# it - true for MSVC, but MinGW-w64 ships a real winpthreads pthread.h, so
+# that emulation's typedefs/declarations there directly conflict with the
+# ones MinGW's own <pthread.h> (pulled in transitively via libstdc++'s
+# gthr-default.h) provides. This patch scopes that emulation to
+# "_WIN32 and not MinGW" so a MinGW build uses the real pthread.h instead.
+set(APRILTAG_MINGW_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-mingw-real-pthreads.patch)
 FetchContent_Declare(
   apriltag
   GIT_REPOSITORY https://github.com/AprilRobotics/apriltag.git
   GIT_TAG v3.4.5
-  # Idempotent: skips re-applying if the patch is already present (needed
-  # since FetchContent may re-run the patch step across reconfigures).
-  PATCH_COMMAND git apply --reverse --check ${APRILTAG_PATCH_FILE} || git apply ${APRILTAG_PATCH_FILE}
+  # Idempotent: skips re-applying a patch already present (needed since
+  # FetchContent may re-run the patch step across reconfigures). Applied via
+  # a cmake -P script rather than a chained shell command line so the
+  # idempotency logic doesn't depend on the PATCH_COMMAND's shell (cmd.exe
+  # vs sh) agreeing on &&/|| grouping.
+  # Comma-, not semicolon-separated - see ApplyPatches.cmake: PATCH_COMMAND
+  # is itself stored as a semicolon-separated CMake list by the
+  # FetchContent/ExternalProject machinery that regenerates it into a
+  # subbuild CMakeLists.txt, so an embedded (even escaped) ; here does not
+  # reliably survive that round-trip and silently splits "-DPATCHES=a;b"
+  # into the two arguments "-DPATCHES=a" and "b", losing the second patch
+  # path entirely with no error.
+  PATCH_COMMAND ${CMAKE_COMMAND}
+        "-DPATCHES=${APRILTAG_PATCH_FILE},${APRILTAG_MINGW_PATCH_FILE}"
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/ApplyPatches.cmake
 )
 FetchContent_MakeAvailable(apriltag)
 

@@ -15,6 +15,17 @@ endif()
 
 include(GNUInstallDirs)
 
+if(WIN32)
+  # <windows.h> - pulled in transitively on Windows by FetchContent'd
+  # apriltag's common/pthreads_cross.h (included from apriltag.h) as well as
+  # by the Vulkan headers - defines min()/max() macros unless NOMINMAX is
+  # set, which break every std::min/std::max call in both our own code and
+  # apriltag's. WIN32_LEAN_AND_MEAN keeps it from dragging in winsock etc.
+  # Set at the top level (before add_subdirectory) so it also reaches
+  # apriltag, which is fetched from inside library/CMakeLists.txt.
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 option(VKAPRILTAG_BUILD_APPS "Build the interactive sample app (V4L2 camera capture)" ON)
 option(VKAPRILTAG_BUILD_TOOLS "Build the libapriltag cross-validation tool" ON)
 

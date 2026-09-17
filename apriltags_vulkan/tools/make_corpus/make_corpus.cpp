@@ -10,7 +10,9 @@
 // resolution-relative threshold behaves sanely across scales and to catch
 // gross regressions, but it is not a substitute for real multi-distance
 // captures before trusting the thresholds in the field.
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
