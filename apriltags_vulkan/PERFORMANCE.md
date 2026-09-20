@@ -326,6 +326,32 @@ the RX 9060 XT it measures as noise - the fused path never engages there
 path's refactor, which is bit-identical and performance-neutral by
 construction.
 
+### The sort network: Batcher's odd-even mergesort
+
+`sort_points_local.comp` ran a naive bitonic network over each blob's
+points, padded up to the next power of two. Replaced with Batcher's
+odd-even mergesort over the same padded capacity: same number of
+barrier-synchronized rounds for a given cap (so no change in
+synchronization cost), 13-21% fewer total compare-exchanges across the cap
+range this shader actually sees (16..4096), since it never compares indices
+that provably cannot be out of order. The comparator schedule was proven
+correct standalone (zero-one principle, exhaustive at cap=8/16, random
+trials at cap=32/64/128) before being ported to GLSL - see
+`OPTIMIZATION_NOTES.md` item 9 for the full writeup, including two other
+shader-vectorization ideas tried alongside it and rejected.
+
+Measured, ABBA, decimation 1, largest corpus image:
+
+| | GPU total |
+| --- | --- |
+| Mali-G610 | -2 to -3% (min of 4 ABBA rounds) |
+| RX 9060 XT | -3 to -5% (min of 4 ABBA rounds, one outlier excluded) |
+| `sort` span alone (RX 9060 XT) | **-29%**, clean and non-overlapping over 10 runs each |
+
+Smaller at decimation 2/4, where blobs are smaller and the sort span is
+already a tiny fraction of the frame - not distinguishable from noise there
+with the sample sizes measured so far.
+
 ## 4. Edge refinement (`APRILTAG_VK_REFINE`)
 
 Upstream libapriltag's `refine_edges` is the single most expensive CPU
@@ -609,7 +635,13 @@ obvious ideas are in the rejected column. The short version:
    while this pipeline is 4-connected and three-valued (127 merges with
    nothing). Tile-local union-find was tried on Mali and was much slower —
    Valhall has no scratchpad, so `shared` is backed by L2 and dependent shared
-   loads are not cheaper than global.
+   loads are not cheaper than global. A simpler idea - just vectorizing
+   `uf_merge` to 4 pixels/thread, no algorithm change, purely fewer
+   invocations/barriers for the same work - was also tried and **measured
+   worse**: correctness-clean, but +6% GPU total on the Mali-G610 (see
+   `OPTIMIZATION_NOTES.md` item 9). Fewer, fatter threads is not free on this
+   part once the per-thread control flow grows to reconstruct what the
+   scheduler used to give for free.
 2. ~~**Reducing the number of full-image passes.**~~ **Largely closed by
    section 3a.** The claim that "this is where the Mali time actually is" came
    from an input-size sweep, which shows time scaling with *pixels* — and then

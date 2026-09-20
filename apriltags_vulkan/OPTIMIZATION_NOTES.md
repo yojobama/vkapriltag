@@ -1274,3 +1274,96 @@ make detections depend on GPU scheduling order. Buying ~2 us costs an
 indirect-args slot, a per-frame buffer fill to zero the tail, and the
 invariant that the scan's grand total sits at
 `blob_point_offsets[max_blobs - 1]`. Rejected.
+
+## 9. Three shader changes, built in parallel: one shipped, two measured and rejected on the real target
+
+The literature scan above left three independent, disjoint candidates: a
+cheaper comparator network for `sort_points_local`, and 4-pixels/thread
+vectorization for `uf_merge` and `blob_diff` (fewer, fatter GPU threads for
+the same total work, no algorithm change). Disjoint shader files and
+disjoint `GpuDetector.cpp` dispatch sites, so - unlike item 8's debugging,
+which needed one person's undivided attention on one bug at a time - these
+three were genuinely parallelizable. **Method, since it worked and
+generalizes**: three agents, each in its own git worktree and branch,
+correctness-verified their own change independently (the synth ground-truth
+tool's fixed-seed 767-case sweep, plus the PGM corpus at decimation 1/2/4)
+on desktop hardware only - none touched the Mali board or the shared build
+cache. All three reported back correctness-clean. Only then were they
+merged, one at a time onto an integration branch, re-verified after each
+merge, and finally taken through the *one* Mali pass this whole process is
+built to protect: a single physical board, reachable only by SSH, is not
+something two shader changes can measure correctly at the same time, so
+hardware verification and benchmarking stayed strictly sequential and were
+never delegated.
+
+That sequential Mali pass is what caught the real result: **the sort
+network is a genuine win on both devices; the two vectorizations are not**,
+despite both being correctness-clean, both passing under
+`VK_LAYER_KHRONOS_validation`, and both looking sound on paper. Bisected by
+building and ABBA-benchmarking each of the three branches individually
+against the pre-item-9 baseline on the Mali-G610 (largest corpus image,
+decimation 1, 4 interleaved rounds each):
+
+| | Mali-G610 GPU total | RX 9060 XT GPU total |
+| --- | --- | --- |
+| Sort network alone | **-2 to -3%** | **-3 to -5%** |
+| `uf_merge` vectorization alone | **+6%** | flat / +4% (noise-level) |
+| `blob_diff` vectorization alone | **+11%** | flat / +4% (noise-level) |
+| All three combined | **+11 to +12%** | (not separately measured; dominated by the same two regressions) |
+
+**Sort network - shipped.** `sort_points_local_body.glsl`'s bitonic network
+replaced with Batcher's odd-even mergesort, same padded capacity, same
+round count, 13-21% fewer compare-exchanges. See `PERFORMANCE.md`'s new "The
+sort network" subsection for the full numbers and the comparator-schedule
+verification method (zero-one principle, exhaustive at cap=8/16).
+
+**`uf_merge` vectorization - rejected.** Each thread was made to own 4
+consecutive columns instead of 1, reusing overlapping `THRESHOLDED_AT` reads
+across lanes and recomputing the run-level-merge `overlap_start` test
+per-lane (bit-identical to the scalar shader, verified against corpus images
+plus two purpose-built images chosen to hit every non-multiple-of-4 width
+remainder the corpus misses). Correctness held perfectly. Performance did
+not: **+6% Mali GPU total**, confirming - and roughly doubling - the flat
+result already seen on the RX 9060 XT. Most likely explanation: `doUnion`'s
+`find()` calls are already the dependent, latency-bound part of this shader
+(the first optimization pass's own finding), and quadrupling the per-thread
+column count did not change how many of those dependent chains a workgroup
+issues, only added the per-lane bookkeeping (four loaded values, a
+lane-0-only boundary read, a small unrolled loop) that used to be the
+scheduler's job to hide across more, thinner threads instead. Fewer,
+fatter threads bought nothing here because the bottleneck was never thread
+launch overhead to begin with.
+
+**`blob_diff` vectorization - rejected, more emphatically.** Each thread
+made to own up to 4 interior pixels, sharing one contiguous `parent[]` read
+per row across lanes instead of 6 independent scalar loads per pixel, with
+an aliased `uvec4` view of the same buffer binding for a real vector load on
+the (per-row, alignment-checked) common case. This is the more elaborate of
+the two changes and the one carrying the most correctness risk (a second,
+differently-typed SPIR-V variable aliasing one descriptor binding) - which
+held up under both the standard two-gate sweep AND a full run of
+`VK_LAYER_KHRONOS_validation` on both devices, zero warnings. It is also the
+larger loss: **+11% Mali GPU total**, worse than `uf_merge`'s, and worse
+than its own flat-to-+4% showing on the RX 9060 XT. Same likely cause,
+compounded by the alignment-check branch and the six-element local arrays
+the aliasing trick needs on every invocation regardless of whether the fast
+path is taken: RDNA's cache already coalesces the exact redundant reads this
+was written to de-duplicate by hand, so the desktop result was a preview of
+"no traffic saved, only overhead added" - Mali just pays more for the added
+overhead than AMD does.
+
+**The general lesson, stated once so it does not need re-deriving:** on
+this Mali-G610, none of `uf_merge`, `blob_diff`, `label_pixels` or
+`uf_final` have ever benefited from fewer/fatter threads or micro-managed
+memory access in this tree (item 6 found the same for subgroup aggregation
+in two of these same shaders) - the wins that *have* landed here
+(sections 5, 7, 8) all reduced the amount of *work* (fewer dispatches,
+fewer redundant unions, fewer submit boundaries), never the *shape* of
+per-thread work for a fixed amount of it. A future idea in this family
+should bound itself against that pattern before writing the correctness
+proof, not after.
+
+Both rejected branches are kept, unmerged, as `perf/item3-uf-merge-vec` and
+`perf/item4-blob-diff-vec` off this branch's pre-item-9 commit, per this
+document's own convention of recording what was tried rather than only what
+shipped.
