@@ -340,17 +340,25 @@ trials at cap=32/64/128) before being ported to GLSL - see
 `OPTIMIZATION_NOTES.md` item 9 for the full writeup, including two other
 shader-vectorization ideas tried alongside it and rejected.
 
-Measured, ABBA, decimation 1, largest corpus image:
+Measured, ABBA, largest corpus image, GPU total (min-of-60 per run):
 
-| | GPU total |
-| --- | --- |
-| Mali-G610 | -2 to -3% (min of 4 ABBA rounds) |
-| RX 9060 XT | -3 to -5% (min of 4 ABBA rounds, one outlier excluded) |
-| `sort` span alone (RX 9060 XT) | **-29%**, clean and non-overlapping over 10 runs each |
+| | Mali-G610 (8 ABBA rounds) | RX 9060 XT (4 ABBA rounds) |
+| --- | --- | --- |
+| decimation 1 | **-2.2%** | **-5.7%** (one outlier run excluded) |
+| decimation 2 | **-2.7%** | **-3.5%** |
+| decimation 4 | **-3.3%** | not distinguishable from noise (n=4, overlapping) |
+| `sort` span alone (RX 9060 XT, decimation 1) | -29%, clean and non-overlapping over 10 runs each | |
 
-Smaller at decimation 2/4, where blobs are smaller and the sort span is
-already a tiny fraction of the frame - not distinguishable from noise there
-with the sample sizes measured so far.
+Mali holds a consistent, non-overlapping win at all three decimations - an
+earlier pass of this table, with only 2 ABBA rounds at decimation 2/4,
+wrongly showed the gain vanishing or reversing at decimation 4; that was
+sampling noise from too few rounds, not a real effect, and is superseded by
+the 8-round numbers above. On the RX 9060 XT the win shrinks with
+decimation as expected (smaller blobs, less for the sort network to do),
+and at decimation 4 the span is small enough relative to desktop-GPU
+scheduling noise that 4 ABBA rounds cannot resolve it - Mali is the
+deployment target this project optimizes for, so this was not chased
+further with more samples.
 
 ## 4. Edge refinement (`APRILTAG_VK_REFINE`)
 
