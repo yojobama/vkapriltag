@@ -570,15 +570,20 @@ void GpuDetector::CreatePipelines() {
   // folds the threshold into the parent[] word instead (see common.glsl), so
   // blob_diff has no thresholded binding at all and the u8 axis moved to
   // label_pixels - where it costs 2 variants instead of doubling 2 into 4.
+  // Binding 4 (blob_diff) / binding 3 (label_pixels) is uf_changed_buf_,
+  // read only by the fused fast path's speculative attempt - see
+  // finish_frame's `speculative` parameter and each shader's own comment
+  // on honour_changed_flag.
   blob_diff_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("blob_diff"),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
-       qbp_keys_buf_.get()},
-      12, wg2d_);
+       qbp_keys_buf_.get(), uf_changed_buf_.get()},
+      16, wg2d_);
 
   label_pixels_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("label_pixels", "label_pixels_u8")),
-      {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()}, 8, wg1d_);
+      {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()},
+      12, wg1d_);
 
   init_extents_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4, wg1d_);
@@ -862,31 +867,62 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // threshold_label_ms figure still includes any extra chunks; only this
   // per-shader breakdown misses them.
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
+  // record_uf_chunk's last dispatch (uf_compress_pl_) uses the DEFAULT
+  // BarrierKind::Compute, whose stage mask is COMPUTE_SHADER only. The copy
+  // below is a vkCmdCopyBuffer - a TRANSFER-stage read - which that barrier
+  // does not synchronize against: its dst stage is compute, not transfer,
+  // so a transfer command recorded after it is not guaranteed to see the
+  // write. This was invisible for years because the unfused path submits
+  // right after (see below), and an otherwise-idle submission gives the
+  // hardware no incentive to run the copy early; fusing the tail behind it
+  // gave the scheduler real work to overlap it with, and a chunk small
+  // enough to have little preceding compute work made the race reliably
+  // lose (APRILTAG_VK_UF_CHUNK=1 reproduced it every time, matching or
+  // exceeding the default chunk size never did). All three sites that
+  // follow record_uf_chunk with this same copy need the same barrier - see
+  // the other two below.
+  vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
+  // This copy is what both paths below use to learn whether `chunk`
+  // iterations converged: for the unfused path it feeds an immediate
+  // readback (unchanged from before); for the fused path it rides along in
+  // the same submission as the entire tail (see `fuse` below), and
+  // finish_frame reads it back only once that one submission returns.
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
-  vk::ComputePipeline::HostReadBarrier(cmd);
-  SubmitTimedAndWait(cmd);
 
   uint32_t uf_iterations = chunk;
-  bool converged = ReadCounterSlot(kSlotUfChanged) == 0;
-  while (!converged && uf_iterations < config_.max_uf_iterations) {
-    const uint32_t next =
-        std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
-    cmd = BeginTimedCommands();
-    record_uf_chunk(cmd, next);
-    RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
-    vk::ComputePipeline::HostReadBarrier(cmd);
-    SubmitTimedAndWait(cmd);
-    uf_iterations += next;
-    converged = ReadCounterSlot(kSlotUfChanged) == 0;
-  }
-  last_uf_iterations_ = uf_iterations;
-  const auto t_label = Clock::now();
+  bool converged = false;
 
   // ------------------------------------------------------------------
-  // Submit 2: blob sizes, boundary point extraction, and compaction. The
-  // compacted count is the number every later stage is sized by.
-  // ------------------------------------------------------------------
-  cmd = BeginTimedCommands();
+  // Submit 2 (unfused) / rest of the frame (fused): blob sizes, boundary
+  // point extraction, compaction, grouping, selection, sort and line-fit,
+  // and every readback. Wrapped in a lambda (capturing everything by
+  // reference, `cmd` as an explicit parameter, matching record_uf_chunk's
+  // convention above) so it can be invoked either once, immediately after
+  // the labelling chunk with no intervening submit (the fused fast path
+  // below), or twice, when that optimistic assumption turns out wrong and
+  // the whole tail has to be discarded and rerun against a genuinely
+  // converged parent[] (the retry branch below). For the unfused path this
+  // is called exactly once, exactly where "Submit 2" used to begin - a
+  // pure extraction, not a behavior change.
+  //
+  // Returns whether the uf_changed copy recorded before this call (either
+  // the one right above, for the fused fast path's first attempt, or the
+  // catch-up loop's own last copy, for everyone else) showed convergence.
+  // The unfused caller and the fused retry's second call both ignore this -
+  // by the time they call finish_frame, convergence is either already
+  // established or being accepted as "gave up at max_uf_iterations", the
+  // same acceptance the pre-existing while loop below already makes.
+  // `speculative` is true only for the fused fast path's first, optimistic
+  // attempt (see below): it gates label_pixels_pl_ and blob_diff_pl_ so
+  // neither runs ahead of a confirmed convergence. It is false for the
+  // unfused path (convergence is already confirmed by the time this is
+  // called) and for the fused retry's second, authoritative call (by then
+  // parent[] is genuinely converged, or max_uf_iterations was hit and we
+  // proceed with whatever's there - the same acceptance the pre-existing
+  // while loop already makes).
+  auto finish_frame = [&](VkCommandBuffer cmd, bool speculative) -> bool {
+  const auto t_label = Clock::now();
+
   // uf_final needs the min-size floor too, to saturate its counter at the
   // same threshold label_pixels tests against (see uf_final.comp), so it
   // can't share dwdh_pc with uf_init/uf_merge/uf_compress. The floor is
@@ -901,7 +937,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Fold blob identity and the min-size test into one spatially-local value
   // per pixel, so blob_diff.comp does no random gathers at all. See
   // label_pixels.comp.
-  struct { uint32_t count, min_blob; } label_pc{pixels, config_.min_cluster_pixels};
+  struct { uint32_t count, min_blob, honour_changed_flag; } label_pc{
+      pixels, config_.min_cluster_pixels, speculative ? 1u : 0u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelPixels));
   label_pixels_pl_.Dispatch1D(cmd, pixels, &label_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelPixels));
@@ -909,8 +946,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // blob_diff appends valid boundary points (with their sort keys) directly
   // into the compacted buffer, so there is no dense intermediate array and no
   // separate full-capacity compaction pass.
-  struct { uint32_t w, h, capacity; } blobdiff_pc{decimated_width_, decimated_height_,
-                                                   qbp_capacity_};
+  struct { uint32_t w, h, capacity, honour_changed_flag; } blobdiff_pc{
+      decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
                            BarrierKind::ComputeAndTransfer);
@@ -1210,8 +1247,13 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.hash_probe_drops = final_hash_drops;
   last_profile_.selected_blob_drops = final_blob_drops;
   last_profile_.oversized_sort_blobs = oversized_sort_blobs;
-  last_profile_.uf_iterations = uf_iterations;
-  last_profile_.uf_converged = converged;
+  // uf_iterations and uf_converged are NOT set here: on the fused fast
+  // path this lambda's own return value is what determines whether the
+  // `converged` this call ran with was ultimately correct, so both fields
+  // are set once, after the caller has resolved that (see the end of
+  // Detect()) - setting them from inside this call would report the fast
+  // path's OWN not-yet-checked guess for uf_converged, which is wrong on
+  // exactly the frames this whole mechanism exists to handle.
   last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);
 
   if (timestamps_enabled_) {
@@ -1245,6 +1287,110 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Quad fitting itself happens in QuadDecode (CPU tail); Detect() only runs
   // the GPU pipeline and exposes its outputs via last_selected_extents /
   // last_line_fit_points.
+  return ReadCounterSlot(kSlotUfChanged) == 0;
+  };  // finish_frame
+
+  if (fuse) {
+    // Fast path: assume `chunk` iterations converged (it is seeded from
+    // last frame's actual count, see the comment above chunk's derivation),
+    // and record the entire tail into the same command buffer as the
+    // labelling chunk, with no submit in between. This is the frame's
+    // remaining submit boundary from PERFORMANCE.md section 3c, and it
+    // collapses to zero exactly when the assumption holds - which, for
+    // continuous video, is every frame after the first.
+    converged = finish_frame(cmd, /*speculative=*/true);
+    if (!converged) {
+      // Rare: chunk undershot what this frame actually needed (most
+      // commonly the very first Detect() call, before last_uf_iterations_
+      // has a real value; occasionally a genuine scene change). Everything
+      // finish_frame just computed is invalid - it read labels that had
+      // not finished merging - and is discarded outright, not patched up.
+      //
+      // parent[] itself is not invalid, only incomplete: uf_merge and
+      // uf_compress are safe to keep calling on a partially-converged
+      // state (that is the whole point of chunking), so this resumes the
+      // convergence process rather than restarting from uf_init. This is
+      // exactly the loop the unfused path below already runs after its
+      // first chunk; here it just starts from a later point, and runs
+      // rarely enough that going back to a plain submit-per-chunk loop for
+      // it is the right trade.
+      while (!converged && uf_iterations < config_.max_uf_iterations) {
+        const uint32_t next =
+            std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
+        cmd = BeginTimedCommands();
+        record_uf_chunk(cmd, next);
+        // Same missing-barrier hazard as the first copy above: uf_compress's
+        // default barrier does not cover the transfer-stage read this copy
+        // performs.
+        vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
+        RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
+        vk::ComputePipeline::HostReadBarrier(cmd);
+        SubmitTimedAndWait(cmd);
+        uf_iterations += next;
+        converged = ReadCounterSlot(kSlotUfChanged) == 0;
+      }
+
+      // parent[] is now genuinely converged (or max_uf_iterations was hit,
+      // the same "accept whatever is there" behaviour the unfused path
+      // already allows). Re-zero exactly the buffers the discarded
+      // speculative tail dirtied - the same set "clear" zeroes at the top
+      // of this function, minus uf_changed_buf_, which record_uf_chunk
+      // already re-zeroes internally before its last iteration - and run
+      // the tail again, for real this time.
+      //
+      // The timestamp pool is reset again here rather than selectively:
+      // Reset() only supports resetting every query at once, and writing a
+      // timestamp to an index the discarded attempt already wrote, without
+      // an intervening reset, is exactly the hazard QueryPool's own comment
+      // warns about. The cost is that this frame's per-span GPU breakdown
+      // (APRILTAG_VK_TIMESTAMPS=1 only - detection itself is unaffected)
+      // reports clear/threshold/labelling as unavailable rather than their
+      // real values, on this one frame; wall-clock timing is untouched,
+      // since it never depended on the query pool. The same loss of
+      // per-span attribution for a rare extra convergence pass is already
+      // accepted above for the unfused path's own catch-up chunks.
+      cmd = BeginTimedCommands();
+      timestamp_pool_.Reset(cmd);
+      qbp_counter_buf_.FillZero(cmd);
+      selected_counter_buf_.FillZero(cmd);
+      blob_size_buf_.FillZero(cmd);
+      hash_owner_buf_.FillZero(cmd);
+      blob_cursor_buf_.FillZero(cmd);
+      raw_blob_counter_buf_.FillZero(cmd);
+      hash_drop_counter_buf_.FillZero(cmd);
+      oversized_sort_counter_buf_.FillZero(cmd);
+      vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
+      finish_frame(cmd, /*speculative=*/false);
+    }
+  } else {
+    // Unfused: unchanged from before this change, modulo the extraction
+    // above - submit the labelling chunk, read back convergence, run any
+    // extra chunks needed, then record and submit the tail as its own,
+    // separate submission.
+    vk::ComputePipeline::HostReadBarrier(cmd);
+    SubmitTimedAndWait(cmd);
+    converged = ReadCounterSlot(kSlotUfChanged) == 0;
+    while (!converged && uf_iterations < config_.max_uf_iterations) {
+      const uint32_t next =
+          std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
+      cmd = BeginTimedCommands();
+      record_uf_chunk(cmd, next);
+      // Same missing-barrier hazard as the first copy above: uf_compress's
+      // default barrier does not cover the transfer-stage read this copy
+      // performs.
+      vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
+      RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
+      vk::ComputePipeline::HostReadBarrier(cmd);
+      SubmitTimedAndWait(cmd);
+      uf_iterations += next;
+      converged = ReadCounterSlot(kSlotUfChanged) == 0;
+    }
+    cmd = BeginTimedCommands();
+    finish_frame(cmd, /*speculative=*/false);
+  }
+  last_uf_iterations_ = uf_iterations;
+  last_profile_.uf_iterations = uf_iterations;
+  last_profile_.uf_converged = converged;
 }
 
 std::string GpuDetector::DescribeSizing() const {

@@ -1084,6 +1084,111 @@ compact arrays, strip-per-warp labelling, separate border merging), which
 would add passes and compaction atomics; see the scan below for why those
 look less promising here.
 
+## 8. The last submit boundary, closed with a retry - and two real bugs found doing it
+
+Item 5 left one boundary open: the host readback of the labelling
+convergence flag, between the labelling chunk and the rest of the frame.
+Closing it needed the retry item 5 already sketched - record the frame
+speculatively assuming `chunk` iterations converged (seeded from last
+frame's actual count, so this holds for essentially every frame after the
+first), and if it didn't, discard the result and redo it - but two things
+went wrong on the way, both worth recording since they generalize past this
+one optimization.
+
+**Bug 1: a shader that destructively rewrites its own input.**
+`label_pixels.comp` overwrites `parent[]` in place with a packed
+(label, threshold code) word, discarding the raw union-find pointer that
+lived there (deliberately - see its own comment on why the rewrite is
+otherwise safe). Running it speculatively, before knowing whether labelling
+had actually converged, meant that on the rare frame where it hadn't, the
+"discard and retry" step tried to resume `uf_merge`/`uf_compress` on a
+buffer that no longer held valid parent pointers. `find()`'s pointer-chasing
+loop has no cycle guard, and a corrupted buffer can produce one - which
+hangs the GPU. **This surfaced as `VK_ERROR_DEVICE_LOST` on the Mali-G610**
+under a synthetic test that forced the retry path, on real hardware, for the
+first time - this device-side destructive rewrite is exactly the kind of
+hazard the CPU-side "clear and redo" story cannot see, because CPU state has
+no equivalent of a shader silently repurposing a buffer's bit layout.
+
+Fixed by gating both `label_pixels.comp` and `blob_diff.comp` (the second
+because it interprets `parent[]`'s bits as labels too, and would read
+garbage from a not-yet-relabelled buffer, though the bit-budget analysis
+that established RawLineFitPoint's packing separately proves this could not
+have produced an out-of-range index - only wasted a full pass appending
+spurious points) behind a `honour_changed_flag` push constant, the exact
+pattern `uf_compress.comp` already used: read `uf_changed_buf_` directly (a
+new binding, one per shader) and skip all work when it shows the labelling
+chunk did not converge. `parent[]` then stays exactly as the labelling chunk
+left it - incomplete, but a valid union-find structure - and the retry's
+`uf_merge`/`uf_compress` calls can safely keep converging it.
+
+Verifying this needed a test that could not use the existing corpus: every
+tested image converges within 1-2 iterations, so there was no naturally
+occurring "genuinely did not converge" case to retry against. The synth
+tool cannot be aimed at a mid-pipeline GPU counter either. What worked was
+forcing the DEVICE-SIDE flag itself nonzero (a raw `vkCmdFillBuffer` on
+`uf_changed_buf_`, gated behind a test-only env var, removed before
+shipping) immediately before it is copied for the speculative check - a
+genuine "labelling didn't converge" signal from every consumer's point of
+view, not a host-side belief with nothing behind it. An earlier attempt that
+instead overrode only the host's `converged` boolean produced a SECOND,
+different device lost: the device-side flag genuinely showed converged, so
+the (correctly gated) shaders ran for real and rewrote `parent[]`, and then
+the artificially-forced "retry" ran `uf_merge`/`uf_compress` on top of that
+already-relabelled buffer - the same hazard bug 1 fixed, self-inflicted by
+the test. **A host-side-only fault injection is not equivalent to a
+device-side one when the code under test makes its own decisions from
+device state** - worth remembering for any future test of a similar
+speculate-then-verify GPU pattern.
+
+**Bug 2, found while chasing what looked like a symptom of bug 1's fix being
+incomplete:** with `APRILTAG_VK_UF_CHUNK=1` (and no forced fault), the
+speculative attempt believed it had converged - correctly, chunk=1 does
+converge for this image - yet still produced zero boundary points. Bisection
+(disabling each of the two gates independently, then reading
+`uf_changed_buf_` back through an isolated, fully-synchronized readback
+inserted purely for diagnosis) traced it to a missing barrier that has
+nothing to do with either gate: `record_uf_chunk`'s last dispatch
+(`uf_compress_pl_`) uses the default `BarrierKind::Compute`, whose stage
+mask is `VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT` only. The
+`RecordCounterCopy` that follows it is a `vkCmdCopyBuffer` - a
+**transfer-stage** read - which that barrier's scope does not cover, so
+nothing actually guarantees the copy sees `uf_merge`'s write.
+
+This gap has been in every version of this code that has ever read
+`uf_changed_buf_` back to the host, including the original 4-submit
+version - it was invisible there because the copy is immediately followed
+by a full submit-and-wait with nothing else queued, which on this hardware
+was evidently enough in practice for the compute work to land before the
+transfer executes. Fusing the tail behind the SAME copy, in the SAME
+command buffer, gave the scheduler real work to overlap it with, and the
+smallest possible chunk (least preceding compute work to hide the race
+behind) made it lose reliably. All three sites in `GpuDetector.cpp` where
+`record_uf_chunk` is immediately followed by this copy now have an explicit
+`vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer)` first -
+including the two in the ORIGINAL, unfused catch-up loop, which predate this
+work entirely and were never proven safe, only never observed to fail.
+
+**Verification, once both fixes were in**: the corpus's own images still
+converge in 1-2 iterations regardless of chunk size, so `APRILTAG_VK_UF_CHUNK`
+swept 1 through 5 (all bit-identical to the unfused baseline) exercises bug
+2's fix but not bug 1's - a genuine multi-iteration retry needs the same
+device-side fault injection used to find it. Both together, plus the
+existing config-axis sweep (8-bit storage, int64 atomics, subgroup,
+workgroup geometry), all bit-identical, all with the forced retry
+reproducing on every frame with no device loss.
+
+Measured on the Mali-G610 against item 7's state (this item's fix is a
+correctness fix wrapped around item 5's mechanism, not a new performance
+idea, so the gain is whatever remained of item 5's closed boundary):
+GPU total -0.7% (decimation 1) to -5.2% (decimation 4), pipeline_total
+-0.8% to -4.6%. Smaller than item 5's own -2.0% to -7.9%, because item 5
+had already closed two of the three boundaries; this is the last, smallest
+one. On the RX 9060 XT the fused path never engages (no host-cached
+readback memory type there), so this measures as noise (-1.1% to -1.4%,
+i.e. zero) - expected, and the pure-refactor unfused path stays exercised
+and bit-identical.
+
 ## A scan of the literature, and what it does and does not offer here
 
 Done at the end of this pass, against the two spans that dominate what is

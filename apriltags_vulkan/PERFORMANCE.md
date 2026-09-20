@@ -292,21 +292,39 @@ discrete card without resizable BAR keeps the four-submit path, and the
 RX 9060 XT here does exactly that - it is the fallback that stays verified,
 not a dead branch.
 
-### What is left of this
+### The last boundary: closed
 
-One boundary remains, before `uf_final`, because the host still reads the
-labelling convergence flag to decide whether to run another union-find chunk.
-Measured on its own it is **0.28 ms, ~9% of the frame** - now the largest
-single non-span item.
+One boundary used to remain here, before `uf_final`, because the host still
+read the labelling convergence flag to decide whether to run another
+union-find chunk - measured on its own at **0.28 ms, ~9% of the frame**.
 
-Removing it exactly (without guessing an iteration count and risking
-under-converged labels) wants a retry rather than a speculation: record the
-whole frame with the chunk count the *previous* frame needed, read the
-convergence flag with all the other counters at the end, and if it says the
-labelling did not converge, redo the frame with a larger count. `clear`
-re-initializes every buffer, so a redo is simply correct, and
-`last_uf_iterations_` already adapts after one frame - so a scene that needs
-more iterations pays double once, not every frame. Not attempted here.
+It is closed now, with the retry this section used to describe as future
+work: record the whole frame assuming the chunk count *last* frame needed
+converges this frame too (true for essentially every frame once steady
+state is reached), and if the flag says it did not, discard everything and
+redo it - the labelling chunks resuming from where they left off, everything
+downstream re-run once `parent[]` is genuinely converged. `clear`
+re-initializes every buffer that needs it, so a redo is simply correct.
+
+Two bugs surfaced while shipping this, both now fixed and both recorded in
+`OPTIMIZATION_NOTES.md` because they generalize past this one change: a
+shader (`label_pixels.comp`) that destructively rewrites its own input had
+to be gated so it never runs before convergence is confirmed - running it
+early corrupted `parent[]` for the retry's own `uf_merge`/`uf_compress`
+calls, which hung the GPU (`VK_ERROR_DEVICE_LOST`, observed on the
+Mali-G610). And a **missing compute-to-transfer barrier**, present in every
+version of this code that has ever copied `uf_changed_buf_` back to the
+host - including the original, still-shipping unfused catch-up loop - had
+been invisible because the copy was always immediately followed by a full
+submit boundary; fusing the tail behind the same copy gave the GPU's
+scheduler real work to overlap it with, exposing the race.
+
+Measured on the Mali-G610 against the state with the earlier two boundaries
+already closed: GPU total -0.7% (decimation 1) to -5.2% (decimation 4). On
+the RX 9060 XT it measures as noise - the fused path never engages there
+(no host-cached readback memory type), so this exercises only the unfused
+path's refactor, which is bit-identical and performance-neutral by
+construction.
 
 ## 4. Edge refinement (`APRILTAG_VK_REFINE`)
 
@@ -571,14 +589,14 @@ rather than `atomicAdd`, at some cost.
 already tried and rejected — read it before proposing work, since most of the
 obvious ideas are in the rejected column. The short version:
 
-0. **The one remaining submit boundary**, before `uf_final`, worth **0.28 ms
-   (~9%)**. Two of the original three are gone (section 3c); this one is held
-   open by the host readback of the labelling convergence flag, and section
-   3c sketches the retry-based way to close it exactly. Note that the old
-   "collapsing submits is not worth it" verdict in `OPTIMIZATION_NOTES.md`
-   was measured when the frame was 11.5 ms and the same absolute cost was
-   ~1%; everything else has since got ~4x faster and this had not, which is
-   why it was worth re-measuring rather than inheriting.
+0. ~~**The one remaining submit boundary**, before `uf_final`~~ **Closed** -
+   all three of the original four-submit frame's mid-frame readbacks are now
+   gone on unified-memory parts, via the retry described in section 3c.
+   Finding and fixing the two bugs that surfaced on the way (a shader that
+   destructively rewrote its own input, and a missing compute-to-transfer
+   barrier present since the very first version of this readback) is
+   recorded in `OPTIMIZATION_NOTES.md` item 8, since both generalize past
+   this one change.
 1. **A better connected-components algorithm.** `labelling` is still the
    largest span at ~28% of the Mali GPU phase, which caps any rewrite there.
    The cheapest part of HA4 - merging per run rather than per pixel - is

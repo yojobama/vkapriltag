@@ -54,11 +54,25 @@ layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 1) writeonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 2) buffer Counter { uint counter; };
 layout(std430, binding = 3) writeonly buffer Keys { uvec2 keys[]; };
+// Read only when honour_changed_flag is set - see the guard in main() and
+// label_pixels_body.glsl's own copy of this mechanism, which this mirrors.
+layout(std430, binding = 4) readonly buffer Changed { uint changed_flag; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
   uint capacity;
+  // Set only by the fused fast path's speculative first attempt. This
+  // shader is not itself destructive, but when labelling has not actually
+  // converged, parent[] here still holds RAW union-find pointers rather
+  // than label_pixels.comp's packed (label, code) word - label_pixels is
+  // gated the same way and will not have run yet - so PixelLabel/
+  // PixelThreshCode below would extract meaningless bits from an arbitrary
+  // pixel index. Bounded and clamped everywhere downstream, so this would
+  // not crash, only waste a full speculative pass appending garbage
+  // points; skipping it here just avoids paying for that on the rare
+  // frame that needs a retry.
+  uint honour_changed_flag;
 } pc;
 
 // Appends one boundary point together with its (rep0, rep1) grouping key.
@@ -108,6 +122,7 @@ void append(bool want_append, uint rep_a, uint rep_b, uint px, uint py, int gx, 
 }
 
 void main() {
+  if (pc.honour_changed_flag != 0u && changed_flag != 0u) return;
   uint iw = pc.width - 2u;
   uint ih = pc.height - 2u;
   uint ox = gl_GlobalInvocationID.x;
