@@ -227,13 +227,14 @@ A/B'd on one binary with `APRILTAG_VK_FORCE_NO_INT64_ATOMIC`:
 ### Net effect on the deployment target
 
 Stock `7587f1b` against everything on this branch, on the Mali-G610,
-ABBA-interleaved, min of 12, **both binaries built `Release`**:
+ABBA-interleaved, min of 12, **both binaries built `Release`**, timestamps
+off:
 
 | | GPU total | `pipeline_total` | device memory |
 | --- | --- | --- | --- |
-| decimation 1 | **-11.2%** | -9.2% | 185 -> 155 MiB |
-| decimation 2 | **-11.0%** | -7.5% | 48 -> 42 MiB |
-| decimation 4 | **-12.5%** | -9.8% | 15 -> 13 MiB |
+| decimation 1 | **-13.9%** | -12.5% | 185 -> 155 MiB |
+| decimation 2 | **-14.2%** | -11.2% | 48 -> 42 MiB |
+| decimation 4 | **-15.4%** | -15.5% | 15 -> 13 MiB |
 
 Detections are identical to stock throughout: 3 decimations x 5
 configurations on Mali, and 8 configuration axes x 3 decimations x the

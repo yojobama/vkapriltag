@@ -294,17 +294,18 @@ Mali, so profiling builds must not be quoted as deployment numbers).
 
 | | `7587f1b` | branch | delta |
 | --- | --- | --- | --- |
-| `GpuDetector` (GPU) | 1.301 ms | 1.162 ms | **-10.7%** |
-| `quad_decode` (CPU) | 0.407 ms | 0.262 ms | **-36%** |
-| `tag_decode` (CPU) | 0.147 ms | 0.147 ms | ~0 |
-| **Pipeline total** | **1.936 ms** | **1.640 ms** | **-15.3%** |
+| `GpuDetector` (GPU) | 1.002 ms | 0.902 ms | **-9.9%** |
+| `quad_decode` (CPU) | 0.387 ms | 0.258 ms | **-33%** |
+| `tag_decode` (CPU) | 0.145 ms | 0.147 ms | ~0 |
+| **Pipeline total** | **1.661 ms** | **1.344 ms** | **-19.1%** |
 | device memory | 185 MiB | 155 MiB | **-16.2%** |
 
-Two of these have nothing to do with the GPU work. `quad_decode` is the
-`inline` on the DP corner-seeding helpers, which is specifically an MSVC
-`/Ob1` (RelWithDebInfo) effect. Most of the GPU delta is retiring two of the
-three subgroup-aggregated shader variants, which measured 72% and 24% slower
-than the plain-atomic versions on this card - see `PERFORMANCE.md` section 6.
+`quad_decode` has nothing to do with the GPU work: it is the `inline` on the
+DP corner-seeding helpers, specifically an MSVC `/Ob1` (RelWithDebInfo)
+effect. Most of the GPU delta is retiring two of the three
+subgroup-aggregated shader variants, which measured 72% and 24% slower than
+the plain-atomic versions on this card, plus run-level merging in the
+labelling stage - see `PERFORMANCE.md` section 6 and `OPTIMIZATION_NOTES.md`.
 The submit fusion does not engage here at all, since it needs a host-cached
 readback memory type that a card without resizable BAR does not offer.
 
@@ -313,10 +314,10 @@ built `Release`:
 
 | | `7587f1b` | branch | delta |
 | --- | --- | --- | --- |
-| `GpuDetector` (GPU) | 8.401 ms | 7.464 ms | **-11.2%** |
-| `quad_decode` (CPU) | 0.666 ms | 0.671 ms | ~0 |
-| `tag_decode` (CPU) | 0.369 ms | 0.369 ms | ~0 |
-| **Pipeline total** | **9.538 ms** | **8.663 ms** | **-9.2%** |
+| `GpuDetector` (GPU) | 8.392 ms | 7.227 ms | **-13.9%** |
+| `quad_decode` (CPU) | 0.668 ms | 0.669 ms | ~0 |
+| `tag_decode` (CPU) | 0.333 ms | 0.361 ms | ~0 |
+| **Pipeline total** | **9.565 ms** | **8.368 ms** | **-12.5%** |
 | device memory | 185 MiB | 155 MiB | **-16.2%** |
 
 The CPU tail does not move here, which is the expected mirror of the desktop
@@ -327,8 +328,8 @@ already excluded from every aggregated variant. Mali's share of the win is
 the extents contention work, the packed line-fit record and the fused
 submissions.
 
-At decimations 2 and 4 the same comparison gives GPU total **-11.0%** and
-**-12.5%**, pipeline total **-7.5%** and **-9.8%**.
+At decimations 2 and 4 the same comparison gives GPU total **-14.2%** and
+**-15.4%**, pipeline total **-11.2%** and **-15.5%**.
 
 Detections are identical to `7587f1b` throughout: 8 configuration axes x
 decimations 1/2/4 x the 5-image corpus on the desktop, and 3 decimations x 5
