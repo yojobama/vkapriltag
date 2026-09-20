@@ -54,11 +54,25 @@ layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 1) writeonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 2) buffer Counter { uint counter; };
 layout(std430, binding = 3) writeonly buffer Keys { uvec2 keys[]; };
+// Read only when honour_changed_flag is set - see the guard in main() and
+// label_pixels_body.glsl's own copy of this mechanism, which this mirrors.
+layout(std430, binding = 4) readonly buffer Changed { uint changed_flag; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
   uint capacity;
+  // Set only by the fused fast path's speculative first attempt. This
+  // shader is not itself destructive, but when labelling has not actually
+  // converged, parent[] here still holds RAW union-find pointers rather
+  // than label_pixels.comp's packed (label, code) word - label_pixels is
+  // gated the same way and will not have run yet - so PixelLabel/
+  // PixelThreshCode below would extract meaningless bits from an arbitrary
+  // pixel index. Bounded and clamped everywhere downstream, so this would
+  // not crash, only waste a full speculative pass appending garbage
+  // points; skipping it here just avoids paying for that on the rare
+  // frame that needs a retry.
+  uint honour_changed_flag;
 } pc;
 
 // Appends one boundary point together with its (rep0, rep1) grouping key.
@@ -69,45 +83,34 @@ layout(push_constant) uniform PushConstants {
 // of QBPoint itself (see common.glsl) - nothing downstream ever read them out
 // of the compacted point, only out of these key arrays.
 //
-// want_append is a plain VALUE, not a condition guarding whether append() is
-// called at all - main() calls append() exactly 4 times for every surviving
-// thread, unconditionally, passing each direction's test result as data.
-// This is deliberate: subgroup operations executed from inside a function
-// that is itself only ENTERED under divergent control flow are a documented
-// gray area on some SPIR-V 1.3-era compilers/drivers (full "maximal
-// reconvergence" guarantees are a later addition) - calling append()
-// uniformly and gating the actual write on a boolean parameter instead
-// keeps every subgroup op reachable through the exact same, non-divergent
-// control-flow path on every invocation, which is unambiguously well-defined
-// on every target. (This was empirically load-bearing, not just caution:
-// the divergent-call version measurably dropped points on the desktop test
-// GPU - see OPTIMIZATION_NOTES.md.)
+// want_append is passed as a VALUE rather than used to guard the call site:
+// main() calls append() exactly 4 times for every surviving thread,
+// unconditionally, handing each direction's test result in as data.
 //
-// AGGREGATE_APPEND_COUNTER (subgroup variants only): every lane with
-// want_append true wants to append exactly one point, to the SAME counter
-// address regardless of key - a plain "warp-aggregated atomic increment"
-// (ballot -> one atomicAdd(counter, popcount) from the elected lane ->
-// broadcast the base back to every lane -> each lane's own slot is
-// base + its exclusive rank in the ballot), the textbook GPU compaction
-// idiom. This needs only ballot + broadcast + elect, all guaranteed
-// wherever SUBGROUP_FEATURE_BALLOT_BIT is reported in COMPUTE - no
-// partition/match-any extension.
+// That shape was originally load-bearing for a reason that no longer
+// applies - the subgroup-aggregated variant below executed subgroup ops
+// inside this function, and subgroup ops reached only through divergent
+// control flow are a documented gray area on SPIR-V 1.3-era drivers (the
+// divergent-call version measurably dropped points on the desktop test GPU;
+// see OPTIMIZATION_NOTES.md). With that variant retired there is no longer
+// a correctness argument for it, only a stylistic one: the four directions
+// read as four uniform calls. Guarding at the call site instead would be
+// equally correct now.
+//
+// There used to be a subgroup-aggregated variant of the append below - the
+// textbook warp-aggregated atomic increment, collapsing one atomicAdd per
+// lane into one per subgroup. It is gone: measured on an RX 9060 XT it made
+// the `boundary` span 24% SLOWER than the plain atomic (0.0437 vs 0.0330 ms,
+// three sessions), and integrated parts never took it at all. Aggregating a
+// bare counter is the case a modern atomic unit already handles well, so the
+// ballot sequence bought nothing and cost its own issue slots. The variant
+// that survives elsewhere in the pipeline, reduce_extents_hash_subgroup,
+// aggregates per-point VALUES by key rather than a counter, which is a
+// different and still-worthwhile trade. See GpuDetector::CreatePipelines().
 void append(bool want_append, uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
-#ifdef AGGREGATE_APPEND_COUNTER
-  uvec4 ballot = subgroupBallot(want_append);
-  uint count = subgroupBallotBitCount(ballot);
-  uint rank = subgroupBallotExclusiveBitCount(ballot);
-  uint base = 0u;
-  if (subgroupElect()) {
-    base = atomicAdd(counter, count);
-  }
-  base = subgroupBroadcastFirst(base);
-  uint pos = base + rank;
-#else
   if (!want_append) return;
   uint pos = atomicAdd(counter, 1u);
-#endif
-  if (!want_append || pos >= pc.capacity) return;
+  if (pos >= pc.capacity) return;
 
   compacted[pos] = PackQBPoint(px, py, gx, gy);
 
@@ -119,6 +122,7 @@ void append(bool want_append, uint rep_a, uint rep_b, uint px, uint py, int gx, 
 }
 
 void main() {
+  if (pc.honour_changed_flag != 0u && changed_flag != 0u) return;
   uint iw = pc.width - 2u;
   uint ih = pc.height - 2u;
   uint ox = gl_GlobalInvocationID.x;

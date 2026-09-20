@@ -34,6 +34,7 @@ using apriltag_vulkan::validate::CompareCorners;
 using apriltag_vulkan::validate::ComputeStats;
 using apriltag_vulkan::validate::ExtractDetections;
 using apriltag_vulkan::validate::ImageMetrics;
+using apriltag_vulkan::validate::PrintGpuStageBreakdown;
 using apriltag_vulkan::validate::PrintIds;
 using apriltag_vulkan::validate::SortedIds;
 using apriltag_vulkan::validate::Stats;
@@ -285,34 +286,7 @@ int main(int argc, char **argv) {
           << std::endl;
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
-      double gpu_span_total = 0.0;
-      if (profile.has_gpu_stage_breakdown) {
-        std::cout << "  GPU stage breakdown (last iteration, APRILTAG_VK_TIMESTAMPS=1):"
-            << std::endl;
-        for (size_t s = 0; s < apriltag_vulkan::GpuDetector::kGpuStageNames.size(); ++s) {
-          std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[s] << "="
-              << profile.gpu_stage_ms[s] << " ms" << std::endl;
-          gpu_span_total += profile.gpu_stage_ms[s];
-        }
-        std::cout << "    (sum of spans = " << gpu_span_total << " ms)" << std::endl;
-
-        double intra_submit_gap_total = 0.0;
-        double submit_boundary_gap_total = 0.0;
-        std::cout << "  GPU inter-span gaps (purely GPU-clock, no CPU/fence time):"
-            << std::endl;
-        for (size_t g = 0; g < profile.gpu_gap_ms.size(); ++g) {
-          const bool crosses_submit = apriltag_vulkan::GpuDetector::kGpuGapCrossesSubmit[g];
-          std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[g] << "->"
-              << apriltag_vulkan::GpuDetector::kGpuStageNames[g + 1] << "="
-              << profile.gpu_gap_ms[g] << " ms"
-              << (crosses_submit ? "  (submit boundary)" : "") << std::endl;
-          (crosses_submit ? submit_boundary_gap_total : intra_submit_gap_total) +=
-              profile.gpu_gap_ms[g];
-        }
-        std::cout << "    (intra-submit gap total = " << intra_submit_gap_total
-            << " ms, submit-boundary gap total = " << submit_boundary_gap_total << " ms)"
-            << std::endl;
-      }
+      const double gpu_span_total = PrintGpuStageBreakdown(profile);
       // Host-side cost of driving the GPU - see DetectProfile's cpu_*_ms
       // comment for what the residual below is (and, importantly, what it
       // is not).

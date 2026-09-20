@@ -35,6 +35,8 @@ struct ContextOptions {
   // without the other's).
   // Env override: APRILTAG_VK_FORCE_NO_8BIT=1
   bool force_no_8bit_storage = false;
+  // Env override: APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1
+  bool force_no_int64_atomics = false;
   // Env override: APRILTAG_VK_FORCE_NO_SUBGROUP=1
   bool force_no_subgroup = false;
 
@@ -110,6 +112,8 @@ struct DeviceCaps {
   // GpuDetector::ShaderPath), with the plain 32-bit-per-pixel shaders as the
   // fallback on parts that lack it (the codebase's default assumption).
   bool has_8bit_storage = false;
+  // VK_KHR_shader_atomic_int64 + shaderBufferInt64Atomics + shaderInt64.
+  bool has_int64_atomics = false;
   // Subgroup capability, queried via VkPhysicalDeviceSubgroupProperties
   // (core Vulkan 1.1, no extension/device-feature enablement needed - unlike
   // 8-bit storage, subgroup operations are gated purely by what the SPIR-V
@@ -248,6 +252,7 @@ public:
   // place that can actually request+enable the extension), read by
   // QueryCaps to populate caps_.has_8bit_storage.
   bool supports_8bit_storage_ = false;
+  bool supports_int64_atomics_ = false;
   PipelineCache pipeline_cache_;
 
   // Reusable command buffers plus the fence tracking each one's submission.

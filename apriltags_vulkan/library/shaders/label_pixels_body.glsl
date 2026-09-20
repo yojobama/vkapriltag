@@ -30,6 +30,9 @@ layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
 layout(std430, binding = 1) readonly buffer BlobSize { uint blob_size[]; };
+// Read only when honour_changed_flag is set - see the guard below and
+// GpuDetector's finish_frame comment on the fused fast path.
+layout(std430, binding = 3) readonly buffer Changed { uint changed_flag; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
@@ -37,11 +40,28 @@ layout(push_constant) uniform PushConstants {
   // counter at this same floor, and the two agreeing is what makes the
   // comparison below exact. See uf_final.comp's proof.
   uint min_blob_pixels;
+  // Set only by the fused fast path's SPECULATIVE first attempt, where
+  // labelling might not actually have converged yet - see GpuDetector's
+  // finish_frame. When set and changed_flag is nonzero, this invocation
+  // returns without touching parent[] at all.
+  //
+  // This guard exists because this shader's own write below is
+  // DESTRUCTIVE: it overwrites parent[] with a packed (label, threshold
+  // code) word, permanently discarding the raw union-find parent pointer
+  // that lived there. If that happened before labelling had genuinely
+  // converged, a retry's uf_merge/uf_compress passes would resume
+  // find()-walking a buffer that no longer holds valid parent pointers -
+  // in the worst case a cycle, which hangs the GPU (observed as
+  // VK_ERROR_DEVICE_LOST while developing this). Skipping here instead
+  // leaves parent[] exactly as the labelling chunk left it: incomplete,
+  // but a valid union-find structure a retry can safely keep converging.
+  uint honour_changed_flag;
 } pc;
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= pc.count) return;
+  if (pc.honour_changed_flag != 0u && changed_flag != 0u) return;
   uint r = parent[i];
   // The "+1" biasing is what lets label 0 mean "no usable blob", collapsing
   // blob_diff's two separate rejections (ambiguous pixel, blob too small)

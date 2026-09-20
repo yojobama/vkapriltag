@@ -23,9 +23,11 @@ struct MinMaxExtentsGpu {
   int32_t max_x = 0;
   int32_t max_y = 0;
   uint32_t count = 0;
+  // Adjacent to count on purpose - the two share one 64-bit word so the GPU
+  // can accumulate both in a single atomic. See common.glsl.
+  int32_t pxgx_plus_pygy_sum = 0;
   int32_t gx_sum = 0;
   int32_t gy_sum = 0;
-  int32_t pxgx_plus_pygy_sum = 0;
 
   double cx() const { return (min_x + max_x) * 0.5 + 0.05118; }
   double cy() const { return (min_y + max_y) * 0.5 + -0.028581; }
@@ -49,19 +51,31 @@ struct IPoint {
 };
 static_assert(sizeof(IPoint) == 12, "IPoint must match std430 layout");
 
+// Mirrors common.glsl's RawLineFitPoint, which packs its four values into
+// two words. See that file for the bit budget and for why every field fits
+// exactly - this is a storage change, not a precision one, and the
+// accessors below return the same values the four-field version did.
+//
+// It is the largest per-frame readback in the pipeline (one entry per
+// selected boundary point, ~51k of them on a 1280x800 frame at decimation
+// 1), so halving it halves both that copy and the writes sort_points_local
+// makes into it.
 struct RawLineFitPoint {
-  int32_t x2 = 0;
-  int32_t y2 = 0;
-  int32_t W = 0;
-  uint32_t blob_index = 0;
+  uint32_t xy2 = 0;     // x2 in bits [0:13], y2 in bits [14:27]
+  uint32_t w_blob = 0;  // W in bits [0:9], blob_index in bits [10:31]
 
-  int32_t Mx() const { return W * x2; }
-  int32_t My() const { return W * y2; }
-  int64_t Mxx() const { return static_cast<int64_t>(W) * x2 * x2; }
-  int64_t Mxy() const { return static_cast<int64_t>(W) * x2 * y2; }
-  int64_t Myy() const { return static_cast<int64_t>(W) * y2 * y2; }
+  int32_t x2() const { return static_cast<int32_t>(xy2 & 0x3FFFu); }
+  int32_t y2() const { return static_cast<int32_t>((xy2 >> 14) & 0x3FFFu); }
+  int32_t W() const { return static_cast<int32_t>(w_blob & 0x3FFu); }
+  uint32_t blob_index() const { return w_blob >> 10; }
+
+  int32_t Mx() const { return W() * x2(); }
+  int32_t My() const { return W() * y2(); }
+  int64_t Mxx() const { return static_cast<int64_t>(W()) * x2() * x2(); }
+  int64_t Mxy() const { return static_cast<int64_t>(W()) * x2() * y2(); }
+  int64_t Myy() const { return static_cast<int64_t>(W()) * y2() * y2(); }
 };
-static_assert(sizeof(RawLineFitPoint) == 16, "RawLineFitPoint must match std430 layout");
+static_assert(sizeof(RawLineFitPoint) == 8, "RawLineFitPoint must match std430 layout");
 
 // CPU-side cumulative line fit moments for a range of points (mirrors
 // frc971::apriltag::LineFitMoments). Built by prefix-summing RawLineFitPoint

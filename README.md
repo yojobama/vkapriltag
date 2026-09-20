@@ -279,6 +279,62 @@ figures from one instrumented frame (`APRILTAG_VK_TIMESTAMPS=1`).
 | `tag_decode` (bit sampling + hamming) | **CPU** | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
 | **Pipeline total** (GPU + both CPU tails) | GPU + CPU | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
 
+### What the current branch changed, at decimation 1
+
+The table above is the steady state. This is the before/after for the work on
+`perf/extents-contention-and-int64-atomics`, measured at **decimation 1** on
+the shipped `grayimage.pgm` (1280x800) rather than `colorImage.pgm`, so these
+numbers are not comparable with the table above — only within this section.
+`7587f1b` is the baseline commit. ABBA-interleaved, min of 12-14 per round,
+`APRILTAG_VK_TIMESTAMPS` **unset** (the instrumentation itself costs ~9% on
+Mali, so profiling builds must not be quoted as deployment numbers).
+
+**Desktop — RX 9060 XT / Ryzen 5 5600X**, three sessions, both binaries built
+`RelWithDebInfo`:
+
+| | `7587f1b` | branch | delta |
+| --- | --- | --- | --- |
+| `GpuDetector` (GPU) | 1.002 ms | 0.902 ms | **-9.9%** |
+| `quad_decode` (CPU) | 0.387 ms | 0.258 ms | **-33%** |
+| `tag_decode` (CPU) | 0.145 ms | 0.147 ms | ~0 |
+| **Pipeline total** | **1.661 ms** | **1.344 ms** | **-19.1%** |
+| device memory | 185 MiB | 155 MiB | **-16.2%** |
+
+`quad_decode` has nothing to do with the GPU work: it is the `inline` on the
+DP corner-seeding helpers, specifically an MSVC `/Ob1` (RelWithDebInfo)
+effect. Most of the GPU delta is retiring two of the three
+subgroup-aggregated shader variants, which measured 72% and 24% slower than
+the plain-atomic versions on this card, plus run-level merging in the
+labelling stage - see `PERFORMANCE.md` section 6 and `OPTIMIZATION_NOTES.md`.
+The submit fusion does not engage here at all, since it needs a host-cached
+readback memory type that a card without resizable BAR does not offer.
+
+**Orange Pi 5 Plus — Mali-G610**, same image and decimation, both binaries
+built `Release`:
+
+| | `7587f1b` | branch | delta |
+| --- | --- | --- | --- |
+| `GpuDetector` (GPU) | 8.392 ms | 7.227 ms | **-13.9%** |
+| `quad_decode` (CPU) | 0.668 ms | 0.669 ms | ~0 |
+| `tag_decode` (CPU) | 0.333 ms | 0.361 ms | ~0 |
+| **Pipeline total** | **9.565 ms** | **8.368 ms** | **-12.5%** |
+| device memory | 185 MiB | 155 MiB | **-16.2%** |
+
+The CPU tail does not move here, which is the expected mirror of the desktop
+result: GCC inlines those helpers at `-O2`/`-O3` whatever the source says, so
+the `inline` keyword is an MSVC `/Ob1` fix and nothing else. Conversely the
+subgroup retirements are invisible on this part, because integrated GPUs were
+already excluded from every aggregated variant. Mali's share of the win is
+the extents contention work, the packed line-fit record and the fused
+submissions.
+
+At decimations 2 and 4 the same comparison gives GPU total **-14.2%** and
+**-15.4%**, pipeline total **-11.2%** and **-15.5%**.
+
+Detections are identical to `7587f1b` throughout: 8 configuration axes x
+decimations 1/2/4 x the 5-image corpus on the desktop, and 3 decimations x 5
+configurations on Mali.
+
 Pose is measured separately, since it is per detected tag rather than per
 frame and is not part of the pipeline total above. **It runs entirely on
 the CPU** — `library/include/vkapriltag/PoseEstimator.h` records why the
