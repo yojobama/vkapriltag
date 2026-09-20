@@ -748,3 +748,308 @@ that part than anything about the algorithm, and it is also the noisiest span
 there (min 1.80-1.90 across repeats, excursions past 4 ms). Nothing in this
 pass explains it; it was not chased because the deployment target is not an
 Intel iGPU.
+
+---
+
+# A third pass: measured on the deployment target
+
+Measured first on a **Windows desktop, AMD Radeon RX 9060 XT (RDNA4,
+discrete, Vulkan 1.4.349)**, then - unlike the first two passes - **on the
+Orange Pi 5 Plus / Mali-G610 deployment target itself** (Armbian 26.5.2,
+vendor kernel 6.1.115, libmali, GPU pinned 1 GHz). `grayimage.pgm` at
+1280x800.
+
+Having the target available overturned the pass's original premise and one
+of its shipped changes, and produced a result that matters more than either:
+**a direct measurement of how much of the GPU phase is DRAM bandwidth at
+all** (item 0).
+Both prior passes reasoned about Mali memory traffic from an input-size
+sweep; that sweep shows time scaling with pixels, which is not the same claim
+and, it turns out, is not mostly bandwidth.
+
+Baseline: GPU total 1.38 ms at decimation 1, 0.89 ms at decimation 2.
+
+## 0. How much of the GPU phase is DRAM bandwidth? 15%, not 86%
+
+Pinning the memory controller with the `userspace` devfreq governor and
+sweeping it, interleaved (decimation 2, GPU pinned at 1 GHz):
+
+| DMC | GPU total | `clear` | `label_pixels` | `uf_final` | `labelling` | `boundary` | `extents` | `sort` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 528 MHz | 4.980 | 0.177 | 0.361 | 0.242 | 1.198 | 0.394 | 0.436 | 0.392 |
+| 1068 MHz | 3.924 | 0.099 | 0.195 | 0.129 | 0.979 | 0.372 | 0.433 | 0.375 |
+| 1560 MHz | 3.574 | 0.062 | 0.143 | 0.099 | 0.938 | 0.364 | 0.428 | 0.434 |
+| 2112 MHz | 3.457 | 0.048 | 0.116 | 0.091 | 0.921 | 0.361 | 0.432 | 0.397 |
+| **528/2112** | **1.44x** | **3.68x** | **3.12x** | **2.66x** | 1.30x | 1.09x | **1.01x** | **0.99x** |
+
+`t = C + K/f` fits the endpoints with `C = 2.95 ms` and `K/f = 0.51 ms` at
+2112 MHz, and predicts the two interior points to within 2%. So **~15% of GPU
+time is bandwidth-proportional**; removing *all* traffic would buy 0.51 ms of
+3.46. Halving it buys ~7%.
+
+The per-span ratios are the more useful half of this. `extents` (1.01x) and
+`sort` (0.99x) - the second and third largest spans - do not move at all
+across a 4x bandwidth range: they are atomic- and latency-bound, and traffic
+work aimed at them cannot pay. `labelling`, the largest span, is 1.30x, i.e.
+mostly dependent-load latency, which is the same conclusion item 8 of the
+first pass reached by ablation. What *is* bandwidth-bound is small: `clear`
+(3.68x, and nearly pure `vkCmdFillBuffer` traffic), `label_pixels` (3.12x)
+and `uf_final` (2.66x), together 0.26 ms.
+
+PERFORMANCE.md section 3's "86% of it is pixel-proportional" is not wrong,
+but it is an input-size scaling, and it has been read as a bandwidth claim
+(including by this file's own "remaining opportunities"). Those are different
+things: more pixels means more *invocations*, more dependent loads and more
+atomics, not only more bytes.
+
+**Governor caution.** The board idles at `dmc_ondemand`/528 MHz, which makes
+pinning look like a 32% win. It is not - `dmc_ondemand` ramps to 2112 MHz
+under sustained load, and head to head the steady state is identical (3.152
+vs 3.156 ms). Pinning buys the variance reduction described further up this
+file, not throughput.
+
+## The bar, and how these were measured
+
+Same bar as the second pass — bit-identical output, plus a measured win — with
+the A/B tightened after the first attempt produced a false signal. Measuring
+before/after in two separate sessions showed `label_pixels` moving 37% on a
+shader neither change touches. Rebuilding both binaries, keeping both, and
+interleaving them **ABBA within one session** collapsed that to -0.1%. Every
+number below comes from the interleaved harness, reported as a min over 8-20
+rounds. Where a span still disagreed with itself between sessions it is
+reported as noise rather than as a result, and only the sign that held
+everywhere is quoted.
+
+Bit-identity was checked on the full matrix each time: decimations 1/2/4, the
+5-image corpus, `APRILTAG_VK_FORCE_NO_8BIT` on and off, and workgroup
+geometries 8x8 / 16x16 / 32x8 / 2x2 / 6x6 (the last two exercising the
+unfused fallback) - every counter, the decoded ID set and the corner RMS
+constant throughout.
+
+## 1. RawLineFitPoint packed into two words - shipped, on
+
+`RawLineFitPoint` is the largest per-frame readback in the pipeline, and it
+spent a full 32-bit word on each of `x2`, `y2`, `W`, `blob_index`. Each has a
+bound that something else already enforces (see PERFORMANCE.md section 6b for
+the table), so all four fit in two words. The packing is exact - the host
+accessors return the same integers - so this is a storage change, not a
+precision one.
+
+| | decimation 1 | decimation 2 |
+| --- | --- | --- |
+| readback bytes/frame | 836848 -> **425760** | 286768 -> **145568** |
+| device memory | 185 -> **154 MiB** | 48 -> **41 MiB** |
+| `readback_copy` span | -84% / -89% | -20% |
+| GPU total (RX 9060 XT) | -3.3% / -8.6% | -5.3% / -10.4% |
+| GPU total (**Mali-G610**) | — | **+1.1% / -0.7% / +0.7%, i.e. nil** |
+| `pipeline_total` (**Mali-G610**) | — | **~-1%** |
+
+The byte and memory figures are exact. **The timings are not**: across four
+interleaved sessions GPU total landed anywhere from -3.3% to -10.4%, and at
+decimation 2 the `sort` and `labelling` spans wandered 13-33% in *both*
+directions - `labelling` on a shader this change cannot affect. So what is
+claimed here is the sign, which held everywhere on that machine, and the
+exact byte and memory reductions.
+
+**On Mali it buys no GPU time at all**, and item 0 says why: the line-fit
+readback there is a direct host-cached read with no PCIe hop to shorten
+(`readback_copy` = 0.006 ms), and `sort`, where the halved writes land,
+measures a bandwidth sensitivity of 0.99x - none. The discrete-card speedup
+was a PCIe effect. It stays on for the 15% memory footprint, which is what
+actually matters on a unified-memory part, and `pipeline_total` is
+consistently ~1% better there from the CPU tail reading half the bytes.
+
+**fp16 was the obvious-looking alternative and is wrong.** Its 11-bit
+mantissa makes integers above 2048 round to even; `x2` reaches 3839 at 1080p
+/ decimation 1, i.e. a half-pixel coordinate error on the right of the frame,
+landing directly in corner positions. And fp16 *moments* are further out
+still - the CPU rebuilds `Mxx/Mxy/Myy` in native `int64` exactly because the
+covariance is a near-total cancellation. Integer packing has no cliff at all.
+
+## 2. uf_compress skips its read pass once converged - shipped, on
+
+`uf_compress.comp` already guarded its store. It still streamed all of
+`parent[]` to find out there was nothing to store - 1 MB per pass at
+decimation 2, on the commonest case in steady-state video. It now reads the
+convergence flag first and returns if the preceding merge joined nothing,
+which is exact rather than approximate: every chunk ends with a compression,
+so `parent[]` is flat entering the merge, and a merge that changes nothing
+leaves it flat. A push constant keeps the flag *un*honoured for the
+compression right after `uf_init`, which must always run - that is the pass
+item 8 above measured at 1.0 ms.
+
+Mali-G610, ABBA, min of 24, three sessions: `labelling` **-2.1% / -2.2% /
+-2.4%**, GPU total **-0.5% / -0.7% / -0.9%**. Bit-identical at decimations
+1/2/4 on both machines.
+
+The ceiling, from removing the dispatch outright, is `labelling` -4.4% / GPU
+total -1.4%. The guard gets about half: the invocations still launch and each
+pays one scalar load. Recovering the rest needs `vkCmdDispatchIndirect` with
+a device-computed group count of zero, costing a dispatch and a barrier -
+2.6-18.7 us on Mali against ~30 us remaining. Not attempted; the sign is not
+obvious.
+
+Note what this is and is not: a *launch and latency* saving that also happens
+to remove traffic, not evidence for the bandwidth thesis item 0 demolishes.
+
+## 3. The extents reduction: 170-way atomic contention - shipped, on
+
+Item 0's per-span table pointed here by pointing *away* from everything else.
+`extents` was the second largest span and moved **1.01x** across a 4x
+memory-clock range, i.e. not bandwidth at all. `reduce_extents_hash.comp`
+issues up to eight atomics per boundary point into that point's blob
+accumulator - ~65k points over 388 blobs at decimation 2, so ~170 points
+contending per counter. Bound, by replacing the atomics with plain stores:
+span 0.434 -> 0.062 ms.
+
+Three changes, all bit-identical, in the order they were measured:
+
+1. **Read before the atomic on min/max.** Exactly equivalent (an `atomicMin`
+   with a value already >= the stored one is a no-op) and a blob's extents
+   stop moving after a handful of points. **-28% of the span.**
+2. **8-way privatization + `merge_extents.comp`.** Only the first 4096 blob
+   indices are replicated, so the cost is ~1 MiB, not 8x3 MB; past that,
+   points fall back to the shared slot, correct but contended. Sweep on
+   Mali (GPU total vs unprivatized): K=2 -13.1%, K=4 -18.5%, **K=8 -20.3%**,
+   K=16 -20.0%, K=32 -20.6%; K=8 and K=16 are within noise head to head, so
+   K=8 wins on memory.
+3. **`VK_KHR_shader_atomic_int64`** - see item 4.
+
+A trap worth recording. The first two bounds were run *without* the merge
+pass, so their results were wrong, and wrong extents meant `select_blobs`
+kept different blobs and every downstream span did different work. They
+reported GPU total -20.3% where the correct implementation measures -5.4%.
+**A bound whose output is wrong can flatter itself through the rest of the
+pipeline**, which is a different failure from the usual "incorrect build"
+technique this file recommends - there the incorrectness was confined to the
+span being measured. Check that a bound's downstream counters still match
+before believing its total.
+
+## 4. Optional extensions: a survey, and the one that paid
+
+The G610 under libmali exposes 130 device extensions. Checked against what
+items 0 and 4 say the pipeline is actually bound by:
+
+| Extension | Verdict |
+| --- | --- |
+| **`VK_KHR_shader_atomic_int64`** | **Adopted.** `count` and `pxgx_plus_pygy_sum` are the only two fields every point touches; `MinMaxExtentsGpu` now places them in one aligned 64-bit word so one `atomicAdd` does both. Exact - the low half cannot carry into the high half, being bounded by the point capacity. `extents` **0.221 ms with, 0.252 without (-12 to -13%)**, ~1% of frame. Gated on the extension + `shaderBufferInt64Atomics` + core `shaderInt64` (the G610 has `shaderInt64` but not `shaderFloat64`), with `reduce_extents_hash.comp` as the unconditional fallback and `APRILTAG_VK_FORCE_NO_INT64_ATOMIC` to A/B it. |
+| `VK_KHR_16bit_storage`, `VK_KHR_shader_float16_int8` | Not pursued. These buy traffic, and item 0 caps *all* traffic work at 15% of GPU time; the specific buffer they would shrink is the line-fit record, whose halving (item 1) measured nil on this part. fp16 would also be lossy - see item 1. |
+| `VK_EXT_subgroup_size_control` | Useless here: `minSubgroupSize == maxSubgroupSize == 16`, so there is nothing to control. |
+| `VK_EXT_shader_subgroup_ballot` / `vote`, `VK_KHR_shader_subgroup_extended_types` | Already ruled out by measurement, and hard: subgroup variants are a 57% regression on this part (see PERFORMANCE.md section 6). |
+| `VK_KHR_synchronization2` | Not pursued. Finer barrier scopes would target the intra-submit gaps, measured at **0.067 ms total** for a whole frame. The gaps that are actually large are at *submit* boundaries, which is a CPU round-trip problem, not a barrier-scope one. |
+| `VK_KHR_timeline_semaphore`, `VK_EXT_host_query_reset` | Structural/diagnostic convenience, no per-frame GPU time. |
+| `VK_EXT_scalar_block_layout`, `VK_KHR_relaxed_block_layout` | Tighter struct packing, i.e. traffic again - capped by item 0. |
+| `VK_KHR_buffer_device_address`, `VK_KHR_push_descriptor` | Descriptor/host-side overhead, not the bottleneck; the host-side submission cost is already measured small. |
+| `VK_ARM_scheduling_controls`, `VK_ARM_shader_core_builtins` | Vendor-specific and would break the "core Vulkan 1.1, zero optional features" posture for no identified bottleneck. Not tried. |
+
+The honest summary: **one extension out of 130 addressed a real bottleneck**,
+and it is worth about 1% of the frame. The other 8% of this pass came from an
+algorithmic change (contention) that needed no extension at all. That ordering
+- measure what you are bound by, then look for a tool - is what item 0 bought.
+
+## 5. The frame's tail is one submission - shipped, on where the memory allows
+
+Item 0 measured spans. The gaps between them turned out to matter as much:
+between the timestamp ending one submission and the one starting the next,
+the GPU is idle waiting for the host, and those gaps totalled **0.44-0.61 ms
+per frame** on Mali - larger than every span but labelling.
+
+Bounded first, and the bound is worth describing because it avoids the trap
+item 4 fell into. Instead of breaking correctness to measure the ceiling, it
+reuses the PREVIOUS frame's counts and records everything as one submission:
+for a repeated still image the counts are identical, so the build is exactly
+correct and its counters can be checked against the four-submit path. It
+reported **GPU total -7.9 to -10.1%** with timestamps off (worth checking
+separately - the timestamp instrumentation itself costs ~9% here, 3.16 ms
+against 2.90 ms, so profiling numbers must not be quoted as deployment
+numbers).
+
+Two of the three readbacks are now gone:
+
+* `build_indirect_args.comp` writes three `VkDispatchIndirectCommand`s from
+  device-side counters instead of one, and `hash_group`,
+  `reduce_extents_hash`, `scatter_index_points` and `sort_points_local` take
+  their bound from a buffer instead of a push constant, so the tail is
+  recorded in the same submission that computes the counts it needs.
+* `selected_extents_buf_` is read in place, like the line-fit buffer already
+  was. Not for the copy's size - it is a few KB - but because a staged copy
+  needs `num_selected_blobs` ON THE HOST at record time, which was the last
+  thing keeping the readback round trip alive.
+
+Measured against item 4's state, ABBA, min of 12-16: decimation 1 **-2.0%**,
+decimation 2 **-4.0/-4.4%**, decimation 4 **-7.9%** GPU total. The gain grows
+as the frame shrinks, because what was removed is per-submit and roughly
+fixed.
+
+Requires both readbacks to be host-visible AND host-cached, which unified
+memory gives and a discrete card without resizable BAR does not - the
+RX 9060 XT keeps the four-submit path, so the fallback stays exercised.
+
+Two things this pass got wrong on the way, both worth knowing:
+
+* Push-constant field order. `count_from_buffer` was appended in the shader
+  after `count` but in the host struct at the end; the two silently
+  disagreed and the frame produced 64856 hash drops and zero blobs. GLSL
+  push-constant blocks are positional, and nothing checks them.
+* `kGpuGapCrossesSubmit` was a static table describing the four-submit
+  layout, so after fusing it still labelled two intra-submit barriers as
+  submit boundaries - attributing ~0.2 ms to submissions that no longer
+  happened. It is now per-frame state (`DetectProfile::gap_crosses_submit`).
+  A diagnostic that hardcodes the structure it measures will lie the moment
+  the structure changes.
+
+**What is left**: the boundary before `uf_final`, worth **0.28 ms (~9%)**,
+held open by the host readback of the labelling convergence flag. The exact
+way to close it is a retry rather than a guess: record the frame with the
+chunk count the previous frame needed, read the flag with the other counters
+at the end, and redo the frame if it says the labelling did not converge.
+`clear` re-initializes everything, so a redo is simply correct, and
+`last_uf_iterations_` already adapts after one frame. Not attempted.
+
+## Measured and rejected (third pass)
+
+**Fusing the preprocessing dispatches.** `decimate` + `block_minmax` and
+`block_filter` + `threshold` each collapse into one pass, removing a
+full-image read and a whole block-grid round trip respectively and deleting
+`minmax_filtered_buf_`. Both were written, verified bit-identical across
+decimations 1/2/4, both storage widths and five workgroup geometries - and
+both **lose on both devices**.
+
+Mali-G610, GPU total, min of 8 ABBA rounds: minmax fusion **+5.9%**,
+threshold fusion **+5.4%**, both **+7.8%**. RX 9060 XT, `threshold` span at
+decimation 1: **+8.1% / +4.1% / +12.7%**. The additivity on both parts is
+what makes it a result rather than noise.
+
+The expectation was that Mali would invert the discrete result, being the
+bandwidth-bound part. Item 0 explains why that was wrong: the fusions target
+`threshold`, whose bandwidth sensitivity is 1.34x and which is 4% of the Mali
+frame, and they pay for the DRAM traffic they remove with shared-memory
+traffic and barriers - on an architecture where `shared` is backed by L2 and
+is not cheaper than global, exactly as the tile-local union-find rejection
+above found.
+
+They were briefly kept behind an `APRILTAG_VK_FUSE_PREPROCESS` env knob, on
+the theory that a future part with a real scratchpad might invert it. That
+was the wrong call for a tree with this much dead-path surface already: two
+measured-negative results do not earn four shader variants, a `_body.glsl`
+pair, a second buffer-allocation path and a branch in the dispatch sequence.
+The shaders are deleted; this entry is the record. Recover them from
+`perf/extents-contention-and-int64-atomics` history if a device ever makes
+the case.
+
+
+**Right-sizing `extract_blob_counts` with `vkCmdDispatchIndirect`.** The last
+dispatch still sized by a capacity rather than a device-side count, and so it
+looks like the remaining instance of the `init_extents` / `select_blobs` fix
+recorded above. Bounded before building, per the method note below: shrinking
+the capacity 8x with `--max-blobs 512` moved the `blob_scan` span 0.01044 ->
+0.00632 ms. That ~4 us is the entire capacity-proportional cost of the
+dispatch **and its whole scan chain**; right-sizing only the dispatch
+recovers a fraction of it, against a 1.38 ms frame. It also agrees with the
+figure already sitting in the constructor's `max_blobs` comment (+2.2 us for
+a 24x capacity increase). And the slack is load-bearing: it exists so a
+scene with unusually many blobs does not overflow `max_blobs`, which would
+make detections depend on GPU scheduling order. Buying ~2 us costs an
+indirect-args slot, a per-frame buffer fill to zero the tail, and the
+invariant that the scan's grand total sits at
+`blob_point_offsets[max_blobs - 1]`. Rejected.

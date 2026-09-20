@@ -64,9 +64,22 @@ layout(std430, binding = 2) readonly buffer Src { IPoint src[]; };
 layout(std430, binding = 4) writeonly buffer Output { RawLineFitPoint output_points[]; };
 // One atomic bump per blob that overflows kLocalCap - see the header comment.
 layout(std430, binding = 5) buffer OversizedBlobs { uint oversized_blobs; };
+// DEVICE-SIDE COUNT. `count` is a boundary-point total that only exists on
+// the GPU until the host reads it back, and that readback is what forced a
+// mid-frame SubmitAndWait. Taking the bound from a buffer instead lets this
+// dispatch be issued indirectly in the same submission that produced the
+// count - see GpuDetector's fused_submits_ and build_indirect_args.comp. The
+// push constant is kept as the fallback for the unfused path, selected by
+// `count_from_buffer`.
+layout(std430, binding = 6) readonly buffer CountBuf { uint count_buf; };
 
 layout(push_constant) uniform PushConstants {
   uint num_selected_blobs;
+  uint count_from_buffer;
+  // select_blobs.comp's counter is the number that PASSED the filters, which
+  // can exceed max_blobs; it drops the overflow to stay inside the output
+  // buffer, so the device-side bound has to clamp the same way the host did.
+  uint max_blobs;
   int decimated_width;
   int decimated_height;
 } pc;
@@ -91,10 +104,8 @@ RawLineFitPoint ComputeLineFitPoint(IPoint p) {
   }
 
   RawLineFitPoint out_pt;
-  out_pt.x2 = ix2;
-  out_pt.y2 = iy2;
-  out_pt.W = W;
-  out_pt.blob_index = p.blob_index;
+  out_pt.xy2 = PackLineFitXY2(ix2, iy2);
+  out_pt.w_blob = PackLineFitWBlob(W, p.blob_index);
   return out_pt;
 }
 
@@ -119,7 +130,8 @@ shared uint s_packed[kLocalCap];
 
 void main() {
   uint blob = gl_WorkGroupID.x;
-  if (blob >= pc.num_selected_blobs) return;
+  if (blob >= (pc.count_from_buffer != 0u ? min(count_buf, pc.max_blobs)
+                                          : pc.num_selected_blobs)) return;
 
   uint tid = gl_LocalInvocationID.x;
   uint threads = gl_WorkGroupSize.x;

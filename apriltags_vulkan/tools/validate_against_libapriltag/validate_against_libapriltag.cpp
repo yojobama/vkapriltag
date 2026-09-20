@@ -31,6 +31,8 @@ using apriltag_vulkan::validate::CompareCorners;
 using apriltag_vulkan::validate::ComputeStats;
 using apriltag_vulkan::validate::ExtractDetections;
 using apriltag_vulkan::validate::ImageMetrics;
+using apriltag_vulkan::validate::PrintGpuStageBreakdown;
+using apriltag_vulkan::validate::PrintHostSubmissionCost;
 using apriltag_vulkan::validate::PrintIds;
 using apriltag_vulkan::validate::SortedIds;
 using apriltag_vulkan::validate::Stats;
@@ -202,6 +204,7 @@ int main(int argc, char **argv) {
               << ", points=" << profile.points << std::endl;
     std::cout << "  bytes: upload=" << profile.upload_bytes
               << ", readback=" << profile.readback_bytes << std::endl;
+    PrintHostSubmissionCost(profile, PrintGpuStageBreakdown(profile));
     std::cout << "Whole-pipeline stage timings over " << iterations << " iteration(s):" << std::endl;
     PrintStats("GPU total", metrics.gpu_total_ms, iterations);
     PrintStats("quad_decode", metrics.quad_decode_ms, iterations);

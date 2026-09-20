@@ -9,16 +9,38 @@
 // pass of a chunk - the one whose only job is to observe convergence, after
 // a merge pass that changed nothing - so guarding it turns that pass into a
 // read-only chain check instead of a full 2 MB rewrite.
+//
+// The READ is guarded too, by `honour_changed_flag`. When the preceding
+// uf_merge.comp joined nothing, parent[] is unchanged and - since every
+// chunk ends with a compression - it was already flat, so this pass cannot
+// find anything to do. It would still stream the whole array to discover
+// that: 1 MB of reads at 1280x800 / decimation 2, and the most common case
+// in steady-state video, where the labelling converges in the first chunk
+// and every later pass is pure verification. Reading the flag first turns
+// that into one scalar load per invocation.
+//
+// The flag is NOT honoured for the compression that runs straight after
+// uf_init.comp, because no merge has run at that point and the flag is
+// still zero from the frame's clear - skipping it there would be wrong, and
+// expensively so: OPTIMIZATION_NOTES.md item 8 measured that particular
+// pass as worth 1.0 ms (a compression between the init and the first merge
+// is what stops the vertical unions walking the run chains the init just
+// built). Hence the explicit push-constant opt-in rather than an
+// unconditional read.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
+layout(std430, binding = 1) readonly buffer Changed { uint changed_flag; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
+  uint honour_changed_flag;
 } pc;
 
 void main() {
+  if (pc.honour_changed_flag != 0u && changed_flag == 0u) return;
+
   uint i = gl_GlobalInvocationID.x;
   uint total = pc.width * pc.height;
   if (i >= total) return;

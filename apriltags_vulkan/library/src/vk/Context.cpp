@@ -85,6 +85,27 @@ bool Supports8BitStorage(VkPhysicalDevice physical_device) {
   return storage8bit.storageBuffer8BitAccess == VK_TRUE;
 }
 
+// Queries whether the device can do 64-bit atomics on storage buffers: the
+// extension, the shaderBufferInt64Atomics sub-feature, and the CORE
+// shaderInt64 feature that the Int64 SPIR-V capability itself needs. All
+// three are required to run reduce_extents_hash_atomic64.comp. They are
+// worth checking separately: the Mali-G610 reports shaderFloat64 = false
+// but shaderInt64 = true.
+bool SupportsInt64Atomics(VkPhysicalDevice physical_device) {
+  if (!DeviceHasExtension(physical_device, "VK_KHR_shader_atomic_int64")) return false;
+
+  VkPhysicalDeviceShaderAtomicInt64FeaturesKHR atomic64{};
+  atomic64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR;
+
+  VkPhysicalDeviceFeatures2 features2{};
+  features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  features2.pNext = &atomic64;
+
+  vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+  return atomic64.shaderBufferInt64Atomics == VK_TRUE &&
+         features2.features.shaderInt64 == VK_TRUE;
+}
+
 bool EnvFlag(const char *name) {
   const char *v = std::getenv(name);
   return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -181,6 +202,7 @@ Context::Context(const ContextOptions &options_in) {
   EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
   if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
   if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
+  if (EnvFlag("APRILTAG_VK_FORCE_NO_INT64_ATOMIC")) options.force_no_int64_atomics = true;
   if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
     options.max_invocations_override = static_cast<uint32_t>(env_int);
   }
@@ -215,6 +237,7 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
     EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
     if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
     if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
+    if (EnvFlag("APRILTAG_VK_FORCE_NO_INT64_ATOMIC")) options.force_no_int64_atomics = true;
     if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
         options.max_invocations_override = static_cast<uint32_t>(env_int);
     }
@@ -466,9 +489,19 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   // 32-bit variants remain the default/fallback path for everything else.
   supports_8bit_storage_ = !options.force_no_8bit_storage && Supports8BitStorage(physical_device_);
 
+  // Same shape as 8-bit storage: an optional feature with a shader variant
+  // behind it and the 32-bit path as the unconditional fallback. See
+  // reduce_extents_hash_atomic64.comp.
+  supports_int64_atomics_ =
+      !options.force_no_int64_atomics && SupportsInt64Atomics(physical_device_);
+
   VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
   storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
   storage8bit.storageBuffer8BitAccess = VK_TRUE;
+
+  VkPhysicalDeviceShaderAtomicInt64FeaturesKHR atomic64{};
+  atomic64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR;
+  atomic64.shaderBufferInt64Atomics = VK_TRUE;
 
   VkPhysicalDeviceFeatures2 features2{};
   features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -478,6 +511,14 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   // NULL whenever a VkPhysicalDeviceFeatures2 is chained in.
   if (supports_8bit_storage_) {
     features2.pNext = &storage8bit;
+  }
+  if (supports_int64_atomics_) {
+    // shaderInt64 is a CORE feature, so it belongs in features2.features
+    // rather than the pNext chain - the only core optional feature this
+    // project ever enables, and only when a selected shader variant needs it.
+    features2.features.shaderInt64 = VK_TRUE;
+    atomic64.pNext = features2.pNext;
+    features2.pNext = &atomic64;
   }
 
   std::vector<const char *> enabled_extensions;
@@ -492,6 +533,9 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     if (DeviceHasExtension(physical_device_, "VK_KHR_storage_buffer_storage_class")) {
       enabled_extensions.push_back("VK_KHR_storage_buffer_storage_class");
     }
+  }
+  if (supports_int64_atomics_) {
+    enabled_extensions.push_back("VK_KHR_shader_atomic_int64");
   }
 
   VkDeviceCreateInfo device_info{};
@@ -522,6 +566,7 @@ void Context::QueryCaps(const ContextOptions &options) {
   // Set by CreateLogicalDevice (the only place that can request+enable the
   // extension), not re-queried here.
   caps_.has_8bit_storage = supports_8bit_storage_;
+  caps_.has_int64_atomics = supports_int64_atomics_;
 
   // Subgroup properties: core Vulkan 1.1, via the VkPhysicalDeviceProperties2
   // pNext chain (a separate query from the plain vkGetPhysicalDeviceProperties
@@ -910,6 +955,7 @@ std::string Context::DescribeDevice() const {
      << ", float64=" << (caps_.has_shader_float64 ? "yes" : "no")
      << ", int64=" << (caps_.has_shader_int64 ? "yes" : "no")
      << ", 8bit_storage=" << (caps_.has_8bit_storage ? "yes" : "no")
+     << ", int64_atomics=" << (caps_.has_int64_atomics ? "yes" : "no")
      << ", subgroup_ballot=" << (caps_.has_subgroup_ballot ? "yes" : "no")
      << ", subgroup_arithmetic=" << (caps_.has_subgroup_arithmetic ? "yes" : "no");
   os << "\n  chosen geometry: wg1d=" << caps_.wg1d << ", wg2d=" << caps_.wg2d_x << "x"

@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -200,6 +201,12 @@ class GpuDetector {
 
   struct DetectProfile {
     // Wall-clock, host side.
+    // Which inter-span gaps actually crossed a queue submission on THIS
+    // frame. Mirrors kGpuGapCrossesSubmit on the unfused path; with
+    // fused_submits_ the two boundaries inside the tail disappear, and
+    // reporting them from the static table would attribute ~0.2 ms of
+    // ordinary barrier time to submissions that did not happen.
+    std::array<bool, kNumGpuGaps> gap_crosses_submit = kGpuGapCrossesSubmit;
     double upload_ms = 0.0;
     double threshold_label_ms = 0.0;  // submits up to and including labelling
     double boundary_ms = 0.0;         // blob_diff + compaction
@@ -378,6 +385,11 @@ class GpuDetector {
   // place kGpuStageNames[g] and [g+1] in different submits, so that gap
   // includes queue-submit/fence overhead on top of any GPU-side barrier
   // cost, unlike the other 8 gaps (purely intra-submit).
+  // NOTE: this is the FOUR-submit layout. When fused_submits_ is on (see
+  // its comment) the last three collapse into one and only the first entry
+  // below still crosses a boundary; DetectProfile::gpu_gap_crosses_submit
+  // carries the layout that actually ran, and is what tools should read.
+  // This table remains the source for the unfused case.
   static constexpr std::array<bool, kNumGpuGaps> kGpuGapCrossesSubmit = {
       false,  // clear -> threshold (submit 1)
       false,  // threshold -> labelling (submit 1)
@@ -479,6 +491,17 @@ class GpuDetector {
   vk::Buffer parent_buf_, blob_size_buf_, uf_changed_buf_;
   vk::Buffer qbp_compacted_buf_, qbp_counter_buf_;
   vk::Buffer qbp_keys_buf_;
+  // Sized for the privatized accumulator layout, not just max_raw_blobs:
+  // kExtentsCopies-1 extra copies of the first kPrivateExtentsBlobs entries
+  // ride behind the canonical array. See common.glsl's ExtentsSlot comment.
+  // The constants are mirrored here; ExtentsSlotCount() is the single place
+  // that turns them into a size.
+  static constexpr uint32_t kExtentsCopies = 8;
+  static constexpr uint32_t kPrivateExtentsBlobs = 4096;
+  static uint32_t ExtentsSlotCount(uint32_t max_raw_blobs) {
+    return max_raw_blobs +
+           (kExtentsCopies - 1) * std::min(kPrivateExtentsBlobs, max_raw_blobs);
+  }
   vk::Buffer extents_buf_;
   vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
   vk::Buffer index_points_buf_;
@@ -527,6 +550,15 @@ class GpuDetector {
   // memory type, so its readback needs neither the on-device copy into
   // readback_staging_ nor a memcpy out of it. See CreateBuffers.
   bool linefit_direct_read_ = false;
+  bool extents_direct_read_ = false;
+  // True when the frame's last three submissions can be recorded as one:
+  // every dispatch after the labelling stage is sized on the device
+  // (build_indirect_args.comp) and both readbacks are read in place, so
+  // nothing in the tail needs a host-visible count at record time. Measured
+  // on the Mali-G610, the round trips this removes were ~0.47 ms of
+  // GPU-clock idle per frame. Requires both direct-read paths, so discrete
+  // parts without a cached readback memory type keep the four-submit path.
+  bool fused_submits_ = false;
   // Backs last_line_fit_points only on the staging path.
   std::vector<RawLineFitPoint> linefit_scratch_;
 
@@ -554,6 +586,8 @@ class GpuDetector {
   // used to do as a separate full-capacity pass.
   vk::ComputePipeline blob_diff_pl_;
   vk::ComputePipeline init_extents_pl_;
+  vk::ComputePipeline merge_extents_pl_;
+  vk::ComputePipeline build_qbp_args_pl_, build_sort_args_pl_;
   vk::ComputePipeline label_pixels_pl_;
   vk::ComputePipeline select_blobs_pl_;
   // Builds indirect_args_buf_ from raw_blob_counter_buf_ - see that buffer's

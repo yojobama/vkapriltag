@@ -44,15 +44,20 @@ layout(std430, binding = 0) readonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
 layout(std430, binding = 3) buffer Extents { MinMaxExtentsGpu extents[]; };
+// Same device-side count as the scalar variants, so all three share one
+// descriptor layout and push-constant block - see the note in
+// reduce_extents_hash_body.glsl.
+layout(std430, binding = 5) readonly buffer CountBuf { uint count_buf; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
   uint max_raw_blobs;
+  uint count_from_buffer;
 } pc;
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
-  bool is_active = i < pc.count;
+  bool is_active = i < (pc.count_from_buffer != 0u ? count_buf : pc.count);
 
   // bi stays 0xFFFFFFFFu (never a valid dense-minus-1 index) for every lane
   // that is out of range, unmatched, or dropped - the same sentinel value

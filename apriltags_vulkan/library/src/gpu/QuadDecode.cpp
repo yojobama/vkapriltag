@@ -169,7 +169,7 @@ struct Point2 {
 
 Point2 PointAt(std::span<const RawLineFitPoint> points, size_t begin, size_t idx) {
   const RawLineFitPoint &p = points[begin + idx];
-  return {static_cast<double>(p.x2), static_cast<double>(p.y2)};
+  return {static_cast<double>(p.x2()), static_cast<double>(p.y2())};
 }
 
 double SqDist(Point2 a, Point2 b) {
@@ -335,14 +335,14 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     LineFitMoments running{};
     for (size_t k = 0; k < total_points; ++k) {
       const RawLineFitPoint &p = points[begin + k];
-      const int64_t wx = static_cast<int64_t>(p.W) * p.x2;
-      const int64_t wy = static_cast<int64_t>(p.W) * p.y2;
+      const int64_t wx = static_cast<int64_t>(p.W()) * p.x2();
+      const int64_t wy = static_cast<int64_t>(p.W()) * p.y2();
       running.Mx += static_cast<int32_t>(wx);
       running.My += static_cast<int32_t>(wy);
-      running.W += p.W;
-      running.Mxx += wx * p.x2;
-      running.Mxy += wx * p.y2;
-      running.Myy += wy * p.y2;
+      running.W += p.W();
+      running.Mxx += wx * p.x2();
+      running.Mxy += wx * p.y2();
+      running.Myy += wy * p.y2();
       cs[k] = running;
     }
   }
@@ -526,9 +526,9 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   {
     size_t i = 0;
     while (i < line_fit_points.size()) {
-      const uint32_t blob_index = line_fit_points[i].blob_index;
+      const uint32_t blob_index = line_fit_points[i].blob_index();
       size_t j = i;
-      while (j < line_fit_points.size() && line_fit_points[j].blob_index == blob_index) ++j;
+      while (j < line_fit_points.size() && line_fit_points[j].blob_index() == blob_index) ++j;
       spans.push_back({i, j});
       i = j;
     }

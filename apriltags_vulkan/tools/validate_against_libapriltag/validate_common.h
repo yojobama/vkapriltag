@@ -21,12 +21,75 @@
 #include <string>
 #include <vector>
 
+#include "vkapriltag/gpu/GpuDetector.h"
+
 extern "C" {
 #include "apriltag.h"
 }
 
 namespace apriltag_vulkan {
 namespace validate {
+
+// Prints the per-dispatch GPU span breakdown and the gaps between spans.
+//
+// This used to live inline in the OpenCV variant only, which meant the
+// PGM-only build - the one that gets built on the Mali deployment target,
+// where OpenCV usually is not installed - printed just the five coarse
+// spans (threshold+label / boundary / sort+group / linefit). Anyone
+// profiling on that board therefore had no per-dispatch attribution at all,
+// and at least one round of optimization proposals was written against the
+// coarse numbers as a result. It is the same DetectProfile either way, so
+// there was never a reason for the two tools to disagree.
+// Returns the summed span time, which callers use to report the residual
+// between it and the host-observed submit+wait cost.
+inline double PrintGpuStageBreakdown(const apriltag_vulkan::GpuDetector::DetectProfile &profile) {
+  if (!profile.has_gpu_stage_breakdown) {
+    std::cout << "  (per-dispatch GPU span breakdown unavailable; "
+                 "set APRILTAG_VK_TIMESTAMPS=1 on a device with timestamp queries)"
+              << std::endl;
+    return 0.0;
+  }
+  double gpu_span_total = 0.0;
+  std::cout << "  GPU stage breakdown (last iteration, APRILTAG_VK_TIMESTAMPS=1):" << std::endl;
+  for (size_t s = 0; s < apriltag_vulkan::GpuDetector::kGpuStageNames.size(); ++s) {
+    std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[s] << "="
+              << profile.gpu_stage_ms[s] << " ms" << std::endl;
+    gpu_span_total += profile.gpu_stage_ms[s];
+  }
+  std::cout << "    (sum of spans = " << gpu_span_total << " ms)" << std::endl;
+
+  double intra_submit_gap_total = 0.0;
+  double submit_boundary_gap_total = 0.0;
+  std::cout << "  GPU inter-span gaps (purely GPU-clock, no CPU/fence time):" << std::endl;
+  for (size_t g = 0; g < profile.gpu_gap_ms.size(); ++g) {
+    const bool crosses_submit = profile.gap_crosses_submit[g];
+    std::cout << "    " << apriltag_vulkan::GpuDetector::kGpuStageNames[g] << "->"
+              << apriltag_vulkan::GpuDetector::kGpuStageNames[g + 1] << "="
+              << profile.gpu_gap_ms[g] << " ms"
+              << (crosses_submit ? "  (submit boundary)" : "") << std::endl;
+    (crosses_submit ? submit_boundary_gap_total : intra_submit_gap_total) += profile.gpu_gap_ms[g];
+  }
+  std::cout << "    (intra-submit gap total = " << intra_submit_gap_total
+            << " ms, submit-boundary gap total = " << submit_boundary_gap_total << " ms)"
+            << std::endl;
+  return gpu_span_total;
+}
+
+// The host's own cost of driving the GPU. Printed by both variants for the
+// same reason as the span breakdown above: the submit-boundary gaps are
+// GPU-clock idle waiting for exactly this work, so seeing the two side by
+// side is what tells you whether to chase submits or barriers.
+inline void PrintHostSubmissionCost(const apriltag_vulkan::GpuDetector::DetectProfile &profile,
+                                    double gpu_span_total) {
+  std::cout << "  Host-side submission cost (last iteration): begin=" << profile.cpu_begin_ms
+            << " ms, submit+wait=" << profile.cpu_submit_wait_ms
+            << " ms, counter_reads=" << profile.cpu_counter_read_ms << " ms, over "
+            << profile.submits << " submit(s)" << std::endl;
+  if (profile.has_gpu_stage_breakdown) {
+    std::cout << "    unspanned GPU time (submit+wait minus spans) = "
+              << (profile.cpu_submit_wait_ms - gpu_span_total) << " ms" << std::endl;
+  }
+}
 
 struct DetectionInfo {
   int id = 0;
