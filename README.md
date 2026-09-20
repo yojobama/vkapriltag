@@ -294,36 +294,41 @@ Mali, so profiling builds must not be quoted as deployment numbers).
 
 | | `7587f1b` | branch | delta |
 | --- | --- | --- | --- |
-| `GpuDetector` (GPU) | 1.288 ms | 1.261 ms | **-2.1%** |
-| `quad_decode` (CPU) | 0.428 ms | 0.272 ms | **-36%** |
-| `tag_decode` (CPU) | 0.147 ms | 0.150 ms | ~0 |
-| **Pipeline total** | **1.908 ms** | **1.718 ms** | **-10.0%** |
+| `GpuDetector` (GPU) | 1.301 ms | 1.162 ms | **-10.7%** |
+| `quad_decode` (CPU) | 0.407 ms | 0.262 ms | **-36%** |
+| `tag_decode` (CPU) | 0.147 ms | 0.147 ms | ~0 |
+| **Pipeline total** | **1.936 ms** | **1.640 ms** | **-15.3%** |
 | device memory | 185 MiB | 155 MiB | **-16.2%** |
 
-The GPU side moves little here because most of the work targeted things a
-discrete card is not bound by: the submit fusion needs a host-cached readback
-memory type and so does not engage on a card without resizable BAR, and the
-subgroup-aggregated extents reduction takes priority over the int64-atomic one
-on discrete parts. The CPU win is the `inline` on the DP corner-seeding
-helpers, which is specifically a `/Ob1` (RelWithDebInfo) effect - see
-`PERFORMANCE.md`.
+Two of these have nothing to do with the GPU work. `quad_decode` is the
+`inline` on the DP corner-seeding helpers, which is specifically an MSVC
+`/Ob1` (RelWithDebInfo) effect. Most of the GPU delta is retiring two of the
+three subgroup-aggregated shader variants, which measured 72% and 24% slower
+than the plain-atomic versions on this card - see `PERFORMANCE.md` section 6.
+The submit fusion does not engage here at all, since it needs a host-cached
+readback memory type that a card without resizable BAR does not offer.
 
-**Orange Pi 5 Plus — Mali-G610**, same image and decimation:
+**Orange Pi 5 Plus — Mali-G610**, same image and decimation, both binaries
+built `Release`:
 
 | | `7587f1b` | branch | delta |
 | --- | --- | --- | --- |
-| `GpuDetector` (GPU) | 8.81 ms | 7.77 ms | **-11.9%** |
-| **Pipeline total** | **9.92 ms** | **8.90 ms** | **-10.3%** |
+| `GpuDetector` (GPU) | 8.401 ms | 7.464 ms | **-11.2%** |
+| `quad_decode` (CPU) | 0.666 ms | 0.671 ms | ~0 |
+| `tag_decode` (CPU) | 0.369 ms | 0.369 ms | ~0 |
+| **Pipeline total** | **9.538 ms** | **8.663 ms** | **-9.2%** |
 | device memory | 185 MiB | 155 MiB | **-16.2%** |
 
-> The Mali figures were taken before the `inline` change and have not been
-> re-run since (the board went off the network mid-session). They should be
-> treated as provisional on two counts: the two binaries came from separate
-> build trees whose `CMAKE_BUILD_TYPE` was not confirmed to match, and GCC
-> inlines these helpers at `-O2` regardless, so the CPU tail there is
-> unlikely to move the way the desktop's did. The GPU-side deltas are
-> corroborated by same-build-tree A/Bs of each change individually
-> (`OPTIMIZATION_NOTES.md`, third pass), which sum to about the same total.
+The CPU tail does not move here, which is the expected mirror of the desktop
+result: GCC inlines those helpers at `-O2`/`-O3` whatever the source says, so
+the `inline` keyword is an MSVC `/Ob1` fix and nothing else. Conversely the
+subgroup retirements are invisible on this part, because integrated GPUs were
+already excluded from every aggregated variant. Mali's share of the win is
+the extents contention work, the packed line-fit record and the fused
+submissions.
+
+At decimations 2 and 4 the same comparison gives GPU total **-11.0%** and
+**-12.5%**, pipeline total **-7.5%** and **-9.8%**.
 
 Detections are identical to `7587f1b` throughout: 8 configuration axes x
 decimations 1/2/4 x the 5-image corpus on the desktop, and 3 decimations x 5

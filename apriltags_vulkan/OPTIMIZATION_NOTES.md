@@ -1006,6 +1006,70 @@ at the end, and redo the frame if it says the labelling did not converge.
 `clear` re-initializes everything, so a redo is simply correct, and
 `last_uf_iterations_` already adapts after one frame. Not attempted.
 
+## 6. Subgroup aggregation, per site - two of three retired
+
+The subgroup-aggregated variants were gated by one flag covering three
+sites. Measuring the three separately on an RX 9060 XT (min of 12, three
+sessions, each reproducing within 1%) says the shared gate was wrong at two:
+
+| site | aggregated | plain atomics | |
+| --- | --- | --- | --- |
+| `uf_final` | 0.1035 ms | **0.0291 ms** | scalar **-72%** |
+| `blob_diff` | 0.0437 ms | **0.0330 ms** | scalar **-24%** |
+| `reduce_extents_hash` | **0.0702 ms** | 0.1028 ms | subgroup **-45%** |
+
+`uf_final_subgroup.comp` and `blob_diff_body.glsl`'s
+`AGGREGATE_APPEND_COUNTER` path are deleted. Worth **GPU total -5.3%** on
+that card; nothing on Mali, which never took them.
+
+For `uf_final` this closes a question this file already left open: the second
+pass measured scalar+guard beating aggregated 3x on an MX230 and said "the
+case for retiring it is now on record" but that the hardware to confirm on a
+bigger discrete part was not available. It is now, and it agrees.
+
+**The transferable rule: aggregate values by key, not bare counters.** What
+separates the survivor is that `reduce_extents_hash` reduces per-point
+*values* across lanes sharing a key, collapsing eight atomics per point into
+eight per distinct key per subgroup. The two retired ones aggregated a
+*counter* - one `atomicAdd` per lane becoming one per subgroup - which is the
+contention a modern discrete part's atomic unit already handles, so the
+ballot sequence bought nothing and cost its own issue slots.
+
+`blob_diff` is retired on one device's evidence rather than two. It is
+recoverable from this branch's history if a part ever makes the case.
+
+## A scan of the literature, and what it does and does not offer here
+
+Done at the end of this pass, against the two spans that dominate what is
+left (`labelling` ~29% on Mali, `sort` ~15%).
+
+**HA4 / FLSL (Hennequin & Lacassagne).** The genuinely relevant find, and the
+one the earlier BUF/BKE dismissal does not cover. This file correctly rules
+out BUF and Block-based Komura Equivalence because they need every foreground
+pixel of a 2x2 block to be connected, which holds for 8-connected binary
+labelling and not for this pipeline's 4-connected three-valued input. **HA4
+is the 4-connected one**: a hybrid pixel/segment (run-length) algorithm that
+splits the image into horizontal strips, gives each strip to one warp, and
+merges using only each run's start pixel as a proxy. FLSL, a GPU port of the
+LSL SIMD algorithm, then improves on HA4 by reducing memory-access conflicts
+on many-core parts.
+
+Two things to weigh before anyone starts. First, `uf_init.comp` already
+pre-joins horizontal runs (item 8 of the first pass), so the pipeline has
+taken the cheapest part of this idea already. Second, and more seriously,
+HA4's efficiency comes from warp intrinsics - and this tree now has three
+independent measurements saying those are the wrong tool on the deployment
+target: `reduce_extents_hash_subgroup` at 6.6x slower on Mali, and the two
+retirements above on a discrete part. HA4 would have to earn its keep through
+the run-based structure alone, with the intrinsics replaced by shared memory
+that Valhall backs with L2. That is not a reason not to try it; it is a
+reason to bound it before writing it.
+
+**Not relevant.** NVIDIA VPI and Isaac ROS AprilTag are CUDA-only and closed,
+so they inform nothing portable. The learned detectors (YoloTag, DeepTag,
+E2ETag) replace the detector wholesale and give up bit-compatibility with
+libapriltag, which is this project's entire correctness gate.
+
 ## Measured and rejected (third pass)
 
 **Fusing the preprocessing dispatches.** `decimate` + `block_minmax` and

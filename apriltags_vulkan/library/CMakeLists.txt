@@ -77,11 +77,9 @@ set(SHADER_SOURCES
   shaders/uf_merge_u8.comp
   shaders/uf_compress.comp
   shaders/uf_final.comp
-  shaders/uf_final_subgroup.comp
   shaders/label_pixels.comp
   shaders/label_pixels_u8.comp
   shaders/blob_diff.comp
-  shaders/blob_diff_subgroup.comp
   shaders/scan_block.comp
   shaders/scan_add_offsets.comp
   shaders/init_extents.comp

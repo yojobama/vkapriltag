@@ -474,17 +474,29 @@ void GpuDetector::CreatePipelines() {
     return u8 ? u8_name : base_name;
   };
 
-  // Picks the subgroup-aggregated variant (see uf_final_subgroup.comp /
-  // reduce_extents_hash_subgroup.comp / blob_diff_body.glsl's
-  // AGGREGATE_APPEND_COUNTER) when the device's subgroup exposes BALLOT,
-  // ARITHMETIC and SHUFFLE in COMPUTE - gated on all three together for all
-  // three sites for simplicity, even though not every site needs every bit:
-  // blob_diff's variant only needs BALLOT; uf_final's and reduce_extents_
-  // hash's reduce-by-key loop also need SHUFFLE, to look a runtime-computed
-  // leader lane's value up (subgroupBroadcast's id must be a compile-time
-  // constant - a real SPIR-V restriction - so a dynamic lane index needs
-  // subgroupShuffle instead); reduce_extents_hash's needs ARITHMETIC too, to
-  // reduce per-point values, not just counts.
+  // Subgroup aggregation survives at ONE site: reduce_extents_hash. It used
+  // to be applied at three, gated together, and measuring the three
+  // separately on an RX 9060 XT (min of 12, three sessions, each result
+  // reproducing within 1%) says that was wrong at two of them:
+  //
+  //   uf_final   subgroup 0.1035 ms  vs  scalar 0.0291 ms   scalar -72%
+  //   blob_diff  subgroup 0.0437 ms  vs  scalar 0.0330 ms   scalar -24%
+  //   extents    subgroup 0.0702 ms  vs  scalar 0.1028 ms   SUBGROUP -45%
+  //
+  // For uf_final that confirms a case OPTIMIZATION_NOTES.md had already
+  // built from the other side: on an MX230 the scalar variant with its
+  // saturating guard beat the aggregated one 3x, and the note says only
+  // that the hardware to re-test on a bigger discrete part was not
+  // available. It is now, and it agrees. Both aggregated variants are
+  // retired; reduce_extents_hash keeps its own, which earns it.
+  //
+  // What distinguishes the survivor: it reduces per-point VALUES across
+  // lanes sharing a key, collapsing eight atomics per point into eight per
+  // distinct key per subgroup. The two retired ones only ever aggregated a
+  // COUNTER - one atomicAdd per lane becoming one per subgroup - which is
+  // exactly the contention a modern discrete part's atomic unit handles
+  // well on its own, so the ballot/shuffle sequence bought nothing and cost
+  // its own issue slots.
   //
   // Excludes integrated GPUs outright, regardless of what they report
   // supporting: measured on the Orange Pi 5's Mali-G610 (which reports all
@@ -501,12 +513,13 @@ void GpuDetector::CreatePipelines() {
   // same code measures a small but real and repeatable win instead
   // (pipeline_total best 1.40 -> 1.33 ms), so this is excluded specifically
   // for integrated GPUs, not disabled outright.
+  // BALLOT + ARITHMETIC + SHUFFLE: reduce_extents_hash's reduce-by-key loop
+  // needs all three - SHUFFLE to read a runtime-computed leader lane's value
+  // (subgroupBroadcast's id must be a compile-time constant, a real SPIR-V
+  // restriction) and ARITHMETIC to reduce per-point values, not just counts.
   const bool subgroup = ctx_.caps().has_subgroup_ballot && ctx_.caps().has_subgroup_arithmetic &&
                         ctx_.caps().has_subgroup_shuffle &&
                         ctx_.caps().type != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-  auto pick_sg = [subgroup](const char *base_name, const char *subgroup_name) {
-    return subgroup ? subgroup_name : base_name;
-  };
 
   // 2D so the shader recovers its (x, y) from gl_GlobalInvocationID.xy rather
   // than a runtime `%`/`/` by a push-constant width - see each shader's own
@@ -542,7 +555,7 @@ void GpuDetector::CreatePipelines() {
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_compress"), {parent_buf_.get(), uf_changed_buf_.get()}, 12, wg1d_);
-  uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick_sg("uf_final", "uf_final_subgroup")),
+  uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_final"),
                                      {parent_buf_.get(), blob_size_buf_.get()}, 12, wg1d_);
 
   // Two-way now, not four: blob_diff used to be parametrized on the u8 axis
@@ -551,7 +564,7 @@ void GpuDetector::CreatePipelines() {
   // blob_diff has no thresholded binding at all and the u8 axis moved to
   // label_pixels - where it costs 2 variants instead of doubling 2 into 4.
   blob_diff_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick_sg("blob_diff", "blob_diff_subgroup")),
+      ctx_, ShaderPath("blob_diff"),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
        qbp_keys_buf_.get()},
       12, wg2d_);

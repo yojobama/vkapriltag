@@ -226,14 +226,14 @@ A/B'd on one binary with `APRILTAG_VK_FORCE_NO_INT64_ATOMIC`:
 
 ### Net effect on the deployment target
 
-Stock `7587f1b` against sections 3b, 3c, 6b and 6c together, on the
-Mali-G610, ABBA-interleaved, min of 14:
+Stock `7587f1b` against everything on this branch, on the Mali-G610,
+ABBA-interleaved, min of 12, **both binaries built `Release`**:
 
 | | GPU total | `pipeline_total` | device memory |
 | --- | --- | --- | --- |
-| decimation 1 | **-11.9%** | -10.3% | 185 -> 155 MiB |
-| decimation 2 | **-12.8%** | -8.4% | 48 -> 42 MiB |
-| decimation 4 | **-12.7%** | -11.6% | 15 -> 13 MiB |
+| decimation 1 | **-11.2%** | -9.2% | 185 -> 155 MiB |
+| decimation 2 | **-11.0%** | -7.5% | 48 -> 42 MiB |
+| decimation 4 | **-12.5%** | -9.8% | 15 -> 13 MiB |
 
 Detections are identical to stock throughout: 3 decimations x 5
 configurations on Mali, and 8 configuration axes x 3 decimations x the
@@ -403,7 +403,34 @@ Other automatic per-device behaviour:
 - **`HOST_CACHED`** readback memory is requested when available, and where the
   memory type allows it the line-fit records are read in place rather than
   staged. The startup line reports which path is in use.
-- **Subgroup variants** are selected when the device advertises ballot,
+- **Subgroup aggregation survives at exactly one site**,
+  `reduce_extents_hash`. It used to be applied at three, gated together, and
+  measuring the three separately on the RX 9060 XT says that was wrong at two
+  of them (min of 12, three sessions, each reproducing within 1%):
+
+  | site | aggregated | plain atomics | |
+  | --- | --- | --- | --- |
+  | `uf_final` | 0.1035 ms | **0.0291 ms** | scalar **-72%** |
+  | `blob_diff` | 0.0437 ms | **0.0330 ms** | scalar **-24%** |
+  | `reduce_extents_hash` | **0.0702 ms** | 0.1028 ms | subgroup **-45%** |
+
+  Retiring the two losers is worth **GPU total -5.3%** on that card and
+  changes nothing on Mali, which never took them. For `uf_final` this only
+  confirms a case `OPTIMIZATION_NOTES.md` had already built from the other
+  side: on an MX230 the scalar variant with its saturating guard beat the
+  aggregated one 3x, and the note says only that a bigger discrete part to
+  re-test on was not available.
+
+  What separates the survivor is *what* it aggregates. `reduce_extents_hash`
+  reduces per-point **values** across lanes sharing a key, collapsing eight
+  atomics per point into eight per distinct key per subgroup. The two retired
+  ones only ever aggregated a **counter** — one `atomicAdd` per lane becoming
+  one per subgroup — which is precisely the contention a modern discrete
+  part's atomic unit already handles well, so the ballot sequence bought
+  nothing and cost its own issue slots. That is the transferable rule:
+  aggregate values by key, not bare counters.
+
+- **The surviving variant** is selected when the device advertises ballot,
   arithmetic *and* shuffle — **and is not an integrated GPU**. Integrated
   parts are excluded outright regardless of what they report: on the
   Orange Pi 5's Mali-G610, which advertises all three and produces
@@ -615,7 +642,13 @@ Three cautions, all learned the hard way here:
   O(n) passes, stayed real calls. They are marked `inline` now, which is
   worth ~35% of `quad_decode` in that configuration and nothing in `/Ob2`,
   but the lesson generalises: a cross-tree A/B compares toolchain settings
-  unless you check.
+  unless you check. The same trap has a worse Linux form - a build directory
+  configured with no `CMAKE_BUILD_TYPE` at all gets **no `-O` flag**, and
+  that is exactly what the Orange Pi's working build tree turned out to be,
+  so an early round of Mali figures compared a `-O3` baseline against an
+  unoptimised branch. `grep CMAKE_BUILD_TYPE build/CMakeCache.txt` on both
+  sides before believing anything; an empty value is the dangerous one,
+  because nothing warns about it.
 - **Verify the binaries actually differ** before believing an A/B —
   `git checkout` carries uncommitted changes onto the new branch, which once
   produced a confident null result from comparing two identical builds.
