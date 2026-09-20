@@ -1038,6 +1038,52 @@ ballot sequence bought nothing and cost its own issue slots.
 `blob_diff` is retired on one device's evidence rather than two. It is
 recoverable from this branch's history if a part ever makes the case.
 
+## 7. Run-level vertical merging - the transferable half of HA4 - shipped, on
+
+Acting on the scan below. `uf_merge` considered every down edge
+independently, one thread per pixel, each paying two `find()` walks and an
+`atomicMin`. But those edges are not independent: wherever a horizontal run
+in row y sits above a run of the same value in row y+1, **every column of the
+overlap asks for the same union of the same two components**, because
+`uf_init` has already joined each row's run into one. Only the overlap's
+leftmost column needs to perform it.
+
+A thread now unions only at an overlap start - `x == 0`, or the pixel to the
+left differs, or the pixel below-left differs. Two extra loads, both adjacent
+to ones already being made, against a `find()`-walk pair and an `atomicMin`
+saved for every interior column of every overlap.
+
+| | `labelling` | GPU total | `pipeline_total` |
+| --- | --- | --- | --- |
+| Mali, decimation 1 | **-7.3%** | -3.4% | -2.7% |
+| Mali, decimation 2 | **-8.1 / -8.6%** | -2.5% | -3.3% |
+| Mali, decimation 4 | **-13.3%** | -4.1% | -3.8% |
+| RX 9060 XT, decimation 1 | **-9.7%** | -1.4 / -4.9% | -2.4 / -7.2% |
+
+Bit-identical on both devices, across decimations 1/2/4 and seven
+configuration axes, including `uf_iterations` - the closure reached per pass
+is unchanged, so convergence takes the same number of passes.
+
+**Why it is exact, not an approximation.** If `v[i-1] == v[i]` then `uf_init`
+joined `i-1` and `i`; if `v[i-1+W] == v[i+W]` it joined those two; so once
+the overlap's leftmost column has unioned its pair, `i` and `i+W` are already
+in one component, and induction gives the rest of the overlap. Hooking is
+still by `atomicMin`, so a component's root is still its minimum index -
+which matters beyond the labelling stage, because the root is what
+`hash_group` keys on.
+
+One mechanical consequence: `uf_merge` is dispatched 2D now, because the
+run-start test needs `x` and recovering it from a linear index would cost a
+runtime integer division on a part with no divide instruction. The workgroup
+stays one row tall, so consecutive threads still walk consecutive columns and
+the two row streams are exactly as coalesced as before.
+
+This is HA4's central idea - work per run, not per pixel - without its warp
+intrinsics. It does not attempt HA4's other halves (extracting runs into
+compact arrays, strip-per-warp labelling, separate border merging), which
+would add passes and compaction atomics; see the scan below for why those
+look less promising here.
+
 ## A scan of the literature, and what it does and does not offer here
 
 Done at the end of this pass, against the two spans that dominate what is
@@ -1054,16 +1100,22 @@ merges using only each run's start pixel as a proxy. FLSL, a GPU port of the
 LSL SIMD algorithm, then improves on HA4 by reducing memory-access conflicts
 on many-core parts.
 
-Two things to weigh before anyone starts. First, `uf_init.comp` already
-pre-joins horizontal runs (item 8 of the first pass), so the pipeline has
-taken the cheapest part of this idea already. Second, and more seriously,
-HA4's efficiency comes from warp intrinsics - and this tree now has three
-independent measurements saying those are the wrong tool on the deployment
-target: `reduce_extents_hash_subgroup` at 6.6x slower on Mali, and the two
-retirements above on a discrete part. HA4 would have to earn its keep through
-the run-based structure alone, with the intrinsics replaced by shared memory
-that Valhall backs with L2. That is not a reason not to try it; it is a
-reason to bound it before writing it.
+Two things to weigh before anyone goes further. First, the run-based idea
+itself is now taken: `uf_init.comp` already pre-joined horizontal runs (item
+8 of the first pass) and item 7 above extends that to the vertical merge, for
+-7 to -13% of the labelling stage at no extra passes. What is left of HA4 is
+its *data structure* - runs extracted into compact per-strip arrays, one warp
+per strip, a separate border-merging kernel - which buys a smaller thread
+count but costs an extraction pass, compaction atomics and two more
+dispatches.
+
+Second, that remaining part is where HA4 leans hardest on warp intrinsics,
+and this tree now has four independent measurements saying those are the
+wrong tool here: `reduce_extents_hash_subgroup` 6.6x slower on Mali, and
+`uf_final` and `blob_diff` both losing on a discrete part (item 6). The
+intrinsics would have to be replaced by shared memory, which Valhall backs
+with L2 and which the first pass already measured as no cheaper than global
+for exactly this dependent-load pattern. Bound it before writing it.
 
 **Not relevant.** NVIDIA VPI and Isaac ROS AprilTag are CUDA-only and closed,
 so they inform nothing portable. The learned detectors (YoloTag, DeepTag,

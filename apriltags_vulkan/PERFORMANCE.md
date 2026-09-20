@@ -578,8 +578,13 @@ obvious ideas are in the rejected column. The short version:
    was measured when the frame was 11.5 ms and the same absolute cost was
    ~1%; everything else has since got ~4x faster and this had not, which is
    why it was worth re-measuring rather than inheriting.
-1. **A better connected-components algorithm.** `labelling` is now the
-   largest span at ~29% of the Mali GPU phase, which caps any rewrite there. Note that BUF /
+1. **A better connected-components algorithm.** `labelling` is still the
+   largest span at ~28% of the Mali GPU phase, which caps any rewrite there.
+   The cheapest part of HA4 - merging per run rather than per pixel - is
+   taken (`OPTIMIZATION_NOTES.md` item 7 of the third pass, -7 to -13% of the
+   stage). What remains of HA4 is its compact per-strip run arrays and
+   warp-per-strip labelling, which add an extraction pass and lean on exactly
+   the warp intrinsics four separate measurements here have rejected. Note that BUF /
    Playne-Equivalence **do not apply**: they require every foreground pixel of
    a 2x2 block to be connected, which holds for binary 8-connected labelling,
    while this pipeline is 4-connected and three-valued (127 merges with

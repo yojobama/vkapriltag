@@ -548,9 +548,16 @@ void GpuDetector::CreatePipelines() {
   uf_init_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
       8, wg2d_);
+  // Dispatched 2D over (x, y) but with a workgroup that is still one row
+  // tall, so consecutive threads keep walking consecutive columns and the
+  // two row streams stay as coalesced as they were under the old 1D
+  // dispatch. The shader needs x for its run-overlap test and recovering it
+  // from a linear index would cost a runtime integer division, which Valhall
+  // has no instruction for. See uf_merge_body.glsl.
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_merge", "uf_merge_u8")),
-      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8, wg1d_);
+      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8,
+      vk::WorkgroupSize{wg1d_.x, 1, 1});
   // Binding 1 / the third push constant are the convergence flag and the
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(
@@ -831,7 +838,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
         uf_changed_buf_.FillZero(c);
         vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
       }
-      uf_merge_pl_.Dispatch1D(c, pixels, &dwdh_pc);
+      uf_merge_pl_.Dispatch2D(c, decimated_width_, decimated_height_, &dwdh_pc);
       // honour_changed_flag = 1: if that merge joined nothing, parent[] is
       // untouched and was already flat (every chunk ends with a
       // compression), so this pass has provably nothing to do and can skip
