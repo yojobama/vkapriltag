@@ -14,8 +14,10 @@
 // (which needed a (blob_index, theta) composite key purely to keep
 // different blobs' points from interleaving).
 //
-// The bitonic network operates over kLocalCap virtual slots, independent of
-// gl_WorkGroupSize.x: each thread owns kLocalCap/gl_WorkGroupSize.x slots in
+// The sorting network (Batcher's odd-even mergesort, see its own comment
+// below - a bitonic network until this change) operates over kLocalCap
+// virtual slots, independent of gl_WorkGroupSize.x: each thread owns
+// kLocalCap/gl_WorkGroupSize.x slots in
 // a strided pattern (idx = tid, tid+threads, tid+2*threads, ...), so the
 // per-blob capacity can be sized from the shared-memory budget alone rather
 // than being capped at the workgroup's thread count. This matters because
@@ -149,10 +151,14 @@ void main() {
   }
 
   // Size the network to THIS blob, not to kLocalCap. `count` is uniform across
-  // the workgroup, so `cap` is too, and every barrier below is still reached
-  // by every invocation.
+  // the workgroup, so `cap` (and log2_cap) are too, and every barrier below is
+  // still reached by every invocation.
   uint cap = 1u;
-  while (cap < count) cap <<= 1u;
+  uint log2_cap = 0u;
+  while (cap < count) {
+    cap <<= 1u;
+    log2_cap += 1u;
+  }
 
   for (uint idx = tid; idx < cap; idx += threads) {
     uint key = (idx < count) ? min(src[base + idx].theta_key, kMaxThetaKey) : kMaxThetaKey;
@@ -161,23 +167,52 @@ void main() {
   memoryBarrierShared();
   barrier();
 
-  for (uint k = 2u; k <= cap; k <<= 1u) {
-    for (uint j = k >> 1u; j > 0u; j >>= 1u) {
-      for (uint idx = tid; idx < cap; idx += threads) {
-        uint partner = idx ^ j;
-        if (partner > idx) {
-          bool ascending = ((idx & k) == 0u);
-          uint a = s_packed[idx];
-          uint b = s_packed[partner];
-          bool swap = ascending ? (b < a) : (a < b);
-          if (swap) {
-            s_packed[idx] = b;
-            s_packed[partner] = a;
+  // Batcher's odd-even mergesort over the same padded `cap` slots the
+  // bitonic network above used to run over - same fixed-comparator-network
+  // contract (a schedule of index pairs that depends only on `cap`, never on
+  // the data), same number of barrier-synchronized rounds for a given `cap`
+  // (log2(cap)*(log2(cap)+1)/2, identical to the bitonic network above - the
+  // two networks differ only in how many index pairs compare in each round,
+  // not in synchronization cost), but ~13-21% fewer total compare-exchanges
+  // across the cap range this shader actually sees (16..4096). This exact
+  // (p, q, r, d) schedule - the standard iterative Batcher construction - was
+  // proven correct standalone before being ported here: the zero-one
+  // principle (a comparator network sorts every input iff it sorts every
+  // 0/1 input - Knuth TAOCP Vol 3) was checked exhaustively for cap = 8 and
+  // 16 (all 2^cap binary sequences), cross-checked against true brute-force
+  // permutation enumeration at cap = 8 (8! cases), and spot-checked with
+  // 20000 random permutations each at cap = 32/64/128. `q - p` below is a
+  // uint subtraction; the same verification script confirmed q >= p at every
+  // step for cap up to 2^20, so it never wraps.
+  if (log2_cap >= 1u) {
+    uint p = 1u << (log2_cap - 1u);
+    while (p >= 1u) {
+      uint q = 1u << (log2_cap - 1u);
+      uint r = 0u;
+      uint d = p;
+      while (d >= 1u) {
+        for (uint idx = tid; idx + d < cap; idx += threads) {
+          if ((idx & p) == r) {
+            uint partner = idx + d;
+            uint a = s_packed[idx];
+            uint b = s_packed[partner];
+            if (a > b) {
+              s_packed[idx] = b;
+              s_packed[partner] = a;
+            }
           }
         }
+        memoryBarrierShared();
+        barrier();
+        if (d == q) {
+          d = 0u;
+        } else {
+          d = q - p;
+          q >>= 1u;
+          r = p;
+        }
       }
-      memoryBarrierShared();
-      barrier();
+      p >>= 1u;
     }
   }
 
