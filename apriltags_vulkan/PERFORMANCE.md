@@ -603,8 +603,19 @@ steady-state numbers: a single `Detect()` is dominated by first-touch page
 faults across every buffer. `--pipelined` selects `FramePipeline`, so both
 paths can be A/B'd from one binary.
 
-Two cautions, both learned the hard way here:
+Three cautions, all learned the hard way here:
 
+- **Verify the two builds use the same `CMAKE_BUILD_TYPE`.** This one cost an
+  afternoon: a baseline worktree configured `Release` against the project's
+  own `x64-Release` preset, which is `RelWithDebInfo`, reported `quad_decode`
+  **+82%** and looked exactly like a serious regression in the change under
+  test. MSVC's `RelWithDebInfo` is `/O2 /Ob1`, and `/Ob1` inlines only
+  functions declared `inline` or defined in-class - so the DP corner-seeding
+  helpers in `QuadDecode.cpp`, called once or twice per point across four
+  O(n) passes, stayed real calls. They are marked `inline` now, which is
+  worth ~35% of `quad_decode` in that configuration and nothing in `/Ob2`,
+  but the lesson generalises: a cross-tree A/B compares toolchain settings
+  unless you check.
 - **Verify the binaries actually differ** before believing an A/B —
   `git checkout` carries uncommitted changes onto the new branch, which once
   produced a confident null result from comparing two identical builds.

@@ -167,12 +167,21 @@ struct Point2 {
   double x, y;
 };
 
-Point2 PointAt(std::span<const RawLineFitPoint> points, size_t begin, size_t idx) {
+// The three helpers below are marked `inline` for a reason that is not
+// about the linker. FindDpCornerIndices makes four O(n) passes calling them
+// once or twice per point, and MSVC's /Ob1 - what CMake's RelWithDebInfo
+// uses, and what this project's own CMakeSettings.json selects for
+// x64-Release - inlines ONLY functions declared inline or defined in-class.
+// Without the keyword these stay real calls in that configuration and
+// quad_decode measures ~75% slower than the same code built /Ob2. Measured
+// while chasing what looked like a regression and turned out to be two
+// build types.
+inline Point2 PointAt(std::span<const RawLineFitPoint> points, size_t begin, size_t idx) {
   const RawLineFitPoint &p = points[begin + idx];
   return {static_cast<double>(p.x2()), static_cast<double>(p.y2())};
 }
 
-double SqDist(Point2 a, Point2 b) {
+inline double SqDist(Point2 a, Point2 b) {
   const double dx = a.x - b.x, dy = a.y - b.y;
   return dx * dx + dy * dy;
 }
@@ -181,7 +190,7 @@ double SqDist(Point2 a, Point2 b) {
 // scaled by |ab|^2 (i.e. actual_dist^2 * |ab|^2) - avoids a sqrt/division
 // per point; callers only ever compare these against each other or against
 // a threshold likewise scaled by diameter_sq.
-double ScaledPerpDistSq(Point2 a, Point2 b, Point2 p) {
+inline double ScaledPerpDistSq(Point2 a, Point2 b, Point2 p) {
   const double abx = b.x - a.x, aby = b.y - a.y;
   const double apx = p.x - a.x, apy = p.y - a.y;
   const double cross = abx * apy - aby * apx;
@@ -335,14 +344,19 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     LineFitMoments running{};
     for (size_t k = 0; k < total_points; ++k) {
       const RawLineFitPoint &p = points[begin + k];
-      const int64_t wx = static_cast<int64_t>(p.W()) * p.x2();
-      const int64_t wy = static_cast<int64_t>(p.W()) * p.y2();
+      // Unpack once. RawLineFitPoint's accessors are bit extractions rather
+      // than field loads (see Types.h), and `cs[k] = running` below writes
+      // through a vector the compiler cannot prove does not alias `points`,
+      // so leaving the calls inline costs a reload and a re-extract per use.
+      const int32_t x2 = p.x2(), y2 = p.y2(), w = p.W();
+      const int64_t wx = static_cast<int64_t>(w) * x2;
+      const int64_t wy = static_cast<int64_t>(w) * y2;
       running.Mx += static_cast<int32_t>(wx);
       running.My += static_cast<int32_t>(wy);
-      running.W += p.W();
-      running.Mxx += wx * p.x2();
-      running.Mxy += wx * p.y2();
-      running.Myy += wy * p.y2();
+      running.W += w;
+      running.Mxx += wx * x2;
+      running.Mxy += wx * y2;
+      running.Myy += wy * y2;
       cs[k] = running;
     }
   }

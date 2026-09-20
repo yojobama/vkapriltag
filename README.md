@@ -279,6 +279,56 @@ figures from one instrumented frame (`APRILTAG_VK_TIMESTAMPS=1`).
 | `tag_decode` (bit sampling + hamming) | **CPU** | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
 | **Pipeline total** (GPU + both CPU tails) | GPU + CPU | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
 
+### What the current branch changed, at decimation 1
+
+The table above is the steady state. This is the before/after for the work on
+`perf/extents-contention-and-int64-atomics`, measured at **decimation 1** on
+the shipped `grayimage.pgm` (1280x800) rather than `colorImage.pgm`, so these
+numbers are not comparable with the table above — only within this section.
+`7587f1b` is the baseline commit. ABBA-interleaved, min of 12-14 per round,
+`APRILTAG_VK_TIMESTAMPS` **unset** (the instrumentation itself costs ~9% on
+Mali, so profiling builds must not be quoted as deployment numbers).
+
+**Desktop — RX 9060 XT / Ryzen 5 5600X**, three sessions, both binaries built
+`RelWithDebInfo`:
+
+| | `7587f1b` | branch | delta |
+| --- | --- | --- | --- |
+| `GpuDetector` (GPU) | 1.288 ms | 1.261 ms | **-2.1%** |
+| `quad_decode` (CPU) | 0.428 ms | 0.272 ms | **-36%** |
+| `tag_decode` (CPU) | 0.147 ms | 0.150 ms | ~0 |
+| **Pipeline total** | **1.908 ms** | **1.718 ms** | **-10.0%** |
+| device memory | 185 MiB | 155 MiB | **-16.2%** |
+
+The GPU side moves little here because most of the work targeted things a
+discrete card is not bound by: the submit fusion needs a host-cached readback
+memory type and so does not engage on a card without resizable BAR, and the
+subgroup-aggregated extents reduction takes priority over the int64-atomic one
+on discrete parts. The CPU win is the `inline` on the DP corner-seeding
+helpers, which is specifically a `/Ob1` (RelWithDebInfo) effect - see
+`PERFORMANCE.md`.
+
+**Orange Pi 5 Plus — Mali-G610**, same image and decimation:
+
+| | `7587f1b` | branch | delta |
+| --- | --- | --- | --- |
+| `GpuDetector` (GPU) | 8.81 ms | 7.77 ms | **-11.9%** |
+| **Pipeline total** | **9.92 ms** | **8.90 ms** | **-10.3%** |
+| device memory | 185 MiB | 155 MiB | **-16.2%** |
+
+> The Mali figures were taken before the `inline` change and have not been
+> re-run since (the board went off the network mid-session). They should be
+> treated as provisional on two counts: the two binaries came from separate
+> build trees whose `CMAKE_BUILD_TYPE` was not confirmed to match, and GCC
+> inlines these helpers at `-O2` regardless, so the CPU tail there is
+> unlikely to move the way the desktop's did. The GPU-side deltas are
+> corroborated by same-build-tree A/Bs of each change individually
+> (`OPTIMIZATION_NOTES.md`, third pass), which sum to about the same total.
+
+Detections are identical to `7587f1b` throughout: 8 configuration axes x
+decimations 1/2/4 x the 5-image corpus on the desktop, and 3 decimations x 5
+configurations on Mali.
+
 Pose is measured separately, since it is per detected tag rather than per
 frame and is not part of the pipeline total above. **It runs entirely on
 the CPU** — `library/include/vkapriltag/PoseEstimator.h` records why the
