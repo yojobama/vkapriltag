@@ -38,7 +38,10 @@ FetchContent_MakeAvailable(apriltag)
 # common/getopt.c's zarray_vmap(..., free)) are hard errors instead of
 # warnings. Pin it to gnu17 so it builds unmodified.
 if(TARGET apriltag)
-  target_compile_options(apriltag PRIVATE -std=gnu17)
+  get_target_property(_lumen_apriltag_is_alias apriltag ALIASED_TARGET)
+  if(NOT _lumen_apriltag_is_alias)
+    target_compile_options(apriltag PRIVATE -std=gnu17)
+  endif()
 endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
