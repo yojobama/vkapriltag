@@ -1562,9 +1562,27 @@ it moved here.
 **Shipped anyway**, same reasoning `PERFORMANCE.md` section 6b already gives
 for `RawLineFitPoint`'s packing (nil GPU-time effect on one device, kept for
 the other device's benefit, verified harmless where it doesn't help): exact
-by construction, and aimed at a target this campaign had no hardware access
-to measure. Worth an ABBA pass on the Mali-G610 before trusting the
-percentage estimate, same caveat as items 10 and 11.
+by construction, and aimed at a target this campaign initially had no
+hardware access to measure.
+
+**Confirmed on the Mali-G610 deployment target**, ABBA-interleaved, 16
+rounds x 300 iterations, 1280x800, against the same binary with this
+change reverted - the target this was aimed at all along:
+
+| | decimation 1 | decimation 2 |
+| --- | --- | --- |
+| `uf_final` span | **-31.4%** (16/16 rounds) | **-12.3%** (16/16 rounds) |
+| `label_pixels` span | **-23.4%** (16/16 rounds) | **-18.4%** (16/16 rounds) |
+| GPU total | **-3.4%** (16/16 rounds) | **-2.1%** (14/16 rounds) |
+
+Both spans move strongly and unanimously in both decimations - unlike the
+RX 9060 XT, where the two spans partly cancelled at a size too small to
+matter, on Mali they're large enough that the win shows up at the whole-
+frame level too. This is the mirror image of item 10's finding: there, the
+gate that was originally too conservative for Mali cost nothing to remove;
+here, the RX 9060 XT result that looked neutral was genuinely device-
+specific, and shipping it anyway on the strength of the Mali estimate was
+the right call.
 
 ## 13. Checked and not needed: a deterministic tie-break for the sort
 
