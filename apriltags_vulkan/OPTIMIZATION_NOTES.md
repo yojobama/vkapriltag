@@ -1561,3 +1561,43 @@ packed `(x,y)` also matched. Across the full 5-image corpus at decimations
 1/2/4, every equal-key pair found was the duplicate-`(x,y)` case (1-5 per
 frame on the larger images) - **zero** genuine distinct-point ties. No
 shader change is warranted; this stays as-is.
+
+## 14. Rejected: drop `uf_merge`'s shared `wg_changed` + barriers for a read-guarded global atomicOr
+
+The convergence flag write in `uf_merge_body.glsl` aggregates in shared
+memory first (one atomic per workgroup, guarded by two barriers) rather
+than writing the global `changed_flag` directly per merged pixel. Tried
+replacing it with `if (merged && changed_flag == 0u) atomicOr(changed_flag,
+1u)` - correctness is unconditional either way (`atomicOr` is idempotent,
+so the guard only bounds how many redundant atomics a race costs, never
+changes the result) - to see whether RDNA's real dedicated LDS makes the
+barrier-based aggregation unnecessary overhead the way it plausibly is not
+on Mali (where `shared` has no dedicated scratchpad at all).
+
+**Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800 - a genuine, decimation-dependent inversion, not noise in either
+direction:**
+
+| | `labelling` | GPU total |
+| --- | --- | --- |
+| decimation 1 | **+44.6%** (worse, 0/16 rounds) | **+11.1%** (worse, 0/16 rounds) |
+| decimation 2 | -8.6% (better, 15-16/16 rounds) | -1.8% to -2.5% (better) |
+
+Both directions are unanimous within their own decimation, so this is a
+real effect, not sampling noise - it just doesn't have a single sign.
+Likely mechanism: contention on the read-guarded global atomic scales with
+the total number of merged pixels racing through it at once, which is
+roughly proportional to pixel count; decimation 1 has ~4x the pixels of
+decimation 2, so the same guard that's sufficient at decimation 2 leaves
+enough concurrent races at decimation 1 for the global atomic to cost more
+than the two barriers it replaced.
+
+Rejected - decimation 1 is a normal, tested configuration (see
+`PERFORMANCE.md`'s own decimation sweep), not a corner case, and a change
+that trades a good result at one decimation for an **11% GPU-total
+regression** at another fails this campaign's own bar of "keep only if GPU
+total improves." Not committed. Would need re-measuring per-decimation
+(or gating on some other signal) to be worth reconsidering, and the shared-
+memory aggregation this would have replaced is unmeasured on Mali too - the
+Arm-best-practices rationale that motivated trying this may still apply
+there even though it does not transfer cleanly here.
