@@ -1542,3 +1542,22 @@ the other device's benefit, verified harmless where it doesn't help): exact
 by construction, and aimed at a target this campaign had no hardware access
 to measure. Worth an ABBA pass on the Mali-G610 before trusting the
 percentage estimate, same caveat as items 10 and 11.
+
+## 13. Checked and not needed: a deterministic tie-break for the sort
+
+`sort_points_local`'s per-blob angular sort orders by `theta_key` alone;
+two points with an exactly equal key sort adjacent, in whichever order
+they happened to land after `scatter_index_points.comp`'s per-blob atomic
+cursor placed them - the source of the documented +/-1-2 candidate-quad
+jitter (`PERFORMANCE.md` section 7). Duplicate `(x,y)` points (from the
+shared SE/SW diagonal midpoint) produce identical output records regardless
+of order, so only a tie between two *distinct* points would actually
+matter.
+
+Measured directly rather than assumed: a temporary diagnostic (reverted,
+not shipped) walked each blob's sorted key array after convergence and
+split every adjacent equal-`theta_key` pair by whether the two points'
+packed `(x,y)` also matched. Across the full 5-image corpus at decimations
+1/2/4, every equal-key pair found was the duplicate-`(x,y)` case (1-5 per
+frame on the larger images) - **zero** genuine distinct-point ties. No
+shader change is warranted; this stays as-is.
