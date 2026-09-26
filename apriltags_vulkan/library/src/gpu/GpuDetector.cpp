@@ -324,7 +324,16 @@ void GpuDetector::CreateBuffers() {
 
   parent_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   blob_size_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
-  uf_changed_buf_ = ssbo(4);
+  // Also the conditional-rendering predicate for the in-chunk uf_compress
+  // passes when the device has the extension - see predicated_compress_.
+  predicated_compress_ = ctx_.caps().has_conditional_rendering;
+  {
+    const VkBufferUsageFlags usage =
+        kSsboUsage | (predicated_compress_ ? VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT : 0);
+    vk::Buffer b(ctx_, 4, usage, vk::MemoryKind::DeviceLocal);
+    device_bytes_ += b.size();
+    uf_changed_buf_ = std::move(b);
+  }
 
   // QBPoint is packed into one uint32 on the GPU side (see common.glsl); no
   // C++ mirror struct exists since nothing on the host ever reads one back.
@@ -836,21 +845,48 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // "the final pass changed nothing", i.e. genuinely converged - clearing it
   // once at the start of the chunk instead would conflate "converged" with
   // "changed something earlier in this chunk" and never terminate tightly.
+  //
+  // If a merge joined nothing, parent[] is untouched and was already flat
+  // (every chunk ends with a compression), so the compression after it has
+  // provably nothing to do. uf_compress.comp's honour_changed_flag guard
+  // returns early on that; with conditional rendering the LAST compression
+  // of the chunk is instead predicated on the flag and skipped outright.
+  // Only the last: every earlier one reads a flag accumulated since the
+  // previous clear, which is nonzero in practice, and on the RX 9060 XT a
+  // predicate that never skips measured +5% labelling at a chunk of 8 -
+  // the front end has to wait for the flag before it can issue the dispatch.
+  // Same flag, read at the same point, so both paths are bit-identical.
   auto record_uf_chunk = [&](VkCommandBuffer c, uint32_t iterations) {
     for (uint32_t iter = 0; iter < iterations; ++iter) {
-      if (iter + 1 == iterations) {
-        vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
+      const bool last = iter + 1 == iterations;
+      const bool predicate = last && predicated_compress_;
+      if (last) {
+        // With predication this also orders an earlier chunk's predicate
+        // read of the flag before the fill overwrites it.
+        vk::ComputePipeline::Barrier(c, predicated_compress_
+                                            ? BarrierKind::ComputeTransferAndPredicate
+                                            : BarrierKind::ComputeAndTransfer);
         uf_changed_buf_.FillZero(c);
         vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
       }
-      uf_merge_pl_.Dispatch2D(c, decimated_width_, decimated_height_, &dwdh_pc);
-      // honour_changed_flag = 1: if that merge joined nothing, parent[] is
-      // untouched and was already flat (every chunk ends with a
-      // compression), so this pass has provably nothing to do and can skip
-      // its full-array read. The dispatch's own default compute barrier is
-      // what makes the merge's flag write visible here.
-      const UfCompressPc compress_pc{decimated_width_, decimated_height_, 1u};
-      uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc);
+      // The merge's barrier is what makes its flag write visible to the
+      // compression - to the shader's guard, or to the predicate read, which
+      // happens at its own pipeline stage and needs that stage named.
+      uf_merge_pl_.Dispatch2D(c, decimated_width_, decimated_height_, &dwdh_pc,
+                              predicate ? BarrierKind::ComputeAndPredicate
+                                        : BarrierKind::Compute);
+      if (predicate) {
+        // honour_changed_flag = 0: the dispatch only runs when the flag is
+        // nonzero, so the guard could never fire - skip its load.
+        const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
+        ctx_.CmdBeginConditionalRendering(c, uf_changed_buf_.get(), 0);
+        uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc, BarrierKind::None);
+        ctx_.CmdEndConditionalRendering(c);
+        vk::ComputePipeline::Barrier(c, BarrierKind::Compute);
+      } else {
+        const UfCompressPc compress_pc{decimated_width_, decimated_height_, 1u};
+        uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc);
+      }
     }
   };
 
@@ -1409,6 +1445,8 @@ std::string GpuDetector::DescribeSizing() const {
   // varies by driver even among unified-memory parts, so a run that silently
   // took the staging path would otherwise be indistinguishable.
   os << ", linefit readback " << (linefit_direct_read_ ? "direct (host-cached)" : "staged");
+  os << ", uf_compress skip "
+     << (predicated_compress_ ? "predicated (conditional rendering)" : "in-shader");
   return os.str();
 }
 

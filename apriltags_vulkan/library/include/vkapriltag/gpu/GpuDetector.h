@@ -559,6 +559,13 @@ class GpuDetector {
   // GPU-clock idle per frame. Requires both direct-read paths, so discrete
   // parts without a cached readback memory type keep the four-submit path.
   bool fused_submits_ = false;
+  // True when each labelling chunk's last uf_compress is predicated on
+  // uf_changed_buf_ with VK_EXT_conditional_rendering, so a pass after a
+  // merge that joined nothing is skipped outright instead of launching every
+  // workgroup just to read the flag and return. Where the extension is
+  // absent (Mali-G610) uf_compress.comp's own honour_changed_flag guard does
+  // the same job at a smaller saving. See PERFORMANCE.md section 6c.
+  bool predicated_compress_ = false;
   // Backs last_line_fit_points only on the staging path.
   std::vector<RawLineFitPoint> linefit_scratch_;
 

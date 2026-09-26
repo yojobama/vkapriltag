@@ -39,6 +39,8 @@ struct ContextOptions {
   bool force_no_int64_atomics = false;
   // Env override: APRILTAG_VK_FORCE_NO_SUBGROUP=1
   bool force_no_subgroup = false;
+  // Env override: APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING=1
+  bool force_no_conditional_rendering = false;
 
   // -1 selects by score (discrete > integrated > virtual > cpu). Otherwise a
   // raw index into vkEnumeratePhysicalDevices order.
@@ -114,6 +116,11 @@ struct DeviceCaps {
   bool has_8bit_storage = false;
   // VK_KHR_shader_atomic_int64 + shaderBufferInt64Atomics + shaderInt64.
   bool has_int64_atomics = false;
+  // VK_EXT_conditional_rendering + conditionalRendering, enabled at device
+  // creation when present. Common on desktop parts, absent on the
+  // Mali-G610, so everything it is used for keeps an in-shader fallback -
+  // see Context::CmdBeginConditionalRendering.
+  bool has_conditional_rendering = false;
   // Subgroup capability, queried via VkPhysicalDeviceSubgroupProperties
   // (core Vulkan 1.1, no extension/device-feature enablement needed - unlike
   // 8-bit storage, subgroup operations are gated purely by what the SPIR-V
@@ -223,6 +230,17 @@ public:
   // serializes every queue on the device. The command buffer is recycled.
   void SubmitAndWait(VkCommandBuffer cmd) const;
 
+  // Brackets commands that the device skips when the 32-bit value at
+  // `offset` in `buffer` is zero (or nonzero, with `inverted`). Only
+  // dispatches are predicated - barriers, copies and fills in between still
+  // execute. The value's producer must be ordered against this with a
+  // BarrierKind::*AndPredicate barrier, and `buffer` must carry
+  // VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT. Only valid when
+  // caps().has_conditional_rendering.
+  void CmdBeginConditionalRendering(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset,
+                                    bool inverted = false) const;
+  void CmdEndConditionalRendering(VkCommandBuffer cmd) const;
+
   // A human readable summary of the selected device and the launch geometry
   // derived from it.
   std::string DescribeDevice() const;
@@ -253,6 +271,11 @@ public:
   // QueryCaps to populate caps_.has_8bit_storage.
   bool supports_8bit_storage_ = false;
   bool supports_int64_atomics_ = false;
+  bool supports_conditional_rendering_ = false;
+  // Extension entry points, loaded by CreateLogicalDevice only when
+  // supports_conditional_rendering_ - the loader does not export them.
+  PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering_ = nullptr;
+  PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering_ = nullptr;
   PipelineCache pipeline_cache_;
 
   // Reusable command buffers plus the fence tracking each one's submission.
