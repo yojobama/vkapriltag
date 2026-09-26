@@ -1514,7 +1514,18 @@ processed by *different* workgroups collide on the *same* copy (since
 every workgroup's lane 0 always targets copy 0, regardless of which blob
 it's processing). Futhark's benchmark was presumably keyed data without
 this kind of run-length locality; it is not the shape this pipeline's
-`reduce_extents_hash` sees. Rejected - not committed.
+`reduce_extents_hash` sees.
+
+**Re-tested on the Mali-G610**, where the scalar/atomic64 path is the
+*only* path - integrated GPUs are excluded from the subgroup variant
+outright (see `PERFORMANCE.md` section 6), so this idea is fully live
+there, unlike on the RX 9060 XT. Same result: ABBA-interleaved, 12 rounds
+x 300 iterations, 1280x800, decimation 2, GPU total **+5.4%**, lane-keyed
+slower in **11/12 rounds**. The mechanism is architecture-independent - it
+follows from `blob_diff.comp`'s own append order, not from anything
+RDNA-specific - so this is now a general finding across two unrelated GPU
+architectures, not a device-specific quirk. Rejected on both devices - not
+committed on either.
 
 ## 12. Skip ambiguous (127) pixels in `uf_final` and `label_pixels`
 
