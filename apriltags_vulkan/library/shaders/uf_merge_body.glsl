@@ -62,10 +62,10 @@ layout(local_size_x_id = 0, local_size_x = 256) in;
 // 0 = naive find(), no compression during the walk. 1 = path splitting
 // (every node visited is repointed to its grandparent with a plain store)
 // - see find()'s own comment for why this is safe and where it's proven.
-// GpuDetector::CreatePipelines chooses the default from
-// !ctx_.caps().unified_memory: the extra stores go over the same memory
-// bus the CPU shares on a unified-memory part, which is the one class of
-// device this has not been measured on.
+// GpuDetector::CreatePipelines defaults this to 1 unconditionally: measured
+// a real win on both a discrete RDNA4 part and a unified-memory Mali-G610,
+// so there is no device class left to gate it against. Override with
+// APRILTAG_VK_FIND_MODE=0 to re-A/B on new hardware.
 layout(constant_id = 3) const uint kFindMode = 0u;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };

@@ -594,13 +594,18 @@ void GpuDetector::CreatePipelines() {
   // dispatch. The shader needs x for its run-overlap test and recovering it
   // from a linear index would cost a runtime integer division, which Valhall
   // has no instruction for. See uf_merge_body.glsl.
-  // Path splitting in find() (see uf_merge_body.glsl's own comment):
-  // measured -17.0%/-2.7% labelling (decimation 1/2) on the RX 9060 XT,
-  // bit-identical. Defaulted on discrete/non-unified-memory devices only -
-  // the extra stores go over the same memory bus the CPU shares on a
-  // unified-memory part, which this has not been measured on. Override
-  // either way with APRILTAG_VK_FIND_MODE=0 (naive) or =1 (split).
-  uint32_t find_mode = ctx_.caps().unified_memory ? 0u : 1u;
+  // Path splitting in find() (see uf_merge_body.glsl's own comment): -17.0%/
+  // -2.7% labelling (decimation 1/2) on the RX 9060 XT. Originally defaulted
+  // off on unified-memory parts on the theory that the extra stores share
+  // the CPU's own memory bus there - measured on the Mali-G610 and that
+  // theory didn't hold: labelling -1.7%/-3.2%, GPU total -0.6%/-0.9%,
+  // unanimous in both directions across 32 ABBA rounds at each decimation.
+  // Smaller than on the RX 9060 XT because Mali's frame is far more
+  // dominated by other costs (bandwidth, dispatch/barrier overhead) - see
+  // PERFORMANCE.md section 3a - but no regression anywhere it's been
+  // tried, so this is unconditional now. Override with
+  // APRILTAG_VK_FIND_MODE=0 (naive) or =1 (split) to re-A/B on new hardware.
+  uint32_t find_mode = 1u;
   if (const char *v = std::getenv("APRILTAG_VK_FIND_MODE")) {
     find_mode = (v[0] != '0') ? 1u : 0u;
   }

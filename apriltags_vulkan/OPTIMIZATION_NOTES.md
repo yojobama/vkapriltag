@@ -1427,11 +1427,12 @@ Marking the store `coherent` was deliberately rejected: it would pay for a
 freshness this shader does not need, the same trade-off `uf_final.comp`'s
 plain read of `blob_size[]` already documents.
 
-Gated behind a `kFindMode` specialization constant (`uf_merge_body.glsl`),
-defaulted from `!ctx_.caps().unified_memory` in `GpuDetector::CreatePipelines`
-- on by default on this discrete card, off by default on any unified-memory
-part (Mali included) until measured there, since the extra stores share the
-same memory bus the CPU uses on those parts. Override either way with
+Gated behind a `kFindMode` specialization constant (`uf_merge_body.glsl`).
+Originally defaulted from `!ctx_.caps().unified_memory` - on for this
+discrete card, off on any unified-memory part (Mali included) until
+measured there, since the extra stores share the same memory bus the CPU
+uses on those parts - then measured on the Mali-G610 (see below) and made
+unconditional once that theory didn't hold. Override either way with
 `APRILTAG_VK_FIND_MODE=0` (naive) or `=1` (split).
 
 Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
@@ -1453,8 +1454,30 @@ on/off x workgroup geometries auto/2x2/6x6 x chunk size 1/default), and
 `APRILTAG_VK_FIND_MODE=0` vs `=1` produce byte-identical `work:` lines
 directly (not just indirectly via matching the old baseline).
 
-Shipped on for this device. Not yet measured on Mali - do that before
-trusting the `unified_memory` gate's polarity rather than assuming it.
+**Measured on the Mali-G610 deployment target** (Armbian 26.8.2, vendor
+kernel 6.1.115, libmali g24p0, GPU/CPU governors default), ABBA-interleaved,
+16 rounds x 300 iterations, 1280x800, against the same binary's
+`APRILTAG_VK_FIND_MODE=0`:
+
+| | `labelling` | GPU total |
+| --- | --- | --- |
+| decimation 1 | **-1.7%** (16/16 rounds) | -0.6% (15/16 rounds) |
+| decimation 2 | **-3.2%** (16/16 rounds) | -0.9% (13/16 rounds) |
+
+Smaller than the RX 9060 XT's figures, as expected: at 1280x800 this
+device's frame is 7.1-7.6 ms (decimation 1) rather than ~1 ms, dominated by
+costs path splitting does not touch (bandwidth, dispatch/barrier overhead -
+see `PERFORMANCE.md` section 3a's finding that labelling is only 1.30x
+memory-clock-sensitive, i.e. mostly latency, not traffic). But every round
+at both decimations moved the same direction on `labelling`, and a clear
+majority did on GPU total too - the "extra stores share the CPU's memory
+bus" theory that motivated gating this off on unified-memory parts did not
+hold. **The `unified_memory` gate is removed**; `kFindMode` defaults to 1
+unconditionally now, with `APRILTAG_VK_FIND_MODE=0` kept as the escape
+hatch for re-A/B on any future device.
+
+Also verified on this device: the full 36-configuration bit-identity
+matrix, and `APRILTAG_VK_FIND_MODE=0` vs `=1` explicitly, both clean.
 
 ## 11. Rejected: extents copy selection by lane instead of workgroup
 
