@@ -1645,3 +1645,33 @@ Revisit if the `r == p, d != p` case gets its own closed-form derivation
 and its own from-scratch zero-one-principle verification, matching the
 rigor `PERFORMANCE.md`'s "The sort network" section already documents for
 the shipped odd-even mergesort itself.
+
+## 16. Rejected: pad `MinMaxExtentsGpu` from 32 to 64 bytes
+
+Two blobs' entries currently share every 64-byte cache line in the
+canonical `extents[]` array (the struct is 32 bytes), and every
+`reduce_extents_hash` variant - including the default subgroup-aggregated
+one, which writes `extents[leaderKey]` directly with no privatized-copy
+scheme at all - writes some blob's entry on nearly every dispatch, with
+adjacent indices touched by unrelated concurrent threads/subgroups. Padding
+to 64 bytes (one cache line per blob) was tried to remove that false
+sharing, with the padding fields never read by anything downstream.
+
+**Measured worse.** ABBA-interleaved, 16 rounds x 300 iterations, 1280x800:
+`extents` span **+2.4%** (decimation 1) / **+4.1%** (decimation 2), padded
+slower in **0/16 rounds** at both - unanimous, not noise. GPU total moves
+with it (+0.4%/+0.5%, both within the ABBA harness's own noise floor for a
+whole-frame figure, but directionally consistent with the span result).
+
+Doubling the struct size doubles the byte traffic of every pass that walks
+the array at its allocated *capacity* rather than the frame's real blob
+count - `merge_extents.comp`, `select_blobs.comp`,
+`extract_blob_counts.comp` - and apparently costs more here than the false
+sharing it removes saves. This is the third contention-mitigation idea in
+this pass to lose on this device (see items 11 and 14): between them they
+suggest this workload's extents-adjacent stages are traffic/capacity-bound
+on the RX 9060 XT, not contention-bound, so relieving contention has
+nothing to reclaim - the same shape of finding
+`PERFORMANCE.md` section 3a already made for Mali's own `extents`/`sort`
+spans (atomic- and latency-bound there, immune to a 4x memory-clock
+sweep), just for a different mechanism. Not committed.
