@@ -62,11 +62,22 @@ void main() {
   uint i = gl_GlobalInvocationID.x;
   if (i >= pc.count) return;
   if (pc.honour_changed_flag != 0u && changed_flag != 0u) return;
-  uint r = parent[i];
-  // The "+1" biasing is what lets label 0 mean "no usable blob", collapsing
-  // blob_diff's two separate rejections (ambiguous pixel, blob too small)
-  // into one comparison.
-  uint label = (blob_size[r] >= pc.min_blob_pixels) ? (r + 1u) : 0u;
   uint code = PackThreshCode(uint(THRESHOLDED_AT(i)));
+  // Ambiguous (127, code 1) pixels never merge with anything (uf_init.comp/
+  // uf_merge_body.glsl), so pixel i is always its own root here, and
+  // uf_final.comp's saturating blob_size[i] can only ever be 0 or 1 for it
+  // (touched by exactly one atomicAdd, from this same pixel, nothing else
+  // ever routes to that slot - see uf_final.comp's proof). Both values
+  // compare false against min_blob_pixels >= 2 (asserted host-side, see
+  // GpuDetector's config handling), so label is always 0 either way -
+  // skipping the blob_size load entirely is exact, not approximate.
+  uint label = 0u;
+  if (code != 1u) {
+    uint r = parent[i];
+    // The "+1" biasing is what lets label 0 mean "no usable blob",
+    // collapsing blob_diff's two separate rejections (ambiguous pixel,
+    // blob too small) into one comparison.
+    label = (blob_size[r] >= pc.min_blob_pixels) ? (r + 1u) : 0u;
+  }
   parent[i] = label | (code << kPixelLabelBits);
 }

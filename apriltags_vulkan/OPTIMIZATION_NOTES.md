@@ -1492,3 +1492,53 @@ every workgroup's lane 0 always targets copy 0, regardless of which blob
 it's processing). Futhark's benchmark was presumably keyed data without
 this kind of run-length locality; it is not the shape this pipeline's
 `reduce_extents_hash` sees. Rejected - not committed.
+
+## 12. Skip ambiguous (127) pixels in `uf_final` and `label_pixels`
+
+A 127-thresholded pixel never merges with anything (`uf_init.comp`/
+`uf_merge_body.glsl`'s own guards), so it is always its own unique root, and
+no other pixel's `find()` can ever reach it - a 127 index is never an
+operand to `doUnion` (the merge shader requires the calling thread's own
+pixel to be non-127 before it unions anything, and it only unions with a
+same-valued, hence also non-127, neighbour). So `blob_size[i]` for a 127
+pixel is touched by exactly one `atomicAdd` (that pixel's own, in
+`uf_final.comp`), making it always exactly 0 or 1 - and with
+`min_cluster_pixels` floored at 2 host-side (added alongside this), both
+values compare false regardless. `label_pixels.comp` already computes the
+threshold code unconditionally; reordering to check it first and skip the
+`blob_size` read for code 1 is exact, not approximate. `uf_final.comp`
+gained a `thresholded` binding (new `uf_final_u8.comp` variant, mirroring
+`label_pixels`' u8 split) to return before touching `parent[]`/`blob_size[]`
+at all for the same pixels.
+
+Bit-identical over 36 configurations, and separately confirmed identical
+across all four of \{fused, unfused\} x \{subgroup, forced-scalar\} - this
+touches a shader shared by every one of those paths.
+
+**Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800 - a genuinely mixed, net-neutral result:**
+
+| | decimation 1 | decimation 2 |
+| --- | --- | --- |
+| `uf_final` span | **-5.1%** (16/16 rounds) | **-2.2%** (16/16 rounds) |
+| `label_pixels` span | +18.3% (0/16 rounds) | +37.6% (0/16 rounds) |
+| GPU total | +0.2% (noise, 5/16) | +0.3% (noise, 6/16) |
+
+Both spans are tiny on this device - `uf_final` ~0.016 ms, `label_pixels`
+~0.005-0.007 ms, against a ~0.9 ms frame - so the label_pixels regression,
+while unanimous, is on the order of a few microseconds and invisible at the
+whole-frame level; most likely the added branch's divergence cost roughly
+cancels the load it skips at this span's tiny absolute size. Contrast with
+Mali, where `PERFORMANCE.md` section 3a profiles `uf_final` at 0.091 ms and
+`label_pixels` at 0.116 ms at the same decimation - both with a measured
+2.66-3.12x DRAM-bandwidth sensitivity, meaning this change's actual target
+(streaming traffic through a much bigger buffer, on a part where that
+traffic is a real cost) is a span roughly 6-20x larger there than the one
+it moved here.
+
+**Shipped anyway**, same reasoning `PERFORMANCE.md` section 6b already gives
+for `RawLineFitPoint`'s packing (nil GPU-time effect on one device, kept for
+the other device's benefit, verified harmless where it doesn't help): exact
+by construction, and aimed at a target this campaign had no hardware access
+to measure. Worth an ABBA pass on the Mali-G610 before trusting the
+percentage estimate, same caveat as items 10 and 11.

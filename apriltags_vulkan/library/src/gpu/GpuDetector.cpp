@@ -142,6 +142,16 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     const uint32_t derived_min_cluster = 4u * (config_.min_tag_pixels / config_.decimation);
     config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, derived_min_cluster);
   }
+  // uf_final.comp/label_pixels.comp's ambiguous-pixel fast path (see their
+  // own comments) is exact only when this floor is at least 2: a 127 pixel
+  // is provably always a size-1 singleton root, so its saturating
+  // blob_size counter can only ever read as 0 or 1, and both compare false
+  // against any floor >= 2. A floor of 0 or 1 would instead make an
+  // ambiguous pixel's own (never legitimately sized) blob pass the "big
+  // enough" test - not a crash, but a behavior change neither shader path
+  // intends. min_cluster_pixels defaults to 24 and nothing sane sets it
+  // below 2, so this only guards a pathological configuration.
+  config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, 2u);
 
   // Launch geometry comes from the device, never from a literal.
   const vk::DeviceCaps &caps = ctx_.caps();
@@ -602,8 +612,12 @@ void GpuDetector::CreatePipelines() {
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_compress"), {parent_buf_.get(), uf_changed_buf_.get()}, 12, wg1d_);
-  uf_final_pl_ = vk::ComputePipeline(ctx_, ShaderPath("uf_final"),
-                                     {parent_buf_.get(), blob_size_buf_.get()}, 12, wg1d_);
+  // Binding 2 is thresholded_buf_, added so this shader can skip ambiguous
+  // (127) pixels without touching parent[]/blob_size[] at all - see
+  // uf_final_body.glsl's comment for why that's exact.
+  uf_final_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath(pick("uf_final", "uf_final_u8")),
+      {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()}, 12, wg1d_);
 
   // Two-way now, not four: blob_diff used to be parametrized on the u8 axis
   // as well, because it read thresholded_buf_ directly. label_pixels.comp
