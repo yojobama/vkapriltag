@@ -1,5 +1,22 @@
 # Research summary — all eight categories
 
+> **Update, 2026-09-27: Tier 1 and part of Tier 2 measured on the RX 9060 XT**,
+> on branch `perf/rdna4-pass` (`main` untouched). See
+> `apriltags_vulkan/OPTIMIZATION_NOTES.md`'s "fourth pass" and items 11-16 for
+> full writeups. Summary: **A1 and B1 shipped with large wins** (−4% and
+> −20 to −27% GPU total respectively, and they compose). **A2 shipped
+> neutral** (aimed at Mali; nil-to-mixed here). **A6, A9, A13, A14 measured
+> and rejected or ruled unnecessary** - notably, three independent
+> contention-mitigation ideas for the extents stage (lane-based copy
+> selection, struct padding, and a barrier-removal change to `uf_merge`'s
+> convergence flag) all lost, and one important scope correction: **this
+> device runs the subgroup-aggregated `reduce_extents_hash` variant by
+> default**, so several planned items (lane selection, `gx_sum`/`gy_sum`
+> packing) only ever applied to the non-default scalar fallback. A3 (sort
+> comparator enumeration) was bounded but not attempted - the real waste is
+> 13-22%, not the ~40% estimated below, and no safe closed-form formula fell
+> out for every round within budget. Nothing has been run on Mali.
+
 Merged 2026-09-26 from the `## Conclusions` of `01`–`08` (219 source entries
 in total). Each item cites the category file where its evidence lives.
 Baseline: Mali-G610 GPU phase 3.76 ms (1280x800, decimation 2, ~1.2 ms CPU
