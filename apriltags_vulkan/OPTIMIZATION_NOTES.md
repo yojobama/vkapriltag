@@ -1603,7 +1603,7 @@ packed `(x,y)` also matched. Across the full 5-image corpus at decimations
 frame on the larger images) - **zero** genuine distinct-point ties. No
 shader change is warranted; this stays as-is.
 
-## 14. Rejected: drop `uf_merge`'s shared `wg_changed` + barriers for a read-guarded global atomicOr
+## 14. `uf_merge`'s shared `wg_changed` vs a read-guarded global atomicOr: device-gated, not rejected
 
 The convergence flag write in `uf_merge_body.glsl` aggregates in shared
 memory first (one atomic per workgroup, guarded by two barriers) rather
@@ -1633,15 +1633,43 @@ decimation 2, so the same guard that's sufficient at decimation 2 leaves
 enough concurrent races at decimation 1 for the global atomic to cost more
 than the two barriers it replaced.
 
-Rejected - decimation 1 is a normal, tested configuration (see
-`PERFORMANCE.md`'s own decimation sweep), not a corner case, and a change
-that trades a good result at one decimation for an **11% GPU-total
-regression** at another fails this campaign's own bar of "keep only if GPU
-total improves." Not committed. Would need re-measuring per-decimation
-(or gating on some other signal) to be worth reconsidering, and the shared-
-memory aggregation this would have replaced is unmeasured on Mali too - the
-Arm-best-practices rationale that motivated trying this may still apply
-there even though it does not transfer cleanly here.
+Initially rejected outright on this evidence alone - decimation 1 is a
+normal, tested configuration, and a change that trades a good result at
+one decimation for an **11% GPU-total regression** at another fails this
+campaign's own bar of "keep only if GPU total improves," with no signal
+available yet to gate it on.
+
+**Then measured on the Mali-G610 deployment target**, where the original
+motivating theory (no dedicated shared-memory scratchpad, so the
+barrier-based aggregation buys nothing there to begin with) is exactly the
+hardware fact that motivated trying this in the first place. ABBA-
+interleaved, 12 rounds x 300 iterations, 1280x800, against the same binary
+with the change reverted:
+
+| | GPU total |
+| --- | --- |
+| decimation 1 | **-3.0%** (12/12 rounds) |
+| decimation 2 | +0.5% (near noise, 5/12 rounds) |
+| decimation 4 | **-2.0%** (11/12 rounds) |
+
+Two of three decimations show a clear, unanimous-or-near-unanimous win;
+the third is a wash, not a loss. The mirror image of the RX 9060 XT
+result, and for the reason the original rationale predicted: RDNA has real
+dedicated LDS, so the barriers were cheap there and only got in the way of
+throughput once contention grew with pixel count; Mali has none, so
+removing them is a clear win once the frame is big enough for it to
+register.
+
+**Shipped as a `kMergeFlagMode` specialization constant** in
+`uf_merge_body.glsl` (constant ID 4, alongside `kFindMode`'s ID 3): mode 0
+is the original shared-memory aggregation, mode 1 is the read-guarded
+global atomicOr. Defaulted from `ctx_.caps().unified_memory` in
+`GpuDetector::CreatePipelines` - the **opposite** polarity from
+`find_mode`, since this is a case where the two device classes genuinely
+disagree and both directions needed to survive. Override with
+`APRILTAG_VK_MERGE_FLAG_MODE=0`/`=1` to re-A/B on new hardware. Bit-
+identical on both devices, across the 36-configuration matrix and with
+both modes forced explicitly.
 
 ## 15. Bounded, not attempted: enumerate active comparators directly in the sort
 

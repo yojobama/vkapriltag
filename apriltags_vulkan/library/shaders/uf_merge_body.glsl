@@ -160,15 +160,41 @@ bool doUnion(uint a, uint b) {
   return merged;
 }
 
+// kMergeFlagMode selects how the per-pixel "did anything merge" result
+// becomes the one global changed_flag write. Measured in opposite
+// directions on the two devices this has been tried on, so both stay:
+//
+//   0 = shared-memory aggregation (one atomicOr per WORKGROUP, guarded by
+//       two barriers either side of it). Cheap on hardware with real
+//       dedicated shared memory - see PERFORMANCE.md/OPTIMIZATION_NOTES.md
+//       for the RX 9060 XT numbers, where removing it cost 11% GPU total
+//       at decimation 1.
+//   1 = read-guarded global atomicOr per PIXEL, no shared memory or
+//       barriers at all (`if (merged && changed_flag == 0u)
+//       atomicOr(changed_flag, 1u)`). atomicOr is idempotent, so
+//       correctness is unconditional either way - the guard only bounds
+//       how many redundant atomics a race costs. Wins on Mali (no
+//       dedicated shared memory - Valhall backs `shared` with L2, so the
+//       barriers bought nothing there to begin with): -3.0% GPU total at
+//       decimation 1, neutral at decimation 2, unanimous either way.
+//
+// GpuDetector::CreatePipelines defaults this from ctx_.caps().unified_memory
+// - the same signal used for kFindMode, but in the OPPOSITE direction: mode
+// 1 wins specifically where there's no real shared-memory hardware to make
+// mode 0 cheap.
+layout(constant_id = 4) const uint kMergeFlagMode = 0u;
+
 void main() {
   uint x = gl_GlobalInvocationID.x;
   uint y = gl_GlobalInvocationID.y;
 
-  // NOTE: every invocation must reach both barriers below, so the bounds and
-  // "ambiguous pixel" tests select work rather than returning early.
-  if (gl_LocalInvocationID.x == 0u) wg_changed = 0u;
-  memoryBarrierShared();
-  barrier();
+  if (kMergeFlagMode == 0u) {
+    // NOTE: every invocation must reach both barriers below, so the bounds
+    // and "ambiguous pixel" tests select work rather than returning early.
+    if (gl_LocalInvocationID.x == 0u) wg_changed = 0u;
+    memoryBarrierShared();
+    barrier();
+  }
 
   bool merged = false;
   if (x < pc.width && y + 1u < pc.height) {
@@ -182,11 +208,15 @@ void main() {
     }
   }
 
-  if (merged) atomicOr(wg_changed, 1u);
-  memoryBarrierShared();
-  barrier();
+  if (kMergeFlagMode == 0u) {
+    if (merged) atomicOr(wg_changed, 1u);
+    memoryBarrierShared();
+    barrier();
 
-  if (gl_LocalInvocationID.x == 0u && wg_changed != 0u) {
+    if (gl_LocalInvocationID.x == 0u && wg_changed != 0u) {
+      atomicOr(changed_flag, 1u);
+    }
+  } else if (merged && changed_flag == 0u) {
     atomicOr(changed_flag, 1u);
   }
 }

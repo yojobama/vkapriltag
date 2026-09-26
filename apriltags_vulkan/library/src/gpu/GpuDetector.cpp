@@ -609,10 +609,24 @@ void GpuDetector::CreatePipelines() {
   if (const char *v = std::getenv("APRILTAG_VK_FIND_MODE")) {
     find_mode = (v[0] != '0') ? 1u : 0u;
   }
+  // Convergence-flag write mode (see uf_merge_body.glsl's own comment):
+  // 0 = shared-memory aggregation (cheap where dedicated shared memory
+  // exists), 1 = read-guarded global atomicOr (wins where it doesn't -
+  // Mali has no dedicated shared memory at all, backing `shared` with L2).
+  // Opposite polarity from find_mode: mode 1 is the unified-memory choice
+  // here. Measured -3.0% GPU total at decimation 1 on the Mali-G610,
+  // neutral at decimation 2, unanimous either way; measured a genuine
+  // regression on the RX 9060 XT at decimation 1 (+11.1%), so this one DOES
+  // still need the device gate that find_mode's own history showed isn't
+  // always warranted.
+  uint32_t merge_flag_mode = ctx_.caps().unified_memory ? 1u : 0u;
+  if (const char *v = std::getenv("APRILTAG_VK_MERGE_FLAG_MODE")) {
+    merge_flag_mode = (v[0] != '0') ? 1u : 0u;
+  }
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_merge", "uf_merge_u8")),
       {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8,
-      vk::WorkgroupSize{wg1d_.x, 1, 1}, {find_mode});
+      vk::WorkgroupSize{wg1d_.x, 1, 1}, {find_mode, merge_flag_mode});
   // Binding 1 / the third push constant are the convergence flag and the
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(
