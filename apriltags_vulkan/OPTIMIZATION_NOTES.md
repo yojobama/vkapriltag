@@ -1455,3 +1455,40 @@ directly (not just indirectly via matching the old baseline).
 
 Shipped on for this device. Not yet measured on Mali - do that before
 trusting the `unified_memory` gate's polarity rather than assuming it.
+
+## 11. Rejected: extents copy selection by lane instead of workgroup
+
+Only the scalar/int64-atomic `reduce_extents_hash` variants privatize the
+extents accumulator across `kExtentsCopies` (8) copies, keyed by
+`gl_WorkGroupID.x & 7`. **This is not the shader this device runs by
+default** - the RX 9060 XT has ballot + arithmetic + shuffle, so it takes
+`reduce_extents_hash_subgroup.comp` instead, which reduces per-key values
+across the whole subgroup before ever touching `extents[]` and has no
+privatized-copy scheme to change at all. The idea below only affects the
+`APRILTAG_VK_FORCE_NO_SUBGROUP=1` fallback path (or a device lacking one of
+the three subgroup capabilities).
+
+The hypothesis - following Futhark SC20's report of a 2-3x win from keying
+a privatized copy by lane rather than by workgroup - was that
+`gl_WorkGroupID.x & 7` lets every lane of a workgroup hitting the same blob
+collide on one copy, and that spreading them across copies by
+`gl_LocalInvocationID.x & 7` instead would relieve that.
+
+**Measured worse.** ABBA-interleaved, forced-scalar path
+(`APRILTAG_VK_FORCE_NO_SUBGROUP=1`), 16 rounds x 300 iterations, 1280x800,
+decimation 2: `extents` span **+11.8%**, lane-keyed slower in **16/16
+rounds** (unanimous, not noise); GPU total +1.6%.
+
+**Why it inverts here.** `blob_diff.comp`'s atomic append order gives
+boundary points from one blob strong index-locality - consecutive
+`gl_GlobalInvocationID.x` values dispatched to one workgroup tend to belong
+to the same blob for long stretches. Keying by workgroup lets an entire
+workgroup's worth of same-blob, same-copy atomics land on one address,
+which RDNA's atomic unit coalesces efficiently across the lanes of a wave;
+keying by lane instead scatters those same-blob lanes across all 8 copies
+(defeating that coalescing) while simultaneously making *unrelated* blobs
+processed by *different* workgroups collide on the *same* copy (since
+every workgroup's lane 0 always targets copy 0, regardless of which blob
+it's processing). Futhark's benchmark was presumably keyed data without
+this kind of run-length locality; it is not the shape this pipeline's
+`reduce_extents_hash` sees. Rejected - not committed.
