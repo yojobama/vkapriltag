@@ -1601,3 +1601,47 @@ total improves." Not committed. Would need re-measuring per-decimation
 memory aggregation this would have replaced is unmeasured on Mali too - the
 Arm-best-practices rationale that motivated trying this may still apply
 there even though it does not transfer cleanly here.
+
+## 15. Bounded, not attempted: enumerate active comparators directly in the sort
+
+The idea (from the research pass): `sort_points_local_body.glsl`'s
+innermost loop visits every `idx` in `[0, cap)` and guards on
+`(idx & p) == r`, so a direct enumeration that computes only the active
+comparator indices could in principle cut the loop's iteration count.
+
+Bounded first with a standalone Python simulation of the exact current
+schedule (not guessed - the schedule is reproduced round-for-round from
+the GLSL loop's own `p`/`q`/`r`/`d` update rule), before writing any GLSL,
+per this file's own stated method. Two things fell out of that:
+
+1. **A direct-enumeration formula was found and verified for the common
+   case.** Fixing bit `log2(p)` of `idx` to `r`'s value and letting `c` in
+   `[0, cap/2)` vary the rest (`idx = ((c >> log2p) << (log2p+1)) | r |
+   (c & (p-1))`) reproduces the guard-based active set exactly for every
+   `(p, d, r)` round the schedule visits, at every cap from 16 to 4096 -
+   *provided* the candidate is also filtered to `idx + d < cap`, since not
+   every bit-fixed index survives that bound.
+2. **The actual waste is much smaller than assumed, and has no clean
+   closed form.** The research pass that proposed this estimated ~40-43%
+   wasted iterations ("0.57-0.64x the warp executions"). Measuring the
+   *real* schedule instead: utilization is **78.8% at cap=16, rising to
+   87.2% at cap=4096** - i.e. only 13-22% of iterations are ever wasted,
+   not roughly half. Digging into why: the very first sub-round of every
+   `p`-block (`r == 0`) is **already 100% utilized** with no waste at all;
+   every bit of waste is concentrated in the later `r == p` sub-rounds
+   within a multi-step `p`-block, and *those* don't reduce to a single
+   formula the way the `r == 0` case does - the valid count depends on the
+   relationship between `d` and `p` in a way that would need its own,
+   separate derivation and its own separate verification.
+
+Given the realistic ceiling is on the order of 1-3% of GPU total (13-22%
+of only the compare-exchange body, itself a fraction of the `sort` span,
+itself ~10-15% of the frame) - smaller than this file's own earlier
+estimate - and a *sorting network* is exactly the kind of place where a
+subtly wrong comparator schedule corrupts output silently rather than
+crashing, this was not pursued further within this campaign's effort
+budget rather than ship a formula verified for only part of the schedule.
+Revisit if the `r == p, d != p` case gets its own closed-form derivation
+and its own from-scratch zero-one-principle verification, matching the
+rigor `PERFORMANCE.md`'s "The sort network" section already documents for
+the shipped odd-even mergesort itself.
