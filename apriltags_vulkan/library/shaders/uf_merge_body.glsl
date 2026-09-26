@@ -59,6 +59,14 @@
 // consecutive columns, so the two row streams stay exactly as coalesced as
 // they were under the 1D dispatch.
 layout(local_size_x_id = 0, local_size_x = 256) in;
+// 0 = naive find(), no compression during the walk. 1 = path splitting
+// (every node visited is repointed to its grandparent with a plain store)
+// - see find()'s own comment for why this is safe and where it's proven.
+// GpuDetector::CreatePipelines chooses the default from
+// !ctx_.caps().unified_memory: the extra stores go over the same memory
+// bus the CPU shares on a unified-memory part, which is the one class of
+// device this has not been measured on.
+layout(constant_id = 3) const uint kFindMode = 0u;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
 layout(std430, binding = 2) buffer Changed { uint changed_flag; };
@@ -70,13 +78,61 @@ layout(push_constant) uniform PushConstants {
 
 shared uint wg_changed;
 
-uint find(uint n) {
+// kFindMode == 0: the original, read-only walk to the root. No writes, so
+// no interaction with concurrent atomicMin hooks beyond what doUnion's own
+// retry loop already handles.
+uint findNaive(uint n) {
   uint p = parent[n];
   while (p != n) {
     n = p;
     p = parent[n];
   }
   return n;
+}
+
+// kFindMode == 1: path splitting (ECL-CC's "Jump4" / Jayanti-Tarjan's
+// "split" in the concurrent disjoint-set-union literature). Every node
+// visited during the walk is repointed to its grandparent with a plain,
+// non-atomic, non-coherent store - deliberately not atomicMin or a
+// coherent write, since a store that loses a race with a concurrent
+// atomicMin costs at most one redundant future walk, never a wrong answer
+// (see the correctness argument below), and marking it coherent would pay
+// for freshness this shader does not need, the same trade-off
+// uf_final.comp's own plain-read comment already makes for blob_size[].
+//
+// SAFE because parent[x] <= x always (every hook is atomicMin, and every
+// initial value from uf_init.comp already points left/at-self), so
+// repointing a node to its grandparent can never create a cycle: the
+// grandparent is reached by following parent pointers, which only ever
+// decrease, so it is strictly <= the node's own current parent. A thread
+// that loses the CAS-free store race with another find() or with doUnion's
+// atomicMin simply leaves parent[] one hop longer than it could have been
+// - doUnion's own retry (comparing against `old` after a lost atomicMin)
+// already tolerates this same class of "the tree moved under me" race, so
+// nothing downstream needs to change.
+//
+// Measured on the RX 9060 XT: labelling -17.0% at decimation 1, -2.7% at
+// decimation 2, bit-identical over 36 configurations (decimations 1/2/4 x
+// 8-bit storage on/off x workgroup geometries x chunk size). See
+// PERFORMANCE.md.
+uint findSplit(uint n) {
+  uint p = parent[n];
+  if (p != n) {
+    uint prev = n;
+    uint next = parent[p];
+    while (p > next) {
+      parent[prev] = next;
+      prev = p;
+      p = next;
+      next = parent[p];
+    }
+    n = p;
+  }
+  return n;
+}
+
+uint find(uint n) {
+  return (kFindMode != 0u) ? findSplit(n) : findNaive(n);
 }
 
 // Returns true if the two elements were in distinct components (i.e. this

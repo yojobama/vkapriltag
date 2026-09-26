@@ -584,10 +584,20 @@ void GpuDetector::CreatePipelines() {
   // dispatch. The shader needs x for its run-overlap test and recovering it
   // from a linear index would cost a runtime integer division, which Valhall
   // has no instruction for. See uf_merge_body.glsl.
+  // Path splitting in find() (see uf_merge_body.glsl's own comment):
+  // measured -17.0%/-2.7% labelling (decimation 1/2) on the RX 9060 XT,
+  // bit-identical. Defaulted on discrete/non-unified-memory devices only -
+  // the extra stores go over the same memory bus the CPU shares on a
+  // unified-memory part, which this has not been measured on. Override
+  // either way with APRILTAG_VK_FIND_MODE=0 (naive) or =1 (split).
+  uint32_t find_mode = ctx_.caps().unified_memory ? 0u : 1u;
+  if (const char *v = std::getenv("APRILTAG_VK_FIND_MODE")) {
+    find_mode = (v[0] != '0') ? 1u : 0u;
+  }
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_merge", "uf_merge_u8")),
       {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8,
-      vk::WorkgroupSize{wg1d_.x, 1, 1});
+      vk::WorkgroupSize{wg1d_.x, 1, 1}, {find_mode});
   // Binding 1 / the third push constant are the convergence flag and the
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(

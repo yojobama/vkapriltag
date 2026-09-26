@@ -1367,3 +1367,91 @@ Both rejected branches are kept, unmerged, as `perf/item3-uf-merge-vec` and
 `perf/item4-blob-diff-vec` off this branch's pre-item-9 commit, per this
 document's own convention of recording what was tried rather than only what
 shipped.
+
+---
+
+# A fourth pass: an RX 9060 XT-only campaign, no Mali access
+
+Everything in this pass was measured **only on a Windows desktop, AMD Radeon
+RX 9060 XT (RDNA4, discrete, Vulkan 1.4)** - the Mali-G610 deployment target
+was unavailable for this campaign. Every item below is gated so the Mali
+path is either unaffected (a device-capability check picks the old
+behaviour there) or, where no such check exists yet, explicitly flagged as
+unmeasured on that device and worth an ABBA pass before being trusted there.
+
+Baseline for this pass is the third pass's end state plus the
+`VK_EXT_conditional_rendering` predication documented in `PERFORMANCE.md`'s
+"Closing the RDNA4 fallback" section, which this pass's first item builds on
+directly.
+
+## 10. Path splitting in `uf_merge`'s `find()`
+
+`find()` used to walk to the root read-only, with all compression left to
+the separate `uf_compress` pass between merge iterations. Within a single
+`uf_merge` pass, though, a thread whose walk crosses a root some other
+thread just hooked re-walks the same chain another thread already paid for.
+
+The fix - "path splitting" in Jayanti & Tarjan's concurrent disjoint-set-
+union taxonomy, the same technique ECL-CC calls "Jump4" - repoints every
+node visited during the walk to its grandparent with a plain, non-atomic
+store:
+
+```glsl
+uint findSplit(uint n) {
+  uint p = parent[n];
+  if (p != n) {
+    uint prev = n;
+    uint next = parent[p];
+    while (p > next) {
+      parent[prev] = next;
+      prev = p;
+      p = next;
+      next = parent[p];
+    }
+    n = p;
+  }
+  return n;
+}
+```
+
+**Why it's safe.** `parent[x] <= x` always (every hook is `atomicMin`, and
+`uf_init.comp`'s initial values already point left or at self), so
+repointing a node to its grandparent can never create a cycle - the
+grandparent is reached by following parent pointers, which only ever
+decrease. A thread that loses the race against a concurrent `atomicMin` or
+another `find()`'s own splitting store just leaves `parent[]` one hop
+longer than it could have been; `doUnion`'s existing retry (comparing
+against `old` after a lost `atomicMin`) already tolerates exactly this
+class of "the tree moved under me" race, so nothing downstream changes.
+Marking the store `coherent` was deliberately rejected: it would pay for a
+freshness this shader does not need, the same trade-off `uf_final.comp`'s
+plain read of `blob_size[]` already documents.
+
+Gated behind a `kFindMode` specialization constant (`uf_merge_body.glsl`),
+defaulted from `!ctx_.caps().unified_memory` in `GpuDetector::CreatePipelines`
+- on by default on this discrete card, off by default on any unified-memory
+part (Mali included) until measured there, since the extra stores share the
+same memory bus the CPU uses on those parts. Override either way with
+`APRILTAG_VK_FIND_MODE=0` (naive) or `=1` (split).
+
+Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800, on top of item 9's `HostVisibleCached` change (see
+`PERFORMANCE.md`):
+
+| | `labelling` | GPU total |
+| --- | --- | --- |
+| decimation 1 | **-16.5%** (16/16 rounds) | **-4.0%** (16/16 rounds) |
+| decimation 2 | -2.8% (15/16 rounds) | -0.7% (11/16, near noise) |
+
+Consistent in direction and magnitude with an earlier same-session
+measurement taken *before* the `HostVisibleCached` change landed (-17.0%/
+-2.7% labelling at decimation 1/2), confirming the two changes compose
+without interfering.
+
+Bit-identical over 36 configurations (decimations 1/2/4 x 8-bit storage
+on/off x workgroup geometries auto/2x2/6x6 x chunk size 1/default), and
+`APRILTAG_VK_FIND_MODE=0` vs `=1` produce byte-identical `work:` lines
+directly (not just indirectly via matching the old baseline).
+
+Shipped on for this device. Not yet measured on Mali - do that before
+trusting the `unified_memory` gate's polarity rather than assuming it.
