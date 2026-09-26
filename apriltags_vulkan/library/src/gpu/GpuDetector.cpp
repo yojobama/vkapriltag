@@ -355,9 +355,28 @@ void GpuDetector::CreateBuffers() {
   // num_selected_blobs on the host, which is exactly the readback that used
   // to force a mid-frame SubmitAndWait. Reading in place removes the last
   // host dependency in the frame's tail; see fused_submits_.
+  //
+  // HostVisibleCached rather than DeviceLocalReadback: the latter REQUIRES
+  // device-local, which on a discrete card without a cached BAR type (no
+  // memory type is both DEVICE_LOCAL and HOST_CACHED on an RX 9060 XT -
+  // verified via vulkaninfo's raw memory-type dump) falls back to plain
+  // DeviceLocal, i.e. the staged path, keeping fused_submits_ permanently
+  // false there. HostVisibleCached drops the device-local requirement (kept
+  // only as a preference), so it lands on the device's host-cached system-
+  // RAM type instead where no device-local+cached type exists, and on a
+  // unified-memory part it still lands on the same ideal device-local +
+  // host-visible + cached type DeviceLocalReadback would have found (the
+  // "want" bitmask check only requires the bits it asks for, not an exact
+  // match) - so this is not a Mali/RDNA fork, one kind serves both. The
+  // trade this exposes on a discrete card: these buffers are also WRITTEN
+  // by GPU shaders every frame (select_blobs.comp, sort_points_local.comp),
+  // so moving them off the BAR/VRAM heap onto system RAM could slow those
+  // writes even as it removes the submission overhead fused_submits_
+  // exists to cut - see PERFORMANCE.md section 3c/8 for the two device
+  // measurements this was A/B'd against before shipping.
   {
     vk::Buffer b(ctx_, VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu), kSsboUsage,
-                 vk::MemoryKind::DeviceLocalReadback);
+                 vk::MemoryKind::HostVisibleCached);
     device_bytes_ += b.size();
     selected_extents_buf_ = std::move(b);
   }
@@ -380,9 +399,11 @@ void GpuDetector::CreateBuffers() {
   // slower than the copy it would replace (Buffer.h records a measured 4x on
   // Mali for exactly that mistake). Discrete parts without resizable BAR
   // fall back to DeviceLocal and keep the staging path.
+  // See selected_extents_buf_'s comment just above for why this is
+  // HostVisibleCached rather than DeviceLocalReadback.
   {
     vk::Buffer b(ctx_, VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint), kSsboUsage,
-                 vk::MemoryKind::DeviceLocalReadback);
+                 vk::MemoryKind::HostVisibleCached);
     device_bytes_ += b.size();
     line_fit_points_buf_ = std::move(b);
   }

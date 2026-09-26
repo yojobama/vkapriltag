@@ -289,9 +289,9 @@ and roughly fixed, so it is a bigger share of a shorter frame.
 
 **Requires both readbacks to be direct**, i.e. a memory type that is both
 host-visible and host-cached, which is what unified-memory parts give. A
-discrete card without resizable BAR keeps the four-submit path, and the
-RX 9060 XT here does exactly that - it is the fallback that stays verified,
-not a dead branch.
+discrete card without resizable BAR used to keep the four-submit path here,
+and the RX 9060 XT was exactly that case - see "Closing the RDNA4 fallback"
+below for why it no longer is.
 
 ### The last boundary: closed
 
@@ -322,10 +322,56 @@ scheduler real work to overlap it with, exposing the race.
 
 Measured on the Mali-G610 against the state with the earlier two boundaries
 already closed: GPU total -0.7% (decimation 1) to -5.2% (decimation 4). On
-the RX 9060 XT it measures as noise - the fused path never engages there
-(no host-cached readback memory type), so this exercises only the unfused
-path's refactor, which is bit-identical and performance-neutral by
-construction.
+the RX 9060 XT it used to measure as noise - the fused path never engaged
+there - but see the next section for why that changed.
+
+### Closing the RDNA4 fallback: `HostVisibleCached` instead of `DeviceLocalReadback`
+
+The fallback above assumed the fused path needed a memory type that is
+`DEVICE_LOCAL` *and* host-cached, and a discrete card without resizable BAR
+has no such type - confirmed directly from a raw `vulkaninfo` memory-type
+dump on the RX 9060 XT (AMD proprietary driver 26.8.1): the resizable-BAR
+heap (`DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) is explicitly
+`DEVICE_UNCACHED_AMD`, and the only host-cached type
+(`HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`) is plain system RAM, not
+device-local.
+
+`selected_extents_buf_` and `line_fit_points_buf_` were allocated with
+`vk::MemoryKind::DeviceLocalReadback`, which *requires* `DEVICE_LOCAL` and
+only prefers host-cached - so on this device it fell back to the
+uncached BAR type, `extents_direct_read_`/`linefit_direct_read_` came back
+false, and `fused_submits_` stayed permanently off. Switching both buffers
+to `vk::MemoryKind::HostVisibleCached` - which requires only `HOST_VISIBLE`
+and prefers `HOST_CACHED`, with no device-local requirement - lands them on
+the host-cached system-RAM type instead, at the cost of every GPU-side write
+to them (`select_blobs.comp`, `sort_points_local.comp`) now crossing PCIe
+rather than staying in VRAM. It is not a Mali/RDNA fork: on a unified-memory
+part the same request still finds the single ideal device-local +
+host-visible + cached type, since the "required" bits are a subset check,
+not an exact match, so nothing changes there.
+
+Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800:
+
+| | GPU total (median) | `extents` span | `sort` span |
+| --- | --- | --- | --- |
+| decimation 1 | **-19.8%** (16/16 rounds) | not separately measured | not separately measured |
+| decimation 2 | **-21.3%** (16/16 rounds) | +101% (0.032 -> 0.064 ms) | +6.3% (0.127 -> 0.135 ms) |
+
+The write-side cost is real and exactly where expected - `extents` roughly
+doubles and `sort` picks up a smaller penalty - but both are a few hundredths
+of a millisecond against a ~0.9 ms frame, and the three submission
+boundaries this removes are worth far more: about 0.19 ms, well above the
+~42 us empty-submit-round-trip figure this file quotes elsewhere, because a
+real submission also drains in-flight work rather than firing on an idle
+queue. Net: a clear win, larger than `OPTIMIZATION_NOTES.md`'s own >=0.13 ms
+estimate for this change.
+
+Bit-identical over 36 configurations (decimations 1/2/4 x
+`APRILTAG_VK_FORCE_NO_8BIT` on/off x workgroup geometries auto/2x2/6x6 x
+`APRILTAG_VK_UF_CHUNK` 1/default) - the only observable difference is
+`submits` dropping from 4 to 1, which is the point of the change, not a
+side effect of it.
 
 ### The sort network: Batcher's odd-even mergesort
 
