@@ -1,21 +1,41 @@
 # Research summary — all eight categories
 
-> **Update, 2026-09-27: Tier 1 and part of Tier 2 measured on the RX 9060 XT**,
-> on branch `perf/rdna4-pass` (`main` untouched). See
-> `apriltags_vulkan/OPTIMIZATION_NOTES.md`'s "fourth pass" and items 11-16 for
-> full writeups. Summary: **A1 and B1 shipped with large wins** (−4% and
-> −20 to −27% GPU total respectively, and they compose). **A2 shipped
-> neutral** (aimed at Mali; nil-to-mixed here). **A6, A9, A13, A14 measured
-> and rejected or ruled unnecessary** - notably, three independent
-> contention-mitigation ideas for the extents stage (lane-based copy
-> selection, struct padding, and a barrier-removal change to `uf_merge`'s
-> convergence flag) all lost, and one important scope correction: **this
-> device runs the subgroup-aggregated `reduce_extents_hash` variant by
-> default**, so several planned items (lane selection, `gx_sum`/`gy_sum`
-> packing) only ever applied to the non-default scalar fallback. A3 (sort
-> comparator enumeration) was bounded but not attempted - the real waste is
-> 13-22%, not the ~40% estimated below, and no safe closed-form formula fell
-> out for every round within budget. Nothing has been run on Mali.
+> **Update, 2026-09-27: now measured on BOTH the RX 9060 XT and the actual
+> Mali-G610 deployment target** (Orange Pi 5 Plus, Armbian 26.8.2, libmali
+> g24p0), on branch `perf/rdna4-pass` (`main` untouched, pushed to
+> `origin`). See `apriltags_vulkan/OPTIMIZATION_NOTES.md`'s "fourth pass" and
+> items 11-16 for full writeups.
+>
+> **Shipped, confirmed on both devices:**
+> - **B1 (`HostVisibleCached`, was gated as RDNA-only):** −20 to −27% GPU
+>   total on the RX 9060 XT. Neutral-by-construction on Mali (already had a
+>   cached readback type; `submits=1` either way).
+> - **A1 (path-splitting `find()`):** originally gated off on unified-memory
+>   devices. Measured on Mali too: labelling −1.7%/−3.2%, GPU total
+>   −0.6%/−0.9% (d1/d2), unanimous. The "shares the CPU's memory bus" theory
+>   didn't hold - **the gate was removed, this is now unconditional.**
+> - **A2 (127-pixel skip, aimed at Mali all along):** confirmed there -
+>   `uf_final` −12 to −31%, `label_pixels` −12 to −23%, GPU total −2.1% to
+>   −3.4%, unanimous. The RX 9060 XT's neutral result was real but
+>   device-specific (both spans too small to matter there); shipping on the
+>   Mali estimate alone was the right call.
+> - **The `uf_merge` convergence-flag write (was rejected on RX 9060 XT
+>   alone):** re-measured on Mali, where the motivating rationale (no
+>   dedicated shared memory) actually applies. GPU total −2.0% to −3.0% at
+>   two of three decimations, neutral at the third, unanimous. **Un-rejected
+>   and shipped as a second `unified_memory`-gated mode**, opposite polarity
+>   from A1 - the two device classes genuinely disagree here and both
+>   directions are kept.
+>
+> **Rejected on both devices, now a general finding, not an RDNA quirk:**
+> lane-based extents copy selection (+11.8% RX 9060 XT forced-scalar path,
+> +5.4% Mali, where scalar/atomic64 is the *only* path since integrated GPUs
+> never take the subgroup variant). The mechanism is `blob_diff`'s own
+> append-order locality, not anything architecture-specific.
+>
+> **Not yet re-tested on Mali:** the extents struct padding rejection (A6a)
+> and the deferred sort comparator enumeration (A3, real waste measured at
+> 13-22%, not the ~40% estimated below).
 
 Merged 2026-09-26 from the `## Conclusions` of `01`–`08` (219 source entries
 in total). Each item cites the category file where its evidence lives.
