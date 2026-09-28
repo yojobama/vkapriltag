@@ -1786,7 +1786,18 @@ on the RX 9060 XT, not contention-bound, so relieving contention has
 nothing to reclaim - the same shape of finding
 `PERFORMANCE.md` section 3a already made for Mali's own `extents`/`sort`
 spans (atomic- and latency-bound there, immune to a 4x memory-clock
-sweep), just for a different mechanism. Not committed.
+sweep), just for a different mechanism.
+
+**Re-tested on the Mali-G610** (this device DOES take the scalar/atomic64
+path unconditionally, unlike the RX 9060 XT where this only affected the
+forced-scalar fallback), ABBA-interleaved, 12 rounds x 300 iterations,
+1280x800, decimation 2: GPU total **-1.6%** median paired, but padded
+faster in only **6/12 rounds** - a coin flip, not a direction. Unlike the
+RX 9060 XT's clean, unanimous regression, Mali shows no clear effect
+either way. Doesn't overturn the rejection (no evidence of a win to set
+against RDNA's clear loss), but it's a different, weaker finding than
+"regresses on both devices" would have been - recorded as such rather
+than folded into the RDNA result. Not committed on either device.
 
 ## 17. Pack `gx_sum`/`gy_sum` into one biased 64-bit atomic
 
