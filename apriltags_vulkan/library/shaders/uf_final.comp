@@ -1,30 +1,11 @@
 #version 450
-// Saturating per-blob pixel counter indexed by root label. Run after the union
-// find has converged and blob_size has been zeroed.
-//
-// Increments stop once blob_size[r] reaches min_blob_pixels, so the stored value
-// is exact only below that floor, but `blob_size[r] >= min_blob_pixels` holds
-// exactly when the true count reaches it. The array is not a histogram; its
-// only reader is label_pixels.comp. The plain read races with other atomicAdds
-// but can only return a stale value <= the true count, which costs an extra
-// atomicAdd and never a wrong result, so the buffer is not marked coherent.
-layout(local_size_x_id = 0, local_size_x = 256) in;
+// 32-bit-per-pixel Thresholded - the always-safe default. See
+// uf_final_body.glsl for the shader itself, and uf_final_u8.comp for the
+// variant GpuDetector picks on devices with storageBuffer8BitAccess.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
 
-layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
-layout(std430, binding = 1) buffer BlobSize { uint blob_size[]; };
+layout(std430, binding = 2) readonly buffer Thresholded { uint thresholded[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
 
-layout(push_constant) uniform PushConstants {
-  uint width;
-  uint height;
-  // Must equal label_pixels.comp's min_blob_pixels.
-  uint min_blob_pixels;
-} pc;
-
-void main() {
-  uint i = gl_GlobalInvocationID.x;
-  uint total = pc.width * pc.height;
-  if (i >= total) return;
-  uint r = parent[i];
-  if (blob_size[r] >= pc.min_blob_pixels) return;
-  atomicAdd(blob_size[r], 1u);
-}
+#include "uf_final_body.glsl"

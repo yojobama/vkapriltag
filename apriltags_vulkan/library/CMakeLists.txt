@@ -49,6 +49,7 @@ set(SHADER_SOURCES
   shaders/uf_merge_u8.comp
   shaders/uf_compress.comp
   shaders/uf_final.comp
+  shaders/uf_final_u8.comp
   shaders/label_pixels.comp
   shaders/label_pixels_u8.comp
   shaders/blob_diff.comp

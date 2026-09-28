@@ -72,6 +72,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
 | `APRILTAG_VK_FORCE_NO_8BIT=1` | Force the 32-bit-per-pixel shader variants even where `VK_KHR_8bit_storage` is available. |
 | `APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1` | Force the 32-bit-atomic extents reduction even where `VK_KHR_shader_atomic_int64` is available. See section 3b. |
+| `APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING=1` | Skip converged `uf_compress` passes with the in-shader guard even where `VK_EXT_conditional_rendering` is available. See section 6c. |
 | `APRILTAG_VK_FUSE_SUBMITS=0` | Keep the four-submit frame even where the tail could be recorded as one. See section 3c. |
 | `APRILTAG_VK_WG2D=<w>x<h>` | Override the 2D workgroup size. |
 | `APRILTAG_VK_TIMESTAMPS=1` | Emit the per-dispatch GPU timestamp-span breakdown. |
@@ -288,9 +289,9 @@ and roughly fixed, so it is a bigger share of a shorter frame.
 
 **Requires both readbacks to be direct**, i.e. a memory type that is both
 host-visible and host-cached, which is what unified-memory parts give. A
-discrete card without resizable BAR keeps the four-submit path, and the
-RX 9060 XT here does exactly that - it is the fallback that stays verified,
-not a dead branch.
+discrete card without resizable BAR used to keep the four-submit path here,
+and the RX 9060 XT was exactly that case - see "Closing the RDNA4 fallback"
+below for why it no longer is.
 
 ### The last boundary: closed
 
@@ -321,10 +322,56 @@ scheduler real work to overlap it with, exposing the race.
 
 Measured on the Mali-G610 against the state with the earlier two boundaries
 already closed: GPU total -0.7% (decimation 1) to -5.2% (decimation 4). On
-the RX 9060 XT it measures as noise - the fused path never engages there
-(no host-cached readback memory type), so this exercises only the unfused
-path's refactor, which is bit-identical and performance-neutral by
-construction.
+the RX 9060 XT it used to measure as noise - the fused path never engaged
+there - but see the next section for why that changed.
+
+### Closing the RDNA4 fallback: `HostVisibleCached` instead of `DeviceLocalReadback`
+
+The fallback above assumed the fused path needed a memory type that is
+`DEVICE_LOCAL` *and* host-cached, and a discrete card without resizable BAR
+has no such type - confirmed directly from a raw `vulkaninfo` memory-type
+dump on the RX 9060 XT (AMD proprietary driver 26.8.1): the resizable-BAR
+heap (`DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`) is explicitly
+`DEVICE_UNCACHED_AMD`, and the only host-cached type
+(`HOST_VISIBLE | HOST_COHERENT | HOST_CACHED`) is plain system RAM, not
+device-local.
+
+`selected_extents_buf_` and `line_fit_points_buf_` were allocated with
+`vk::MemoryKind::DeviceLocalReadback`, which *requires* `DEVICE_LOCAL` and
+only prefers host-cached - so on this device it fell back to the
+uncached BAR type, `extents_direct_read_`/`linefit_direct_read_` came back
+false, and `fused_submits_` stayed permanently off. Switching both buffers
+to `vk::MemoryKind::HostVisibleCached` - which requires only `HOST_VISIBLE`
+and prefers `HOST_CACHED`, with no device-local requirement - lands them on
+the host-cached system-RAM type instead, at the cost of every GPU-side write
+to them (`select_blobs.comp`, `sort_points_local.comp`) now crossing PCIe
+rather than staying in VRAM. It is not a Mali/RDNA fork: on a unified-memory
+part the same request still finds the single ideal device-local +
+host-visible + cached type, since the "required" bits are a subset check,
+not an exact match, so nothing changes there.
+
+Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800:
+
+| | GPU total (median) | `extents` span | `sort` span |
+| --- | --- | --- | --- |
+| decimation 1 | **-19.8%** (16/16 rounds) | not separately measured | not separately measured |
+| decimation 2 | **-21.3%** (16/16 rounds) | +101% (0.032 -> 0.064 ms) | +6.3% (0.127 -> 0.135 ms) |
+
+The write-side cost is real and exactly where expected - `extents` roughly
+doubles and `sort` picks up a smaller penalty - but both are a few hundredths
+of a millisecond against a ~0.9 ms frame, and the three submission
+boundaries this removes are worth far more: about 0.19 ms, well above the
+~42 us empty-submit-round-trip figure this file quotes elsewhere, because a
+real submission also drains in-flight work rather than firing on an idle
+queue. Net: a clear win, larger than `OPTIMIZATION_NOTES.md`'s own >=0.13 ms
+estimate for this change.
+
+Bit-identical over 36 configurations (decimations 1/2/4 x
+`APRILTAG_VK_FORCE_NO_8BIT` on/off x workgroup geometries auto/2x2/6x6 x
+`APRILTAG_VK_UF_CHUNK` 1/default) - the only observable difference is
+`submits` dropping from 4 to 1, which is the point of the change, not a
+side effect of it.
 
 ### The sort network: Batcher's odd-even mergesort
 
@@ -591,6 +638,41 @@ load. Closing that gap needs `vkCmdDispatchIndirect` with a device-computed
 group count of zero, which costs an extra dispatch and barrier — and on Mali
 a barrier is 2.6-18.7 us against the ~30 us remaining, so it is not obviously
 positive. Not attempted.
+
+**Where `VK_EXT_conditional_rendering` exists, the dispatch is now skipped
+outright** - no extra dispatch and no extra barrier. The predicate is
+`uf_changed_buf_` itself, and the merge's existing barrier just names the
+conditional-rendering stage too. The Mali-G610 does not expose the
+extension, so there the in-shader guard above is still what runs. Only the
+*last* compression of each chunk is predicated: every earlier one reads a
+flag that has been accumulating since the previous clear, which is nonzero
+in practice, and a predicate that never skips is not free. Predicating
+every iteration measured **+5.3% `labelling` at `APRILTAG_VK_UF_CHUNK=8`**
+(slower in 10 of 12 rounds) before it was narrowed.
+
+Measured on the RX 9060 XT (four-submit path), A/B'd on one binary with
+`APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING`, ABBA-interleaved, 16 rounds of
+300 iterations, 1280x800. Figures are the median per-round paired delta of
+each run's median `labelling` span:
+
+| | `labelling` | GPU total |
+| --- | --- | --- |
+| decimation 1 | **-3.0%** (15/16 rounds) | -0.6% (10/16, noise) |
+| decimation 1, chunk 1 | **-3.0%** (16/16) | -0.9% (14/16) |
+| decimation 2 | -1.1% (12/16) | -0.4% (10/16, noise) |
+| decimation 2, chunk 8 | -0.6% (10/16, noise) | 0.0% |
+
+That is on top of the in-shader guard, not instead of it. GPU total barely
+moves because this path is dominated by its submit round trips. Bit-identical
+over decimations 1/2/4, `APRILTAG_VK_FORCE_NO_8BIT` on and off, workgroup
+geometries auto/8x8/32x8/2x2/6x6 and `APRILTAG_VK_UF_CHUNK` 1 and the
+default. Clean under `VK_LAYER_KHRONOS_validation` with synchronization
+validation. That last point says less than it looks like, though: a
+deliberately broken build that dropped the predicate stage from the merge's
+barrier was *also* reported clean, so the layer does not model the
+predicate read, and that barrier rests on the spec rather than on the tool.
+The single-submit path with the extension (a unified-memory desktop part)
+has not been run - no such device was available.
 
 Verified launch geometries (all produce identical detections):
 

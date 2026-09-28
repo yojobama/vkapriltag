@@ -1,44 +1,95 @@
-// Shared body for sort_points_local.comp / sort_points_local_u8.comp; the
-// wrapper declares DecimatedImage and a DECIMATED_AT(i) accessor before
-// including this.
+// Shared body for sort_points_local.comp / sort_points_local_u8.comp. The
+// two differ only in DecimatedImage's element type (uint vs uint8_t, see
+// decimate_u8.comp's comment on why that variant exists) - the wrapper
+// #including this file declares DecimatedImage itself and a DECIMATED_AT(i)
+// accessor macro before this point, so everything below is written against
+// the macro and never mentions the buffer's actual type.
 //
-// Sorts each selected blob's points by theta_key (angle around the centroid),
-// one workgroup per blob, within its contiguous range [base, base + count). The
-// sorting network runs over kLocalCap virtual slots strided across the
-// workgroup's threads.
+// Sorts each selected blob's points into ascending angular order around its
+// centroid, one workgroup per blob. rewrite_index_points.comp already packed
+// every blob's points into one contiguous range [base, base+count) of the
+// input array, so this needs no composite key at all - only theta_key, and
+// only within the blob's own range. That replaces what used to be a single
+// flat radix/bitonic sort across every selected blob's points combined
+// (which needed a (blob_index, theta) composite key purely to keep
+// different blobs' points from interleaving).
 //
-// A blob with more than kLocalCap points is emitted unsorted and counted in
-// OversizedBlobs (DetectProfile::oversized_sort_blobs).
+// The sorting network (Batcher's odd-even mergesort, see its own comment
+// below - a bitonic network until this change) operates over kLocalCap
+// virtual slots, independent of gl_WorkGroupSize.x: each thread owns
+// kLocalCap/gl_WorkGroupSize.x slots in
+// a strided pattern (idx = tid, tid+threads, tid+2*threads, ...), so the
+// per-blob capacity can be sized from the shared-memory budget alone rather
+// than being capped at the workgroup's thread count. This matters because
+// real blobs (e.g. a large tag's own border) can comfortably exceed the
+// device's max workgroup invocation count while still fitting in shared
+// memory.
 //
-// Each output RawLineFitPoint is computed directly from the point that lands at
-// that sorted position.
+// Blobs whose point count exceeds kLocalCap fall back to processing points
+// in their original (unsorted) order: no lost points and no crash, but that
+// blob's points aren't angularly resorted, and FitQuadForBlob consumes them
+// as an ordered walk around the perimeter - so such a blob yields a
+// geometrically meaningless quad rather than a slightly worse one. A tag
+// whose own border lands here stops being detectable at all, which is
+// exactly what happened at decimation 1 before the ceiling was made to
+// scale with decimation (see local_sort_virtual_cap_ in GpuDetector.cpp).
+// Because the failure is silent and total rather than gradual, each blob
+// that takes this path bumps OversizedBlobs below, surfaced as
+// DetectProfile::oversized_sort_blobs. A handful per frame is normal (large
+// background structures that clear select_blobs.comp's filters and then fit
+// junk quads that harmlessly fail to decode); the counter earns its keep
+// when an expected tag goes missing, which is otherwise invisible.
+// select_blobs.comp's shape/size filters do not bound point count, so this
+// path is reached by ordinary scenes rather than only pathological ones -
+// what the cap has to guarantee is headroom above a real *tag* border at
+// the configured decimation, which is why it is derived from decimation
+// rather than being a flat constant.
+//
+// Fused with the line-fit moment computation (formerly a separate
+// compute_line_fit_points.comp dispatch reading this shader's sorted
+// output): once a blob's points are in final order, each thread already
+// knows exactly which source point lands at its output position, so it can
+// sample the decimated image and write the RawLineFitPoint itself instead
+// of writing an intermediate sorted IPoint for a second dispatch to re-read.
+// That retires a whole 2-3 MB buffer (index_points_sorted_buf_) and its
+// read/write traffic.
 layout(local_size_x_id = 0, local_size_x = 256) in;
-// Virtual per-blob capacity, derived from the shared-memory budget (one word
-// per point); see local_sort_virtual_cap_ in GpuDetector.cpp.
+// Virtual per-blob element capacity, decoupled from the workgroup's thread
+// count and derived from the device's shared memory budget (1 word/point -
+// key and local index packed together, see kLocalIndexBits below) - see
+// local_sort_virtual_cap_ in GpuDetector.cpp.
 layout(constant_id = 3) const uint kLocalCap = 1024;
 
 layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 2) readonly buffer Src { IPoint src[]; };
 layout(std430, binding = 4) writeonly buffer Output { RawLineFitPoint output_points[]; };
-// Incremented once per blob that exceeds kLocalCap.
+// One atomic bump per blob that overflows kLocalCap - see the header comment.
 layout(std430, binding = 5) buffer OversizedBlobs { uint oversized_blobs; };
-// Point count read from this buffer when count_from_buffer is set, else from
-// the push constant.
+// DEVICE-SIDE COUNT. `count` is a boundary-point total that only exists on
+// the GPU until the host reads it back, and that readback is what forced a
+// mid-frame SubmitAndWait. Taking the bound from a buffer instead lets this
+// dispatch be issued indirectly in the same submission that produced the
+// count - see GpuDetector's fused_submits_ and build_indirect_args.comp. The
+// push constant is kept as the fallback for the unfused path, selected by
+// `count_from_buffer`.
 layout(std430, binding = 6) readonly buffer CountBuf { uint count_buf; };
 
 layout(push_constant) uniform PushConstants {
   uint num_selected_blobs;
   uint count_from_buffer;
-  // select_blobs.comp's counter can exceed max_blobs, so the device-side bound
-  // clamps to it.
+  // select_blobs.comp's counter is the number that PASSED the filters, which
+  // can exceed max_blobs; it drops the overflow to stay inside the output
+  // buffer, so the device-side bound has to clamp the same way the host did.
   uint max_blobs;
   int decimated_width;
   int decimated_height;
 } pc;
 
-// TransformLineFitPoint's gradient-weight computation; emits x2, y2, W and
-// blob_index (see RawLineFitPoint in common.glsl).
+// TransformLineFitPoint's gradient-weight computation (formerly
+// compute_line_fit_points.comp's entire body). Mx/My/Mxx/Mxy/Myy are all
+// exact functions of (x2, y2, W), so only those three plus blob_index are
+// emitted - see RawLineFitPoint's own comment in common.glsl.
 RawLineFitPoint ComputeLineFitPoint(IPoint p) {
   int ix2 = int(UnpackX(p.xy)) + 1;
   int iy2 = int(UnpackY(p.xy)) + 1;
@@ -60,8 +111,20 @@ RawLineFitPoint ComputeLineFitPoint(IPoint p) {
   return out_pt;
 }
 
-// Key (high 20 bits) and local index (low 12) share one word, so comparing
-// packed values sorts by key. kLocalCap is at most 4096.
+// theta_key (scatter_index_points.comp) is scaled to fit 20 bits and
+// kLocalCap is capped at 4096 (12 bits), so key and local index share one
+// word - key in the high 20 bits, index in the low 12 - instead of two
+// separate arrays. Comparing packed values directly still sorts by key
+// first (it occupies the high bits), with the index as an incidental,
+// harmless tiebreaker; this halves the network's shared-memory footprint
+// and its per-compare traffic (one load/store pair instead of two).
+//
+// 12 rather than 11 bits because a blob's perimeter, in decimated points,
+// scales as 1/decimation: the ~1200-point border of a 1080p tag at
+// decimation 2 becomes ~2400 at decimation 1, which overflowed the old
+// 2048-slot ceiling and silently took the unsorted fallback below - see the
+// host's local_sort_virtual_cap_ derivation, which only requests the larger
+// ceiling for the decimations that actually need it.
 const uint kLocalIndexBits = 12u;
 const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
 
@@ -78,7 +141,8 @@ void main() {
   uint base = blob_point_offsets[blob] - count;
 
   if (count > kLocalCap) {
-    // One bump per blob, not per point.
+    // One bump per blob, not per point: this counts candidates that came out
+    // unsorted, which is the number a caller can act on.
     if (tid == 0u) atomicAdd(oversized_blobs, 1u);
     for (uint idx = tid; idx < count; idx += threads) {
       output_points[base + idx] = ComputeLineFitPoint(src[base + idx]);
@@ -86,8 +150,9 @@ void main() {
     return;
   }
 
-  // Size the network to this blob. count is workgroup-uniform, so every barrier
-  // is reached by all invocations.
+  // Size the network to THIS blob, not to kLocalCap. `count` is uniform across
+  // the workgroup, so `cap` (and log2_cap) are too, and every barrier below is
+  // still reached by every invocation.
   uint cap = 1u;
   uint log2_cap = 0u;
   while (cap < count) {
@@ -102,25 +167,66 @@ void main() {
   memoryBarrierShared();
   barrier();
 
-  // Batcher's odd-even mergesort over the padded `cap` slots: a fixed comparator
-  // schedule depending only on cap, in log2(cap)*(log2(cap)+1)/2 barrier rounds.
-  // q >= p always, so q - p never wraps.
+  // Batcher's odd-even mergesort over the same padded `cap` slots the
+  // bitonic network above used to run over - same fixed-comparator-network
+  // contract (a schedule of index pairs that depends only on `cap`, never on
+  // the data), same number of barrier-synchronized rounds for a given `cap`
+  // (log2(cap)*(log2(cap)+1)/2, identical to the bitonic network above - the
+  // two networks differ only in how many index pairs compare in each round,
+  // not in synchronization cost), but ~13-21% fewer total compare-exchanges
+  // across the cap range this shader actually sees (16..4096). This exact
+  // (p, q, r, d) schedule - the standard iterative Batcher construction - was
+  // proven correct standalone before being ported here: the zero-one
+  // principle (a comparator network sorts every input iff it sorts every
+  // 0/1 input - Knuth TAOCP Vol 3) was checked exhaustively for cap = 8 and
+  // 16 (all 2^cap binary sequences), cross-checked against true brute-force
+  // permutation enumeration at cap = 8 (8! cases), and spot-checked with
+  // 20000 random permutations each at cap = 32/64/128. `q - p` below is a
+  // uint subtraction; the same verification script confirmed q >= p at every
+  // step for cap up to 2^20, so it never wraps.
+  // DIRECT COMPARATOR ENUMERATION rather than visiting every idx in [0,cap)
+  // and testing (idx & p) == r: the guard leaves 13-22% of iterations idle
+  // (measured across this range of cap, not the ~40% once assumed - see
+  // OPTIMIZATION_NOTES.md). idx has bit log2(p) fixed to r's value (r is
+  // always 0 or p), so the valid idx form a period-2p pattern with p valid
+  // values per period; the extra idx+d<cap bound truncates that pattern at
+  // T=cap-d, cutting it to (full periods below T) * p, plus however much
+  // of the partial period survives. Both p and 2p are powers of two
+  // throughout (p only ever comes from `1u << k` or a right shift of one),
+  // so the "how many full periods" and "where in the current period" steps
+  // below are a shift and a mask, never a runtime divide/mod - this device
+  // class has no integer divide instruction (see decimate.comp's own
+  // comment on the same constraint).
+  //
+  // Verified standalone before porting, the same way the network itself
+  // was: a Python simulation reproduced this schedule's exact p/q/r/d
+  // sequence, and both the comparator COUNT below and the exact IDX SET it
+  // enumerates were checked to match the original guard-based form for
+  // every one of the 354 rounds this shader's whole cap range (16..4096)
+  // ever visits - not sampled, all of them.
   if (log2_cap >= 1u) {
     uint p = 1u << (log2_cap - 1u);
+    uint log2p = log2_cap - 1u;
     while (p >= 1u) {
       uint q = 1u << (log2_cap - 1u);
       uint r = 0u;
       uint d = p;
       while (d >= 1u) {
-        for (uint idx = tid; idx + d < cap; idx += threads) {
-          if ((idx & p) == r) {
-            uint partner = idx + d;
-            uint a = s_packed[idx];
-            uint b = s_packed[partner];
-            if (a > b) {
-              s_packed[idx] = b;
-              s_packed[partner] = a;
-            }
+        uint two_p = p << 1u;
+        uint region_below = cap - d;
+        uint full_periods = region_below >> (log2p + 1u);
+        uint remainder = region_below & (two_p - 1u);
+        int partial_signed = int(remainder) - int(r);
+        uint partial = uint(clamp(partial_signed, 0, int(p)));
+        uint n_active = full_periods * p + partial;
+        for (uint c = tid; c < n_active; c += threads) {
+          uint idx = ((c >> log2p) << (log2p + 1u)) | r | (c & (p - 1u));
+          uint partner = idx + d;
+          uint a = s_packed[idx];
+          uint b = s_packed[partner];
+          if (a > b) {
+            s_packed[idx] = b;
+            s_packed[partner] = a;
           }
         }
         memoryBarrierShared();
@@ -134,6 +240,7 @@ void main() {
         }
       }
       p >>= 1u;
+      log2p -= 1u;
     }
   }
 

@@ -93,6 +93,22 @@ bool SupportsInt64Atomics(VkPhysicalDevice physical_device) {
          features2.features.shaderInt64 == VK_TRUE;
 }
 
+// Queries VK_EXT_conditional_rendering and its conditionalRendering feature.
+// Widely exposed by desktop drivers, not by the Mali-G610's.
+bool SupportsConditionalRendering(VkPhysicalDevice physical_device) {
+  if (!DeviceHasExtension(physical_device, "VK_EXT_conditional_rendering")) return false;
+
+  VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{};
+  conditional.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT;
+
+  VkPhysicalDeviceFeatures2 features2{};
+  features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  features2.pNext = &conditional;
+
+  vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+  return conditional.conditionalRendering == VK_TRUE;
+}
+
 bool EnvFlag(const char *name) {
   const char *v = std::getenv(name);
   return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -185,6 +201,9 @@ Context::Context(const ContextOptions &options_in) {
   if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
   if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
   if (EnvFlag("APRILTAG_VK_FORCE_NO_INT64_ATOMIC")) options.force_no_int64_atomics = true;
+  if (EnvFlag("APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING")) {
+    options.force_no_conditional_rendering = true;
+  }
   if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
     options.max_invocations_override = static_cast<uint32_t>(env_int);
   }
@@ -220,6 +239,9 @@ Context::Context(const std::string& deviceName, const ContextOptions& options_in
     if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
     if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
     if (EnvFlag("APRILTAG_VK_FORCE_NO_INT64_ATOMIC")) options.force_no_int64_atomics = true;
+    if (EnvFlag("APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING")) {
+        options.force_no_conditional_rendering = true;
+    }
     if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
         options.max_invocations_override = static_cast<uint32_t>(env_int);
     }
@@ -464,6 +486,12 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   supports_int64_atomics_ =
       !options.force_no_int64_atomics && SupportsInt64Atomics(physical_device_);
 
+  // No shader variant behind this one: it predicates dispatches whose
+  // shaders already carry an in-shader early-out, and that early-out is the
+  // fallback. See GpuDetector's predicated_compress_.
+  supports_conditional_rendering_ = !options.force_no_conditional_rendering &&
+                                    SupportsConditionalRendering(physical_device_);
+
   VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
   storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
   storage8bit.storageBuffer8BitAccess = VK_TRUE;
@@ -471,6 +499,10 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   VkPhysicalDeviceShaderAtomicInt64FeaturesKHR atomic64{};
   atomic64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR;
   atomic64.shaderBufferInt64Atomics = VK_TRUE;
+
+  VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{};
+  conditional.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT;
+  conditional.conditionalRendering = VK_TRUE;
 
   VkPhysicalDeviceFeatures2 features2{};
   features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -485,6 +517,10 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     atomic64.pNext = features2.pNext;
     features2.pNext = &atomic64;
   }
+  if (supports_conditional_rendering_) {
+    conditional.pNext = features2.pNext;
+    features2.pNext = &conditional;
+  }
 
   std::vector<const char *> enabled_extensions;
   if (supports_8bit_storage_) {
@@ -497,6 +533,9 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   }
   if (supports_int64_atomics_) {
     enabled_extensions.push_back("VK_KHR_shader_atomic_int64");
+  }
+  if (supports_conditional_rendering_) {
+    enabled_extensions.push_back("VK_EXT_conditional_rendering");
   }
 
   VkDeviceCreateInfo device_info{};
@@ -511,6 +550,32 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
 
   CheckVk(vkCreateDevice(physical_device_, &device_info, nullptr, &device_), "vkCreateDevice");
   vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+
+  if (supports_conditional_rendering_) {
+    begin_conditional_rendering_ = reinterpret_cast<PFN_vkCmdBeginConditionalRenderingEXT>(
+        vkGetDeviceProcAddr(device_, "vkCmdBeginConditionalRenderingEXT"));
+    end_conditional_rendering_ = reinterpret_cast<PFN_vkCmdEndConditionalRenderingEXT>(
+        vkGetDeviceProcAddr(device_, "vkCmdEndConditionalRenderingEXT"));
+    // An enabled extension must resolve, but a driver that gets this wrong
+    // should cost the optimization, not the device.
+    if (begin_conditional_rendering_ == nullptr || end_conditional_rendering_ == nullptr) {
+      supports_conditional_rendering_ = false;
+    }
+  }
+}
+
+void Context::CmdBeginConditionalRendering(VkCommandBuffer cmd, VkBuffer buffer,
+                                           VkDeviceSize offset, bool inverted) const {
+  VkConditionalRenderingBeginInfoEXT info{};
+  info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
+  info.buffer = buffer;
+  info.offset = offset;
+  info.flags = inverted ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
+  begin_conditional_rendering_(cmd, &info);
+}
+
+void Context::CmdEndConditionalRendering(VkCommandBuffer cmd) const {
+  end_conditional_rendering_(cmd);
 }
 
 void Context::QueryCaps(const ContextOptions &options) {
@@ -528,6 +593,7 @@ void Context::QueryCaps(const ContextOptions &options) {
   // extension), not re-queried here.
   caps_.has_8bit_storage = supports_8bit_storage_;
   caps_.has_int64_atomics = supports_int64_atomics_;
+  caps_.has_conditional_rendering = supports_conditional_rendering_;
 
   // Subgroup properties via the VkPhysicalDeviceProperties2 pNext chain (core 1.1).
   {
@@ -895,6 +961,7 @@ std::string Context::DescribeDevice() const {
      << ", int64=" << (caps_.has_shader_int64 ? "yes" : "no")
      << ", 8bit_storage=" << (caps_.has_8bit_storage ? "yes" : "no")
      << ", int64_atomics=" << (caps_.has_int64_atomics ? "yes" : "no")
+     << ", conditional_rendering=" << (caps_.has_conditional_rendering ? "yes" : "no")
      << ", subgroup_ballot=" << (caps_.has_subgroup_ballot ? "yes" : "no")
      << ", subgroup_arithmetic=" << (caps_.has_subgroup_arithmetic ? "yes" : "no");
   os << "\n  chosen geometry: wg1d=" << caps_.wg1d << ", wg2d=" << caps_.wg2d_x << "x"

@@ -242,7 +242,8 @@ void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 
   VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-  if (kind == BarrierKind::ComputeAndTransfer) {
+  if (kind == BarrierKind::ComputeAndTransfer ||
+      kind == BarrierKind::ComputeTransferAndPredicate) {
     stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
@@ -250,6 +251,13 @@ void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
   } else {
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  }
+  if (kind == BarrierKind::ComputeAndPredicate ||
+      kind == BarrierKind::ComputeTransferAndPredicate) {
+    // On the source side this is only an execution dependency (the predicate
+    // read writes nothing), which is all a write-after-read needs.
+    stages |= VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT;
+    barrier.dstAccessMask |= VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT;
   }
 
   vkCmdPipelineBarrier(cmd, stages, stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);

@@ -1367,3 +1367,483 @@ Both rejected branches are kept, unmerged, as `perf/item3-uf-merge-vec` and
 `perf/item4-blob-diff-vec` off this branch's pre-item-9 commit, per this
 document's own convention of recording what was tried rather than only what
 shipped.
+
+---
+
+# A fourth pass: an RX 9060 XT-only campaign, no Mali access
+
+Everything in this pass was measured **only on a Windows desktop, AMD Radeon
+RX 9060 XT (RDNA4, discrete, Vulkan 1.4)** - the Mali-G610 deployment target
+was unavailable for this campaign. Every item below is gated so the Mali
+path is either unaffected (a device-capability check picks the old
+behaviour there) or, where no such check exists yet, explicitly flagged as
+unmeasured on that device and worth an ABBA pass before being trusted there.
+
+Baseline for this pass is the third pass's end state plus the
+`VK_EXT_conditional_rendering` predication documented in `PERFORMANCE.md`'s
+"Closing the RDNA4 fallback" section, which this pass's first item builds on
+directly.
+
+## 10. Path splitting in `uf_merge`'s `find()`
+
+`find()` used to walk to the root read-only, with all compression left to
+the separate `uf_compress` pass between merge iterations. Within a single
+`uf_merge` pass, though, a thread whose walk crosses a root some other
+thread just hooked re-walks the same chain another thread already paid for.
+
+The fix - "path splitting" in Jayanti & Tarjan's concurrent disjoint-set-
+union taxonomy, the same technique ECL-CC calls "Jump4" - repoints every
+node visited during the walk to its grandparent with a plain, non-atomic
+store:
+
+```glsl
+uint findSplit(uint n) {
+  uint p = parent[n];
+  if (p != n) {
+    uint prev = n;
+    uint next = parent[p];
+    while (p > next) {
+      parent[prev] = next;
+      prev = p;
+      p = next;
+      next = parent[p];
+    }
+    n = p;
+  }
+  return n;
+}
+```
+
+**Why it's safe.** `parent[x] <= x` always (every hook is `atomicMin`, and
+`uf_init.comp`'s initial values already point left or at self), so
+repointing a node to its grandparent can never create a cycle - the
+grandparent is reached by following parent pointers, which only ever
+decrease. A thread that loses the race against a concurrent `atomicMin` or
+another `find()`'s own splitting store just leaves `parent[]` one hop
+longer than it could have been; `doUnion`'s existing retry (comparing
+against `old` after a lost `atomicMin`) already tolerates exactly this
+class of "the tree moved under me" race, so nothing downstream changes.
+Marking the store `coherent` was deliberately rejected: it would pay for a
+freshness this shader does not need, the same trade-off `uf_final.comp`'s
+plain read of `blob_size[]` already documents.
+
+Gated behind a `kFindMode` specialization constant (`uf_merge_body.glsl`).
+Originally defaulted from `!ctx_.caps().unified_memory` - on for this
+discrete card, off on any unified-memory part (Mali included) until
+measured there, since the extra stores share the same memory bus the CPU
+uses on those parts - then measured on the Mali-G610 (see below) and made
+unconditional once that theory didn't hold. Override either way with
+`APRILTAG_VK_FIND_MODE=0` (naive) or `=1` (split).
+
+Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800, on top of item 9's `HostVisibleCached` change (see
+`PERFORMANCE.md`):
+
+| | `labelling` | GPU total |
+| --- | --- | --- |
+| decimation 1 | **-16.5%** (16/16 rounds) | **-4.0%** (16/16 rounds) |
+| decimation 2 | -2.8% (15/16 rounds) | -0.7% (11/16, near noise) |
+
+Consistent in direction and magnitude with an earlier same-session
+measurement taken *before* the `HostVisibleCached` change landed (-17.0%/
+-2.7% labelling at decimation 1/2), confirming the two changes compose
+without interfering.
+
+Bit-identical over 36 configurations (decimations 1/2/4 x 8-bit storage
+on/off x workgroup geometries auto/2x2/6x6 x chunk size 1/default), and
+`APRILTAG_VK_FIND_MODE=0` vs `=1` produce byte-identical `work:` lines
+directly (not just indirectly via matching the old baseline).
+
+**Measured on the Mali-G610 deployment target** (Armbian 26.8.2, vendor
+kernel 6.1.115, libmali g24p0, GPU/CPU governors default), ABBA-interleaved,
+16 rounds x 300 iterations, 1280x800, against the same binary's
+`APRILTAG_VK_FIND_MODE=0`:
+
+| | `labelling` | GPU total |
+| --- | --- | --- |
+| decimation 1 | **-1.7%** (16/16 rounds) | -0.6% (15/16 rounds) |
+| decimation 2 | **-3.2%** (16/16 rounds) | -0.9% (13/16 rounds) |
+
+Smaller than the RX 9060 XT's figures, as expected: at 1280x800 this
+device's frame is 7.1-7.6 ms (decimation 1) rather than ~1 ms, dominated by
+costs path splitting does not touch (bandwidth, dispatch/barrier overhead -
+see `PERFORMANCE.md` section 3a's finding that labelling is only 1.30x
+memory-clock-sensitive, i.e. mostly latency, not traffic). But every round
+at both decimations moved the same direction on `labelling`, and a clear
+majority did on GPU total too - the "extra stores share the CPU's memory
+bus" theory that motivated gating this off on unified-memory parts did not
+hold. **The `unified_memory` gate is removed**; `kFindMode` defaults to 1
+unconditionally now, with `APRILTAG_VK_FIND_MODE=0` kept as the escape
+hatch for re-A/B on any future device.
+
+Also verified on this device: the full 36-configuration bit-identity
+matrix, and `APRILTAG_VK_FIND_MODE=0` vs `=1` explicitly, both clean.
+
+## 11. Rejected: extents copy selection by lane instead of workgroup
+
+Only the scalar/int64-atomic `reduce_extents_hash` variants privatize the
+extents accumulator across `kExtentsCopies` (8) copies, keyed by
+`gl_WorkGroupID.x & 7`. **This is not the shader this device runs by
+default** - the RX 9060 XT has ballot + arithmetic + shuffle, so it takes
+`reduce_extents_hash_subgroup.comp` instead, which reduces per-key values
+across the whole subgroup before ever touching `extents[]` and has no
+privatized-copy scheme to change at all. The idea below only affects the
+`APRILTAG_VK_FORCE_NO_SUBGROUP=1` fallback path (or a device lacking one of
+the three subgroup capabilities).
+
+The hypothesis - following Futhark SC20's report of a 2-3x win from keying
+a privatized copy by lane rather than by workgroup - was that
+`gl_WorkGroupID.x & 7` lets every lane of a workgroup hitting the same blob
+collide on one copy, and that spreading them across copies by
+`gl_LocalInvocationID.x & 7` instead would relieve that.
+
+**Measured worse.** ABBA-interleaved, forced-scalar path
+(`APRILTAG_VK_FORCE_NO_SUBGROUP=1`), 16 rounds x 300 iterations, 1280x800,
+decimation 2: `extents` span **+11.8%**, lane-keyed slower in **16/16
+rounds** (unanimous, not noise); GPU total +1.6%.
+
+**Why it inverts here.** `blob_diff.comp`'s atomic append order gives
+boundary points from one blob strong index-locality - consecutive
+`gl_GlobalInvocationID.x` values dispatched to one workgroup tend to belong
+to the same blob for long stretches. Keying by workgroup lets an entire
+workgroup's worth of same-blob, same-copy atomics land on one address,
+which RDNA's atomic unit coalesces efficiently across the lanes of a wave;
+keying by lane instead scatters those same-blob lanes across all 8 copies
+(defeating that coalescing) while simultaneously making *unrelated* blobs
+processed by *different* workgroups collide on the *same* copy (since
+every workgroup's lane 0 always targets copy 0, regardless of which blob
+it's processing). Futhark's benchmark was presumably keyed data without
+this kind of run-length locality; it is not the shape this pipeline's
+`reduce_extents_hash` sees.
+
+**Re-tested on the Mali-G610**, where the scalar/atomic64 path is the
+*only* path - integrated GPUs are excluded from the subgroup variant
+outright (see `PERFORMANCE.md` section 6), so this idea is fully live
+there, unlike on the RX 9060 XT. Same result: ABBA-interleaved, 12 rounds
+x 300 iterations, 1280x800, decimation 2, GPU total **+5.4%**, lane-keyed
+slower in **11/12 rounds**. The mechanism is architecture-independent - it
+follows from `blob_diff.comp`'s own append order, not from anything
+RDNA-specific - so this is now a general finding across two unrelated GPU
+architectures, not a device-specific quirk. Rejected on both devices - not
+committed on either.
+
+## 12. Skip ambiguous (127) pixels in `uf_final` and `label_pixels`
+
+A 127-thresholded pixel never merges with anything (`uf_init.comp`/
+`uf_merge_body.glsl`'s own guards), so it is always its own unique root, and
+no other pixel's `find()` can ever reach it - a 127 index is never an
+operand to `doUnion` (the merge shader requires the calling thread's own
+pixel to be non-127 before it unions anything, and it only unions with a
+same-valued, hence also non-127, neighbour). So `blob_size[i]` for a 127
+pixel is touched by exactly one `atomicAdd` (that pixel's own, in
+`uf_final.comp`), making it always exactly 0 or 1 - and with
+`min_cluster_pixels` floored at 2 host-side (added alongside this), both
+values compare false regardless. `label_pixels.comp` already computes the
+threshold code unconditionally; reordering to check it first and skip the
+`blob_size` read for code 1 is exact, not approximate. `uf_final.comp`
+gained a `thresholded` binding (new `uf_final_u8.comp` variant, mirroring
+`label_pixels`' u8 split) to return before touching `parent[]`/`blob_size[]`
+at all for the same pixels.
+
+Bit-identical over 36 configurations, and separately confirmed identical
+across all four of \{fused, unfused\} x \{subgroup, forced-scalar\} - this
+touches a shader shared by every one of those paths.
+
+**Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800 - a genuinely mixed, net-neutral result:**
+
+| | decimation 1 | decimation 2 |
+| --- | --- | --- |
+| `uf_final` span | **-5.1%** (16/16 rounds) | **-2.2%** (16/16 rounds) |
+| `label_pixels` span | +18.3% (0/16 rounds) | +37.6% (0/16 rounds) |
+| GPU total | +0.2% (noise, 5/16) | +0.3% (noise, 6/16) |
+
+Both spans are tiny on this device - `uf_final` ~0.016 ms, `label_pixels`
+~0.005-0.007 ms, against a ~0.9 ms frame - so the label_pixels regression,
+while unanimous, is on the order of a few microseconds and invisible at the
+whole-frame level; most likely the added branch's divergence cost roughly
+cancels the load it skips at this span's tiny absolute size. Contrast with
+Mali, where `PERFORMANCE.md` section 3a profiles `uf_final` at 0.091 ms and
+`label_pixels` at 0.116 ms at the same decimation - both with a measured
+2.66-3.12x DRAM-bandwidth sensitivity, meaning this change's actual target
+(streaming traffic through a much bigger buffer, on a part where that
+traffic is a real cost) is a span roughly 6-20x larger there than the one
+it moved here.
+
+**Shipped anyway**, same reasoning `PERFORMANCE.md` section 6b already gives
+for `RawLineFitPoint`'s packing (nil GPU-time effect on one device, kept for
+the other device's benefit, verified harmless where it doesn't help): exact
+by construction, and aimed at a target this campaign initially had no
+hardware access to measure.
+
+**Confirmed on the Mali-G610 deployment target**, ABBA-interleaved, 16
+rounds x 300 iterations, 1280x800, against the same binary with this
+change reverted - the target this was aimed at all along:
+
+| | decimation 1 | decimation 2 |
+| --- | --- | --- |
+| `uf_final` span | **-31.4%** (16/16 rounds) | **-12.3%** (16/16 rounds) |
+| `label_pixels` span | **-23.4%** (16/16 rounds) | **-18.4%** (16/16 rounds) |
+| GPU total | **-3.4%** (16/16 rounds) | **-2.1%** (14/16 rounds) |
+
+Both spans move strongly and unanimously in both decimations - unlike the
+RX 9060 XT, where the two spans partly cancelled at a size too small to
+matter, on Mali they're large enough that the win shows up at the whole-
+frame level too. This is the mirror image of item 10's finding: there, the
+gate that was originally too conservative for Mali cost nothing to remove;
+here, the RX 9060 XT result that looked neutral was genuinely device-
+specific, and shipping it anyway on the strength of the Mali estimate was
+the right call.
+
+## 13. Checked and not needed: a deterministic tie-break for the sort
+
+`sort_points_local`'s per-blob angular sort orders by `theta_key` alone;
+two points with an exactly equal key sort adjacent, in whichever order
+they happened to land after `scatter_index_points.comp`'s per-blob atomic
+cursor placed them - the source of the documented +/-1-2 candidate-quad
+jitter (`PERFORMANCE.md` section 7). Duplicate `(x,y)` points (from the
+shared SE/SW diagonal midpoint) produce identical output records regardless
+of order, so only a tie between two *distinct* points would actually
+matter.
+
+Measured directly rather than assumed: a temporary diagnostic (reverted,
+not shipped) walked each blob's sorted key array after convergence and
+split every adjacent equal-`theta_key` pair by whether the two points'
+packed `(x,y)` also matched. Across the full 5-image corpus at decimations
+1/2/4, every equal-key pair found was the duplicate-`(x,y)` case (1-5 per
+frame on the larger images) - **zero** genuine distinct-point ties. No
+shader change is warranted; this stays as-is.
+
+## 14. `uf_merge`'s shared `wg_changed` vs a read-guarded global atomicOr: device-gated, not rejected
+
+The convergence flag write in `uf_merge_body.glsl` aggregates in shared
+memory first (one atomic per workgroup, guarded by two barriers) rather
+than writing the global `changed_flag` directly per merged pixel. Tried
+replacing it with `if (merged && changed_flag == 0u) atomicOr(changed_flag,
+1u)` - correctness is unconditional either way (`atomicOr` is idempotent,
+so the guard only bounds how many redundant atomics a race costs, never
+changes the result) - to see whether RDNA's real dedicated LDS makes the
+barrier-based aggregation unnecessary overhead the way it plausibly is not
+on Mali (where `shared` has no dedicated scratchpad at all).
+
+**Measured on the RX 9060 XT, ABBA-interleaved, 16 rounds x 300 iterations,
+1280x800 - a genuine, decimation-dependent inversion, not noise in either
+direction:**
+
+| | `labelling` | GPU total |
+| --- | --- | --- |
+| decimation 1 | **+44.6%** (worse, 0/16 rounds) | **+11.1%** (worse, 0/16 rounds) |
+| decimation 2 | -8.6% (better, 15-16/16 rounds) | -1.8% to -2.5% (better) |
+
+Both directions are unanimous within their own decimation, so this is a
+real effect, not sampling noise - it just doesn't have a single sign.
+Likely mechanism: contention on the read-guarded global atomic scales with
+the total number of merged pixels racing through it at once, which is
+roughly proportional to pixel count; decimation 1 has ~4x the pixels of
+decimation 2, so the same guard that's sufficient at decimation 2 leaves
+enough concurrent races at decimation 1 for the global atomic to cost more
+than the two barriers it replaced.
+
+Initially rejected outright on this evidence alone - decimation 1 is a
+normal, tested configuration, and a change that trades a good result at
+one decimation for an **11% GPU-total regression** at another fails this
+campaign's own bar of "keep only if GPU total improves," with no signal
+available yet to gate it on.
+
+**Then measured on the Mali-G610 deployment target**, where the original
+motivating theory (no dedicated shared-memory scratchpad, so the
+barrier-based aggregation buys nothing there to begin with) is exactly the
+hardware fact that motivated trying this in the first place. ABBA-
+interleaved, 12 rounds x 300 iterations, 1280x800, against the same binary
+with the change reverted:
+
+| | GPU total |
+| --- | --- |
+| decimation 1 | **-3.0%** (12/12 rounds) |
+| decimation 2 | +0.5% (near noise, 5/12 rounds) |
+| decimation 4 | **-2.0%** (11/12 rounds) |
+
+Two of three decimations show a clear, unanimous-or-near-unanimous win;
+the third is a wash, not a loss. The mirror image of the RX 9060 XT
+result, and for the reason the original rationale predicted: RDNA has real
+dedicated LDS, so the barriers were cheap there and only got in the way of
+throughput once contention grew with pixel count; Mali has none, so
+removing them is a clear win once the frame is big enough for it to
+register.
+
+**Shipped as a `kMergeFlagMode` specialization constant** in
+`uf_merge_body.glsl` (constant ID 4, alongside `kFindMode`'s ID 3): mode 0
+is the original shared-memory aggregation, mode 1 is the read-guarded
+global atomicOr. Defaulted from `ctx_.caps().unified_memory` in
+`GpuDetector::CreatePipelines` - the **opposite** polarity from
+`find_mode`, since this is a case where the two device classes genuinely
+disagree and both directions needed to survive. Override with
+`APRILTAG_VK_MERGE_FLAG_MODE=0`/`=1` to re-A/B on new hardware. Bit-
+identical on both devices, across the 36-configuration matrix and with
+both modes forced explicitly.
+
+## 15. Enumerate active comparators directly in the sort - the closed form, completed
+
+`sort_points_local_body.glsl`'s innermost loop used to visit every `idx` in
+`[0, cap)` (well, `[tid, cap-d)`, strided by `threads`) and guard on
+`(idx & p) == r`, so most invocations did a scalar loop-body execution just
+to discard themselves. The idea: enumerate only the active comparators
+directly.
+
+**First attempt (this file's earlier revision) stopped short.** A direct-
+enumeration formula was found and verified for the `r == 0` sub-round of
+each `p`-block (the first one), but the later `r == p` sub-rounds seemed
+to need their own, unfound closed form, and the estimated payoff - based
+on a Python simulation's "utilization" metric - looked small enough
+(1-3% of GPU total) that finishing the derivation wasn't worth the risk
+of shipping a formula verified for only part of the schedule.
+
+**Both of those turned out to be wrong**, caught by continuing to look
+rather than trusting the earlier stopping point:
+
+1. **The `r == p` closed form exists and is simple.** Valid `idx` values
+   for a given `(p, r)` form a period-`2p` pattern (`p` valid values per
+   period, starting at offset `r`), and the extra `idx + d < cap` bound
+   just truncates that pattern at `T = cap - d`. Splitting `T` into whole
+   periods below it plus a partial remainder gives the count in closed
+   form for **both** `r == 0` and `r == p` at once:
+   `n = full_periods * p + clamp(remainder - r, 0, p)`, where
+   `full_periods = T >> (log2p + 1)` and `remainder = T & (2p - 1)` -
+   shifts and masks only, since `p` is always a power of two here and this
+   device class (Mali/Valhall) has no integer divide instruction (the
+   same constraint `decimate.comp` avoids elsewhere in this codebase).
+   Verified exhaustively - not sampled - against a standalone Python
+   reproduction of the real schedule: **every one of the 354 rounds this
+   shader's whole `cap` range (16..4096) ever visits**, checking both the
+   comparator *count* and the exact *index set* it enumerates. This is the
+   same rigor `PERFORMANCE.md`'s sort-network section already documents
+   for the shipped odd-even mergesort itself, applied to the schedule
+   that walks it.
+2. **The earlier "1-3% ceiling" used the wrong denominator.** That
+   estimate measured "utilization" against `cap/2` total slots per round,
+   but the loop's real per-round visited range is `cap - d`, which varies
+   per round and is frequently much larger than `cap/2` - so the true
+   wasted-iteration count (and the *scalar loop overhead* of every wasted
+   iteration, on top of the wasted comparator work itself) was
+   substantially underestimated. The measured result below reflects that.
+
+**Shipped.** Bit-identical over 36 configurations on both devices, plus a
+separate full 36-configuration matrix run specifically for this change on
+the Mali-G610 (a sorting network is exactly the class of change where a
+subtly wrong schedule corrupts output silently, so this got its own pass
+rather than trusting the general matrix alone).
+
+**Measured on the RX 9060 XT**, ABBA-interleaved, 12-16 rounds x 300
+iterations, 1280x800:
+
+| | `sort` span | GPU total |
+| --- | --- | --- |
+| decimation 1 | **-31.7%** | **-6.2% to -6.9%** (16/16 and 12/12 rounds) |
+| decimation 2 | **-49.1%** | **-7.9% to -8.0%** (16/16 rounds) |
+| decimation 4 | **-27.0%** | **-3.6%** |
+
+One of the largest single wins measured this campaign, and unanimous at
+every decimation tested.
+
+**Measured on the Mali-G610**, same protocol, 12 rounds x 300 iterations:
+GPU total **+0.4%** (d1, 5/12 rounds) / **+0.2%** (d2, 5/12) - noise-level
+either way, not a regression. This makes architectural sense rather than
+contradicting the RDNA result: Mali's `sort` span is barrier- and
+latency-bound (`PERFORMANCE.md` section 3a: 0.99x memory-clock
+sensitivity, i.e. immune to bandwidth, and the barrier *count* here is
+unchanged by this optimization - only which `idx` values each round
+visits changed), while the RDNA win is consistent with removing per-lane
+divergent-branch cost across a much wider SIMD unit (32-64 lanes vs
+Mali's fixed 16), which a barrier-bound span on a narrower SIMD device
+would not expose the same way. No gate needed either way: it helps one
+device substantially and costs nothing on the other.
+
+## 16. Rejected: pad `MinMaxExtentsGpu` from 32 to 64 bytes
+
+Two blobs' entries currently share every 64-byte cache line in the
+canonical `extents[]` array (the struct is 32 bytes), and every
+`reduce_extents_hash` variant - including the default subgroup-aggregated
+one, which writes `extents[leaderKey]` directly with no privatized-copy
+scheme at all - writes some blob's entry on nearly every dispatch, with
+adjacent indices touched by unrelated concurrent threads/subgroups. Padding
+to 64 bytes (one cache line per blob) was tried to remove that false
+sharing, with the padding fields never read by anything downstream.
+
+**Measured worse.** ABBA-interleaved, 16 rounds x 300 iterations, 1280x800:
+`extents` span **+2.4%** (decimation 1) / **+4.1%** (decimation 2), padded
+slower in **0/16 rounds** at both - unanimous, not noise. GPU total moves
+with it (+0.4%/+0.5%, both within the ABBA harness's own noise floor for a
+whole-frame figure, but directionally consistent with the span result).
+
+Doubling the struct size doubles the byte traffic of every pass that walks
+the array at its allocated *capacity* rather than the frame's real blob
+count - `merge_extents.comp`, `select_blobs.comp`,
+`extract_blob_counts.comp` - and apparently costs more here than the false
+sharing it removes saves. This is the third contention-mitigation idea in
+this pass to lose on this device (see items 11 and 14): between them they
+suggest this workload's extents-adjacent stages are traffic/capacity-bound
+on the RX 9060 XT, not contention-bound, so relieving contention has
+nothing to reclaim - the same shape of finding
+`PERFORMANCE.md` section 3a already made for Mali's own `extents`/`sort`
+spans (atomic- and latency-bound there, immune to a 4x memory-clock
+sweep), just for a different mechanism.
+
+**Re-tested on the Mali-G610** (this device DOES take the scalar/atomic64
+path unconditionally, unlike the RX 9060 XT where this only affected the
+forced-scalar fallback), ABBA-interleaved, 12 rounds x 300 iterations,
+1280x800, decimation 2: GPU total **-1.6%** median paired, but padded
+faster in only **6/12 rounds** - a coin flip, not a direction. Unlike the
+RX 9060 XT's clean, unanimous regression, Mali shows no clear effect
+either way. Doesn't overturn the rejection (no evidence of a win to set
+against RDNA's clear loss), but it's a different, weaker finding than
+"regresses on both devices" would have been - recorded as such rather
+than folded into the RDNA result. Not committed on either device.
+
+## 17. Pack `gx_sum`/`gy_sum` into one biased 64-bit atomic
+
+`reduce_extents_hash_atomic64.comp` - Mali's default reduction shader
+(`extents_atomic64 = !subgroup && has_int64_atomics`, and integrated GPUs
+never take the subgroup path) - already folds `count` and
+`pxgx_plus_pygy_sum` into one 64-bit atomic (item 4 of the third pass).
+`gx_sum`/`gy_sum` sit in the struct's *other* 64-bit word (bytes 24-31,
+word index 3) but were still two separate conditional 32-bit atomics.
+
+Packed the same way, with one difference the `count`/`pxgx_plus_pygy_sum`
+trick didn't need: **the packed word is biased by +1 per field per point**
+(`(gy+1)` high, `(gx+1)` low, each landing in {0,1,2}), and the add is
+unconditional. This is *not* the same trick as before - `count` is safe
+unbiased because it is monotonic (always +1, never negative), but `gx_sum`/
+`gy_sum` individually wander through zero across a frame's points, so an
+unbiased signed low half would legitimately wrap its own 0/0xFFFFFFFF
+boundary and spuriously carry into the high half. The bias keeps the
+running low-half total strictly monotonic and bounded (at most 2x the
+point capacity), restoring the same safety argument `count` already has.
+Unbiased once, in `select_blobs.comp`, right after `e = extents[i]` is
+read: `e.gx_sum -= e.count; e.gy_sum -= e.count;`, gated on a new
+`gx_gy_biased` push-constant flag set from the same `extents_atomic64`
+bool that picks the shader (stored as `extents_atomic64_`, since
+`CreatePipelines` and `Detect`/`select_blobs`'s dispatch are different
+functions). `merge_extents.comp` needs no change - biased sums still fold
+associatively across the privatized copies exactly like `count` does,
+since bias-per-copy sums to `bias x total-count` regardless of which copy
+a point landed in.
+
+Net: removes the second atomic entirely for SE/SW diagonal boundary points
+(both `gx` and `gy` nonzero), a wash for E/S points (already one atomic
+either way, since one of `gx`/`gy` was structurally zero).
+
+Bit-identical over 36 configurations on both devices, and separately on
+the forced-scalar-atomic64 path (`APRILTAG_VK_FORCE_NO_SUBGROUP=1` on the
+RX 9060 XT, where this is not the default; unconditional on Mali) and the
+plain-32-bit scalar path (`+APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1`, which
+this change never touches).
+
+**Measured on the RX 9060 XT** (forced-scalar-atomic64, ABBA-interleaved,
+12 rounds x 300 iterations, 1280x800): `extents` span **-9.8%** (d1,
+12/12 rounds) / **-3.0%** (d2, 11/12), GPU total -1.3% (11/12) / -0.6%
+(9/12).
+
+**Measured on the Mali-G610** (this is the default path there, no force
+flag needed), same protocol: GPU total **-0.7%** (d1, unanimous 12/12) /
+-1.3% (d2, 7/12 - a plausible small win, noisier). No regression at
+either decimation on either device. Shipped on.
