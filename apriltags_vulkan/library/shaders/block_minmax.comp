@@ -1,7 +1,6 @@
 #version 450
-// Computes the min/max pixel value for each 4x4 block of the decimated
-// image.  Mirrors InternalBlockMinMax.  Result is packed as (min | max<<8)
-// in a single uint so we don't need 8-bit storage buffer support.
+// Min/max of each 4x4 block of the decimated image (InternalBlockMinMax),
+// packed as (min | max<<8) in one uint.
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint decimated[]; };
@@ -14,11 +13,7 @@ layout(push_constant) uniform PushConstants {
   uint block_height;
 } pc;
 
-// decimated_width_/height_ need not be a multiple of 4 (only the original
-// image's width/height are guaranteed even), so the last block column/row
-// can be ragged. Edge-clamp rather than bounds-check-and-skip: a 4x4 min/max
-// window that runs past the real image just repeats the edge pixel, which is
-// a standard, harmless way to extend a min/max filter past the image border.
+// Coordinates past the image edge clamp to the edge pixel (ragged last block).
 uint sampleAt(uint x, uint y) {
   x = min(x, pc.decimated_width - 1u);
   y = min(y, pc.decimated_height - 1u);

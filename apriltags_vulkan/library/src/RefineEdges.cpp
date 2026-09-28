@@ -7,16 +7,14 @@
 #include <string>
 
 extern "C" {
-// Exposed non-static by cmake/patches/apriltag-expose-decode-steps.patch, same
-// as quad_decode_index - see TagDecoder.h.
+// Exposed non-static by cmake/patches/apriltag-expose-decode-steps.patch.
 void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct quad *quad);
 }
 
 namespace apriltag_vulkan {
 namespace {
 
-// The four-tap bilinear tap order is upstream's, verbatim. Reassociating it
-// would change the low bits of g1/g2 and cost kExact its bit-identity.
+// The four-tap bilinear order is upstream's verbatim; reassociating it breaks kExact's bit-identity.
 template <typename S>
 inline S BilinearAt(const image_u8_t *im, int xi, int yi, S fx, S fy) {
   const uint8_t *row0 = im->buf + yi * im->stride + xi;
@@ -25,8 +23,7 @@ inline S BilinearAt(const image_u8_t *im, int xi, int yi, S fx, S fy) {
          fx * fy * row1[1];
 }
 
-// `Sample` is the precision of the innermost search loop only; everything
-// outside it is double regardless - see RefineEdgesMethod::kFast.
+// `Sample` is the precision of the innermost search loop only.
 template <typename Sample>
 void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
   double lines[4][4];  // for each line, [Ex Ey nx ny]
@@ -120,8 +117,7 @@ void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
     const double Cxy = Mxy / N - Ex * Ey;
     const double Cyy = Myy / N - Ey * Ey;
 
-    // atan2f/cosf/sinf, not the double forms: upstream uses the float ones
-    // here even though everything around them is double.
+    // Float atan2f/cosf/sinf, as upstream.
     const double normal_theta = .5 * atan2f(-2 * Cxy, (Cyy - Cxx));
     lines[edge][0] = Ex;
     lines[edge][1] = Ey;
@@ -144,8 +140,7 @@ void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
       quad->p[(i + 1) & 3][0] = lines[i][0] + L0 * A00;
       quad->p[(i + 1) & 3][1] = lines[i][1] + L0 * A10;
     }
-    // else: degenerate intersection, keep the corner we had (upstream does
-    // the same).
+    // else: degenerate intersection; keep the existing corner (as upstream).
   }
 }
 

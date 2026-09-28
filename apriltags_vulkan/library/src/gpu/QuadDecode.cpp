@@ -12,7 +12,7 @@
 namespace apriltag_vulkan {
 namespace {
 
-// Mirrors frc971::apriltag::FilterCoefficients() (line_fit_filter.h).
+// Gaussian filter taps applied to the windowed error.
 constexpr std::array<double, 7> kFilterCoefficients = {
     0.01110899634659290314, 0.13533528149127960205, 0.60653066635131835938,
     1.00000000000000000000, 0.60653066635131835938, 0.13533528149127960205,
@@ -21,8 +21,7 @@ constexpr std::array<double, 7> kFilterCoefficients = {
 
 constexpr int kNMaxima = 10;
 
-// LineFitMoments + / - (mirrors SumLineFitPoints / the implicit subtraction
-// done inline throughout line_fit_filter.cu).
+// LineFitMoments addition and subtraction.
 LineFitMoments Add(const LineFitMoments &a, const LineFitMoments &b) {
   LineFitMoments r;
   r.Mx = a.Mx + b.Mx;
@@ -45,24 +44,9 @@ LineFitMoments Sub(const LineFitMoments &a, const LineFitMoments &b) {
   return r;
 }
 
-// Exact port of frc971::apriltag::ReadMoments (line_fit_filter.cu): reads a
-// cumulative range-sum of moments over the circular point index range
-// [index0, index1] (inclusive), where `cs` is a prefix-sum array (cs[k] =
-// sum of points [0, k] inclusive) of length `total_points`. Faithfully
-// replicates the original's `index0 < index1` branch condition (including
-// its behavior when index0 == index1, which falls into the "wrap around"
-// branch exactly as in the original).
-//
-// Bug fix: the wrap-around branch used to read cs[index0 - 1]
-// unconditionally, unlike the index0 < index1 branch just above it, which
-// already guards the equivalent read with `if (index0 > 0)`. index0 == 0
-// reaches this branch whenever ksz == 0 (blobs under 12 points, at point
-// index 0 - see FitQuadForBlob's `const int ksz = ...`), which read
-// cs[SIZE_MAX]: an out-of-bounds read landing on whatever memory happens to
-// sit just before the cs vector's buffer. Found while porting this window
-// read to GPU (A9) and cross-checking against synthetic inputs small
-// enough to hit this path - see the GPU shader's mirroring guard
-// (compute_window_error.comp) for the equivalent fix on that side.
+// Cumulative moments over the circular index range [index0, index1] inclusive, from prefix sums
+// `cs` (cs[k] = sum of points [0, k]) of length total_points. index0 >= index1 takes the
+// wrap-around branch.
 LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, size_t total_points,
                                 size_t index0, size_t index1) {
   LineFitMoments result;
@@ -84,7 +68,7 @@ LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, size_t t
   return result;
 }
 
-// Exact port of FitLineError (line_fit_filter.cu).
+// Sum of squared error of a line fit from its moments.
 double FitLineError(int N, int64_t Mx, int64_t My, int64_t Mxx, int64_t Myy, int64_t Mxy,
                     int64_t W) {
   int64_t Cxx = Mxx * W - Mx * Mx;
@@ -96,10 +80,8 @@ double FitLineError(int N, int64_t Mx, int64_t My, int64_t Mxx, int64_t Myy, int
   return N * eig_small;
 }
 
-// Exact port of the two-output-variant FitLine (line_fit_filter.cu /
-// apriltag_detect.cu's HostFitLine): computes the point-on-line
-// (lineparam01) and unit normal (lineparam23), plus sum-of-squared-error and
-// mean-squared-error, from a moments window.
+// Point-on-line (lineparam01), unit normal (lineparam23), sum and mean squared error from a
+// moments window.
 void FitLine(const LineFitMoments &moments, double *lineparam01, double *lineparam23, double *err,
             double *mse) {
   int64_t Mx = moments.Mx, My = moments.My, W = moments.W;
@@ -140,42 +122,24 @@ void FitLine(const LineFitMoments &moments, double *lineparam01, double *linepar
   *mse = eig_small;
 }
 
-// Per-blob result of the quad fit, from either the combinatorial search
-// (mirrors FitQuad in line_fit_filter.h) or the item-3 DP corner-seeding
-// path.
+// Per-blob quad fit result (combinatorial search or DP seeding).
 struct FitQuadResult {
   bool valid = false;
-  // Set (regardless of `valid`) whenever quad_fit_method == kDp and this
-  // blob was eligible (>= 4 points) - i.e. DP was tried at all. dp_used is
-  // set only when it actually produced the accepted result; attempted-but-
-  // not-used means DP fell back to the combinatorial search. Purely for
-  // QuadDecode::last_dp_stats() instrumentation.
+  // Set whenever DP was tried (quad_fit_method == kDp and >= 4 points); dp_used only if it
+  // produced the accepted result. For QuadDecode::last_dp_stats().
   bool dp_attempted = false;
   bool dp_used = false;
   uint32_t indices[4] = {};
   LineFitMoments moments[4];
 };
 
-// Coordinates for DP corner seeding: RawLineFitPoint's (x2, y2), the same
-// "doubled" decimated-pixel grid the line fit itself uses. Approximate
-// (integer boundary-tracing coordinates, not sub-pixel), which is fine here
-// since these only SEED which 4 indices to fit lines through - the actual
-// corner accuracy comes from the exact same ReadMomentsWindow + FitLine +
-// intersection code the peaks path already uses on whichever 4 indices are
-// chosen.
+// Coordinates for DP corner seeding: RawLineFitPoint's (x2, y2). They only seed the corner
+// indices; corner accuracy comes from the line fits.
 struct Point2 {
   double x, y;
 };
 
-// The three helpers below are marked `inline` for a reason that is not
-// about the linker. FindDpCornerIndices makes four O(n) passes calling them
-// once or twice per point, and MSVC's /Ob1 - what CMake's RelWithDebInfo
-// uses, and what this project's own CMakeSettings.json selects for
-// x64-Release - inlines ONLY functions declared inline or defined in-class.
-// Without the keyword these stay real calls in that configuration and
-// quad_decode measures ~75% slower than the same code built /Ob2. Measured
-// while chasing what looked like a regression and turned out to be two
-// build types.
+// Marked inline so MSVC /Ob1 inlines them into FindDpCornerIndices' loops.
 inline Point2 PointAt(std::span<const RawLineFitPoint> points, size_t begin, size_t idx) {
   const RawLineFitPoint &p = points[begin + idx];
   return {static_cast<double>(p.x2()), static_cast<double>(p.y2())};
@@ -186,10 +150,7 @@ inline double SqDist(Point2 a, Point2 b) {
   return dx * dx + dy * dy;
 }
 
-// Squared perpendicular distance of p from the (infinite) line through a, b,
-// scaled by |ab|^2 (i.e. actual_dist^2 * |ab|^2) - avoids a sqrt/division
-// per point; callers only ever compare these against each other or against
-// a threshold likewise scaled by diameter_sq.
+// Squared perpendicular distance of p from line ab, scaled by |ab|^2 (avoids a sqrt/division).
 inline double ScaledPerpDistSq(Point2 a, Point2 b, Point2 p) {
   const double abx = b.x - a.x, aby = b.y - a.y;
   const double apx = p.x - a.x, apy = p.y - a.y;
@@ -197,16 +158,9 @@ inline double ScaledPerpDistSq(Point2 a, Point2 b, Point2 p) {
   return cross * cross;
 }
 
-// Seeds 4 corner indices geometrically: the two mutually-farthest boundary
-// points (a 2-pass O(n) approximation of the polygon's diameter - exact
-// all-pairs would be O(n^2)), then the point of maximum perpendicular
-// deviation from that diameter on each of the two resulting arcs. Returns
-// false (leaving out_indices untouched) whenever the blob doesn't look like
-// a clean quad this way: too few points, a degenerate (near-zero) diameter,
-// an empty arc, or a "corner" that doesn't meaningfully deviate from the
-// diameter line (a triangle or a rounded blob would still produce SOME
-// max-distance point on each arc, just an unconvincing one). The caller
-// falls back to the peaks-based combinatorial search in every failure case.
+// Seeds 4 corner indices: the two mutually-farthest points (2-pass approximation), then the
+// point of maximum perpendicular deviation on each arc. Returns false if the blob does not look
+// like a clean quad (too few points, degenerate diameter, empty arc, or no real deviation).
 bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, size_t n,
                          uint32_t out_indices[4]) {
   if (n < 8) return false;
@@ -263,19 +217,12 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
   }
   if (c1_idx == n || c2_idx == n) return false;
 
-  // Require both corner candidates to meaningfully deviate from the
-  // diameter line. 1% of (diameter * diameter) is a low bar - a real tag
-  // corner deviates by roughly half the diameter - it exists only to reject
-  // genuinely degenerate shapes (near-triangles, rounded blobs).
+  // Reject degenerate shapes: both corners must deviate from the diameter line (threshold is
+  // scaled by diameter_sq^2).
   const double min_perp = 0.0001 * diameter_sq * diameter_sq;
   if (best_perp1 < min_perp || best_perp2 < min_perp) return false;
 
-  // Circular order around the perimeter: lo -> c1 -> hi -> c2 -> (back to
-  // lo). c1 lies strictly between lo and hi by construction; c2 lies
-  // strictly outside [lo, hi], i.e. on the arc that wraps from hi through
-  // n-1/0 back to lo. Absolute numeric order doesn't matter beyond that -
-  // ReadMomentsWindow's wrap-around branch handles any consecutive pair
-  // regardless - only that consecutive entries trace consecutive arcs.
+  // Circular order: lo -> c1 -> hi -> c2. c1 lies between lo and hi, c2 outside [lo, hi].
   out_indices[0] = static_cast<uint32_t>(lo);
   out_indices[1] = static_cast<uint32_t>(c1_idx);
   out_indices[2] = static_cast<uint32_t>(hi);
@@ -283,12 +230,8 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
   return true;
 }
 
-// Attempts the DP corner-seeding path for one blob. `cs` is the same
-// prefix-sum array FitQuadForBlob already computes for the peaks path.
-// Returns an invalid (default) result whenever DP's geometric seeding fails
-// outright, or the resulting 4 segments don't pass the same
-// max_line_fit_mse gate the combinatorial search applies to every candidate
-// segment - both cases mean "fall back to peaks", handled by the caller.
+// Tries DP corner seeding for one blob using the prefix sums `cs`. Returns an invalid result if
+// seeding fails or a segment exceeds max_line_fit_mse (the caller then falls back to peaks).
 FitQuadResult TryDpQuad(const DetectorConfig &config, std::span<const RawLineFitPoint> points,
                         size_t begin, size_t total_points,
                         const std::vector<LineFitMoments> &cs) {
@@ -312,14 +255,8 @@ FitQuadResult TryDpQuad(const DetectorConfig &config, std::span<const RawLineFit
   return result;
 }
 
-// Ports DoFitLines' per-point windowed-error + 7-tap-gaussian-filter +
-// peak-detection, followed by DoFitQuads' top-10-peaks combinatorial search,
-// for a single blob. The blob's RawLineFitPoint entries are `points[begin,
-// end)`, in perimeter (theta-sorted) order.
-//
-// Takes a span rather than a copied vector: the caller used to materialize a
-// fresh std::vector per blob, which is a heap allocation and a copy of the
-// whole run for every one of the several hundred blobs in a frame.
+// Windowed error, 7-tap Gaussian filter and peak detection, then a combinatorial search over the
+// top 10 peaks, for one blob. Its points are `points[begin, end)`, in perimeter (theta) order.
 FitQuadResult FitQuadForBlob(const DetectorConfig &config,
                             std::span<const RawLineFitPoint> points, size_t begin,
                             size_t end, QuadFitScratch &scratch) {
@@ -327,10 +264,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   const size_t total_points = end - begin;
   if (total_points < 4) return result;
 
-  // scratch is reused across every blob this SLOT fits (see QuadFitScratch's
-  // comment in QuadDecode.h for why this is slot-indexed rather than
-  // thread_local). FitQuadForBlob is called once per blob (several hundred
-  // per frame); these buffers only ever grow.
+  // scratch is reused across blobs on this slot; the buffers only grow.
   std::vector<LineFitMoments> &cs = scratch.cs;
   std::vector<double> &error = scratch.error;
   std::vector<double> &filtered = scratch.filtered;
@@ -344,10 +278,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     LineFitMoments running{};
     for (size_t k = 0; k < total_points; ++k) {
       const RawLineFitPoint &p = points[begin + k];
-      // Unpack once. RawLineFitPoint's accessors are bit extractions rather
-      // than field loads (see Types.h), and `cs[k] = running` below writes
-      // through a vector the compiler cannot prove does not alias `points`,
-      // so leaving the calls inline costs a reload and a re-extract per use.
+      // Unpack once: the accessors are bit extractions and cs may alias points as far as the compiler knows.
       const int32_t x2 = p.x2(), y2 = p.y2(), w = p.W();
       const int64_t wx = static_cast<int64_t>(w) * x2;
       const int64_t wy = static_cast<int64_t>(w) * y2;
@@ -369,15 +300,12 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
       dp_result.dp_used = true;
       return dp_result;
     }
-    // Falls through to the peaks-based combinatorial search below.
+    // Fall back to the peaks-based search.
   }
 
   const int ksz = std::min<int>(20, static_cast<int>(total_points / 12));
 
-  // Windowed error per point (DoFitLines). The circular index arithmetic is
-  // done with conditional subtraction rather than `%`: the offsets are always
-  // within one period, so a compare-and-subtract is exact, and this loop nest
-  // was issuing roughly a dozen integer divisions per boundary point.
+  // Windowed error per point. Circular indices use conditional subtraction instead of `%`.
   const size_t n = total_points;
   const size_t k_off = static_cast<size_t>(ksz);
   for (size_t i = 0; i < n; ++i) {
@@ -400,9 +328,8 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     filtered[i] = accumulated;
   }
 
-  // Peak detection: is_peak = my_error > before_error && my_error > after_error;
-  // peak.error = -my_error (so ascending sort by error puts the strongest
-  // peaks first).
+  // Peaks are strict local maxima of the filtered error, stored negated so an ascending sort
+  // puts the strongest first.
   {
     double before = filtered[n - 1];
     double cur = filtered[0];
@@ -446,8 +373,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     }
   }
 
-  // Brute force all C(10, 4) = 210 combinations of increasing maxima
-  // indices, keeping the minimum total error (DoFitQuads).
+  // Brute force all C(10, 4) = 210 combinations, keeping the minimum total error.
   double best_error = std::numeric_limits<double>::max();
   uint32_t best[4] = {0, 0, 0, 0};
 
@@ -529,9 +455,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     std::span<const RawLineFitPoint> line_fit_points) const {
   std::vector<DetectedQuad> output;
 
-  // Group line_fit_points into contiguous per-blob spans (the array is
-  // sorted by (blob_index, theta) ascending, so each blob's points form one
-  // contiguous run). Cheap, and inherently serial.
+  // Group the points into contiguous per-blob spans (sorted by blob_index, then theta).
   struct Span {
     size_t begin;
     size_t end;
@@ -548,9 +472,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
   }
 
-  // Fit every blob independently - this is where essentially all of the CPU
-  // tail's time goes. Each entry is written by exactly one task, so no
-  // synchronization is needed beyond the pool's own.
+  // Fit every blob independently; each entry is written by exactly one task.
   std::vector<FitQuadResult> per_span(spans.size());
   pool_->ParallelFor(spans.size(), [&](size_t s, unsigned slot) {
     per_span[s] =
@@ -565,8 +487,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
   }
 
-  // Collect survivors in span order, NOT completion order, so the result is
-  // bit-identical to the serial version regardless of thread scheduling.
+  // Collect survivors in span order so the output is independent of thread scheduling.
   std::vector<FitQuadResult> fit_quads;
   fit_quads.reserve(per_span.size());
   for (const FitQuadResult &fq : per_span) {
@@ -622,8 +543,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
       if (area < 0.95 * min_tag_width * min_tag_width) continue;
     }
 
-    // Reject quads whose cumulative angle change isn't consistent with a
-    // convex, consistently-wound quadrilateral.
+    // Reject quads that are not convex and consistently wound.
     bool reject = false;
     for (int i = 0; i < 4 && !reject; ++i) {
       int i0 = i, i1 = (i + 1) & 3, i2 = (i + 2) & 3;
@@ -639,26 +559,8 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
     if (reject) continue;
 
-    // Decimated grid -> full-resolution pixels: a plain scale, matching
-    // upstream apriltag.c exactly (`q->p[j][0] *= td->quad_decimate`).
-    //
-    // There is deliberately NO pixel-center adjustment here. decimate.comp
-    // POINT-SAMPLES the top-left pixel of each block (sx = dx * kDecimation),
-    // which is also what upstream's image_u8_decimate does for an integer
-    // factor, so decimated index c corresponds to full-resolution index c*d
-    // and nothing else needs correcting. A "(c - 0.5) * d + 0.5" form would
-    // be right for an AREA/box decimation, whose output pixel represents the
-    // block's centre rather than its first sample - but that is not the
-    // filter either implementation uses.
-    //
-    // This previously carried that centre-adjusting form, which is short by
-    // exactly (d-1)/2 full-resolution pixels: a systematic corner bias of
-    // 0 at d=1, -0.5 at d=2 (the default!), -1.5 at d=4, reproduced exactly
-    // in measurement. It survived because the existing corner check reports
-    // RMS without gating on it, and because the bias is invisible at d=1.
-    // tools/validate_pose_e2e prints the mean SIGNED corner offset per tag
-    // for this reason: a constant offset is a convention bug, and only a
-    // signed statistic can tell it apart from zero-mean corner noise.
+    // Decimated grid to full-resolution pixels: a plain scale. decimate.comp point-samples the
+    // top-left pixel of each block, so no pixel-centre adjustment applies.
     const double decimation = static_cast<double>(config_.decimation);
     DetectedQuad out;
     for (int i = 0; i < 4; ++i) {

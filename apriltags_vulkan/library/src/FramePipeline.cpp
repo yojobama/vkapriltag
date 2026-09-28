@@ -11,14 +11,12 @@ FramePipeline::FramePipeline(GpuDetector &detector, QuadDecode &quad_decode,
 }
 
 FramePipeline::~FramePipeline() {
-  // Drain first: joining while a Detect() is still running would destroy the
-  // members it is using.
+  // Drain first: joining while Detect() is running would destroy the members it uses.
   if (in_flight_) {
     try {
       HarvestInFlight();
     } catch (...) {
-      // A GPU error on the last frame must not escape a destructor. It is
-      // already unobservable at this point - the pipeline is going away.
+      // A GPU error on the last frame must not escape a destructor.
     }
   }
   {
@@ -68,21 +66,13 @@ void FramePipeline::HarvestInFlight() {
   in_flight_ = false;
 
   if (error) {
-    // The detector's results for this frame are undefined; drop the frame
-    // rather than staging it. have_done_ stays as it was.
+    // The detector's results for this frame are undefined; drop it (have_done_ is unchanged).
     std::rethrow_exception(error);
   }
 
-  // Safe without the lock: the worker is idle, so nothing else touches these.
+  // The worker is idle, so no lock is needed.
   std::swap(done_extents_, detector_.last_selected_extents);
-  // last_line_fit_points is a non-owning span - either straight into the
-  // host-visible readback buffer, or over the detector's linefit_scratch_ -
-  // and the next Detect() overwrites whichever it is. A swap cannot take
-  // ownership of a view, so the pipelined path has to copy, which is exactly
-  // the copy the in-place readback exists to avoid. assign() keeps the
-  // capacity, so it is a memcpy and not an allocation after the first frame.
-  // Serial callers still get the zero-copy path; this cost is the price of
-  // overlapping, and it is far smaller than the CPU tail it hides.
+  // last_line_fit_points is a non-owning span overwritten by the next Detect(), so it is copied.
   done_points_.assign(detector_.last_line_fit_points.begin(),
                       detector_.last_line_fit_points.end());
   done_profile_ = detector_.last_profile();
@@ -116,8 +106,7 @@ zarray_t *FramePipeline::Push(const uint8_t *gray_frame, uint32_t width, uint32_
   cv_.notify_one();
   in_flight_ = true;
 
-  // The whole point: this runs on the caller's thread while the worker drives
-  // the GPU pass for the frame just pushed.
+  // Runs on the caller's thread while the worker drives the GPU pass for the pushed frame.
   return DecodeHarvested();
 }
 

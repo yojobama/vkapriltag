@@ -1,16 +1,7 @@
 name: Release .deb packages
 
-# Pushing a tag matching vMAJOR.MINOR.PATCH builds the vkapriltag library
-# (headers + static lib + embedded-shader-free SPIR-V corpus + CMake package
-# config - the same scope as library/CMakeLists.txt's install() rules, no
-# tools/apps) natively for amd64 and arm64, packages each as a .deb via
-# CPack, and publishes both as assets on a GitHub Release for that tag.
-#
-# Native arm64 build (ubuntu-24.04-arm, a free GitHub-hosted runner on
-# public repos) rather than cross-compilation: this repo links Vulkan +
-# FetchContent's own apriltag build, and cross-linking those reliably would
-# need multiarch apt sources for no real benefit when a native arm64 runner
-# is available for free.
+# Builds the vkapriltag library natively on amd64 and arm64 for tags matching vMAJOR.MINOR.PATCH,
+# packages each as a .deb via CPack and publishes both to a GitHub Release.
 
 on:
   push:
@@ -31,9 +22,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Derive package version from tag
-        # Strict vMAJOR.MINOR.PATCH only (no -rc/build-metadata suffixes) -
-        # fail fast before any build/apt work if the tag doesn't match,
-        # rather than producing a release with a nonsensical version.
+        # Accept strict vMAJOR.MINOR.PATCH tags only.
         run: |
           TAG="${GITHUB_REF_NAME}"
           if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
@@ -43,9 +32,7 @@ jobs:
           echo "PKG_VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
-        # No libopencv-dev: the packaged library itself has no OpenCV
-        # dependency (only tools/, which this release build excludes via
-        # -DVKAPRILTAG_BUILD_TOOLS=OFF below).
+        # No libopencv-dev: only tools/ need OpenCV and they are built with -DVKAPRILTAG_BUILD_TOOLS=OFF.
         run: |
           sudo apt-get update
           sudo apt-get install -y \

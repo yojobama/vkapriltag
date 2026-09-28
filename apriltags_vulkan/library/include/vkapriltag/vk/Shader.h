@@ -9,9 +9,8 @@
 
 namespace apriltag_vulkan::vk {
 
-// Where a shader module's SPIR-V comes from: a file on disk, or a blob
-// compiled into the binary (see EmbeddedShaders.h). Implicitly constructible
-// from a path so existing path-based callers are unaffected.
+// Source of a shader module's SPIR-V: a file on disk or an embedded blob. Implicitly constructible
+// from a path.
 struct ShaderSource {
   ShaderSource(std::string spv_path) : path(spv_path), label(std::move(spv_path)) {}
   ShaderSource(const uint32_t *spv_code, size_t spv_bytes, std::string spv_label)
@@ -25,8 +24,7 @@ struct ShaderSource {
   std::string label;             // for diagnostics; the path, or the shader name
 };
 
-// Wraps a VkShaderModule built from SPIR-V, read either from disk or from
-// memory.
+// Wraps a VkShaderModule built from SPIR-V.
 class Shader {
  public:
   Shader() = default;

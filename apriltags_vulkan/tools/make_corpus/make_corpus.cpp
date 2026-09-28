@@ -1,15 +1,4 @@
-// Phase 0 corpus generation: rescales a tracked source image into a spread
-// of resolutions, giving the validate tool a set of images with different
-// effective tag pixel sizes to sweep the item-2 geometric-prefilter
-// thresholds (min_tag_pixels, aspect_max, fill bounds) against.
-//
-// Caveat, stated plainly: rescaling the whole frame is a proxy for "the tag
-// is farther away", not an identical stand-in for it - background clutter,
-// noise and blur all shrink proportionally too, which a real long-range shot
-// would not do identically. It is good enough to validate that a
-// resolution-relative threshold behaves sanely across scales and to catch
-// gross regressions, but it is not a substitute for real multi-distance
-// captures before trusting the thresholds in the field.
+// Rescales a source image into a spread of resolutions (downscale only) to sweep the geometric-prefilter thresholds.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -25,9 +14,7 @@
 
 namespace {
 
-// The directory-mode loader in validate_against_libapriltag_opencv.cpp skips
-// images whose dimensions aren't even (the GPU pipeline's decimation halves
-// each dimension), so every generated image must round to that.
+// Output dimensions are rounded to even: the GPU pipeline's decimation halves each dimension.
 int RoundToEven(double value) {
   int rounded = static_cast<int>(std::lround(value / 2.0)) * 2;
   return std::max(2, rounded);
@@ -38,12 +25,7 @@ int RoundToEven(double value) {
 int main(int argc, char **argv) {
   std::string input_path;
   std::string out_dir;
-  // Downscale only (<= 1.0). Upscaling synthesizes pixels the source image
-  // never had - it manufactures a smoother/differently-interpolated edge
-  // profile rather than the resolution loss a real distant/small tag would
-  // actually show, so it is not a valid stand-in for "the tag is farther
-  // away" and must not be used for validating the resolution-relative
-  // thresholds (item 2) or corner-fit changes (item 3).
+  // Downscale only (<= 1.0).
   std::vector<double> scales = {0.25, 0.375, 0.5, 0.75, 1.0};
 
   for (int i = 1; i < argc; ++i) {
@@ -90,8 +72,7 @@ int main(int argc, char **argv) {
     int h = RoundToEven(src.rows * scale);
 
     cv::Mat resized;
-    // INTER_AREA is the right choice when shrinking (proper decimation,
-    // avoids aliasing); INTER_LINEAR is fine for the occasional upscale.
+    // INTER_AREA when shrinking, INTER_LINEAR for upscales.
     const int interp = (scale < 1.0) ? cv::INTER_AREA : cv::INTER_LINEAR;
     cv::resize(src, resized, cv::Size(w, h), 0, 0, interp);
 

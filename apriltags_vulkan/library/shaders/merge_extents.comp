@@ -1,20 +1,8 @@
 #version 450
-// Folds reduce_extents_hash.comp's private accumulator copies back into the
-// canonical entry, so every downstream reader (select_blobs.comp,
-// extract_blob_counts.comp, the host's MinMaxExtentsGpu readback) sees one
-// merged result at extents[bi] and needs no knowledge of the replication.
-// See common.glsl's ExtentsSlot comment for the layout and for why the
-// replication exists.
-//
-// Dispatched indirectly over the frame's real raw blob count, exactly like
-// init_extents.comp and select_blobs.comp, so this is a few hundred
-// invocations folding 7 entries each - against the ~65k points x 8 atomics
-// of contention it removes.
-//
-// min/max/sum all fold associatively and exactly, and an untouched copy
-// holds the identity init_extents.comp wrote, so the result is bit-identical
-// to the unprivatized reduction regardless of how the points were
-// distributed across copies.
+// Folds reduce_extents_hash.comp's private accumulator copies into the
+// canonical extents[bi] (layout in common.glsl's ExtentsSlot). Dispatched
+// indirectly over the raw blob count. Min/max/sum fold exactly, and untouched
+// copies hold init_extents.comp's identity.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
@@ -29,8 +17,7 @@ layout(push_constant) uniform PushConstants {
 void main() {
   uint bi = gl_GlobalInvocationID.x;
   if (bi >= pc.capacity) return;
-  // Blobs past the privatized range were accumulated into the canonical slot
-  // directly, so there is nothing to fold.
+  // Blobs past the privatised range were accumulated into the canonical slot.
   if (bi >= kPrivateExtentsBlobs) return;
 
   MinMaxExtentsGpu acc = extents[bi];

@@ -4,17 +4,12 @@ extern "C" {
 #include "common/g2d.h"
 #include "common/matd.h"
 
-// Exposed as non-static entry points by cmake/patches/apriltag-expose-decode-steps.patch,
-// applied to the fetched (unmodified upstream) apriltag library - not exposed via
-// any header, forward-declared here exactly as the original CUDA
-// apriltag_detect.cu does.
+// Non-static entry points exposed by cmake/patches/apriltag-expose-decode-steps.patch,
+// forward-declared here.
 void quad_decode_index(apriltag_detector_t *td, struct quad *quad_original, image_u8_t *im,
                        image_u8_t *im_samples, zarray_t *detections);
 void reconcile_detections(zarray_t *detections, zarray_t *poly0, zarray_t *poly1);
-// Same patch, same treatment: upstream's own gradient-based corner
-// refinement (apriltag.c), run optionally (see TagDecoder's constructor
-// comment) immediately before quad_decode_index, mirroring
-// apriltag_detector_detect()'s own quad_decode_task ordering.
+// Upstream's gradient-based corner refinement, exposed by the same patch.
 void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct quad *quad);
 }
 
@@ -36,12 +31,7 @@ void ClearDetections(zarray_t *detections) {
   zarray_truncate(detections, 0);
 }
 
-// Empties a per-quad scratch array WITHOUT destroying its elements. Every
-// pointer a scratch array holds is also, after the merge step in Decode(),
-// held by detections_ - which is the sole owner for destruction purposes.
-// Calling ClearDetections (which destroys) on a scratch array would race
-// ClearDetections(detections_) over the exact same objects: whichever runs
-// second is a double-free.
+// Empties a per-quad scratch array without destroying its elements; detections_ owns them.
 void ResetScratch(zarray_t *scratch) { zarray_truncate(scratch, 0); }
 
 }  // namespace
@@ -51,9 +41,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
     : td_(td),
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads))),
       refine_method_(ResolveRefineEdgesMethod(refine_method)) {
-  // See the constructor's header comment: refine_edges() (called below, if
-  // td_->refine_edges is set) reads td_->quad_decimate for its search
-  // radius, and this is the only place that value can come from.
+  // refine_edges() reads td_->quad_decimate for its search radius.
   td_->quad_decimate = static_cast<float>(decimation);
   poly0_ = g2d_polygon_create_zeros(4);
   poly1_ = g2d_polygon_create_zeros(4);
@@ -61,9 +49,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
 }
 
 TagDecoder::~TagDecoder() {
-  // detections_ is the sole owner of the detection objects (see ResetScratch's
-  // comment) - destroy them here, then only free the per_quad_ arrays'
-  // structure, not their (already-freed, aliased) elements.
+  // detections_ owns the detection objects; the per_quad_ arrays are freed structurally only.
   ClearDetections(detections_);
   zarray_destroy(detections_);
   for (zarray_t *z : per_quad_) {
@@ -84,19 +70,11 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       .buf = const_cast<uint8_t *>(gray_frame),
   };
 
-  // One scratch zarray per quad (grown, never shrunk - see per_quad_'s
-  // comment) so quad_decode_index's tasks share no mutable state except
-  // td_->mutex, which it already takes internally around its own append.
-  // This is exactly how upstream's own workpool calls quad_decode_index
-  // (apriltag.c's quad_decode_task) - see the class comment.
+  // One scratch zarray per quad, so tasks share no mutable state beyond td_->mutex.
   while (per_quad_.size() < quads.size()) {
     per_quad_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
   }
-  // Only over [0, quads.size()): per_quad_ never shrinks, so a frame with
-  // fewer quads than some earlier frame leaves entries beyond this range
-  // holding that earlier frame's now-destroyed pointers. Touching them here
-  // would be a use-after-free; leaving them untouched is fine since the
-  // merge loop below is bounded the same way and never looks at them.
+  // Only [0, quads.size()): entries beyond hold stale pointers from earlier frames.
   for (size_t i = 0; i < quads.size(); ++i) ResetScratch(per_quad_[i]);
 
   pool_->ParallelFor(quads.size(), [&](size_t i, unsigned /*slot*/) {
@@ -110,43 +88,20 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     quad_original.H = nullptr;
     quad_original.Hinv = nullptr;
 
-    // Same order upstream's own quad_decode_task uses: refine (if enabled)
-    // before decode. refine_edges only reads td_->quad_decimate (set once,
-    // before this ParallelFor starts) and td_->refine_edges/mutex-free
-    // fields, and only ever writes to quad_original (this task's own stack
-    // local) - safe to call concurrently across quads, same as
-    // quad_decode_index below.
+    // Refine (if enabled) before decode; both are safe to run concurrently across quads.
     if (td_->refine_edges) {
       RefineEdges(refine_method_, td_, &im, &quad_original);
     }
 
-    // quad_decode_index appends any successful decode(s) (one per matching
-    // tag family) to per_quad_[i]; it computes quad->H/Hinv itself.
+    // quad_decode_index appends decodes to per_quad_[i] and allocates quad->H/Hinv.
     quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, per_quad_[i]);
 
-    // ...and leaves both of those allocated on the quad we passed in.
-    // Nothing inside frees them: upstream's apriltag_detector_detect keeps
-    // its quads in a zarray and destroys them itself once the decode loop is
-    // done, so ownership of H/Hinv lands on whoever supplied the quad. Ours
-    // is a stack local, so skipping this leaked two matd_t per quad - four
-    // allocations, since matd_create() callocs the header and the data
-    // separately - every quad of every frame. At ~100 candidate quads and 30
-    // fps that is roughly 2 GB/hour in a continuous camera loop, which is
-    // exactly this library's intended workload.
-    //
-    // Safe unconditionally: quad_update_homographies only ever leaves H/Hinv
-    // freshly allocated or NULL when they were NULL on entry, which the
-    // initialisation above guarantees for every iteration (it is only
-    // reusing a quad across calls that can leave Hinv dangling there).
+    // Free the homographies allocated on the stack-local quad.
     if (quad_original.H) matd_destroy(quad_original.H);
     if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
   });
 
-  // Merge in quad order, not completion order, so the result - and what
-  // reconcile_detections below keeps when two candidates overlap - is
-  // bit-identical to the fully serial version regardless of thread count.
-  // Bounded to [0, quads.size()), matching the reset loop above - see its
-  // comment on why entries beyond that must not be touched.
+  // Merge in quad order over [0, quads.size()), as in the reset loop above.
   for (size_t i = 0; i < quads.size(); ++i) {
     zarray_t *z = per_quad_[i];
     for (int j = 0; j < zarray_size(z); ++j) {

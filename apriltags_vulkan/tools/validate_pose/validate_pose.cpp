@@ -1,28 +1,6 @@
-// Verifies apriltag_vulkan::PoseEstimator against libapriltag's
-// apriltag_pose.c, which is the reference implementation this is a port of.
-//
-// libapriltag exposes every intermediate stage publicly
-// (estimate_pose_for_tag_homography, and estimate_tag_pose_orthogonal_iteration
-// with both solutions, both errors and a settable nIters), so each half of the
-// algorithm is checked on its own rather than only the final answer. A
-// divergence therefore localizes to a stage instead of just showing up at the
-// end. No patch to libapriltag is needed for any of this.
-//
-// Ladder:
-//   L1  seed                vs estimate_pose_for_tag_homography
-//   L2  solution 1 + err1   vs estimate_tag_pose_orthogonal_iteration
-//   L3  solution 2 + err2   vs the same (exercises fix_pose_ambiguities)
-//   L4  final pick          vs estimate_tag_pose
-//
-// Inputs:
-//   * a synthetic sweep over distance / tilt / in-plane rotation / off-axis
-//     translation, which additionally gives an ABSOLUTE error against known
-//     ground truth - that catches the case where both implementations agree
-//     with each other and are both wrong.
-//   * deliberately degenerate geometry (t parallel to e_x, fronto-parallel,
-//     extreme range, tiny tag, near-collinear corners).
-//   * optionally, real detections from a .pgm run through the actual pipeline
-//     (--data), so the H matrices are in-distribution rather than synthesized.
+// Verifies apriltag_vulkan::PoseEstimator against libapriltag's apriltag_pose.c stage by stage:
+// L1 seed, L2/L3 orthogonal-iteration solutions 1/2 with errors, L4 final pick.
+// Inputs: a synthetic sweep (with absolute error vs ground truth), degenerate geometry, and optionally real detections (--data <.pgm>).
 // The Vulkan headers pull in windows.h on MSVC, whose min/max macros would
 // otherwise break every std::min/std::max below.
 #ifndef NOMINMAX
@@ -62,9 +40,7 @@ using apriltag_vulkan::TagPosePair;
 // kPi is not in the C++ standard and MSVC omits it by default.
 constexpr double kPi = 3.14159265358979323846;
 
-// Below this the object-space error is numerically indistinguishable from
-// zero (a synthetic case is fitted exactly), so a relative comparison of
-// two such values carries no information.
+// Below this the object-space error is indistinguishable from zero, so relative comparison is meaningless.
 constexpr double kErrFloor = 1e-12;
 
 // --- comparison metrics ---------------------------------------------------
@@ -84,17 +60,8 @@ double Norm3(const double v[3]) {
   return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
-// Geodesic angle between two rotations, from the axis-angle form of
-// D = A'B: atan2(|axis|, cos-part).
-//
-// NOT acos((trace(D) - 1) / 2), which is the textbook formula and is useless
-// here. acos has an infinite derivative at 1, so for two nearly-identical
-// rotations - exactly the case this tool spends its time measuring - a
-// single-ULP error in the trace becomes ~4e-8 rad, i.e. ~2.4e-6 deg of
-// phantom difference. That put a hard noise floor under every rotation
-// number, visible as a nonzero angle when comparing a solver against
-// ITSELF. The atan2 form below is well conditioned at both ends and reports
-// a true zero for identical input.
+// Geodesic angle between two rotations from the axis-angle form of D = A'B: atan2(|axis|, cos-part).
+// Well conditioned near identity, unlike acos((trace - 1) / 2).
 double RotationAngleDeg(const double A[3][3], const double B[3][3]) {
   // D = A' * B
   double D[3][3];
@@ -145,10 +112,7 @@ Delta Compare(const TagPose &ours, const matd_t *ref_R, const matd_t *ref_t, dou
 
 // Worst-case accumulator, so a single bad case cannot be averaged away.
 struct Worst {
-  // Explicit constructor rather than aggregate initialization: brace-init of
-  // just the name leaves the remaining members unmentioned, which GCC
-  // reports under -Wmissing-field-initializers even though the default
-  // member initializers below cover them.
+  // Explicit constructor: avoids -Wmissing-field-initializers under GCC.
   explicit Worst(const char *n) : name(n) {}
 
   const char *name = "";
@@ -174,9 +138,7 @@ struct Worst {
       if (d.dt_rel > dt_rel) dt_rel = d.dt_rel;
       worst_label = label;
     }
-    // A synthetic case is fitted essentially exactly, so both error scalars
-    // land near zero and their ratio is noise. Only compare relatively once
-    // the reference error is large enough for the ratio to mean anything.
+    // Synthetic cases fit exactly, so compare relatively only when the reference error clears kErrFloor.
     err_abs = std::max(err_abs, d.err_abs);
     max_err_ref = std::max(max_err_ref, std::fabs(d.err_ref));
     if (std::fabs(d.err_ref) > kErrFloor) {
@@ -265,9 +227,7 @@ void Mul33(const double a[3][3], const double b[3][3], double out[3][3]) {
   std::memcpy(out, tmp, sizeof(tmp));
 }
 
-// Projects the four tag corners for a known pose and derives H from them the
-// same way the real pipeline would (homography_compute over the corner
-// correspondences), so the reference and the port both see a realistic H.
+// Projects the four tag corners for a known pose and derives H via homography_compute, as the real pipeline does.
 SynthCase MakeSynthCase(const CameraIntrinsics &intr, double tagsize, double dist, double tilt,
                         double spin, double off_x, double off_y, const std::string &label) {
   SynthCase c;
@@ -358,9 +318,7 @@ void RunCase(const PoseEstimator &est, const CameraIntrinsics &intr, double tags
   if (ours_both.solution2.valid == ref2_valid && ref2_valid) {
     st->l3.Add(Compare(ours_both.solution2, ref2.R, ref2.t, ref_err2, true), label);
   } else if (ours_both.solution2.valid != ref2_valid) {
-    // A different count of ambiguity minima is a legitimate outcome of tiny
-    // numerical differences (see the plan's quality-loss list), so it is
-    // counted rather than treated as a pass or a hard failure.
+    // A differing count of ambiguity minima is counted, not treated as a failure.
     Delta d;
     d.validity_mismatch = true;
     st->l3.Add(d, label);
@@ -381,8 +339,7 @@ void RunCase(const PoseEstimator &est, const CameraIntrinsics &intr, double tags
         ours_both.solution2.valid && (ours_both.solution2.error < ours_both.solution1.error);
     if (ref_took_2 != ours_took_2) {
       ++st->branch_disagreements;
-      // A disagreement is benign exactly when the two errors are effectively
-      // tied, because then the choice is decided by the last bits.
+      // A disagreement is benign when the two errors are effectively tied.
       const double e1 = ours_both.solution1.valid ? ours_both.solution1.error : HUGE_VAL;
       const double e2 = ours_both.solution2.valid ? ours_both.solution2.error : HUGE_VAL;
       const double scale = std::max(std::min(std::fabs(e1), std::fabs(e2)), 1e-300);
@@ -463,9 +420,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  // convergence_tol = 0: libapriltag always runs its full iteration count,
-  // so the ladder below compares like with like. The early exit is a
-  // deliberate deviation and is measured separately, further down.
+  // convergence_tol = 0: full iteration count, as libapriltag runs; the early exit is measured separately below.
   const PoseEstimator est(intr, tagsize, 0, 0.0);
   std::printf("PoseEstimator vs libapriltag apriltag_pose.c\n");
   std::printf("  intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f, tagsize=%.4f m, threads=%u\n\n",
@@ -643,10 +598,7 @@ int main(int argc, char **argv) {
         ref_best = std::min(ref_best, dt);
         ref_total += dt;
       }
-      // Both configurations: `est` runs the full iteration count (the
-      // libapriltag-parity setting the ladder above verifies), `early_est`
-      // uses the default convergence tolerance. The gap between those two
-      // rows is exactly what the early exit buys.
+      // `est` runs the full iteration count, `early_est` uses the default convergence tolerance.
       const PoseEstimator early_est(intr, tagsize, 1);
       double our_best = 1e30, our_total = 0.0;
       double sink = 0.0;  // keeps the calls from being optimized away
@@ -667,8 +619,7 @@ int main(int argc, char **argv) {
         early_best = std::min(early_best, dt);
         early_total += dt;
       }
-      // Consume `sink` so the loop body cannot be discarded, without a
-      // zero-length printf (which warns under -Wformat-zero-length).
+      // Consume `sink` so the loop is not discarded, avoiding a zero-length printf (-Wformat-zero-length).
       if (!std::isfinite(sink)) {
         std::fprintf(stderr, "non-finite pose accumulated over timing loop\n");
         return 1;
@@ -692,13 +643,7 @@ int main(int argc, char **argv) {
   }
 
   // ---------------- EstimateAll: threaded batch path ----------------
-  //
-  // Distinct from everything above, which exercises the single-detection
-  // entry points. EstimateAll writes results by index rather than in
-  // completion order, so its output must be bit-identical to calling
-  // Estimate() serially - at any thread count. That is what is asserted
-  // here, since "it produced plausible poses" would not catch an
-  // index/ordering bug.
+  // EstimateAll output must be bit-identical to serial Estimate() at any thread count.
   bool batch_ok = true;
   {
     // Reuse a spread of the synthetic sweep as a multi-tag frame.
@@ -722,9 +667,7 @@ int main(int argc, char **argv) {
       dets.push_back(&rds[i].det);
     }
 
-    // Serial reference: the single-detection path, one at a time.
-    // Serial reference in the SHIPPING configuration (default tolerance),
-    // single-threaded, so this isolates the batching from everything else.
+    // Serial reference: single-detection path, default tolerance, single-threaded.
     const PoseEstimator serial_est(intr, tagsize, 1);
     std::vector<TagPose> serial(cases.size());
     for (size_t i = 0; i < cases.size(); ++i) {
@@ -748,9 +691,7 @@ int main(int argc, char **argv) {
           continue;
         }
         if (!out[i].valid) continue;
-        // Bit-identical is the requirement here, not "close": both sides run
-        // the same code on the same input, so any difference means the batch
-        // path mixed up results.
+        // Bit-identical is required: both sides run the same code on the same input.
         bool same = (out[i].error == serial[i].error);
         for (int a = 0; a < 3 && same; ++a) {
           if (out[i].t[a] != serial[i].t[a]) same = false;
@@ -768,24 +709,12 @@ int main(int argc, char **argv) {
   std::printf("\n");
 
   // ---------------- early exit (Phase B) ----------------
-  //
-  // The convergence early exit is NOT part of the libapriltag port -
-  // libapriltag always runs its full 50 steps - so libapriltag is the wrong
-  // oracle for it. It is checked two ways instead:
-  //
-  //   1. against the fixed-iteration solver (convergence_tol = 0), which is
-  //      the configuration verified against libapriltag, and
-  //   2. against synthetic ground truth, because agreeing with the
-  //      fixed-iteration solver would mean nothing if both had drifted.
-  //
-  // The tolerance is swept rather than assumed, so the default is chosen from
-  // the measured iterations/accuracy tradeoff instead of guessed.
+  // The early exit is not part of the libapriltag port; it is checked against the fixed-iteration solver and synthetic ground truth.
   bool early_ok = true;
   {
     const PoseEstimator exact(intr, tagsize, 1, 0.0);  // fixed 50 steps
 
-    // Ground-truth accuracy of the fixed-iteration solver, which is the bar
-    // the early exit must not fall below.
+    // Ground-truth accuracy of the fixed-iteration solver, the bar the early exit must not fall below.
     double base_truth_rot = 0.0, base_truth_dt = 0.0;
 
     struct Row {
@@ -832,10 +761,7 @@ int main(int argc, char **argv) {
     for (double tol : tols) {
       const PoseEstimator est_t(intr, tagsize, 1, tol);
       Row r{tol, 0, 0, 0, 0, 0, 0, 0, 0, 0.0};
-      // Wall clock over the whole case set. Iteration count is only a proxy
-      // for cost - the seed, the per-point F precompute and the ambiguity
-      // search (with its quartic solve) are fixed overhead the early exit
-      // cannot touch - so measure the thing that matters directly.
+      // Wall clock over the whole case set (iteration count alone ignores fixed overhead).
       {
         double best_ms = 1e30, sink = 0.0;
         for (int pass = 0; pass < 5; ++pass) {
@@ -914,32 +840,15 @@ int main(int argc, char **argv) {
       std::printf("   (iterations are only a proxy; this is the real figure)\n");
     }
 
-    // Gate on the DEFAULT tolerance only, and gate it on the right thing.
-    //
-    // Deviating from the fixed-iteration solver by roughly the tolerance is
-    // what a tolerance MEANS, so a fixed absolute bound on that deviation
-    // would just be a restatement of the tolerance. Two bounds that actually
-    // carry information instead:
-    //
-    //   1. Accuracy against ground truth must not regress at all. This is
-    //      the one that matters to a caller, and it is why "early exit and
-    //      fixed iteration agree" would be insufficient on its own - they
-    //      could agree and both have drifted.
-    //   2. The deviation from the fixed solver must stay an order of
-    //      magnitude below the accuracy limit the input itself imposes.
-    //      Being closer to the fixed solver than the fixed solver is to
-    //      reality means the early exit cannot be what limits the answer.
-    //
-    // Plus: the deviation must scale with the tolerance rather than exceed
-    // it wildly, which catches an exit criterion that fires too early.
+    // Gate on the DEFAULT tolerance only: accuracy against ground truth must not regress, the deviation from the fixed solver
+    // must stay an order of magnitude below the input's accuracy limit, and it must scale with the tolerance.
     for (const Row &r : rows) {
       if (r.tol != PoseEstimator::kDefaultConvergenceTol) continue;
       const bool truth_not_worse = r.truth_rot <= base_truth_rot + 1e-9 &&
                                    r.truth_dt <= base_truth_dt * (1.0 + 1e-6) + 1e-12;
       const bool far_below_accuracy_limit =
           r.rot_vs_fixed < base_truth_rot * 0.1 && r.dt_vs_fixed < base_truth_dt * 0.1;
-      // Translation deviation is dimensionless-relative, same units as the
-      // tolerance, so it should land within a small multiple of it.
+      // Translation deviation is relative, in the tolerance's units: expect a small multiple of it.
       const bool consistent_with_tol = r.dt_vs_fixed < r.tol * 100.0;
       early_ok = early_ok && truth_not_worse && far_below_accuracy_limit &&
                  consistent_with_tol && r.pick_flips == 0;
@@ -952,27 +861,8 @@ int main(int argc, char **argv) {
   std::printf("\n");
 
   // ---------------- verdict ----------------
-  //
-  // Thresholds are calibrated against what the deliberate divergences from
-  // libapriltag actually cost, with margin - not pulled from thin air:
-  //
-  //  * The seed (L1) is where the one intentional precision change lives:
-  //    libapriltag computes homography_to_pose's scale factor with
-  //    single-precision sqrtf, this port uses double. Measured effect on the
-  //    seed is ~1.4e-7 relative in translation, so L1 gets its own looser
-  //    translation bound. Orthogonal iteration then washes that out - by L2
-  //    translation agrees to ~4e-10.
-  //
-  //  * The rotation bound is shared. The measured worst divergence is
-  //    ~2.1e-6 deg, and 1e-4 deg leaves ~48x margin while still being ~30x
-  //    TIGHTER than the error both implementations share against synthetic
-  //    ground truth (~3.2e-3 deg). That is the honest framing: the port
-  //    tracks libapriltag far more closely than either tracks reality.
-  //
-  //  * The object-space error is compared in absolute terms, because a
-  //    synthetic case is fitted exactly and both scalars sit at ~1e-13 or
-  //    below, where a ratio is pure noise. Relative agreement is asserted
-  //    only over the cases clearing kErrFloor.
+  // L1 has a looser translation bound (single-precision sqrtf upstream, double here); the rotation bound is shared.
+  // Object-space error is compared in absolute terms; relative agreement only over cases clearing kErrFloor.
   auto LevelOk = [](const Worst &w, double max_rot_deg, double max_dt_rel) {
     return w.validity_mismatches == 0 && w.rot_deg < max_rot_deg && w.dt_rel < max_dt_rel &&
            w.err_abs < 1e-12 && w.err_rel < 1e-9;
@@ -985,9 +875,7 @@ int main(int argc, char **argv) {
     bool ok = LevelOk(st.l1, kMaxRotDeg, kMaxDtRelSeed) &&
               LevelOk(st.l2, kMaxRotDeg, kMaxDtRelRefined) &&
               LevelOk(st.l4, kMaxRotDeg, kMaxDtRelRefined);
-    // L3 exercises fix_pose_ambiguities, where a differing count of minima is
-    // a documented legitimate outcome of last-bit differences; its validity
-    // mismatches are reported but only gated where asked.
+    // L3 exercises fix_pose_ambiguities; validity mismatches are reported but only gated where asked.
     if (require_l3) {
       ok = ok && st.l3.rot_deg < kMaxRotDeg && st.l3.dt_rel < kMaxDtRelRefined &&
            st.l3.err_abs < 1e-12 && st.l3.err_rel < 1e-9;

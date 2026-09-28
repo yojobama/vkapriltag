@@ -15,7 +15,7 @@ ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_
       workgroup_size_(workgroup_size) {
   for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = ctx.caps().max_workgroup_count[i];
 
-  // Fail loudly at build time rather than with an obscure driver error later.
+  // Fail at build time rather than with an obscure driver error later.
   if (workgroup_size_.invocations() > ctx.caps().max_workgroup_invocations ||
       workgroup_size_.x > ctx.caps().max_workgroup_size[0] ||
       workgroup_size_.y > ctx.caps().max_workgroup_size[1] ||
@@ -60,9 +60,7 @@ ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_
   CheckVk(vkCreatePipelineLayout(device_, &pipeline_layout_info, nullptr, &pipeline_layout_),
           "vkCreatePipelineLayout");
 
-  // Feed the workgroup dimensions in as specialization constants 0/1/2, which
-  // the shaders declare via layout(local_size_{x,y,z}_id = ...). Any extra
-  // caller-supplied constants follow at IDs 3, 4, ...
+  // Workgroup dimensions are specialization constants 0/1/2; caller constants follow from ID 3.
   std::vector<uint32_t> spec_data = {workgroup_size_.x, workgroup_size_.y, workgroup_size_.z};
   spec_data.insert(spec_data.end(), extra_specialization_constants.begin(),
                    extra_specialization_constants.end());

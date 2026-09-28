@@ -1,70 +1,34 @@
 # ---------------------------------------------------------------------------
-# vkapriltag: the Vulkan-compute GPU detection pipeline + CPU QuadDecode/
-# TagDecoder tail, packaged as a standalone, installable library. Consumers
-# link against the `vkapriltag::vkapriltag` target (or plain `vkapriltag` when
-# add_subdirectory()'d in-tree).
+# vkapriltag: Vulkan compute detection pipeline + CPU QuadDecode/TagDecoder tail, as an installable library
+# (target vkapriltag::vkapriltag, or vkapriltag in-tree).
 # ---------------------------------------------------------------------------
 
 find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
-# The AprilTag CPU decode library.  This is a pure-C library (no CUDA/OpenCV
-# dependency) that performs the final quad -> tag id/pose decode step, exactly
-# like the original CUDA implementation does (it also ran this part on the
-# CPU). We fetch the official upstream AprilRobotics library and apply a small
-# patch that extracts two blocks apriltag_detector_detect() already contains
-# (the per-quad family decode, and the cross-family duplicate-reconciliation
-# pass) into non-static entry points - quad_decode_index()/
-# reconcile_detections() - so the GPU pipeline can drive them directly with
-# its own externally-detected quads instead of apriltag_detector_detect()'s
-# own (CPU-only) quad-detection step. The patch changes no behavior of
-# apriltag_detector_detect() itself.
+# Upstream AprilRobotics apriltag, patched to expose quad_decode_index() and reconcile_detections()
+# so the GPU pipeline can feed its own quads to the CPU decode.
 # ---------------------------------------------------------------------------
 include(FetchContent)
 set(APRILTAG_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-decode-steps.patch)
-# common/pthreads_cross.{h,c} assume any _WIN32 target has no real pthread.h
-# and needs its own CRITICAL_SECTION/CONDITION_VARIABLE-based emulation of
-# it - true for MSVC, but MinGW-w64 ships a real winpthreads pthread.h, so
-# that emulation's typedefs/declarations there directly conflict with the
-# ones MinGW's own <pthread.h> (pulled in transitively via libstdc++'s
-# gthr-default.h) provides. This patch scopes that emulation to
-# "_WIN32 and not MinGW" so a MinGW build uses the real pthread.h instead.
+# Patch scoping the pthreads_cross emulation to "_WIN32 and not MinGW" so MinGW uses its real pthread.h.
 set(APRILTAG_MINGW_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-mingw-real-pthreads.patch)
 FetchContent_Declare(
   apriltag
   GIT_REPOSITORY https://github.com/AprilRobotics/apriltag.git
   GIT_TAG v3.4.5
-  # Idempotent: skips re-applying a patch already present (needed since
-  # FetchContent may re-run the patch step across reconfigures). Applied via
-  # a cmake -P script rather than a chained shell command line so the
-  # idempotency logic doesn't depend on the PATCH_COMMAND's shell (cmd.exe
-  # vs sh) agreeing on &&/|| grouping.
-  # Comma-, not semicolon-separated - see ApplyPatches.cmake: PATCH_COMMAND
-  # is itself stored as a semicolon-separated CMake list by the
-  # FetchContent/ExternalProject machinery that regenerates it into a
-  # subbuild CMakeLists.txt, so an embedded (even escaped) ; here does not
-  # reliably survive that round-trip and silently splits "-DPATCHES=a;b"
-  # into the two arguments "-DPATCHES=a" and "b", losing the second patch
-  # path entirely with no error.
+  # Applied via ApplyPatches.cmake, which skips patches already present.
+  # Comma-separated, not semicolon-separated.
   PATCH_COMMAND ${CMAKE_COMMAND}
         "-DPATCHES=${APRILTAG_PATCH_FILE},${APRILTAG_MINGW_PATCH_FILE}"
         -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/ApplyPatches.cmake
 )
-# Upstream's own CMakeLists.txt defaults BUILD_EXAMPLES to ON and installs
-# its apriltag_demo/opencv_demo example binaries unconditionally when it is
-# - swept into *our* install()/CPack output otherwise (opencv_demo in
-# particular then pulls a spurious OpenCV runtime dependency onto every
-# vkapriltag package, on any host that happens to have OpenCV's dev package
-# available, regardless of whether OUR build wants it). We only ever need
-# the apriltag library itself.
+# Disable upstream's example binaries so they are not installed.
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(apriltag)
 
-# Newer GCC (15+) defaults to a C standard where implicit/incompatible
-# pointer-type function calls (used throughout this older C library, e.g.
-# common/getopt.c's zarray_vmap(..., free)) are hard errors instead of
-# warnings. Pin it to gnu17 so it builds unmodified.
+# Pin gnu17: newer GCC defaults turn the old C sources' incompatible pointer calls into errors.
 if(TARGET apriltag)
   target_compile_options(apriltag PRIVATE -std=gnu17)
 endif()
@@ -107,13 +71,8 @@ set(SHADER_SOURCES
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)
 
 # ---------------------------------------------------------------------------
-# Compile the SPIR-V corpus into the library, so a deployed binary needs
-# nothing on disk beside it. This is what makes the library usable from a
-# context with no install prefix at all - most concretely a JNI shared object
-# extracted from a jar, which is how PhotonVision consumes native code. Turn
-# it off to fall back to loading .spv files from SHADER_DIR at runtime; the
-# selection happens at runtime via vk::HasEmbeddedShaders(), so both paths
-# stay compiled and exercised.
+# Compile the SPIR-V corpus into the library; OFF loads .spv files from SHADER_DIR at runtime
+# (selected by vk::HasEmbeddedShaders()).
 # ---------------------------------------------------------------------------
 option(VKAPRILTAG_EMBED_SHADERS "Compile the SPIR-V corpus into the library" ON)
 
@@ -121,8 +80,7 @@ set(EMBEDDED_SHADERS_CPP ${CMAKE_CURRENT_BINARY_DIR}/embedded_shaders.cpp)
 set(GENERATE_EMBEDDED_SHADERS_SCRIPT
   ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/GenerateEmbeddedShaders.cmake)
 
-# '|'-joined: a ';'-separated list would be split into separate arguments on
-# the way through -D.
+# '|'-joined so -D does not split the list.
 string(REPLACE ";" "|" SHADER_SPIRV_BINARIES_ARG "${SHADER_SPIRV_BINARIES}")
 
 add_custom_command(
@@ -164,8 +122,7 @@ target_include_directories(vkapriltag PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-# The shader SPIR-V lives next to the build tree during development, and next
-# to the installed library (under share/vkapriltag/shaders) once installed.
+# SPIR-V location: the build tree in development, share/vkapriltag/shaders once installed.
 target_compile_definitions(vkapriltag PUBLIC
   "SHADER_DIR=\"$<BUILD_INTERFACE:${SHADER_OUTPUT_DIR}>$<INSTALL_INTERFACE:${CMAKE_INSTALL_FULL_DATADIR}/vkapriltag/shaders>\""
 )
@@ -183,8 +140,7 @@ endif()
 set_target_properties(vkapriltag PROPERTIES OUTPUT_NAME vkapriltag)
 
 # ---------------------------------------------------------------------------
-# Install rules: library, public headers, compiled shaders, and a CMake
-# package config so downstream projects can find_package(vkapriltag).
+# Install rules: library, public headers, compiled shaders and the CMake package config.
 # ---------------------------------------------------------------------------
 install(TARGETS vkapriltag
   EXPORT vkapriltagTargets

@@ -1,14 +1,6 @@
 #version 450
-// Identical to threshold.comp except DecimatedImage and Thresholded are both
-// uint8_t per pixel instead of uint - selected at runtime (GpuDetector::
-// ShaderPath) on devices that report storageBuffer8BitAccess. Both buffers
-// change together, not independently: this shader is the one place that
-// reads decimated_buf_ AND writes thresholded_buf_ in the same dispatch, so
-// there is no clean way to make only one of the two 8-bit here - see
-// decimate_u8.comp's comment for the general rationale.
-//
-// Thresholded is still logically three-valued (0/127/255) even packed into
-// a byte - no change to that encoding, just the storage width.
+// threshold.comp with uint8_t DecimatedImage and Thresholded (both change
+// together; the encoding stays 0/127/255).
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
@@ -31,11 +23,7 @@ void main() {
   if (x >= pc.decimated_width || y >= pc.decimated_height) return;
   uint i = y * pc.decimated_width + x;
 
-  // block_width is passed explicitly rather than recomputed as
-  // decimated_width/4u: decimated_width need not be a multiple of 4 (only
-  // the source image's width/height are guaranteed even), so the host's
-  // ceil-rounded block grid (GpuDetector::block_width_) is the only correct
-  // stride into minmax_filtered[].
+  // block_width is the host's ceil-rounded block grid (decimated_width need not be a multiple of 4).
   uint packed = minmax_filtered[(x / 4u) + (y / 4u) * pc.block_width];
   uint mn = packed & 0xffu;
   uint mx = (packed >> 8u) & 0xffu;

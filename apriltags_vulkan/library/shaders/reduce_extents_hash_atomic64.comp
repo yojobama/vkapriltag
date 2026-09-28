@@ -1,9 +1,7 @@
 #version 450
-// VK_KHR_shader_atomic_int64 variant: folds the two atomics every point
-// performs into one. Selected at runtime when the device reports
-// shaderBufferInt64Atomics (and shaderInt64); reduce_extents_hash.comp is
-// the fallback and stays the default everywhere else. See
-// reduce_extents_hash_body.glsl for the packing and why it is exact.
+// 64-bit atomic variant (needs shaderBufferInt64Atomics and shaderInt64): one
+// atomicAdd covers count and pxgx_plus_pygy_sum. reduce_extents_hash.comp is
+// the fallback.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_atomic_int64 : require

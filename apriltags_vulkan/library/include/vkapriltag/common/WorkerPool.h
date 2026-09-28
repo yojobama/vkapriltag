@@ -12,57 +12,27 @@
 
 namespace apriltag_vulkan {
 
-// A minimal persistent worker pool for the detector's CPU tail.
-//
-// Persistent rather than thread-per-frame on purpose: spawning a dozen
-// std::threads costs a few hundred microseconds, which is negligible against
-// the ~10 ms the tail used to take but not against the ~1.5 ms it takes once
-// parallelized.
-//
-// Work is handed out by an atomic index rather than statically partitioned,
-// because per-blob cost varies by more than an order of magnitude (the
-// combinatorial quad search runs only for blobs with >= 4 detected peaks), so
-// an even split would leave most threads idle waiting for one straggler.
+// Persistent worker pool for the CPU tail; work is handed out by an atomic index.
 class WorkerPool {
  public:
-  // `threads` is the TOTAL degree of parallelism including the calling thread,
-  // so a value of 1 runs everything inline with no synchronization at all.
-  // 0 selects std::thread::hardware_concurrency().
+  // `threads` is the total parallelism including the calling thread (1 runs inline; 0 selects
+  // hardware_concurrency).
   explicit WorkerPool(unsigned threads = 0);
   ~WorkerPool();
 
   WorkerPool(const WorkerPool &) = delete;
   WorkerPool &operator=(const WorkerPool &) = delete;
 
-  // Invokes fn(i, slot) exactly once for every i in [0, count), on an
-  // unspecified thread, and returns only once all of them have completed. fn
-  // must be safe to call concurrently for distinct i.
-  //
-  // `slot` is a value in [0, threads()) that is FIXED for the lifetime of
-  // whichever thread is calling fn - 0 is always the calling (ParallelFor's
-  // caller's) thread, and each pool worker thread keeps the same nonzero
-  // slot across every batch it ever participates in. This exists so a
-  // caller whose per-item work wants cheap, race-free per-thread scratch
-  // state can index a `std::vector` sized to `threads()` by `slot`, instead
-  // of using a C++11 `thread_local` - which is unsafe here: this library is
-  // always loaded via dlopen() when used from a JNI shim (that's what JNI's
-  // System.load() does), and a fresh, dlopen()'d module's `thread_local`
-  // variables are not safely accessible from a freshly spawned pthread on
-  // every platform - observed as an immediate SIGBUS (BUS_ADRALN) the first
-  // time a pool worker thread touched one, on an aarch64/glibc target, even
-  // with no concurrent access to it at all (see QuadDecode.cpp's history for
-  // the scratch buffers this replaced). Prefer `slot`-indexed scratch over
-  // `thread_local` for exactly this reason in any code that runs on these
-  // worker threads.
+  // Invokes fn(i, slot) once for each i in [0, count) and returns when all have completed; fn must
+  // be safe to call concurrently for distinct i. `slot` in [0, threads()) is fixed per thread
+  // (0 is the caller), so per-thread scratch can be indexed by it instead of using thread_local.
   void ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn);
 
   unsigned threads() const { return 1 + static_cast<unsigned>(workers_.size()); }
 
  private:
   void WorkerMain(unsigned slot);
-  // Claims indices until the current batch is exhausted. Shared by the
-  // workers and the calling thread, so the caller also does a share of the
-  // work instead of blocking idle.
+  // Claims indices until the batch is exhausted; used by workers and the calling thread.
   void DrainBatch(unsigned slot);
 
   std::vector<std::thread> workers_;
@@ -79,12 +49,8 @@ class WorkerPool {
   bool stop_ = false;
 };
 
-// Resolves a WorkerPool's degree of parallelism the same way everywhere it's
-// constructed in the CPU tail (QuadDecode, TagDecoder): an explicit config
-// value wins, then APRILTAG_CPU_THREADS, then WorkerPool's own
-// hardware_concurrency default. Kept in one place so the env var means the
-// same thing - and can be set once to affect both phases - regardless of
-// which phase is constructing the pool.
+// Thread count for the CPU tail: explicit config value, else APRILTAG_CPU_THREADS, else 0
+// (WorkerPool default).
 inline unsigned ResolveThreadCount(uint32_t configured) {
   if (configured > 0) return configured;
   if (const char *t = std::getenv("APRILTAG_CPU_THREADS")) {

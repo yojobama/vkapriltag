@@ -1,7 +1,6 @@
 #version 450
-// 32-bit-per-pixel Thresholded - the always-safe default. See
-// label_pixels_body.glsl for the shader itself, and label_pixels_u8.comp for
-// the variant GpuDetector picks on devices with storageBuffer8BitAccess.
+// Thresholded as uint per pixel; label_pixels_u8.comp is the uint8_t variant.
+// The shader is in label_pixels_body.glsl.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 

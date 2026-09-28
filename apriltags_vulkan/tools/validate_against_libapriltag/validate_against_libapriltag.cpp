@@ -1,10 +1,5 @@
-// Standalone validation tool: runs this project's full Vulkan+CPU detection
-// pipeline (GpuDetector -> QuadDecode -> TagDecoder) on a static grayscale
-// PGM image and compares the resulting decoded tag IDs AND corner positions
-// against the fetched `apriltag` C library's own, unmodified, reference CPU
-// detector (apriltag_detector_detect()) run on the exact same image. This is
-// the "verify against the official libapriltag outputs" check - not a
-// manual/eyeballed comparison.
+// Runs the full Vulkan+CPU pipeline (GpuDetector -> QuadDecode -> TagDecoder) on a PGM image and compares decoded tag IDs
+// and corner positions against the unmodified apriltag_detector_detect() on the same image.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -51,16 +46,9 @@ int main(int argc, char **argv) {
   std::string pgm_path;
   std::string family_name = "tag36h11";
   std::string csv_path;
-  // A single Detect() call is dominated by cold-start costs (first-touch page
-  // faults across every buffer, pipeline warm-up), which say nothing about
-  // per-frame throughput. Repeat and report the best/median to measure the
-  // steady state a live camera feed would actually see. The WHOLE pipeline
-  // (GPU + quad_decode + tag_decode) is timed per iteration, not just
-  // Detect(), since CPU-tail changes are invisible to a GPU-only timer.
+  // Repeats the whole pipeline (GPU + quad_decode + tag_decode) and reports best/median timings.
   int iterations = 1;
-  // Matches DetectorConfig::decimation's default. Kept in sync with
-  // td_ref->quad_decimate below so "verified against unmodified upstream
-  // apriltag" stays true at every tested decimation factor, not just 2.
+  // Matches DetectorConfig::decimation's default; kept equal to td_ref->quad_decimate below.
   uint32_t decimation = 2;
 
   for (int i = 1; i < argc; ++i) {
@@ -110,10 +98,7 @@ int main(int argc, char **argv) {
     // --- Our pipeline: Vulkan GPU detector + CPU QuadDecode + TagDecoder ---
     apriltag_detector_t *td_ours = apriltag_detector_create();
     apriltag_detector_add_family(td_ours, tf);
-    // td_ref below is never told otherwise, so it runs in upstream's own
-    // default config (refine_edges = true, apriltag.c) - matching that here
-    // is what this tool's own header comment promises: verification against
-    // the actual official outputs, not a handicapped comparison.
+    // td_ref runs with upstream's default config (refine_edges = true), so match it here.
     td_ours->refine_edges = true;
 
     apriltag_vulkan::vk::Context ctx;
@@ -135,11 +120,7 @@ int main(int argc, char **argv) {
     metrics.height = height;
     metrics.iterations = iterations;
 
-    // Warm-up plus timed repeats. Every iteration processes the same pixels,
-    // so the detection result is identical; only the timing differs. The
-    // whole pipeline (GPU + quad_decode + tag_decode) is timed every
-    // iteration rather than once cold, since items 2/3 of the optimization
-    // plan are mostly CPU-tail changes.
+    // Warm-up plus timed repeats of the whole pipeline; every iteration processes the same pixels.
     std::vector<double> gpu_totals, quad_decode_totals, tag_decode_totals, pipeline_totals;
     gpu_totals.reserve(static_cast<size_t>(iterations));
     quad_decode_totals.reserve(static_cast<size_t>(iterations));

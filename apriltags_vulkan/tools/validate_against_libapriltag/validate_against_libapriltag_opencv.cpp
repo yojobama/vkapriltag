@@ -1,10 +1,5 @@
-// Standalone validation tool: runs this project's full Vulkan+CPU detection
-// pipeline (GpuDetector -> QuadDecode -> TagDecoder) on a static grayscale
-// image and compares the resulting decoded tag IDs AND corner positions
-// against the fetched `apriltag` C library's own, unmodified, reference CPU
-// detector (apriltag_detector_detect()) run on the exact same image. This is
-// the "verify against the official libapriltag outputs" check - not a
-// manual/eyeballed comparison.
+// Runs the full Vulkan+CPU pipeline (GpuDetector -> QuadDecode -> TagDecoder) on greyscale images and compares decoded tag IDs
+// and corner positions against the unmodified apriltag_detector_detect() on the same image.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -53,26 +48,13 @@ int main(int argc, char **argv) {
   std::string load_path;
   std::string family_name = "tag36h11";
   std::string csv_path;
-  // A single Detect() call is dominated by cold-start costs (first-touch page
-  // faults across every buffer, pipeline warm-up), which say nothing about
-  // per-frame throughput. Repeat and report the best/median to measure the
-  // steady state a live camera feed would actually see. The WHOLE pipeline
-  // (GPU + quad_decode + tag_decode) is timed per iteration, not just
-  // Detect(), since CPU-tail changes are invisible to a GPU-only timer.
+  // Repeats the whole pipeline (GPU + quad_decode + tag_decode) and reports best/median timings.
   int iterations = 1;
-  // Matches DetectorConfig::decimation's default. Kept in sync with
-  // td_ref->quad_decimate below so "verified against unmodified upstream
-  // apriltag" stays true at every tested decimation factor, not just 2.
+  // Matches DetectorConfig::decimation's default; kept equal to td_ref->quad_decimate below.
   uint32_t decimation = 2;
-  // 0 = leave DetectorConfig's default. Exposed because a frame that
-  // overflows max_blobs detects a different set of tags every run, so raising
-  // it until selected_blob_drops reads zero is the way to confirm that is what
-  // a nondeterministic result is caused by.
+  // 0 = leave DetectorConfig's default; otherwise overrides max_blobs.
   uint32_t max_blobs = 0;
-  // Run the frame-pipelined path (FramePipeline) instead of the serial
-  // Detect -> QuadDecode -> TagDecoder chain, so the two can be A/B'd from one
-  // binary. Throughput-only: per-iteration timings below stop being a
-  // breakdown, since the GPU pass and the CPU tail deliberately overlap.
+  // Use the frame-pipelined path (FramePipeline) instead of the serial chain; timings are throughput-only.
   bool pipelined = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -117,7 +99,7 @@ int main(int argc, char **argv) {
     std::cout << "Testing all images in directory: " << load_path << std::endl;
 
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
-      // Skips subdirectories if you only want regular files
+      // Skips subdirectories.
       if (std::filesystem::is_regular_file(entry.path())) {
 	cv::Mat img = cv::imread(entry.path().string(), cv::IMREAD_GRAYSCALE);
         if (img.empty()) {
@@ -149,7 +131,7 @@ int main(int argc, char **argv) {
 
       uint32_t width = image.cols, height = image.rows;
 
-      // initialize the vkapritlag stuff
+      // Initialise the vkapriltag pipeline.
       apriltag_vulkan::vk::Context ctx;
       apriltag_family_t* tf = nullptr;
       if (!setup_tag_family(&tf, family_name.c_str())) {
@@ -157,10 +139,7 @@ int main(int argc, char **argv) {
       }
       apriltag_detector_t* td_ours = apriltag_detector_create();
       apriltag_detector_add_family(td_ours, tf);
-      // td_ref below is never told otherwise, so it runs in upstream's own
-      // default config (refine_edges = true, apriltag.c) - matching that
-      // here is what this tool's own header comment promises: verification
-      // against the actual official outputs, not a handicapped comparison.
+      // td_ref runs with upstream's default config (refine_edges = true), so match it here.
       td_ours->refine_edges = true;
       apriltag_vulkan::DetectorConfig config;
       config.width = width;
@@ -192,18 +171,13 @@ int main(int argc, char **argv) {
       std::vector<apriltag_vulkan::DetectedQuad> quads;
 
       if (pipelined) {
-        // Pushing the same buffer every iteration is safe here only because
-        // both consumers read it: the GPU pass copies it into its staging
-        // buffer and TagDecoder samples it. A live camera must alternate two
-        // buffers - see FramePipeline::Push.
+        // The same buffer is pushed every iteration; a live camera must alternate two buffers (see FramePipeline::Push).
         apriltag_vulkan::FramePipeline pipe(detector, quad_decode, tag_decoder);
         for (int it = 0; it < iterations; ++it) {
           const auto t0 = std::chrono::steady_clock::now();
           zarray_t *done = pipe.Push(image.data, width, height, config.reversed_border);
           const auto t1 = std::chrono::steady_clock::now();
-          // Wall time per pushed frame - the throughput number. It is NOT
-          // comparable to the serial path's per-stage breakdown, which is why
-          // the three stage vectors stay empty in this mode.
+          // Wall time per pushed frame (the throughput number); the stage vectors stay empty in this mode.
           pipeline_totals.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
           if (done != nullptr) {
             ours = done;
@@ -287,18 +261,13 @@ int main(int argc, char **argv) {
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
       const double gpu_span_total = PrintGpuStageBreakdown(profile);
-      // Host-side cost of driving the GPU - see DetectProfile's cpu_*_ms
-      // comment for what the residual below is (and, importantly, what it
-      // is not).
+      // Host-side cost of driving the GPU (see DetectProfile's cpu_*_ms).
       std::cout << "  Host-side submission cost (last iteration): begin="
           << profile.cpu_begin_ms << " ms, submit+wait=" << profile.cpu_submit_wait_ms
           << " ms, counter_reads=" << profile.cpu_counter_read_ms << " ms, over "
           << profile.submits << " submit(s)" << std::endl;
       if (profile.has_gpu_stage_breakdown) {
-        // Deliberately NOT divided by the submit count: that reading
-        // ("cost per round trip") was tested by removing a submission and
-        // disproved - see DetectProfile's cpu_*_ms comment. This is GPU-side
-        // time no span covers, dominated by inter-dispatch barriers.
+        // Not divided by the submit count: GPU-side time no span covers, dominated by inter-dispatch barriers.
         std::cout << "    unspanned GPU time (submit+wait minus spans) = "
             << (profile.cpu_submit_wait_ms - gpu_span_total) << " ms" << std::endl;
       }
@@ -368,11 +337,7 @@ int main(int argc, char **argv) {
 
     std::cout << "Final Results: " << match << " matches, " << mismatch << " mismatches." << std::endl;
 
-  // Exit non-zero on any mismatch, matching the PGM-only variant, so this can
-  // gate a scripted run rather than only being read by a human. Zero images
-  // validated is also a failure: a mistyped --data path or a directory whose
-  // every image was skipped (unloadable, or odd dimensions) would otherwise
-  // report success having checked nothing at all.
+  // Exit non-zero on any mismatch, or if no image was validated.
   if (mismatch > 0) return 1;
   if (match == 0) {
     std::cerr << "No images were validated - nothing to compare against libapriltag." << std::endl;

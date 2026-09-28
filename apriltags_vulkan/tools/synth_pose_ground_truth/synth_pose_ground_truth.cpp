@@ -1,48 +1,5 @@
-// Ground-truths the libapriltag-vs-vkapriltag pose delta that
-// validate_pose_e2e measures on real photographs.
-//
-// A real photograph has no known true pose, so validate_pose_e2e's mutual
-// delta cannot say WHICH side is closer to correct: a real image where the
-// two pipelines disagree by 8 degrees is consistent with "vkapriltag is 8
-// degrees off truth", "libapriltag is 8 degrees off truth", or anything in
-// between that sums to 8. This tool renders a tag at a CHOSEN 6-DoF pose
-// into a synthetic camera frame, runs the exact same two independent
-// end-to-end pipelines validate_pose_e2e does, and compares BOTH sides
-// against the pose used to render the frame - not just against each other.
-//
-// The rendered pixel grid is not a guess at "what a printed tag looks
-// like": it is built directly from the family's own bit_x/bit_y/codes
-// tables (apriltag_family_t, apriltag.h), the exact data the decoder
-// itself samples against. That guarantees the synthetic tag is decodable
-// by construction and that any measured error is the detector's, not an
-// artifact of a mis-guessed rendering convention. (Contrast
-// apriltag_to_image() in the vendored library: it exists, but draws a
-// 1px-per-cell perimeter-outline debug thumbnail, not a solid-cell image a
-// camera could plausibly have photographed - unsuitable as source pixels
-// for a warp.)
-//
-// Pipeline per case:
-//   1. Choose a pose (R, t) and project the tag's border-square corners
-//      through the pinhole model - the same projection validate_pose.cpp's
-//      MakeSynthCase uses, so this tool's ground truth is consistent with
-//      the pose solver's own synthetic-sweep ground truth.
-//   2. Solve the exact homography from the canonical bitmap's border-square
-//      corners to those projected image corners (4 point correspondences,
-//      not an over-determined fit - this IS the ground truth, not an
-//      estimate of it), and warp the whole bitmap (border ring + quiet
-//      zone) through it onto a flat background.
-//   3. Run stock libapriltag (apriltag_detector_detect + estimate_tag_pose)
-//      and vkapriltag (GpuDetector -> QuadDecode -> TagDecoder ->
-//      PoseEstimator) independently on the rendered frame, exactly as
-//      validate_pose_e2e does on a real photograph.
-//   4. Compare: each side's pose against the KNOWN truth, each side's
-//      detected corners against the KNOWN truth corners (in pixels,
-//      independent of the pose solver), and the two sides against each
-//      other (the same mutual metric validate_pose_e2e reports).
-//
-// Modeled on tools/validate_pose/validate_pose.cpp (synthetic geometry,
-// RotationAngleDeg) and tools/validate_pose_e2e/validate_pose_e2e.cpp
-// (running both full pipelines on one frame).
+// Ground-truths the libapriltag-vs-vkapriltag pose delta: renders a tag at a chosen 6-DoF pose into a synthetic frame,
+// runs both end-to-end pipelines (as validate_pose_e2e does) and compares each against the known pose and against each other.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -65,9 +22,7 @@
 #include "vkapriltag/vk/Context.h"
 
 #include <opencv2/opencv.hpp>
-// OpenCV 5 moved getPerspectiveTransform() out of imgproc into a new
-// geometry module that opencv.hpp does not pull in on its own; older
-// versions have no such header, so pull it in only where it exists.
+// OpenCV 5 moved getPerspectiveTransform() into a geometry module; include it only where it exists.
 #if __has_include(<opencv2/geometry.hpp>)
 #include <opencv2/geometry.hpp>
 #endif
@@ -90,9 +45,7 @@ double Norm3(const double v[3]) {
   return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
-// Copied verbatim from tools/validate_pose/validate_pose.cpp and
-// tools/validate_pose_e2e/validate_pose_e2e.cpp - see either for why this
-// form (not acos((trace-1)/2)) is the one to use near identity.
+// Copied from validate_pose.cpp and validate_pose_e2e.cpp; stable near identity.
 double RotationAngleDeg(const double A[3][3], const double B[3][3]) {
   double D[3][3];
   for (int i = 0; i < 3; ++i) {
@@ -133,21 +86,8 @@ void Mul33(const double a[3][3], const double b[3][3], double out[3][3]) {
 
 // --- canonical tag bitmap, built from the family's own data -------------
 
-// Renders family/id as a solid-cell grayscale bitmap: `cell_px` pixels per
-// grid cell, `total_width` cells square (border ring + data cells + quiet
-// zone), matching what a camera would plausibly have photographed - unlike
-// apriltag_to_image()'s perimeter-outline debug thumbnail (see header
-// comment). bit_x/bit_y/codes/width_at_border/total_width/reversed_border
-// come straight from apriltag_family_t, so the cell layout is exactly what
-// the decoder itself checks: this cannot silently disagree with the
-// decoder about which cell is which.
-//
-// Convention (matches quad_decode_index's bit sampling in apriltag.c: a
-// sample above threshold sets rcode's bit to 1): quiet zone and "1" data
-// bits are white (255); the border ring and "0" data bits are black (0).
-// reversed_border swaps which of {border ring, data bits} plays which role
-// is NOT handled here (tag36h11 has reversed_border == false; this project
-// does not test reversed-border families elsewhere either).
+// Renders family/id as a solid-cell greyscale bitmap: `cell_px` pixels per cell, `total_width` cells square
+// (border ring, data cells, quiet zone). Quiet zone and "1" bits are white (255), border ring and "0" bits black (0); reversed_border is not handled.
 cv::Mat RenderTagBitmap(const apriltag_family_t *tf, uint32_t id, int cell_px, int *border_start_px,
                         int *border_width_px) {
   const int total_px = tf->total_width * cell_px;
@@ -159,10 +99,7 @@ cv::Mat RenderTagBitmap(const apriltag_family_t *tf, uint32_t id, int cell_px, i
   *border_start_px = bstart_px;
   *border_width_px = bwidth_px;
 
-  // Solid black border ring (the whole width_at_border square starts black;
-  // data-bit cells below punch white squares into it where the code bit is
-  // 1, exactly as a printed tag has a black ring with white bit-squares in
-  // it).
+  // Solid black border ring; "1" data-bit cells punch white squares into it.
   cv::rectangle(bitmap, cv::Rect(bstart_px, bstart_px, bwidth_px, bwidth_px), cv::Scalar(0),
                 cv::FILLED);
 
@@ -182,12 +119,8 @@ cv::Mat RenderTagBitmap(const apriltag_family_t *tf, uint32_t id, int cell_px, i
 struct SynthCase {
   double truth_R[3][3];
   double truth_t[3];
-  // Border-square corners in IMAGE pixels, order (-1,1),(1,1),(1,-1),(-1,-1)
-  // in the tag's own object frame - the same fixed correspondence
-  // validate_pose.cpp's MakeSynthCase and libapriltag's own homography
-  // solve use, so no corner-order reconciliation is needed anywhere below:
-  // a detector's own p[] is already in this convention by construction (its
-  // hamming decode fixes the rotation/starting corner).
+  // Border-square corners in image pixels, ordered (-1,1),(1,1),(1,-1),(-1,-1) in the tag's object frame,
+  // the order a detector's p[] uses.
   double corners[4][2];
   double px_size = 0.0;  // mean edge length of the four corners, in pixels
   bool ok = false;
@@ -215,8 +148,7 @@ SynthCase MakeSynthCase(const CameraIntrinsics &intr, double tagsize, double dis
     if (!(cam[2] > 1e-6)) return c;  // behind or on the camera plane
     c.corners[i][0] = intr.fx * cam[0] / cam[2] + intr.cx;
     c.corners[i][1] = intr.fy * cam[1] / cam[2] + intr.cy;
-    // Reject anything that would fall (even partly) outside the frame -
-    // that is a framing artifact of this sweep, not a detector question.
+    // Reject anything falling even partly outside the frame.
     if (c.corners[i][0] < 0 || c.corners[i][0] >= width || c.corners[i][1] < 0 ||
         c.corners[i][1] >= height) {
       return c;
@@ -236,24 +168,8 @@ SynthCase MakeSynthCase(const CameraIntrinsics &intr, double tagsize, double dis
 cv::Mat RenderFrame(const cv::Mat &bitmap, int border_start_px, int border_width_px,
                     const double corners_image[4][2], int width, int height, double blur_sigma,
                     double noise_sigma, uint8_t background) {
-  // Bitmap-space corners of the border square, in the SAME order as
-  // corners_image / SynthCase's obj[] = {(-1,1),(1,1),(1,-1),(-1,-1)}: a
-  // plain axis-aligned square, since RenderTagBitmap places the border ring
-  // at a fixed offset.
-  //
-  // The object frame's +y is NOT "up" in bitmap pixel rows: MakeSynthCase's
-  // pinhole projection (image_y = fy*cam_y/cam_z + cy, no sign flip) treats
-  // increasing object y as increasing pixel row, exactly like bit_y already
-  // does in RenderTagBitmap (row 0 at the top, consistent with the decoder's
-  // own bit sampling - verified directly against apriltag_detector_detect).
-  // So obj (-1,+1) - first in the fixed correspondence - must map to the
-  // LARGER-y (bottom) bitmap corner, not the smaller-y (top) one. Getting
-  // this backwards silently renders a vertically-mirrored tag: warping and
-  // decoding still succeed as a matter of arithmetic (getPerspectiveTransform
-  // solves whatever 4-point correspondence it is given), so the failure
-  // mode is not a crash or a warning, it is 100% of synthetic frames
-  // failing to decode on EITHER side - reproduced and confirmed by this
-  // exact swap in isolation before touching the real sweep.
+  // Bitmap-space corners of the border square in the same order as corners_image.
+  // Object +y maps to increasing pixel row, so obj (-1,+1) is the larger-y (bottom) bitmap corner.
   const cv::Point2f src[4] = {
       {static_cast<float>(border_start_px),
        static_cast<float>(border_start_px + border_width_px)},
@@ -268,19 +184,10 @@ cv::Mat RenderFrame(const cv::Mat &bitmap, int border_start_px, int border_width
   const cv::Mat H = cv::getPerspectiveTransform(src, dst);
 
   cv::Mat frame(height, width, CV_8UC1, cv::Scalar(background));
-  // BORDER_TRANSPARENT: destination pixels the warped source never reaches
-  // (everything outside the tag's own plane) are left as the flat
-  // background just filled above, exactly like a tag sitting on an
-  // otherwise-featureless wall.
+  // BORDER_TRANSPARENT leaves the pre-filled flat background outside the tag's plane.
   cv::warpPerspective(bitmap, frame, H, frame.size(), cv::INTER_AREA, cv::BORDER_TRANSPARENT);
 
-  // A perfectly crisp, noise-free warp is not what any real sensor
-  // produces, and its idealized edges can hide the kind of last-bit
-  // corner-fit ties this project has already found (e.g. a rotation delta
-  // of EXACTLY 0.000 deg from two bit-identical corner reads on a real
-  // photograph, in validate_pose_e2e's field2.jpg/.png outputs). A little
-  // blur and read noise brings the sub-pixel corner estimate back into the
-  // regime an actual camera produces.
+  // Blur and read noise, so corner estimates are sub-pixel as on a real camera.
   if (blur_sigma > 0.0) cv::GaussianBlur(frame, frame, cv::Size(0, 0), blur_sigma);
   if (noise_sigma > 0.0) {
     cv::Mat noise(frame.size(), CV_32F);
@@ -341,13 +248,7 @@ Stat3 Summarize(std::vector<double> v) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  // RenderFrame's cv::randn() draws from OpenCV's default global RNG. Two
-  // runs this session (real AMD hardware, then Mesa lavapipe) produced
-  // bit-identical output, so this is already deterministic in practice - but
-  // this tool now gates CI (see the VERDICT section below), and a gate
-  // should not depend on an implicit default that could change across
-  // OpenCV versions. Fix the seed explicitly so reproducibility is a stated
-  // property, not an accident of the current default.
+  // Fixed seed so cv::randn() output, and hence the CI gate, is reproducible.
   cv::theRNG() = cv::RNG(0x5eed);
 
   std::string family_name = "tag36h11";
@@ -386,12 +287,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Sweep: target pixel sizes chosen to straddle the ~18-50px regime where
-  // validate_pose_e2e found its worst real-corpus deltas, plus larger tags
-  // for context. tilt/spin add foreshortening and in-plane rotation; dist is
-  // solved from the target size at tilt=0 so the sweep is expressed in the
-  // units this actually matters in (pixels on the sensor), not an arbitrary
-  // metre figure.
+  // Sweep of target pixel sizes; tilt/spin add foreshortening and in-plane rotation.
+  // dist is solved from the target size at tilt=0.
   const double target_px_sizes[] = {15, 20, 30, 50, 80, 150};
   const double tilts_deg[] = {0.0, 20.0, 40.0, 60.0};
   const double spins_deg[] = {0.0, 30.0, 60.0, 90.0};
@@ -403,8 +300,7 @@ int main(int argc, char **argv) {
   for (uint32_t id : ids) std::printf("%u ", id);
   std::printf("\n============================================================\n");
 
-  // Bucketed by truth pixel size, since that is what this project's real
-  // corpus showed the error actually depends on.
+  // Bucketed by truth pixel size.
   struct Bucket {
     std::string label;
     double lo, hi;
@@ -453,10 +349,7 @@ int main(int argc, char **argv) {
     const PoseEstimator est(intr, tagsize);
 
     for (uint32_t id : ids) {
-      // Render the canonical bitmap once per id; cell_px chosen generously
-      // (32px/cell) so downsampling to any tag size in the sweep is always
-      // a MINIFICATION for warpPerspective's INTER_AREA, never magnifying
-      // blocky cells into visibly blocky output.
+      // Render the canonical bitmap once per id at 32px/cell so warpPerspective's INTER_AREA always minifies.
       int border_start_px = 0, border_width_px = 0;
       const cv::Mat bitmap = RenderTagBitmap(tf, id, 32, &border_start_px, &border_width_px);
 
@@ -617,18 +510,8 @@ int main(int argc, char **argv) {
               total_cases, total_both_ok);
 
   // ---------------- VERDICT ----------------
-  //
-  // Styled after tools/validate_pose/validate_pose.cpp's own VERDICT block:
-  // named checks, PASS/FAIL, non-zero exit on any failure - this is what
-  // lets a CI workflow gate on "did libapriltag and vkapriltag diverge",
-  // not just print numbers for a human to eyeball.
-  //
-  // Every threshold below gates on the MEAN, deliberately, never the worst
-  // case. The worst mutual delta is dominated by legitimate pose-ambiguity
-  // branch flips at small/oblique tag sizes (measured up to ~124 deg here -
-  // see this file's header comment and validate_pose_e2e's branch-flip
-  // tracking) - a real, expected property of the geometry, not a bug.
-  // Gating on it would make this CI job flaky on entirely correct code.
+  // Named PASS/FAIL checks; non-zero exit on any failure. Thresholds gate on the mean, not the worst case,
+  // since the worst mutual delta is dominated by pose-ambiguity branch flips.
   bool all_ok = true;
   if (all_lib_rot.empty()) {
     std::printf("VERDICT: FAIL (no cases both sides decoded and produced a valid pose)\n");

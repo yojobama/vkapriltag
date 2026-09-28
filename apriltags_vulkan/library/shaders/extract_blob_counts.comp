@@ -1,12 +1,7 @@
 #version 450
-// Copies each selected blob's point count into a buffer sized to max_blobs,
-// zero-padding beyond num_selected_blobs, so it can be inclusive-scanned
-// (scan_block.comp / scan_add_offsets.comp) into per-blob base offsets for
-// rewrite_index_points.comp and sort_points_local.comp.
-//
-// This runs in the same submission as select_blobs.comp, before the host has
-// read back num_selected_blobs, so it reads the count straight off the GPU
-// counter buffer instead of taking it as a push constant.
+// Copies each selected blob's point count into a max_blobs-sized buffer,
+// zero-padded beyond the selected count, for the inclusive scan (scan_block.comp
+// / scan_add_offsets.comp). Reads the count from the GPU counter buffer.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 

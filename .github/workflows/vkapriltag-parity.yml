@@ -1,18 +1,8 @@
 name: vkapriltag parity gate
 
-# Builds the Vulkan-compute AprilTag pipeline and runs
-# apriltag_synth_ground_truth as a regression gate: it renders tag36h11 at
-# known poses, runs stock libapriltag and this port independently, and fails
-# (non-zero exit - see its own VERDICT section) if the measured delta
-# between them exceeds a threshold. See
-# apriltags_vulkan/tools/synth_pose_ground_truth/synth_pose_ground_truth.cpp.
-#
-# GitHub-hosted runners have no GPU, so this runs on Mesa's software Vulkan
-# implementation (lavapipe/llvmpipe) instead of real hardware. Confirmed
-# separately (not assumed) that lavapipe reports every feature this pipeline
-# needs (shaderFloat64, storageBuffer8BitAccess, subgroup ballot+arithmetic)
-# and reproduces bit-identical output to real AMD/Mali hardware for this
-# tool - see the commit that added this workflow for the numbers.
+# Builds the Vulkan-compute pipeline and runs apriltag_synth_ground_truth as a regression gate:
+# it fails if the stock libapriltag / vkapriltag pose delta exceeds a threshold.
+# Runs on Mesa's software Vulkan (lavapipe), as the runners have no GPU.
 
 on:
   push:
@@ -29,9 +19,7 @@ jobs:
   parity-gate:
     runs-on: ubuntu-latest
     env:
-      # The pipeline refuses a CPU/software Vulkan device by default
-      # (vk/Context.cpp) since it is 50-500x slower than real hardware -
-      # this is the documented escape hatch for exactly this CI use case.
+      # Allows the software Vulkan device that vk/Context.cpp rejects by default.
       APRILTAG_VK_ALLOW_CPU: "1"
     steps:
       - uses: actions/checkout@v4
@@ -45,19 +33,7 @@ jobs:
             libopencv-dev
 
       - name: Locate the lavapipe ICD and point the loader at it
-        # Deliberately NOT a hardcoded path: a first attempt at this
-        # workflow hardcoded /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-        # (matching Ubuntu's published package file list for
-        # mesa-vulkan-drivers) and it failed on the actual ubuntu-latest
-        # runner - "Failed to open JSON file", i.e. the file was not at that
-        # path for whatever mesa-vulkan-drivers version/channel that runner
-        # actually resolved (dpkg reported the package installed
-        # successfully; the file layout just did not match what
-        # packages.ubuntu.com's "noble" listing showed - most likely a
-        # noble-updates version with a different layout). Rather than guess
-        # again, find whatever got installed and use that, so a future Mesa
-        # packaging change breaks this the same self-diagnosing way instead
-        # of silently.
+        # Locates the lavapipe ICD json under the standard ICD directories.
         run: |
           echo "Files mesa-vulkan-drivers actually installed under vulkan/icd.d:"
           dpkg -L mesa-vulkan-drivers | grep icd.d || echo "  (none reported by dpkg)"
@@ -73,9 +49,7 @@ jobs:
           echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
 
       - name: Verify the software Vulkan device is visible
-        # Fails here, clearly, if the discovered ICD still doesn't work -
-        # rather than failing confusingly inside
-        # apriltag_synth_ground_truth's own Vulkan setup later.
+        # Fails early if the discovered ICD does not work.
         run: |
           vulkaninfo --summary
           vulkaninfo --summary | grep -q "deviceType.*CPU" || \

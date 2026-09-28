@@ -1,9 +1,6 @@
 #version 450
 // Final adaptive threshold: writes 127 (ambiguous), 0 (black) or 255 (white)
-// per decimated pixel.  Mirrors InternalThreshold.
-//
-// Dispatched 2D so x/y come straight from gl_GlobalInvocationID.xy instead
-// of a runtime `%`/`/` by decimated_width (see decimate.comp's comment).
+// per decimated pixel (InternalThreshold). Dispatched 2D.
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint decimated[]; };
@@ -23,11 +20,7 @@ void main() {
   if (x >= pc.decimated_width || y >= pc.decimated_height) return;
   uint i = y * pc.decimated_width + x;
 
-  // block_width is passed explicitly rather than recomputed as
-  // decimated_width/4u: decimated_width need not be a multiple of 4 (only
-  // the source image's width/height are guaranteed even), so the host's
-  // ceil-rounded block grid (GpuDetector::block_width_) is the only correct
-  // stride into minmax_filtered[].
+  // block_width is the host's ceil-rounded block grid (decimated_width need not be a multiple of 4).
   uint packed = minmax_filtered[(x / 4u) + (y / 4u) * pc.block_width];
   uint mn = packed & 0xffu;
   uint mx = (packed >> 8u) & 0xffu;

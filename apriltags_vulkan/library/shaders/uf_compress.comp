@@ -1,32 +1,10 @@
 #version 450
-// Full path compression: every pixel's parent becomes its ultimate root.
-// Run after each uf_merge.comp pass (and once more at the end) so that
-// downstream shaders can treat `parent[i]` as the final blob label.
+// Full path compression: every pixel's parent becomes its root.
 //
-// The store is guarded: once a chain is already flat (n == i, i.e. parent[i]
-// was already its root), rewriting the identical value is pure write
-// traffic with no effect. That is the common case for the LAST compression
-// pass of a chunk - the one whose only job is to observe convergence, after
-// a merge pass that changed nothing - so guarding it turns that pass into a
-// read-only chain check instead of a full 2 MB rewrite.
-//
-// The READ is guarded too, by `honour_changed_flag`. When the preceding
-// uf_merge.comp joined nothing, parent[] is unchanged and - since every
-// chunk ends with a compression - it was already flat, so this pass cannot
-// find anything to do. It would still stream the whole array to discover
-// that: 1 MB of reads at 1280x800 / decimation 2, and the most common case
-// in steady-state video, where the labelling converges in the first chunk
-// and every later pass is pure verification. Reading the flag first turns
-// that into one scalar load per invocation.
-//
-// The flag is NOT honoured for the compression that runs straight after
-// uf_init.comp, because no merge has run at that point and the flag is
-// still zero from the frame's clear - skipping it there would be wrong, and
-// expensively so: OPTIMIZATION_NOTES.md item 8 measured that particular
-// pass as worth 1.0 ms (a compression between the init and the first merge
-// is what stops the vertical unions walking the run chains the init just
-// built). Hence the explicit push-constant opt-in rather than an
-// unconditional read.
+// The store is skipped when the chain is already flat. With honour_changed_flag
+// set, the pass returns if changed_flag is 0 (the preceding uf_merge.comp
+// joined nothing); it is not set for the compression straight after
+// uf_init.comp, when the flag is still 0.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
@@ -52,8 +30,6 @@ void main() {
     n = p;
     p = parent[n];
   }
-  // parent[i] is only ever written by this invocation (each thread owns
-  // exactly one entry), so `original` - captured before the walk - is still
-  // exactly what's in the buffer now; no need to re-read it.
+  // Each thread owns parent[i], so `original` is still its current value.
   if (n != original) parent[i] = n;
 }

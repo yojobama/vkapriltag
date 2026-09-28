@@ -1,6 +1,5 @@
 #version 450
-// Initializes the raw per-blob extents accumulator array before
-// reduce_extents.comp runs its atomic min/max/sum reduction.
+// Initialises the raw per-blob extents accumulator before reduce_extents_hash.comp.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
@@ -27,16 +26,8 @@ void main() {
   e.pxgx_plus_pygy_sum = 0;
   extents[i] = e;
 
-  // Every private copy this blob can be accumulated into needs the same
-  // identity, because merge_extents.comp folds all of them unconditionally.
-  // One invocation per blob writing kExtentsCopies-1 extra entries keeps this
-  // sized by the frame's real blob count (the dispatch is indirect) instead
-  // of by the replicated capacity - a few hundred blobs, not 94k slots.
-  //
-  // Identity, not "zero": min/max fold correctly only against +/-INT_MAX,
-  // and the sums fold correctly only against 0. A copy that is never written
-  // therefore contributes nothing, which is what lets the subgroup variant of
-  // the reduction stay unprivatized and still merge correctly.
+  // Every private copy needs the same identity because merge_extents.comp folds
+  // all of them: min/max start at +/-INT_MAX, sums at 0.
   if (i < kPrivateExtentsBlobs) {
     for (uint c = 1u; c < kExtentsCopies; ++c) {
       extents[ExtentsSlot(i, c, pc.capacity)] = e;

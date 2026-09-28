@@ -1,16 +1,7 @@
 #pragma once
 
-// Shared metrics/comparison helpers for the two validate_against_libapriltag
-// variants (PGM-only and OpenCV). Kept header-only and dependency-free
-// (no OpenCV) so both variants can use it unconditionally.
-//
-// Phase 0 of the ArUco-derived optimization plan: before touching detector
-// code, the harness needs to (a) time the WHOLE pipeline (GPU + quad_decode +
-// tag_decode) per iteration, not just Detect(), since items 2/3 are mostly
-// CPU-tail changes that a GPU-only timer can't see, and (b) compare per-tag
-// CORNER positions against the reference detector, not just decoded ID sets,
-// since item 3 (DP corner seeding) can regress corner accuracy while leaving
-// the ID set unchanged. Both gaps existed in the original tool.
+// Metrics and comparison helpers shared by the PGM-only and OpenCV validate_against_libapriltag variants;
+// header-only and OpenCV-free.
 
 #include <algorithm>
 #include <cmath>
@@ -31,17 +22,7 @@ namespace apriltag_vulkan {
 namespace validate {
 
 // Prints the per-dispatch GPU span breakdown and the gaps between spans.
-//
-// This used to live inline in the OpenCV variant only, which meant the
-// PGM-only build - the one that gets built on the Mali deployment target,
-// where OpenCV usually is not installed - printed just the five coarse
-// spans (threshold+label / boundary / sort+group / linefit). Anyone
-// profiling on that board therefore had no per-dispatch attribution at all,
-// and at least one round of optimization proposals was written against the
-// coarse numbers as a result. It is the same DetectProfile either way, so
-// there was never a reason for the two tools to disagree.
-// Returns the summed span time, which callers use to report the residual
-// between it and the host-observed submit+wait cost.
+// Returns the summed span time, used to report the residual against the host-observed submit+wait cost.
 inline double PrintGpuStageBreakdown(const apriltag_vulkan::GpuDetector::DetectProfile &profile) {
   if (!profile.has_gpu_stage_breakdown) {
     std::cout << "  (per-dispatch GPU span breakdown unavailable; "
@@ -75,10 +56,7 @@ inline double PrintGpuStageBreakdown(const apriltag_vulkan::GpuDetector::DetectP
   return gpu_span_total;
 }
 
-// The host's own cost of driving the GPU. Printed by both variants for the
-// same reason as the span breakdown above: the submit-boundary gaps are
-// GPU-clock idle waiting for exactly this work, so seeing the two side by
-// side is what tells you whether to chase submits or barriers.
+// Prints the host's own cost of driving the GPU.
 inline void PrintHostSubmissionCost(const apriltag_vulkan::GpuDetector::DetectProfile &profile,
                                     double gpu_span_total) {
   std::cout << "  Host-side submission cost (last iteration): begin=" << profile.cpu_begin_ms
@@ -131,11 +109,8 @@ inline void PrintIds(const char *label, const std::vector<int> &ids) {
   std::cout << "]" << std::endl;
 }
 
-// Per-tag corner RMS distance, in pixels, for every tag ID present in BOTH
-// `ours` and `ref`. Corner index correspondence is assumed (both detectors
-// derive p[4][2] the same way - homography-refined corners in a fixed
-// winding order - from the same input image), so index i in `ours` compares
-// directly against index i in `ref` without a nearest-corner search.
+// Per-tag corner RMS distance, in pixels, for every tag ID present in both `ours` and `ref`.
+// Corner index i in `ours` is compared directly with index i in `ref`.
 struct CornerComparison {
   int compared_tags = 0;
   double mean_rms = 0.0;  // mean over compared tags of that tag's per-corner RMS
@@ -147,8 +122,7 @@ inline CornerComparison CompareCorners(const std::vector<DetectionInfo> &ours,
   CornerComparison result;
   double sum_rms = 0.0;
   size_t oi = 0, ri = 0;
-  // Both vectors are sorted by id (ExtractDetections), so this is a linear
-  // merge rather than an O(n*m) search.
+  // Both vectors are sorted by id, so this is a linear merge.
   while (oi < ours.size() && ri < ref.size()) {
     if (ours[oi].id < ref[ri].id) {
       ++oi;
@@ -173,9 +147,7 @@ inline CornerComparison CompareCorners(const std::vector<DetectionInfo> &ours,
   return result;
 }
 
-// min/median/max of a list of stage timings collected across --iterations
-// repetitions, so cold-start cost (first-touch page faults, pipeline
-// warm-up) doesn't dominate the reported number.
+// min/median/max of stage timings collected across --iterations repetitions.
 struct Stats {
   double best = 0.0, median = 0.0, worst = 0.0;
 };
@@ -190,9 +162,7 @@ inline Stats ComputeStats(std::vector<double> values) {
   return s;
 }
 
-// One row of the --csv output: everything needed to diff a before/after run,
-// or compare the same run across the host and Orange Pi machines, without
-// eyeballing console output.
+// One row of the --csv output.
 struct ImageMetrics {
   std::string file;
   uint32_t width = 0, height = 0;
@@ -214,18 +184,13 @@ struct ImageMetrics {
   bool ids_match = false;
   CornerComparison corners;
 
-  // Item 3 (DP corner seeding) instrumentation. Both 0 when
-  // config.quad_fit_method is the default kPeaks. dp_fallbacks/dp_attempts
-  // is the fraction of blobs where DP couldn't produce a valid quad and the
-  // combinatorial search ran anyway - a high rate means DP is adding cost
-  // without saving the search's.
+  // DP corner-seeding counters; both 0 when config.quad_fit_method is the default kPeaks.
+  // dp_fallbacks/dp_attempts is the fraction of blobs where the combinatorial search ran anyway.
   uint32_t dp_attempts = 0;
   uint32_t dp_fallbacks = 0;
 };
 
-// Appends one CSV row, writing the header first if `path` doesn't exist yet.
-// Intentionally simple (no escaping): every field is a filename, a count, or
-// a number, none of which can contain a comma in practice here.
+// Appends one CSV row, writing the header first if `path` doesn't exist yet. Fields are not escaped.
 inline void AppendCsvRow(const std::string &path, const ImageMetrics &m) {
   const bool write_header = !std::ifstream(path).good();
   std::ofstream f(path, std::ios::app);

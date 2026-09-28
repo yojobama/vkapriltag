@@ -23,8 +23,7 @@ namespace {
 volatile std::sig_atomic_t g_stop = 0;
 void HandleSignal(int) { g_stop = 1; }
 
-// Dumps a grayscale frame as a binary PPM (P5) for quick visual sanity
-// checking without any image-library dependency.
+// Dumps a grayscale frame as a binary PGM (P5) for visual checking.
 void DumpPgm(const std::string &path, const std::vector<uint8_t> &gray, uint32_t width,
             uint32_t height) {
   std::ofstream f(path, std::ios::binary);
@@ -39,7 +38,7 @@ int main(int argc, char **argv) {
   uint32_t width = 1280;
   uint32_t height = 720;
   std::string family_name = "tag36h11";
-  std::string dump_path;  // if non-empty, periodically dump the raw frame here
+  std::string dump_path;  // If non-empty, periodically dump the raw frame here.
   int dump_every_n_frames = 0;
 
   for (int i = 1; i < argc; ++i) {
@@ -74,13 +73,11 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Final tag-id/hamming/pose-precursor decode (everything the fetched
-  // `apriltag` C library does apart from apriltag_pose.h's pose estimation,
-  // which is out of scope - see README.md). quad_decimate defaults to 2.0,
-  // matching this port's fixed 2x GPU decimation.
+  // Tag decode via the `apriltag` C library (no pose estimation); quad_decimate matches the 2x
+  // GPU decimation.
   apriltag_detector_t *td = apriltag_detector_create();
   apriltag_detector_add_family(td, tf);
-  td->refine_edges = false;  // Off by default; flip to true to enable it.
+  td->refine_edges = false;  // Set to true to enable edge refinement.
 
   try {
     apriltag_vulkan::vk::Context ctx;
@@ -92,19 +89,15 @@ int main(int argc, char **argv) {
     config.reversed_border = tf->reversed_border;
     config.normal_border = !tf->reversed_border;
 
-    // decimation must match config.decimation - see TagDecoder's constructor
-    // comment - so this is constructed here, after config exists, rather
-    // than alongside `td` above.
+    // decimation must match config.decimation, so this is built after config.
     apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation);
 
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);
 
     apriltag_vulkan::V4l2Capture capture(device, width, height);
-    // The driver may have negotiated a different resolution than requested;
-    // reflect that into the detector config used above would require
-    // reconstructing the detector, so just fail loudly instead of silently
-    // producing a mismatched pipeline.
+    // The driver negotiated a different resolution than requested; fail rather than run a
+    // mismatched pipeline.
     if (capture.width() != width || capture.height() != height) {
       std::cerr << "Requested " << width << "x" << height << " but device negotiated "
                << capture.width() << "x" << capture.height() << "; adjust --width/--height."
@@ -152,10 +145,7 @@ int main(int argc, char **argv) {
                << std::endl;
       print_detections(detections);
 
-      // NOTE (scope reduction): pose estimation (apriltag_pose.h, which
-      // additionally requires a calibrated camera matrix/tag size) is not
-      // wired up - see README.md for this and the other scope reductions
-      // taken versus the original CUDA implementation.
+      // Pose estimation is not wired up here; see README.md.
 
       if (!dump_path.empty() && dump_every_n_frames > 0 &&
           frame_index % dump_every_n_frames == 0) {

@@ -26,8 +26,7 @@ Shader::Shader(VkDevice device, const ShaderSource &source) : device_(device) {
   VkShaderModuleCreateInfo create_info{};
   create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
 
-  // Kept alive until vkCreateShaderModule returns; unused for embedded
-  // sources, which point straight at rodata.
+  // Kept alive until vkCreateShaderModule returns.
   std::vector<char> file_contents;
 
   if (source.embedded()) {

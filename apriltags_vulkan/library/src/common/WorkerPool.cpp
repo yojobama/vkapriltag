@@ -8,10 +8,7 @@ WorkerPool::WorkerPool(unsigned threads) {
   if (total == 0) total = 1;
 
   workers_.reserve(total - 1);
-  // Slot 0 is reserved for ParallelFor's calling thread (see WorkerPool.h);
-  // pool workers get 1, 2, ... - captured by value here, not read from any
-  // thread_local, so each worker thread knows its own fixed slot with no
-  // per-thread storage of any kind.
+  // Slot 0 is the calling thread; workers get 1, 2, ... (see WorkerPool.h).
   for (unsigned i = 0; i + 1 < total; ++i) {
     const unsigned slot = i + 1;
     workers_.emplace_back([this, slot] { WorkerMain(slot); });
@@ -31,8 +28,7 @@ WorkerPool::~WorkerPool() {
 }
 
 void WorkerPool::DrainBatch(unsigned slot) {
-  // fn_ and count_ are guaranteed stable for the whole batch: ParallelFor does
-  // not clear them until every participant has left this function.
+  // fn_ and count_ stay stable until every participant has left this function.
   const std::function<void(size_t, unsigned)> *fn = fn_;
   if (fn == nullptr) return;
   const size_t count = count_;
@@ -66,8 +62,7 @@ void WorkerPool::WorkerMain(unsigned slot) {
 void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn) {
   if (count == 0) return;
 
-  // Not worth waking anyone for a single item, and this is also the
-  // single-threaded configuration's only path. Slot 0: the calling thread.
+  // A single item (or a single-threaded pool) runs inline on the calling thread as slot 0.
   if (workers_.empty() || count == 1) {
     for (size_t i = 0; i < count; ++i) fn(i, 0);
     return;
@@ -83,14 +78,13 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
   }
   batch_ready_.notify_all();
 
-  // The calling thread takes a share of the work rather than blocking idle,
-  // as slot 0 (see WorkerPool.h).
+  // The calling thread also drains the batch, as slot 0.
   DrainBatch(0);
 
   {
     std::unique_lock<std::mutex> lock(mutex_);
     batch_done_.wait(lock, [this] { return outstanding_ == 0; });
-    // Safe now: every participant has returned from DrainBatch().
+    // Every participant has returned from DrainBatch().
     fn_ = nullptr;
     count_ = 0;
   }

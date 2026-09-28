@@ -1,31 +1,12 @@
 #version 450
-// Down-samples the full resolution grayscale image by an integer factor
-// (kDecimation - GpuDetector::DetectorConfig::decimation), keeping one
-// representative pixel per kDecimation x kDecimation block (matches
-// CudaToGreyscaleAndDecimateHalide's decimation, which copies rather than
-// averages).
+// Down-samples the grayscale image by kDecimation, keeping one pixel per
+// kDecimation x kDecimation block (copies, does not average).
 //
-// The source image arrives PACKED, four 8-bit pixels per uint32 in raster
-// order, and is unpacked here. That keeps the upload at one byte per pixel
-// instead of the four it used to cost (the host previously widened every
-// pixel to a uint32 in a scalar loop, then uploaded 4x the bytes, purely to
-// avoid depending on an optional device feature).
-//
-// Unpacking with a shift rather than relying on 8-bit storage means this
-// needs no VK_KHR_8bit_storage / storageBuffer8BitAccess support, so it works
-// on parts that lack it. The byte order within each word is the natural
-// little-endian one produced by memcpy'ing the source image, which is what
-// every Vulkan-capable platform uses.
-//
-// Dispatched 2D so dx/dy come straight from gl_GlobalInvocationID.xy instead
-// of a runtime `%`/`/` by decimated_width - Mali (Valhall) has no integer
-// divide instruction, so that recovery used to cost a software divide
-// sequence per invocation, once per pixel.
+// The source is packed four 8-bit pixels per uint32 (little-endian) and is
+// unpacked with shifts. Dispatched 2D: (dx, dy) come from
+// gl_GlobalInvocationID.xy.
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
-// Fixed for this detector's whole lifetime, resolved at pipeline-creation
-// time - see GpuDetector.cpp's comment on why this is a specialization
-// constant rather than a push constant (a runtime divide/multiply by a
-// non-compile-time value on a device with no integer divide instruction).
+// Specialisation constant, resolved at pipeline creation.
 layout(constant_id = 3) const uint kDecimation = 2u;
 
 layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };

@@ -1,57 +1,23 @@
 #version 450
-// Assigns every boundary point a hash-table slot for its (rep0, rep1) pair,
-// replacing the global (rep0, rep1) SORT that used to exist purely to make
-// equal pairs adjacent.
+// Assigns every boundary point a hash-table slot for its (rep0, rep1) pair.
 //
-// The sort was doing far more than the pipeline needs. Nothing downstream
-// consumes the ORDER of the boundary points - only their GROUPING - because
-// each selected blob's points are re-sorted by angle around its centroid
-// immediately afterwards (sort_points_local.comp). Grouping by an unordered
-// key is a hash-table problem, not a sort problem: one pass over the points
-// instead of 2 * ceil(bits/4) stable radix passes, each of which read and
-// rewrote three words per element.
-//
-// The insert is lock-free AND spin-free. A slot's value is `owner + 1` where
-// `owner` is the index of the point that claimed it (0 means empty, so a
-// plain FillZero resets the table). Whoever loses the CAS gets the winner's
-// index back and can immediately compare keys, because the claimant's key was
-// written by blob_diff.comp in an earlier, barriered dispatch and is therefore
-// already visible. No thread ever waits on another thread's later write, which
-// matters: Vulkan does not guarantee independent forward progress between
-// workgroups, so a spin here could deadlock on a conformant implementation.
-//
-// The thread whose atomicCompSwap actually wins a slot (prev == 0u) is the
-// UNIQUE claimant of that slot for the whole frame - no other thread can ever
-// win the same slot after it, and this thread runs this branch exactly once.
-// That makes it the natural place to assign the slot's dense (1-based) raw
-// blob id too, with one atomicAdd on a per-frame counter: mark_slots.comp
-// plus a full scan over the (much larger, mostly-empty) hash table used to
-// exist purely to recover this same "count the occupied slots, number them"
-// result from the outside, one pass later. Nothing downstream needs the
-// dense ids to be assigned in slot order - only that they're distinct and
-// 1-based - so this is a strict replacement, not an approximation.
+// The insert is lock-free and spin-free: a slot holds `owner + 1` (0 = empty),
+// where owner is the claimant point's index. A thread that loses the
+// atomicCompSwap compares keys against the winner, whose key was written by
+// blob_diff.comp in an earlier dispatch. The winning thread is the slot's
+// unique claimant and assigns its 1-based raw blob id from raw_blob_counter
+// (ids are distinct, not in slot order).
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
-// One uvec2 per point rather than two parallel uint arrays: the probe loop
-// below compares a candidate slot's whole (rep0, rep1) key, so split arrays
-// meant two random gathers into two separate ~800 KB buffers - two cache
-// lines - for every probe iteration. std430 gives a uvec2 array stride 8 and
-// alignment 8, and the descriptor is bound at offset 0, so this is a single
-// naturally-aligned 8-byte load instead. blob_diff.comp's append() likewise
-// does one 8-byte store where it did two scattered 4-byte ones.
+// One uvec2 per point: the probe compares the whole key with one aligned 8-byte load.
 layout(std430, binding = 0) readonly buffer Keys { uvec2 keys[]; };
 layout(std430, binding = 1) buffer HashOwner { uint hash_owner[]; };
 layout(std430, binding = 2) writeonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 3) writeonly buffer SlotDense { uint slot_dense[]; };
 layout(std430, binding = 4) buffer RawBlobCounter { uint raw_blob_counter; };
 layout(std430, binding = 5) buffer DropCounter { uint drop_counter; };
-// DEVICE-SIDE COUNT. `count` is a boundary-point total that only exists on
-// the GPU until the host reads it back, and that readback is what forced a
-// mid-frame SubmitAndWait. Taking the bound from a buffer instead lets this
-// dispatch be issued indirectly in the same submission that produced the
-// count - see GpuDetector's fused_submits_ and build_indirect_args.comp. The
-// push constant is kept as the fallback for the unfused path, selected by
-// `count_from_buffer`.
+// Point count read from this buffer when count_from_buffer is set (indirect
+// dispatch, see build_indirect_args.comp), otherwise from the push constant.
 layout(std430, binding = 6) readonly buffer CountBuf { uint count_buf; };
 
 layout(push_constant) uniform PushConstants {
@@ -67,8 +33,7 @@ void main() {
 
   uvec2 k = keys[i];
 
-  // 64 -> 32 bit mix (murmur-style finalizer). The keys are dense small ids,
-  // so a plain xor/shift would cluster badly under linear probing.
+  // 64 -> 32 bit murmur-style mix.
   uint h = k.x * 0x9E3779B1u + k.y * 0x85EBCA6Bu;
   h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
   h &= pc.table_mask;
@@ -78,8 +43,7 @@ void main() {
     if (owner == 0u) {
       uint prev = atomicCompSwap(hash_owner[h], 0u, i + 1u);
       if (prev == 0u) {
-        // Won the slot: the unique claimant, now and for the rest of the
-        // frame. Number it.
+        // Won the slot: unique claimant. Number it.
         uint dense = atomicAdd(raw_blob_counter, 1u);
         slot_dense[h] = dense + 1u;
       }
@@ -92,11 +56,7 @@ void main() {
     }
     h = (h + 1u) & pc.table_mask;
   }
-  // Table effectively full along this probe chain (or genuinely full, if
-  // this frame's distinct-pair count approaches max_raw_blobs). Dropping the
-  // point is the same defensive behaviour the capacity clamps elsewhere use.
-  // Counted rather than silent, so a table sized too tightly for some future
-  // scene shows up in profiling instead of quietly losing points.
+  // Probe chain exhausted: drop the point and count it.
   atomicAdd(drop_counter, 1u);
   point_slot[i] = 0xFFFFFFFFu;
 }

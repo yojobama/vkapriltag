@@ -44,8 +44,7 @@ V4l2Capture::V4l2Capture(const std::string &device, uint32_t width, uint32_t hei
   fmt.fmt.pix.field = V4L2_FIELD_NONE;
   CheckIoctl(fd_, VIDIOC_S_FMT, &fmt, "VIDIOC_S_FMT");
 
-  // The driver may adjust width/height/format to the closest supported mode;
-  // reflect that back so downstream buffer sizing stays correct.
+  // The driver may adjust width/height/format; reflect that back.
   width_ = fmt.fmt.pix.width;
   height_ = fmt.fmt.pix.height;
   if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
@@ -93,8 +92,7 @@ V4l2Capture::~V4l2Capture() {
 }
 
 void V4l2Capture::CaptureGrayFrame(std::vector<uint8_t> &out) {
-  // Frame isn't ready yet on a non-blocking fd until select()/poll() says so;
-  // a simple blocking retry loop keeps this file free of extra dependencies.
+  // Blocking retry until the frame is ready.
   v4l2_buffer buf{};
   buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   buf.memory = V4L2_MEMORY_MMAP;

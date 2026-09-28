@@ -1,9 +1,6 @@
 #version 450
-// Identical to block_minmax.comp except DecimatedImage is uint8_t per pixel
-// instead of uint - see decimate_u8.comp's comment. UnfilteredMinMax stays a
-// packed uint (min | max<<8): it is a 4x-smaller array than the per-pixel
-// image already (one entry per 4x4 block), so packing it further isn't
-// where the traffic is.
+// block_minmax.comp with a uint8_t DecimatedImage; UnfilteredMinMax stays
+// packed as (min | max<<8).
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
@@ -19,11 +16,7 @@ layout(push_constant) uniform PushConstants {
   uint block_height;
 } pc;
 
-// decimated_width_/height_ need not be a multiple of 4 (only the original
-// image's width/height are guaranteed even), so the last block column/row
-// can be ragged. Edge-clamp rather than bounds-check-and-skip: a 4x4 min/max
-// window that runs past the real image just repeats the edge pixel, which is
-// a standard, harmless way to extend a min/max filter past the image border.
+// Coordinates past the image edge clamp to the edge pixel (ragged last block).
 uint sampleAt(uint x, uint y) {
   x = min(x, pc.decimated_width - 1u);
   y = min(y, pc.decimated_height - 1u);

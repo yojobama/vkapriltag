@@ -53,11 +53,7 @@ std::string HexBytes(const uint8_t *data, size_t size) {
   return os.str();
 }
 
-// Hashes the compiled .spv corpus under `shader_dir` so a shader rebuild
-// lands on a different cache filename instead of feeding stale entries to
-// the driver. Not a correctness requirement (the driver keys on the full
-// create-info of each pipeline, so a stale entry is just a miss) - purely to
-// keep the cache directory from accumulating dead files across rebuilds.
+// Hashes the .spv files under `shader_dir` so a shader rebuild lands on a different cache file.
 uint64_t HashShaderDir(const std::string &shader_dir) {
   std::vector<fs::path> files;
   std::error_code ec;
@@ -78,9 +74,7 @@ uint64_t HashShaderDir(const std::string &shader_dir) {
   return h;
 }
 
-// Where cache files live, honoring APRILTAG_VK_CACHE_DIR, then platform
-// conventions. Empty return disables caching (e.g. no writable home in a
-// stripped-down container).
+// Cache directory: APRILTAG_VK_CACHE_DIR, then platform conventions; empty disables caching.
 std::string CacheDirectory() {
   if (const char *override_dir = std::getenv("APRILTAG_VK_CACHE_DIR")) {
     if (override_dir[0] != '\0') return override_dir;
@@ -100,15 +94,11 @@ std::string CacheDirectory() {
   return "";
 }
 
-// A cache blob larger than this is treated as corrupt rather than trusted -
-// this pipeline creates on the order of 30 small compute pipelines, so a
-// well-formed cache has no legitimate reason to approach this size.
+// A larger blob is treated as corrupt.
 constexpr size_t kMaxCacheFileBytes = 16u * 1024 * 1024;
 
-// Our own framing around the driver's blob: an 8-byte FNV-1a of the payload,
-// so a process killed mid-write is detected as corrupt rather than handed to
-// the driver. The driver's own VkPipelineCacheHeaderVersionOne is validated
-// separately, on the payload itself.
+// Framing around the driver's blob: an 8-byte FNV-1a of the payload, to detect a truncated write.
+// The driver's VkPipelineCacheHeaderVersionOne is validated separately.
 constexpr size_t kOurHeaderBytes = sizeof(uint64_t);
 
 std::vector<uint8_t> LoadValidated(const std::string &file_path, VkPhysicalDevice physical_device,
@@ -193,8 +183,7 @@ std::string PipelineCache::CacheFilePath(VkPhysicalDevice physical_device,
 
 PipelineCache::PipelineCache(VkDevice device, VkPhysicalDevice physical_device,
                              const std::string &shader_dir, bool enabled, bool verbose)
-    // Skip the directory scan entirely when caching is off - the hash is only
-    // ever used to name the cache file, which this build will not write.
+    // Skip the directory scan when caching is off; the hash only names the cache file.
     : PipelineCache(device, physical_device, enabled ? HashShaderDir(shader_dir) : 0, enabled,
                     verbose) {}
 
@@ -219,10 +208,7 @@ PipelineCache::PipelineCache(VkDevice device, VkPhysicalDevice physical_device,
 
   VkResult result = vkCreatePipelineCache(device_, &create_info, nullptr, &cache_);
   if (result != VK_SUCCESS && !initial_data.empty()) {
-    // A blob that passed our own validation can still be one this exact
-    // driver build refuses (a corrupted-but-checksum-consistent file, or a
-    // driver quirk) - fall back to an empty cache rather than failing
-    // detector startup entirely.
+    // A blob the driver still refuses falls back to an empty cache.
     if (verbose) {
       std::cerr << "apriltag_vulkan: driver rejected pipeline cache data from " << file_path_
                 << "; starting with an empty cache." << std::endl;
@@ -300,8 +286,7 @@ void PipelineCache::Save() const {
 
   const uint64_t hash = Fnv1a(data.data(), data.size());
   if (has_synced_hash_ && hash == last_synced_hash_) {
-    // Nothing new since we loaded (or last saved) - the common warm-run
-    // case - so skip touching the filesystem at all.
+    // Nothing new since the last load/save.
     return;
   }
   if (data.size() > kMaxCacheFileBytes) {

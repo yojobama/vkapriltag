@@ -11,18 +11,8 @@
 
 namespace apriltag_vulkan {
 
-// Per-blob-fit scratch for QuadDecode's peaks-based fit path, reused across
-// calls instead of heap-allocated fresh each time. One instance per
-// WorkerPool slot (see WorkerPool.h), indexed by the `slot` ParallelFor hands
-// each task - NOT `thread_local`: this library is always loaded via dlopen()
-// when used from a JNI shim, and a fresh dlopen()'d module's thread_local
-// variables are not safely accessible from a freshly spawned pthread on
-// every platform (observed: an immediate SIGBUS the first time a pool worker
-// thread touched one, on an aarch64/glibc target, with no concurrent access
-// at all). Slot-indexed scratch avoids the whole class of problem while
-// keeping the same "allocate once, reuse every call" performance property.
-// A free struct (not nested in QuadDecode) so QuadDecode.cpp's file-local
-// FitQuadForBlob can use it without needing member access.
+// Reusable per-blob-fit scratch for the peaks-based fit path. One instance per
+// WorkerPool slot, indexed by the `slot` ParallelFor passes to each task.
 struct QuadFitScratch {
   std::vector<LineFitMoments> cs;
   std::vector<double> error;
@@ -30,52 +20,21 @@ struct QuadFitScratch {
   std::vector<std::pair<double, uint32_t>> peaks;
 };
 
-// CPU tail of the detector pipeline. GpuDetector::Detect() only computes,
-// per selected blob, its perimeter point count/bounding box (extents) and
-// the RAW (non-cumulative) per-point line-fit moments; everything from here
-// on - cumulative range sums, peak finding, and the small (<= C(10,4) = 210
-// combination) per-blob combinatorial quad search - is scalar/branchy work
-// on a tiny amount of data (a few thousand candidate blobs/points per
-// frame at most), and is both much simpler and much easier to verify as
-// plain C++ than as GPU compute shaders. See line_fit_filter.cu's
-// DoFitLines / DoFitQuads / apriltag_detect.cu's UpdateFitQuads for the
-// original CUDA algorithms this ports.
-//
-// PERFORMANCE: this becomes the single most expensive stage once the GPU
-// pipeline is properly sized - ~10 ms single-threaded at 1080p with 440
-// blobs, against a few milliseconds for all the GPU work on a discrete card.
-// The per-blob fits are completely independent, so they run across a
-// persistent worker pool. Results are collected in blob order, so the output
-// is identical to the serial version regardless of thread scheduling.
+// CPU tail of the detector pipeline: cumulative sums, peak finding and the
+// per-blob quad fit over the GPU's raw line-fit points. Blobs are fitted in
+// parallel on a worker pool; results are returned in blob order.
 class QuadDecode {
  public:
   // Honours APRILTAG_CPU_THREADS when config.cpu_threads is left at 0.
   explicit QuadDecode(const DetectorConfig &config);
 
-  // Runs the full CPU tail (peak finding, combinatorial quad fit, corner
-  // intersection, geometric sanity checks, decimation-scale correction) and
-  // returns the resulting quads' corners in full-resolution pixel
-  // coordinates (matching the original un-decimated input image passed to
-  // GpuDetector::Detect()).
-  // Takes a span, so GpuDetector can hand over a view straight into
-  // host-visible device memory on parts that support it rather than a copy -
-  // see GpuDetector::last_line_fit_points.
-  //
-  // The former `selected_extents` first parameter is gone. It was never read:
-  // everything the fit needs is already folded into each point's blob_index
-  // and the run structure of the array, and the body ended in
-  // `(void)selected_extents;`. GpuDetector::last_selected_extents is still
-  // populated for callers that want it.
+  // Fits quads to the line-fit points and returns their corners in
+  // full-resolution (un-decimated) pixel coordinates.
   std::vector<DetectedQuad> Decode(std::span<const RawLineFitPoint> line_fit_points) const;
 
   unsigned threads() const { return pool_->threads(); }
 
-  // Per-blob outcome of the item-3 DP corner-seeding path (config.
-  // quad_fit_method == kDp), from the most recent Decode() call. Meaningless
-  // (both 0) when quad_fit_method is kPeaks. A high fallback rate
-  // (fallbacks/attempts) means DP is spending its own cost without saving
-  // the combinatorial search's, since the caller falls all the way through
-  // to it anyway.
+  // DP corner-seeding outcomes from the last Decode() (both 0 unless quad_fit_method == kDp).
   struct DpStats {
     uint32_t attempts = 0;
     uint32_t fallbacks = 0;
@@ -84,9 +43,8 @@ class QuadDecode {
 
  private:
   DetectorConfig config_;
-  // unique_ptr so a const Decode() can still hand work to the (stateful) pool.
   std::unique_ptr<WorkerPool> pool_;
-  // Sized to pool_->threads() at construction time; see QuadFitScratch.
+  // One entry per pool slot.
   mutable std::vector<QuadFitScratch> scratch_;
   mutable DpStats last_dp_stats_;
 };

@@ -1,16 +1,11 @@
-# Generates a C++ translation unit containing the compiled SPIR-V corpus, so
-# the library can create its shader modules with no filesystem access at all.
-# See library/include/vkapriltag/vk/EmbeddedShaders.h for why that matters.
+# Generates a C++ translation unit embedding the compiled SPIR-V corpus (see vk/EmbeddedShaders.h).
 #
 # Run via `cmake -P`, not included:
 #
 #   cmake -DSPV_FILES="a.spv|b.spv" -DOUTPUT=embedded_shaders.cpp -DEMBED=ON
 #         -P GenerateEmbeddedShaders.cmake
 #
-# With EMBED=OFF it still runs and still writes OUTPUT, but emits an empty
-# table. That keeps the build graph and the call sites identical either way -
-# the disk fallback is selected at runtime by HasEmbeddedShaders(), not by a
-# preprocessor branch threaded through GpuDetector.
+# With EMBED=OFF it writes an empty table; the disk fallback is chosen at runtime by HasEmbeddedShaders().
 
 if(NOT DEFINED OUTPUT)
   message(FATAL_ERROR "GenerateEmbeddedShaders: OUTPUT not set")
@@ -20,15 +15,12 @@ if(NOT DEFINED EMBED)
   set(EMBED ON)
 endif()
 
-# The file list arrives '|'-separated: a ';'-separated list passed through -D
-# would be split into separate command-line arguments before it ever reached
-# this script.
+# '|'-separated because -D would split a ';'-separated list.
 if(DEFINED SPV_FILES)
   string(REPLACE "|" ";" SPV_FILES "${SPV_FILES}")
 endif()
 
-# Sort by path so the emitted order - and therefore the corpus digest - does
-# not depend on the order CMake happened to hand us the file list in.
+# Sorted by path so the emitted order and corpus digest are deterministic.
 set(SPV_SORTED "")
 if(DEFINED SPV_FILES AND EMBED)
   set(SPV_SORTED ${SPV_FILES})
@@ -39,10 +31,7 @@ set(ARRAYS "")
 set(TABLE "")
 set(DIGEST_INPUT "")
 
-# Matches exactly kBytesPerLine consecutive "0xNN," groups, for line wrapping
-# below. Spelled out rather than written "(0x..,){16}" because CMake's regex
-# engine has no {n} repetition operator - it accepts the syntax as literal
-# characters and silently matches nothing.
+# Matches kBytesPerLine consecutive "0xNN," groups (CMake regex has no {n} repetition).
 set(BYTES_PER_LINE 16)
 set(LINE_PATTERN "")
 foreach(UNUSED RANGE 1 ${BYTES_PER_LINE})
@@ -54,7 +43,7 @@ foreach(SPV_PATH ${SPV_SORTED})
     message(FATAL_ERROR "GenerateEmbeddedShaders: missing SPIR-V file ${SPV_PATH}")
   endif()
 
-  # "decimate.comp.spv" -> "decimate"; that is the name GpuDetector asks for.
+  # "decimate.comp.spv" -> "decimate", the name GpuDetector requests.
   get_filename_component(SPV_NAME "${SPV_PATH}" NAME)
   string(REGEX REPLACE "\\.comp\\.spv$" "" SHADER_NAME "${SPV_NAME}")
   string(REGEX REPLACE "\\.spv$" "" SHADER_NAME "${SHADER_NAME}")
@@ -70,21 +59,15 @@ foreach(SPV_PATH ${SPV_SORTED})
       "that is not valid SPIR-V")
   endif()
 
-  # Each file's own digest feeds the corpus digest below. Hashing the digests
-  # rather than the bytes keeps this cheap: the corpus is ~half a megabyte,
-  # and CMake string ops over that much hex are not free.
+  # Each file's digest feeds the corpus digest.
   file(MD5 "${SPV_PATH}" SPV_MD5)
   string(APPEND DIGEST_INPUT "${SHADER_NAME}:${SPV_MD5};")
 
   string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," SPV_BYTES "${SPV_HEX}")
-  # Wrap at BYTES_PER_LINE per line. A single multi-hundred-kilobyte source
-  # line is legal C++ but not every compiler is happy about it.
+  # Wrap lines at BYTES_PER_LINE bytes.
   string(REGEX REPLACE "(${LINE_PATTERN})" "\\1\n    " SPV_BYTES "${SPV_BYTES}")
 
-  # alignas(4) is load-bearing: VkShaderModuleCreateInfo::pCode is a
-  # const uint32_t*, and the cast below is only defined if the storage is
-  # actually 4-byte aligned. A bare unsigned char array carries no such
-  # guarantee.
+  # alignas(4): pCode is read as const uint32_t*.
   string(APPEND ARRAYS
     "alignas(4) const unsigned char k_${SYMBOL}[] = {\n    ${SPV_BYTES}\n};\n\n")
   string(APPEND TABLE
@@ -137,18 +120,12 @@ uint64_t EmbeddedShaderCorpusHash() { return ${CORPUS_HASH}; }
 }  // namespace apriltag_vulkan::vk
 ")
 
-# An empty corpus emits `const EmbeddedShader kShaders[] = {};`, which is a
-# zero-length array - ill-formed in standard C++ even though every compiler
-# accepts it as an extension. Emit a single inert entry instead and keep
-# kShaderCount at 0, so the loop above never reads it.
+# Empty corpus: emit one inert entry (zero-length arrays are ill-formed) and keep kShaderCount at 0.
 if(SHADER_COUNT EQUAL 0)
   string(REPLACE "const EmbeddedShader kShaders[] = {\n};"
                  "const EmbeddedShader kShaders[] = {\n    {\"\", nullptr, 0u},\n};"
                  GENERATED "${GENERATED}")
 endif()
 
-# Written unconditionally, on purpose. The build system decides whether to run
-# this script at all by comparing OUTPUT's timestamp against the .spv files;
-# skipping the write when the contents match would leave OUTPUT older than its
-# inputs and re-run the generator on every single build.
+# Written unconditionally so OUTPUT stays newer than the .spv inputs.
 file(WRITE "${OUTPUT}" "${GENERATED}")

@@ -3,28 +3,19 @@
 #include <cstdint>
 
 // C++ mirrors of the GLSL structs in shaders/common.glsl. Field order and
-// widths must match exactly (all members are 4-byte, so std430 layout has
-// no implicit padding beyond what's declared here).
-//
-// QBPoint has no C++ mirror: the GLSL struct of the same name is a
-// documentation aid over a single packed uint32 (see common.glsl's
-// PackQBPoint/UnpackQBPoint), and qbp_compacted_buf_ is sized/allocated as a
-// plain uint32 array in GpuDetector - nothing on the CPU side ever
-// constructs or reads one.
+// widths must match exactly (std430 layout, all members 4 bytes).
+// QBPoint has no C++ mirror: it is a single packed uint32 on the GPU.
 
 namespace apriltag_vulkan {
 
-// Mirrors common.glsl's MinMaxExtentsGpu, which drops the CUDA-original
-// struct's starting_offset and rep0/rep1 fields - none of the CPU-side
-// callers (QuadDecode, the validate tools) ever read them back.
+// Mirrors common.glsl's MinMaxExtentsGpu (without starting_offset and rep0/rep1).
 struct MinMaxExtentsGpu {
   int32_t min_x = 0;
   int32_t min_y = 0;
   int32_t max_x = 0;
   int32_t max_y = 0;
   uint32_t count = 0;
-  // Adjacent to count on purpose - the two share one 64-bit word so the GPU
-  // can accumulate both in a single atomic. See common.glsl.
+  // Must stay adjacent to count: the pair is accumulated as one 64-bit word on the GPU.
   int32_t pxgx_plus_pygy_sum = 0;
   int32_t gx_sum = 0;
   int32_t gy_sum = 0;
@@ -40,10 +31,7 @@ struct MinMaxExtentsGpu {
 };
 static_assert(sizeof(MinMaxExtentsGpu) == 32, "MinMaxExtentsGpu must match std430 layout");
 
-// Mirrors common.glsl's IPoint, which drops gx/gy (written once, never read)
-// and packs x/y into one word (see common.glsl's PackXY/UnpackX/UnpackY).
-// No CPU-side code constructs or reads one - kept for documentation and for
-// GpuDetector's buffer sizing.
+// Mirrors common.glsl's IPoint (x/y packed into one word). Used only for buffer sizing.
 struct IPoint {
   uint32_t blob_index = 0;
   uint32_t xy = 0;
@@ -51,15 +39,7 @@ struct IPoint {
 };
 static_assert(sizeof(IPoint) == 12, "IPoint must match std430 layout");
 
-// Mirrors common.glsl's RawLineFitPoint, which packs its four values into
-// two words. See that file for the bit budget and for why every field fits
-// exactly - this is a storage change, not a precision one, and the
-// accessors below return the same values the four-field version did.
-//
-// It is the largest per-frame readback in the pipeline (one entry per
-// selected boundary point, ~51k of them on a 1280x800 frame at decimation
-// 1), so halving it halves both that copy and the writes sort_points_local
-// makes into it.
+// Mirrors common.glsl's RawLineFitPoint: four values packed into two words.
 struct RawLineFitPoint {
   uint32_t xy2 = 0;     // x2 in bits [0:13], y2 in bits [14:27]
   uint32_t w_blob = 0;  // W in bits [0:9], blob_index in bits [10:31]
@@ -77,10 +57,7 @@ struct RawLineFitPoint {
 };
 static_assert(sizeof(RawLineFitPoint) == 8, "RawLineFitPoint must match std430 layout");
 
-// CPU-side cumulative line fit moments for a range of points (mirrors
-// frc971::apriltag::LineFitMoments). Built by prefix-summing RawLineFitPoint
-// values with true 64 bit / double precision arithmetic (no GPU width
-// restrictions on the CPU).
+// Cumulative line-fit moments for a range of points, prefix-summed from RawLineFitPoint.
 struct LineFitMoments {
   int32_t Mx = 0;
   int32_t My = 0;
@@ -91,8 +68,7 @@ struct LineFitMoments {
   int32_t N = 0;
 };
 
-// Final fitted quad corners in un-decimated pixel coordinates (mirrors
-// frc971::apriltag::QuadCorners).
+// Fitted quad corners in un-decimated pixel coordinates.
 struct QuadCorners {
   double corners[4][2] = {};
 };

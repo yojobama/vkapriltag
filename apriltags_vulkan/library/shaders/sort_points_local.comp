@@ -1,7 +1,6 @@
 #version 450
-// 32-bit-per-pixel DecimatedImage variant - see sort_points_local_body.glsl
-// for the shader itself and sort_points_local_u8.comp for the 8-bit-storage
-// sibling GpuDetector picks on devices that support it.
+// 32-bit-per-pixel DecimatedImage variant; the shader is in
+// sort_points_local_body.glsl.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 

@@ -1,7 +1,5 @@
 #version 450
-// Identical to uf_init.comp except Thresholded is uint8_t per pixel instead
-// of uint - see decimate_u8.comp's comment. Parent stays uint32 (it holds a
-// pixel index, which routinely exceeds 255).
+// uf_init.comp with a uint8_t Thresholded; Parent stays uint32.
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 

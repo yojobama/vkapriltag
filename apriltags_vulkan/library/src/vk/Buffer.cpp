@@ -22,12 +22,7 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
     case MemoryKind::HostVisible:
       return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, true};
     case MemoryKind::HostVisibleCached:
-      // COHERENT is deliberately NOT required: on devices with no memory
-      // type that is both COHERENT and CACHED (e.g. Mali-G610), requiring it
-      // would silently exclude the cached type and fall through to uncached
-      // memory - measured 4x slower for readback on that device. Buffer::
-      // Read()/Write() detect the resulting non-coherent type (via
-      // Context::MemoryTypeFlags) and invalidate/flush explicitly.
+      // COHERENT is not required; Read()/Write() flush/invalidate when the type is non-coherent.
       return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
               ctx.caps().has_host_cached
                   ? static_cast<VkMemoryPropertyFlags>(VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
@@ -38,14 +33,8 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
               0, true};
     case MemoryKind::DeviceLocalReadback:
-      // Shader-written memory the HOST then READS, on parts where that can
-      // skip a staging copy entirely. COHERENT is not required and CACHED is
-      // strongly preferred, for the reason HostVisibleCached documents: an
-      // uncached mapping is fine to write through and terrible to read
-      // through. The caller MUST check host_cached() and keep a staging path
-      // - taking this path on an uncached type would replace a fast
-      // device-to-device copy plus a cached memcpy with an uncached read,
-      // which is slower, not faster.
+      // Shader-written memory the host reads; the caller must check host_cached() and keep a
+      // staging path.
       return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
               static_cast<VkMemoryPropertyFlags>(VK_MEMORY_PROPERTY_HOST_CACHED_BIT), true};
   }
@@ -70,9 +59,7 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
   uint32_t type_index =
       ctx.FindMemoryType(mem_reqs.memoryTypeBits, request.required, request.preferred);
 
-  // DeviceLocalMapped is a best-effort request: discrete GPUs without a
-  // resizable BAR have no such memory type, so fall back to plain
-  // device-local and let the caller stage through a separate host buffer.
+  // Best-effort: falls back to plain device-local, and the caller stages via a host buffer.
   if (type_index == UINT32_MAX &&
       (kind == MemoryKind::DeviceLocalMapped || kind == MemoryKind::DeviceLocalReadback)) {
     request = RequestFor(ctx, MemoryKind::DeviceLocal);
@@ -149,10 +136,8 @@ Buffer &Buffer::operator=(Buffer &&other) noexcept {
 }
 
 namespace {
-// vkFlushMappedMemoryRanges/vkInvalidateMappedMemoryRanges both require an
-// offset that's a multiple of nonCoherentAtomSize and a size that's either a
-// multiple of it or VK_WHOLE_SIZE - round outward rather than clamp the
-// range down, so the whole requested [offset, offset+bytes) is covered.
+// Flush/invalidate need an offset aligned to nonCoherentAtomSize and a size that is a multiple of
+// it or VK_WHOLE_SIZE; the range is rounded outward.
 VkMappedMemoryRange AlignedRange(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize bytes,
                                  VkDeviceSize atom, VkDeviceSize buffer_size) {
   const VkDeviceSize aligned_offset = (offset / atom) * atom;
@@ -200,9 +185,7 @@ void Buffer::Read(void *dst, VkDeviceSize bytes, VkDeviceSize offset) const {
 }
 
 void Buffer::InvalidateRange(VkDeviceSize offset, VkDeviceSize bytes) const {
-  // Read()'s invalidate, without the copy - for a caller reading the mapping
-  // in place rather than memcpy'ing out of it. A no-op on coherent memory,
-  // exactly as Read()'s is.
+  // Read()'s invalidate without the copy; a no-op on coherent memory.
   if (mapped_ == nullptr) {
     throw std::runtime_error("Buffer::InvalidateRange on a buffer that is not host visible");
   }
@@ -242,7 +225,7 @@ void Buffer::FillZero(VkCommandBuffer cmd) const {
 
 void Buffer::FillZeroRange(VkCommandBuffer cmd, VkDeviceSize offset, VkDeviceSize bytes) const {
   if (bytes == 0) return;
-  // vkCmdFillBuffer requires 4-byte aligned offset and multiple-of-4 size.
+  // vkCmdFillBuffer needs a 4-byte aligned offset and size.
   const VkDeviceSize aligned_offset = offset & ~VkDeviceSize(3);
   VkDeviceSize aligned_bytes = (bytes + (offset - aligned_offset) + 3) & ~VkDeviceSize(3);
   if (aligned_offset >= size_) return;

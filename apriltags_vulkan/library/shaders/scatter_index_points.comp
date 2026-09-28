@@ -1,21 +1,9 @@
 #version 450
-// rewrite_index_points.comp without the sorted array. Each surviving point
-// takes the next free slot in its blob's contiguous output range via a
-// per-blob cursor, so the blob's points are still packed contiguously (which
-// is all sort_points_local.comp requires) without any global ordering having
-// been established first.
-//
-// Order within a blob is atomic-arrival dependent, exactly as the boundary
-// point append order in blob_diff.comp already was - and it is immediately
-// overwritten by the angular sort in sort_points_local.comp.
-//
-// No separate output counter: every point that reaches the `atomicAdd(
-// blob_cursor[sel], ...)` below is, by construction, one of exactly
-// e.count points sharing that blob's (rep0, rep1) key (reduce_extents_hash.
-// comp counted them the same way), so the total written across every
-// selected blob is exactly blob_point_offsets_buf_'s last (inclusive-scanned)
-// entry - already computed by extract_blob_counts.comp's scan chain, with no
-// separate atomic needed here.
+// Places each surviving point at the next free slot of its blob's contiguous
+// output range (per-blob cursor), so a blob's points are contiguous for
+// sort_points_local.comp. Order within a blob is nondeterministic and is
+// overwritten by the angular sort. The total written equals the last entry of
+// the inclusive-scanned blob point offsets.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
@@ -29,13 +17,8 @@ layout(std430, binding = 4) readonly buffer Selected { MinMaxExtentsGpu selected
 layout(std430, binding = 5) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 6) buffer BlobCursor { uint blob_cursor[]; };
 layout(std430, binding = 7) writeonly buffer Output { IPoint output_points[]; };
-// DEVICE-SIDE COUNT. `count` is a boundary-point total that only exists on
-// the GPU until the host reads it back, and that readback is what forced a
-// mid-frame SubmitAndWait. Taking the bound from a buffer instead lets this
-// dispatch be issued indirectly in the same submission that produced the
-// count - see GpuDetector's fused_submits_ and build_indirect_args.comp. The
-// push constant is kept as the fallback for the unfused path, selected by
-// `count_from_buffer`.
+// Point count read from this buffer when count_from_buffer is set, else from
+// the push constant.
 layout(std430, binding = 8) readonly buffer CountBuf { uint count_buf; };
 
 layout(push_constant) uniform PushConstants {
@@ -65,32 +48,16 @@ void main() {
   float cx = (float(e.min_x) + float(e.max_x)) * 0.5 + 0.05118;
   float cy = (float(e.min_y) + float(e.max_y)) * 0.5 + -0.028581;
 
-  // A pseudo-angle instead of atan2(dy, dx): only the SORT ORDER around the
-  // blob's perimeter is ever consumed (sort_points_local.comp), never the
-  // angle's actual value, and this is monotonic in true angle - strictly
-  // increasing counterclockwise through the same four quadrant crossings
-  // atan2 would - at a fraction of the cost (one divide, no transcendental).
-  // Standard "diamond" construction: walks 0->1 across the first quadrant,
-  // 1->3 across dx<0 (both remaining quadrants in one branch, since -dy/d
-  // is already monotonic decreasing through dy>0 -> dy<0 there), 3->4 back
-  // across dx>=0, dy<0. The absolute zero point differs from atan2+PI's
-  // (this one starts at the +x axis, not needing the +PI shift at all), but
-  // nothing here depends on that - a blob's points are sorted circularly,
-  // so where the "seam" falls doesn't change the ordering FitQuadForBlob
-  // reads back out on the CPU side.
+  // Pseudo-angle in [0, 4) instead of atan2: monotonic in the true angle,
+  // counterclockwise from +x, with no transcendental.
   float dx = float(p.x) - cx;
   float dy = float(p.y) - cy;
   float d = abs(dx) + abs(dy);
   float ratio = (d > 0.0) ? (dy / d) : 0.0;
   float pseudo_angle = (dx >= 0.0) ? ((dy >= 0.0) ? ratio : (4.0 + ratio)) : (2.0 - ratio);
 
-  // Scaled to fit 20 bits (max 1,000,000 at pseudo_angle==4): sort_points_
-  // local.comp packs this key together with a 12-bit local sort index into
-  // one shared word (20 + 12 = 32), so the key only needs enough resolution
-  // to order points around a blob's perimeter - nowhere near the precision
-  // an unscaled-for-packing key would carry. With the 4096-point ceiling
-  // that 12-bit index implies, a full blob still gets ~244 key units per
-  // point, so ties remain vanishingly rare at any decimation.
+  // Scaled to 20 bits (max 1,000,000 at pseudo_angle 4); sort_points_local.comp
+  // packs it with a 12-bit local index.
   int theta_int = int(round(pseudo_angle * 2.5e5));
   uint theta_key = uint(max(theta_int, 0));
 

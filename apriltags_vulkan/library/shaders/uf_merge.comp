@@ -1,5 +1,5 @@
 #version 450
-// 32-bit-thresholded variant. See uf_merge_body.glsl.
+// 32-bit Thresholded variant; see uf_merge_body.glsl.
 #extension GL_GOOGLE_include_directive : require
 
 layout(std430, binding = 1) readonly buffer Thresholded { uint thresholded[]; };

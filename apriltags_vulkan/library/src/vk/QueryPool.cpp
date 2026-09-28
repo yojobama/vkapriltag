@@ -54,11 +54,7 @@ void QueryPool::WriteTimestamp(VkCommandBuffer cmd, uint32_t index,
 std::vector<QueryPool::Result> QueryPool::ReadResults() const {
   if (pool_ == VK_NULL_HANDLE) return {};
 
-  // Each query yields two 64-bit words (value, availability) rather than one,
-  // so a query a given frame never wrote (a stage this frame skipped, e.g.
-  // no boundary points survived compaction) reports as unavailable instead
-  // of blocking forever or racing WAIT_BIT against a query that will never
-  // complete.
+  // Two 64-bit words per query (value, availability), so unwritten queries report as unavailable.
   std::vector<uint64_t> raw(static_cast<size_t>(count_) * 2, 0);
   vkGetQueryPoolResults(device_, pool_, 0, count_, raw.size() * sizeof(uint64_t), raw.data(),
                         2 * sizeof(uint64_t),

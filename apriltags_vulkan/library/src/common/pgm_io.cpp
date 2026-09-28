@@ -6,9 +6,7 @@
 namespace apriltag_vulkan {
 namespace {
 
-// Skips whitespace and '#'-prefixed comments, per the NetPBM plain-header
-// grammar (used for the P5 magic/width/height/maxval fields, before the
-// raw binary pixel data begins).
+// Skips whitespace and '#' comments in the PGM header.
 void SkipWhitespaceAndComments(std::istream &in) {
   for (;;) {
     int c = in.peek();
@@ -48,9 +46,7 @@ bool LoadGrayPgm(const std::string &path, std::vector<uint8_t> *out_pixels, uint
   if (!ReadHeaderToken(f, &maxval)) return false;
   if (width <= 0 || height <= 0 || maxval <= 0 || maxval > 255) return false;
 
-  // Exactly one whitespace character separates maxval from the raw pixel
-  // data; ReadHeaderToken's istream >> already consumed it.
-  f.get();  // consume the single mandatory separator after maxval.
+  f.get();  // Consume the single separator after maxval.
 
   std::vector<uint8_t> pixels(static_cast<size_t>(width) * height);
   f.read(reinterpret_cast<char *>(pixels.data()), pixels.size());

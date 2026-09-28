@@ -13,27 +13,17 @@
 namespace apriltag_vulkan::vk {
 
 // How strongly to order a dispatch against what follows it.
-//
-// The original port emitted the widest possible barrier after every single
-// dispatch (COMPUTE|TRANSFER on both sides, every access bit set). With ~570
-// dispatches per frame that is ~570 full pipeline drains, most of which only
-// ever needed shader-write -> shader-read ordering.
 enum class BarrierKind {
-  // No barrier. For back-to-back dispatches that touch disjoint buffers, or
-  // when the caller inserts its own.
+  // No barrier.
   None,
   // Shader writes become visible to subsequent shader reads/writes.
   Compute,
-  // Also orders against transfer operations (vkCmdCopyBuffer/vkCmdFillBuffer)
-  // on either side.
+  // Also orders against transfer operations on either side.
   ComputeAndTransfer,
 };
 
-// Workgroup dimensions, supplied to the shader through specialization
-// constants (ids 0/1/2) rather than baked into the GLSL. Vulkan only
-// guarantees maxComputeWorkGroupInvocations >= 128, and real parts differ a
-// lot (Mali-G610 tops out at 512 where desktop GPUs allow 1024), so the host
-// picks these from the device's reported limits at startup.
+// Workgroup dimensions, supplied to shaders as specialization constants 0/1/2 and chosen from the
+// device limits at startup.
 struct WorkgroupSize {
   uint32_t x = 1;
   uint32_t y = 1;
@@ -42,17 +32,12 @@ struct WorkgroupSize {
   uint32_t invocations() const { return x * y * z; }
 };
 
-// A compute pipeline bound to a fixed list of SSBO bindings (in order,
-// starting at binding 0) plus an optional push constant block. Since this
-// detector allocates all of its GPU buffers once up front and reuses them
-// every frame, the descriptor set is written exactly once at construction.
+// A compute pipeline bound to a fixed list of SSBOs (in order from binding 0) plus an optional push
+// constant block; the descriptor set is written once at construction.
 class ComputePipeline {
  public:
   ComputePipeline() = default;
-  // `extra_specialization_constants` are bound to consecutive constant IDs
-  // starting at 3 (right after the workgroup size's 0/1/2), for shaders that
-  // need an additional device-derived compile-time constant (e.g. a shared
-  // memory array length decoupled from the workgroup's thread count).
+  // `extra_specialization_constants` are bound to consecutive constant IDs starting at 3.
   ComputePipeline(const Context &ctx, const ShaderSource &shader_source,
                   const std::vector<VkBuffer> &buffers, uint32_t push_constant_bytes,
                   WorkgroupSize workgroup_size,
@@ -66,10 +51,8 @@ class ComputePipeline {
 
   const WorkgroupSize &workgroup_size() const { return workgroup_size_; }
 
-  // Records a dispatch covering `elements` invocations in X, using this
-  // pipeline's own workgroup size (so the host can never disagree with the
-  // shader about it). A zero element count records nothing at all - with
-  // count-driven dispatch sizes, empty frames are normal.
+  // Records a dispatch of `elements` invocations in X using the pipeline's workgroup size; a zero
+  // count records nothing.
   void Dispatch1D(VkCommandBuffer cmd, uint32_t elements, const void *push_constants,
                   BarrierKind barrier = BarrierKind::Compute) const;
 
@@ -81,13 +64,9 @@ class ComputePipeline {
                    const void *push_constants,
                    BarrierKind barrier = BarrierKind::Compute) const;
 
-  // Like DispatchRaw, but the group counts are read from a VkDispatchIndirect
-  // Command (3 consecutive uint32s: x, y, z) at `offset` in `indirect_buffer`,
-  // rather than supplied by the host - see build_indirect_args.comp. The
-  // buffer must have been created with VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-  // and its write must already be ordered against this call with
-  // IndirectDispatchBarrier (a plain Compute-kind Barrier is not enough -
-  // see that method's comment).
+  // As DispatchRaw, but the group counts (x, y, z uint32s) are read from `indirect_buffer` at
+  // `offset`. The buffer needs VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT and must be ordered with
+  // IndirectDispatchBarrier.
   void DispatchIndirect(VkCommandBuffer cmd, VkBuffer indirect_buffer, VkDeviceSize offset,
                         const void *push_constants,
                         BarrierKind barrier = BarrierKind::Compute) const;
@@ -95,16 +74,12 @@ class ComputePipeline {
   // Inserts a standalone buffer memory barrier.
   static void Barrier(VkCommandBuffer cmd, BarrierKind kind = BarrierKind::Compute);
 
-  // Makes preceding transfer writes visible to host reads of mapped memory.
-  // Required before waiting on a fence and reading a readback buffer: a fence
-  // alone does not make device writes host-visible in the Vulkan memory model.
+  // Makes preceding transfer writes visible to host reads of mapped memory (required before
+  // reading a readback buffer after a fence wait).
   static void HostReadBarrier(VkCommandBuffer cmd);
 
-  // Makes a preceding compute shader's write to an indirect-dispatch argument
-  // buffer visible to a later DispatchIndirect call. vkCmdDispatchIndirect
-  // reads at the DRAW_INDIRECT pipeline stage, which BarrierKind::Compute's
-  // compute-to-compute barrier does not cover - this is the dedicated
-  // compute-to-indirect-read barrier that does.
+  // Makes a compute shader's write to an indirect-argument buffer visible to DispatchIndirect
+  // (the DRAW_INDIRECT stage is not covered by BarrierKind::Compute).
   static void IndirectDispatchBarrier(VkCommandBuffer cmd);
 
  private:

@@ -1,22 +1,10 @@
 #version 450
-// Identical to decimate.comp except DecimatedImage is uint8_t per pixel
-// instead of uint - selected at runtime (GpuDetector::ShaderPath) on devices
-// that report storageBuffer8BitAccess, quartering decimated_buf_'s size and
-// every shader's traffic through it (decimate's own write, block_minmax's
-// read, and sort_points_local.comp's gradient sample). See common.glsl's
-// note on why the codebase defaults to the 32-bit path otherwise: no
-// optional device feature may be assumed.
-//
-// GrayImage stays packed uint32 regardless - it is the upload buffer, sized
-// once per frame from the host, and unrelated to this device feature.
+// decimate.comp with a uint8_t DecimatedImage; GrayImage stays packed uint32.
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
-// Fixed for this detector's whole lifetime, resolved at pipeline-creation
-// time - see GpuDetector.cpp's comment on why this is a specialization
-// constant rather than a push constant (a runtime divide/multiply by a
-// non-compile-time value on a device with no integer divide instruction).
+// Specialisation constant, resolved at pipeline creation.
 layout(constant_id = 3) const uint kDecimation = 2u;
 
 layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };

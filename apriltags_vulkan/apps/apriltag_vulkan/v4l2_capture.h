@@ -6,11 +6,7 @@
 
 namespace apriltag_vulkan {
 
-// Minimal V4L2 mmap-mode capture device, replacing OpenCV's VideoCapture
-// (which the original CUDA implementation used). Requests a YUYV (YUV
-// 4:2:2) stream at the given resolution - the vast majority of USB/UVC
-// cameras support this format natively - and exposes only the luma (Y)
-// plane, which is all the AprilTag detector needs.
+// Minimal V4L2 mmap-mode capture device requesting a YUYV stream and exposing only the luma plane.
 class V4l2Capture {
  public:
   V4l2Capture(const std::string &device, uint32_t width, uint32_t height);
@@ -22,9 +18,8 @@ class V4l2Capture {
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
 
-  // Blocks until the next frame is available, extracts its luma (grayscale)
-  // plane into `out` (resized to width() * height()), and returns.  Throws
-  // std::runtime_error on any V4L2 failure.
+  // Blocks until the next frame, extracts its luma plane into `out` (resized to width() *
+  // height()); throws std::runtime_error on V4L2 failure.
   void CaptureGrayFrame(std::vector<uint8_t> &out);
 
  private:

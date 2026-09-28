@@ -6,15 +6,12 @@
 namespace apriltag_vulkan {
 namespace {
 
-// Fixed-size stack arithmetic, replacing the matd_t/matd_op machinery
-// libapriltag's apriltag_pose.c is built on. Every routine below writes into
-// caller-provided storage; nothing here allocates.
-//
-// Layout is row-major: m[row][col].
+// Fixed-size stack arithmetic (row-major, m[row][col]); routines write into caller storage and do
+// not allocate.
 using Mat3 = double[3][3];
 using Vec3 = double[3];
 
-constexpr int kN = 4;  // tag corners; libapriltag's n_points, always 4 here
+constexpr int kN = 4;  // tag corners (libapriltag's n_points)
 
 void Mat3Identity(Mat3 out) {
   for (int i = 0; i < 3; ++i)
@@ -105,8 +102,7 @@ double Vec3Dot(const Vec3 a, const Vec3 b) {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-// Normalizes in place. Returns false on a (near-)zero vector, which is the
-// degenerate case libapriltag's matd_vec_normalize walks into silently.
+// Normalises in place; returns false on a (near-)zero vector.
 bool Vec3Normalize(Vec3 v) {
   const double n = std::sqrt(Vec3Dot(v, v));
   if (!(n > 0.0) || !std::isfinite(n)) return false;
@@ -116,21 +112,8 @@ bool Vec3Normalize(Vec3 v) {
 
 // --- Singular value decomposition of a 3x3 -------------------------------
 //
-// M = U * diag(sv) * V', singular values non-negative and sorted descending,
-// matching matd_svd's own normalization (it sorts by descending magnitude and
-// folds the sign into U).
-//
-// A real SVD is genuinely required by the caller below, not a
-// polar-decomposition shortcut: orthogonal iteration's
-// M3 = sum_j (q_j - q_mean) * p_res_j' is ALWAYS rank deficient, because the
-// four tag corners are coplanar, so every p_res_j has a zero z component and
-// M3's third column is identically zero. A Newton polar iteration needs
-// M^-1 and collapses to a zero pose on exactly this input.
-//
-// Symmetric cyclic Jacobi on A = M'M yields V and the squared singular
-// values; U's columns follow as M*v_i / sv_i. The column belonging to a zero
-// singular value is unconstrained by that relation and is recovered as the
-// cross product of the other two, which keeps U orthogonal.
+// M = U * diag(sv) * V' with singular values non-negative and sorted descending, via cyclic
+// Jacobi on M'M. The column of U for a zero singular value is the cross product of the other two.
 void Svd3x3(const Mat3 M, Mat3 U, double sv[3], Mat3 V) {
   Mat3 A;
   Mat3TransposedMul(M, M, A);
@@ -197,11 +180,7 @@ void Svd3x3(const Mat3 M, Mat3 U, double sv[3], Mat3 V) {
         U[r][c] = acc / sv[c];
       }
     } else {
-      // At most one deficient direction arises for the matrices this solver
-      // produces (M3 loses exactly its third column). If more than one were
-      // deficient the later columns would be filled from the earlier ones,
-      // which is still orthogonal, just arbitrary - the same freedom
-      // matd_svd has on such input.
+      // At most one deficient direction arises here; further ones would be filled arbitrarily.
       deficient = c;
     }
   }
@@ -221,8 +200,7 @@ void Svd3x3(const Mat3 M, Mat3 U, double sv[3], Mat3 V) {
   }
 }
 
-// R = U * V' for M = U S V'. This is the orthogonal factor of M - the closest
-// rotation (or reflection) to it.
+// R = U * V' for M = U S V': the closest rotation (or reflection) to M.
 void NearestOrthogonal(const Mat3 M, Mat3 out) {
   Mat3 U, V;
   double sv[3];
@@ -233,25 +211,15 @@ void NearestOrthogonal(const Mat3 M, Mat3 out) {
 // --- Polynomial helpers ---------------------------------------------------
 
 // p(x) = p[0] + p[1]*x + ... by Horner.
-//
-// libapriltag's polyval sums p[i]*pow(x, i), i.e. one libm pow() call per
-// term. That runs inside a 100-iteration Newton loop inside the recursive
-// root finder below, and is the single largest avoidable cost in this file.
-// Horner is also better conditioned, so root positions differ from
-// libapriltag's in the last bits - see the tolerance discussion in
-// tools/validate_pose.
 double PolyEval(const double *p, int degree, double x) {
   double acc = p[degree];
   for (int i = degree - 1; i >= 0; --i) acc = acc * x + p[i];
   return acc;
 }
 
-// Ported from libapriltag's solve_poly_approx: recursively bracket roots
-// between the derivative's roots, then a Newton/bisection hybrid per
-// bracket. Approximate by construction - it discards roots beyond
-// kMaxRoot and runs a fixed 100 iterations with no convergence assertion,
-// so an unconverged root is still returned. Both behaviours are preserved
-// deliberately; changing them would change which pose comes out.
+// Port of libapriltag's solve_poly_approx: recursively bracket roots between the derivative's
+// roots, then Newton/bisection per bracket. Roots beyond kMaxRoot are discarded and a fixed 100
+// iterations run without a convergence check, as in libapriltag.
 void SolvePolyApprox(const double *p, int degree, double *roots, int *n_roots) {
   constexpr double kMaxRoot = 1000.0;
 
@@ -259,22 +227,18 @@ void SolvePolyApprox(const double *p, int degree, double *roots, int *n_roots) {
     if (std::fabs(p[0]) > kMaxRoot * std::fabs(p[1])) {
       *n_roots = 0;
     } else {
-      // Matches libapriltag exactly, including that an all-zero linear
-      // polynomial yields a non-finite root rather than being rejected.
+      // As libapriltag: an all-zero linear polynomial yields a non-finite root.
       roots[0] = -p[0] / p[1];
       *n_roots = 1;
     }
     return;
   }
 
-  // Degree is at most 4 here (the quartic from FixPoseAmbiguities), so the
-  // recursion depth and these buffers are bounded and can live on the stack.
+  // Degree is at most 4, so recursion depth and buffers are bounded.
   double p_der[5];
   for (int i = 0; i < degree; ++i) p_der[i] = (i + 1) * p[i + 1];
 
-  // Zero-initialized: only [0, n_der_roots) is ever read below, which is
-  // exactly what the recursive call fills, but GCC cannot prove that across
-  // the recursion and warns. Five doubles cost nothing to clear.
+  // Zero-initialised to avoid a GCC maybe-uninitialised warning across the recursion.
   double der_roots[5] = {};
   int n_der_roots = 0;
   SolvePolyApprox(p_der, degree - 1, der_roots, &n_der_roots);
@@ -342,25 +306,10 @@ void CalculateF(const Vec3 v, Mat3 out) {
     for (int b = 0; b < 3; ++b) out[a][b] = v[a] * v[b] / den;
 }
 
-// Orthogonal iteration (Lu/Hager/Mjolsness 2000), libapriltag's
-// orthogonal_iteration with n_points fixed at 4.
-//
-// R and t are in/out: R must hold the initial guess. Returns the object-space
-// error after the final step, and writes the number of steps actually run to
-// `steps_run`.
-//
-// Differences from libapriltag's structure, both pure hoisting with no change
-// to the arithmetic performed:
-//   - (F_j - I) is built once here; libapriltag re-derives it inside matd_op
-//     on every iteration.
-//   - R*p_j is computed once per point per iteration and reused by the
-//     translation, rotation and error steps; libapriltag's expression
-//     structure recomputes it three times.
-//
-// Plus one deliberate behavioural change when `tol > 0`: stop once the pose
-// stops moving, rather than always running the full n_steps as libapriltag
-// does. See PoseEstimator::kDefaultConvergenceTol for why the test is on the
-// pose rather than on the error.
+// Orthogonal iteration (Lu/Hager/Mjolsness 2000), libapriltag's orthogonal_iteration with four
+// points. R holds the initial guess on entry; returns the object-space error after the final step
+// and writes the steps run to `steps_run`. (F_j - I) and R*p_j are hoisted out of the loop. If
+// `tol > 0`, stops once the pose stops moving (see PoseEstimator::kDefaultConvergenceTol).
 double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_steps, double tol,
                            int *steps_run) {
   Vec3 p_mean = {0.0, 0.0, 0.0};
@@ -439,8 +388,7 @@ double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_s
       for (int a = 0; a < 3; ++a) R[a][2] = -R[a][2];
     }
 
-    // error = sum_j || (I - F_j)(R p_j + t) ||^2. Recomputed with the new R,
-    // matching libapriltag's ordering (it updates R, then measures).
+    // error = sum_j || (I - F_j)(R p_j + t) ||^2, with the new R.
     error = 0.0;
     for (int j = 0; j < kN; ++j) {
       Vec3 Rp_new, sum, e;
@@ -451,14 +399,10 @@ double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_s
       error += Vec3Dot(e, e);
     }
 
-    // Converged when neither the rotation nor the translation moved this
-    // step. Compared against the PREVIOUS step's pose, so the first step
-    // always runs (there is nothing to compare it against, and solution 2
-    // enters with t unset).
+    // Converged when neither rotation nor translation moved since the previous step (so the first
+    // step always runs).
     if (tol > 0.0 && have_prev) {
-      // Written without std::max deliberately: this is a library source, and
-      // on MSVC windows.h's min/max macros (pulled in transitively) would
-      // break those calls unless every consumer happens to define NOMINMAX.
+      // Avoids std::max: windows.h min/max macros would break it on MSVC.
       double dR = 0.0;
       for (int a = 0; a < 3; ++a) {
         for (int b = 0; b < 3; ++b) {
@@ -474,12 +418,11 @@ double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_s
         const double m = std::fabs(t[a]);
         if (m > t_norm) t_norm = m;
       }
-      // R is orthonormal so its entries are O(1) and an absolute bound is
-      // already scale-free; t is in metres, so bound it relatively (falling
-      // back to absolute for a pose at the origin).
+      // R entries are O(1), so an absolute bound suffices; t is bounded relatively (absolute at
+      // the origin).
       const double dt_rel = (t_norm > 0.0) ? dt / t_norm : dt;
       if (dR < tol && dt_rel < tol) {
-        ++step;  // count the step that established convergence
+        ++step;  // Count the step that established convergence.
         break;
       }
     }
@@ -491,28 +434,21 @@ double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_s
   return error;
 }
 
-// Second local minimum of the pose error (Schweighofer/Pinz 2006),
-// libapriltag's fix_pose_ambiguities. Writes the second solution's rotation
-// to out_R and returns true when one exists.
+// Second local minimum of the pose error (Schweighofer/Pinz 2006), libapriltag's
+// fix_pose_ambiguities; writes its rotation to out_R and returns true if one exists.
 bool FixPoseAmbiguities(const Vec3 *v, const Vec3 *p, const Vec3 t, const Mat3 R, Mat3 out_R) {
   // 1. Build R_t, an orthonormal basis whose third row is t normalized.
   Vec3 R_t_3 = {t[0], t[1], t[2]};
   if (!Vec3Normalize(R_t_3)) return false;
 
-  // Gram-Schmidt e_x against R_t_3. Degenerate when t is parallel to e_x,
-  // which libapriltag walks into silently (matd_vec_normalize of a zero
-  // vector); rejected here instead.
+  // Gram-Schmidt e_x against R_t_3; degenerate (rejected) when t is parallel to e_x.
   Vec3 R_t_1 = {1.0 - R_t_3[0] * R_t_3[0], -R_t_3[0] * R_t_3[1], -R_t_3[0] * R_t_3[2]};
   if (!Vec3Normalize(R_t_1)) return false;
 
   Vec3 R_t_2;
   Vec3Cross(R_t_3, R_t_1, R_t_2);
 
-  // Each basis vector becomes a ROW of R_t. libapriltag assembles this by
-  // reading MATD_EL(R_t_1, 0, 1) and (0, 2) off a 3x1 column vector - outside
-  // its declared column range, but landing on the right flat offsets in
-  // row-major storage, so the effect is the vector's three components laid
-  // out as a row. That intent is what is ported here.
+  // Each basis vector becomes a row of R_t.
   Mat3 R_t = {{R_t_1[0], R_t_1[1], R_t_1[2]},
               {R_t_2[0], R_t_2[1], R_t_2[2]},
               {R_t_3[0], R_t_3[1], R_t_3[2]}};
@@ -645,15 +581,13 @@ bool FixPoseAmbiguities(const Vec3 *v, const Vec3 *p, const Vec3 t, const Mat3 R
                                      (-8.0 * a3 + 6.0 * a1) * t3 +
                                      (-6.0 * a4 + 3.0 * a2) * t4 + a3 * t5;
     if (second_derivative >= 0.0) {
-      // Keep only a minimum qualitatively different from the one we already
-      // have.
+      // Keep only a minimum different from the current one.
       const double t_cur = 2.0 * std::atan(roots[i]);
       if (std::fabs(t_cur - t_initial) > 0.1) minima[n_minima++] = roots[i];
     }
   }
 
-  // 5. Recover the pose for the single new minimum. More than one means the
-  // prior estimate was poor; libapriltag gives up in that case too.
+  // 5. Recover the pose for the single new minimum; more than one means a poor prior (give up).
   if (n_minima != 1) return false;
 
   const double t_cur = minima[0];
@@ -673,15 +607,8 @@ bool FixPoseAmbiguities(const Vec3 *v, const Vec3 *p, const Vec3 t, const Mat3 R
   return true;
 }
 
-// libapriltag's homography_to_pose, writing the rotation and translation
-// separately instead of assembling a 4x4.
-//
-// The only deliberate change is precision: libapriltag computes the scale
-// factor with single-precision sqrtf, which perturbs the seed by ~1e-7
-// relative. Since orthogonal iteration is a local optimizer, that can very
-// occasionally steer it into the other basin of the planar-pose ambiguity -
-// the main reason a comparison against libapriltag is a tolerance, not an
-// equality.
+// libapriltag's homography_to_pose, writing R and t separately; the scale uses double precision
+// rather than libapriltag's sqrtf.
 bool HomographyToPose(const double H[3][3], double fx, double fy, double cx, double cy, Mat3 R,
                       Vec3 t) {
   double R20 = H[2][0];
@@ -694,16 +621,14 @@ bool HomographyToPose(const double H[3][3], double fx, double fy, double cx, dou
   double R11 = (H[1][1] - cy * R21) / fy;
   double TY = (H[1][2] - cy * TZ) / fy;
 
-  // Scale so the rotation columns are unit length (geometric mean of the two
-  // we have).
+  // Scale so the rotation columns are unit length (geometric mean of the two).
   const double length1 = std::sqrt(R00 * R00 + R10 * R10 + R20 * R20);
   const double length2 = std::sqrt(R01 * R01 + R11 * R11 + R21 * R21);
   const double denom = std::sqrt(length1 * length2);
   if (!(denom > 0.0) || !std::isfinite(denom)) return false;
   double s = 1.0 / denom;
 
-  // Sign of s comes from requiring the tag to sit in front of the camera,
-  // which looks along -Z.
+  // The tag must sit in front of the camera, which looks along -Z.
   if (TZ > 0.0) s *= -1.0;
 
   R20 *= s;
@@ -721,10 +646,7 @@ bool HomographyToPose(const double H[3][3], double fx, double fy, double cx, dou
   const double R12 = R20 * R01 - R00 * R21;
   const double R22 = R00 * R11 - R10 * R01;
 
-  // Make the rotation proper by polar decomposition. Note this takes the
-  // orthogonal factor with NO determinant fixup, unlike orthogonal
-  // iteration's use of the same decomposition - preserved as libapriltag has
-  // it.
+  // Polar decomposition without a determinant fixup, as libapriltag.
   const Mat3 raw = {{R00, R01, R02}, {R10, R11, R12}, {R20, R21, R22}};
   NearestOrthogonal(raw, R);
 
@@ -752,8 +674,7 @@ TagPose PoseEstimator::EstimateSeed(const double H[3][3]) const {
   TagPose out;
   Mat3 R;
   Vec3 t;
-  // Note the negated fx and the diag(1, -1, -1) correction below: both are
-  // libapriltag's estimate_pose_for_tag_homography, not incidental.
+  // The negated fx and diag(1, -1, -1) correction are libapriltag's.
   if (!HomographyToPose(H, -intrinsics_.fx, intrinsics_.fy, intrinsics_.cx, intrinsics_.cy, R,
                         t)) {
     return out;
@@ -832,8 +753,7 @@ TagPose PoseEstimator::Estimate(const double corners[4][2], const double H[3][3]
   const TagPosePair both = EstimateBoth(corners, H);
   if (!both.solution1.valid) return both.solution1;
   if (!both.solution2.valid) return both.solution1;
-  // Matches libapriltag's tie-break: solution 1 wins when the errors are
-  // equal.
+  // As libapriltag: solution 1 wins ties.
   return (both.solution1.error <= both.solution2.error) ? both.solution1 : both.solution2;
 }
 
@@ -851,9 +771,7 @@ void PoseEstimator::EstimateAll(const std::vector<const apriltag_detection_t *> 
       corners[c][0] = det->p[c][0];
       corners[c][1] = det->p[c][1];
     }
-    // Each entry is written by exactly one task, so no synchronization is
-    // needed, and writing by index keeps the output independent of thread
-    // scheduling.
+    // Each entry is written by exactly one task, in input order.
     out[i] = Estimate(corners, H);
   });
 }

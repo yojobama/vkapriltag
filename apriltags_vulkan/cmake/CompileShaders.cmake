@@ -1,13 +1,5 @@
-# Compiles a list of GLSL compute shaders to SPIR-V using glslangValidator,
-# targeting the Vulkan 1.1 environment.
-#
-# 1.1 rather than 1.2 on purpose: nothing in these shaders needs a 1.2
-# feature, and targeting 1.1 keeps older mobile drivers (Mali/Adreno, older
-# Panfrost) eligible. The shaders also avoid every optional device feature -
-# no shaderFloat64, no shaderInt64, no 8-bit storage - so the resulting
-# SPIR-V loads unmodified on desktop NVIDIA/AMD/Intel and on mobile parts
-# alike. Workgroup sizes are specialization constants, chosen at runtime from
-# the device's reported limits.
+# Compiles GLSL compute shaders to SPIR-V with glslangValidator, targeting Vulkan 1.1.
+# Workgroup sizes are specialisation constants.
 find_program(GLSLANG_VALIDATOR_EXECUTABLE
   NAMES glslangValidator
   HINTS Vulkan::glslangValidator
@@ -18,20 +10,13 @@ if(NOT GLSLANG_VALIDATOR_EXECUTABLE)
 endif()
 
 function(compile_shaders TARGET_NAME SHADER_LIST OUT_DIR_VAR)
-  # Optional 4th argument: name of a variable (set in the caller's scope) to
-  # receive the full list of compiled .spv paths, e.g. for install(FILES ...).
+  # Optional 4th argument: variable (in the caller's scope) receiving the list of compiled .spv paths.
   set(OUT_BINARIES_VAR "${ARGV3}")
 
   set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
   file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 
-  # Every .comp file may `#include` any of these via GL_GOOGLE_include_directive
-  # (common.glsl today; any future shared header lands here too, via the glob).
-  # glslangValidator's own dependency info isn't wired into this build, so
-  # without this, editing a shared header leaves every .comp file that
-  # #includes it silently stale - Ninja/Make see no reason to recompile a
-  # .comp file whose own timestamp didn't change, and the previous .spv (built
-  # against the header's old layout) stays right where CMake left it.
+  # Shared headers included via GL_GOOGLE_include_directive; globbed so edits to them recompile the .comp files.
   file(GLOB SHADER_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.glsl")
 
   set(SPIRV_BINARIES)

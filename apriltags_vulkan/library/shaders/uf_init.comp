@@ -1,31 +1,8 @@
 #version 450
-// Initializes the union-find parent array. Rather than starting every pixel
-// as its own root, each pixel is pointed at its left neighbour whenever the
-// two are the same (non-ambiguous) value - so every horizontal run of equal
-// pixels is already a single component before the first merge pass runs.
-//
-// This is exactly the structure the first uf_merge.comp pass used to build
-// for the right-hand edges: with all-singleton input, unioning (i, i+1) hooks
-// parent[i+1] = i, because the pass hooks with atomicMin and i < i+1. Building
-// it directly instead is strictly cheaper. It is a pure streaming write with
-// no atomics, no find() walks, and no contention, where the merge pass had to
-// do two find()s, an atomicMin and a retry loop per horizontal edge - and
-// horizontal edges are the majority of same-component neighbour pairs in a
-// thresholded image, since runs are long and rows are wide.
-//
-// uf_merge.comp is then only responsible for the vertical (down) edges, which
-// halves its union work. See the note there.
-//
-// The root convention is preserved: a horizontal run's root is its leftmost
-// pixel, which is its minimum index, which is what atomicMin hooking expects.
-//
-// Ambiguous pixels (value 127) never merge with anything, matching the CUDA
-// implementation's "127 means I'm my own blob" rule, so they always stay
-// their own root here.
-// Dispatched 2D so the row-start test (x > 0) comes straight from
-// gl_GlobalInvocationID.x instead of a runtime `%` by width (see
-// decimate.comp's comment) - the linear index i is still what parent[] and
-// thresholded[] are indexed by, since x's actual value is never needed here.
+// Initialises the union-find parent array: a pixel joins its left neighbour
+// when both hold the same non-ambiguous value, so each horizontal run is one
+// component rooted at its leftmost (minimum) index. Ambiguous pixels (127) stay
+// their own root. Dispatched 2D so x comes from gl_GlobalInvocationID.x.
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) writeonly buffer Parent { uint parent[]; };
