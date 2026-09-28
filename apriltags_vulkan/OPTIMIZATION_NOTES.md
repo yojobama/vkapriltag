@@ -1682,49 +1682,81 @@ disagree and both directions needed to survive. Override with
 identical on both devices, across the 36-configuration matrix and with
 both modes forced explicitly.
 
-## 15. Bounded, not attempted: enumerate active comparators directly in the sort
+## 15. Enumerate active comparators directly in the sort - the closed form, completed
 
-The idea (from the research pass): `sort_points_local_body.glsl`'s
-innermost loop visits every `idx` in `[0, cap)` and guards on
-`(idx & p) == r`, so a direct enumeration that computes only the active
-comparator indices could in principle cut the loop's iteration count.
+`sort_points_local_body.glsl`'s innermost loop used to visit every `idx` in
+`[0, cap)` (well, `[tid, cap-d)`, strided by `threads`) and guard on
+`(idx & p) == r`, so most invocations did a scalar loop-body execution just
+to discard themselves. The idea: enumerate only the active comparators
+directly.
 
-Bounded first with a standalone Python simulation of the exact current
-schedule (not guessed - the schedule is reproduced round-for-round from
-the GLSL loop's own `p`/`q`/`r`/`d` update rule), before writing any GLSL,
-per this file's own stated method. Two things fell out of that:
+**First attempt (this file's earlier revision) stopped short.** A direct-
+enumeration formula was found and verified for the `r == 0` sub-round of
+each `p`-block (the first one), but the later `r == p` sub-rounds seemed
+to need their own, unfound closed form, and the estimated payoff - based
+on a Python simulation's "utilization" metric - looked small enough
+(1-3% of GPU total) that finishing the derivation wasn't worth the risk
+of shipping a formula verified for only part of the schedule.
 
-1. **A direct-enumeration formula was found and verified for the common
-   case.** Fixing bit `log2(p)` of `idx` to `r`'s value and letting `c` in
-   `[0, cap/2)` vary the rest (`idx = ((c >> log2p) << (log2p+1)) | r |
-   (c & (p-1))`) reproduces the guard-based active set exactly for every
-   `(p, d, r)` round the schedule visits, at every cap from 16 to 4096 -
-   *provided* the candidate is also filtered to `idx + d < cap`, since not
-   every bit-fixed index survives that bound.
-2. **The actual waste is much smaller than assumed, and has no clean
-   closed form.** The research pass that proposed this estimated ~40-43%
-   wasted iterations ("0.57-0.64x the warp executions"). Measuring the
-   *real* schedule instead: utilization is **78.8% at cap=16, rising to
-   87.2% at cap=4096** - i.e. only 13-22% of iterations are ever wasted,
-   not roughly half. Digging into why: the very first sub-round of every
-   `p`-block (`r == 0`) is **already 100% utilized** with no waste at all;
-   every bit of waste is concentrated in the later `r == p` sub-rounds
-   within a multi-step `p`-block, and *those* don't reduce to a single
-   formula the way the `r == 0` case does - the valid count depends on the
-   relationship between `d` and `p` in a way that would need its own,
-   separate derivation and its own separate verification.
+**Both of those turned out to be wrong**, caught by continuing to look
+rather than trusting the earlier stopping point:
 
-Given the realistic ceiling is on the order of 1-3% of GPU total (13-22%
-of only the compare-exchange body, itself a fraction of the `sort` span,
-itself ~10-15% of the frame) - smaller than this file's own earlier
-estimate - and a *sorting network* is exactly the kind of place where a
-subtly wrong comparator schedule corrupts output silently rather than
-crashing, this was not pursued further within this campaign's effort
-budget rather than ship a formula verified for only part of the schedule.
-Revisit if the `r == p, d != p` case gets its own closed-form derivation
-and its own from-scratch zero-one-principle verification, matching the
-rigor `PERFORMANCE.md`'s "The sort network" section already documents for
-the shipped odd-even mergesort itself.
+1. **The `r == p` closed form exists and is simple.** Valid `idx` values
+   for a given `(p, r)` form a period-`2p` pattern (`p` valid values per
+   period, starting at offset `r`), and the extra `idx + d < cap` bound
+   just truncates that pattern at `T = cap - d`. Splitting `T` into whole
+   periods below it plus a partial remainder gives the count in closed
+   form for **both** `r == 0` and `r == p` at once:
+   `n = full_periods * p + clamp(remainder - r, 0, p)`, where
+   `full_periods = T >> (log2p + 1)` and `remainder = T & (2p - 1)` -
+   shifts and masks only, since `p` is always a power of two here and this
+   device class (Mali/Valhall) has no integer divide instruction (the
+   same constraint `decimate.comp` avoids elsewhere in this codebase).
+   Verified exhaustively - not sampled - against a standalone Python
+   reproduction of the real schedule: **every one of the 354 rounds this
+   shader's whole `cap` range (16..4096) ever visits**, checking both the
+   comparator *count* and the exact *index set* it enumerates. This is the
+   same rigor `PERFORMANCE.md`'s sort-network section already documents
+   for the shipped odd-even mergesort itself, applied to the schedule
+   that walks it.
+2. **The earlier "1-3% ceiling" used the wrong denominator.** That
+   estimate measured "utilization" against `cap/2` total slots per round,
+   but the loop's real per-round visited range is `cap - d`, which varies
+   per round and is frequently much larger than `cap/2` - so the true
+   wasted-iteration count (and the *scalar loop overhead* of every wasted
+   iteration, on top of the wasted comparator work itself) was
+   substantially underestimated. The measured result below reflects that.
+
+**Shipped.** Bit-identical over 36 configurations on both devices, plus a
+separate full 36-configuration matrix run specifically for this change on
+the Mali-G610 (a sorting network is exactly the class of change where a
+subtly wrong schedule corrupts output silently, so this got its own pass
+rather than trusting the general matrix alone).
+
+**Measured on the RX 9060 XT**, ABBA-interleaved, 12-16 rounds x 300
+iterations, 1280x800:
+
+| | `sort` span | GPU total |
+| --- | --- | --- |
+| decimation 1 | **-31.7%** | **-6.2% to -6.9%** (16/16 and 12/12 rounds) |
+| decimation 2 | **-49.1%** | **-7.9% to -8.0%** (16/16 rounds) |
+| decimation 4 | **-27.0%** | **-3.6%** |
+
+One of the largest single wins measured this campaign, and unanimous at
+every decimation tested.
+
+**Measured on the Mali-G610**, same protocol, 12 rounds x 300 iterations:
+GPU total **+0.4%** (d1, 5/12 rounds) / **+0.2%** (d2, 5/12) - noise-level
+either way, not a regression. This makes architectural sense rather than
+contradicting the RDNA result: Mali's `sort` span is barrier- and
+latency-bound (`PERFORMANCE.md` section 3a: 0.99x memory-clock
+sensitivity, i.e. immune to bandwidth, and the barrier *count* here is
+unchanged by this optimization - only which `idx` values each round
+visits changed), while the RDNA win is consistent with removing per-lane
+divergent-branch cost across a much wider SIMD unit (32-64 lanes vs
+Mali's fixed 16), which a barrier-bound span on a narrower SIMD device
+would not expose the same way. No gate needed either way: it helps one
+device substantially and costs nothing on the other.
 
 ## 16. Rejected: pad `MinMaxExtentsGpu` from 32 to 64 bytes
 

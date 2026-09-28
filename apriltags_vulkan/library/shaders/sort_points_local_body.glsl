@@ -184,22 +184,49 @@ void main() {
   // 20000 random permutations each at cap = 32/64/128. `q - p` below is a
   // uint subtraction; the same verification script confirmed q >= p at every
   // step for cap up to 2^20, so it never wraps.
+  // DIRECT COMPARATOR ENUMERATION rather than visiting every idx in [0,cap)
+  // and testing (idx & p) == r: the guard leaves 13-22% of iterations idle
+  // (measured across this range of cap, not the ~40% once assumed - see
+  // OPTIMIZATION_NOTES.md). idx has bit log2(p) fixed to r's value (r is
+  // always 0 or p), so the valid idx form a period-2p pattern with p valid
+  // values per period; the extra idx+d<cap bound truncates that pattern at
+  // T=cap-d, cutting it to (full periods below T) * p, plus however much
+  // of the partial period survives. Both p and 2p are powers of two
+  // throughout (p only ever comes from `1u << k` or a right shift of one),
+  // so the "how many full periods" and "where in the current period" steps
+  // below are a shift and a mask, never a runtime divide/mod - this device
+  // class has no integer divide instruction (see decimate.comp's own
+  // comment on the same constraint).
+  //
+  // Verified standalone before porting, the same way the network itself
+  // was: a Python simulation reproduced this schedule's exact p/q/r/d
+  // sequence, and both the comparator COUNT below and the exact IDX SET it
+  // enumerates were checked to match the original guard-based form for
+  // every one of the 354 rounds this shader's whole cap range (16..4096)
+  // ever visits - not sampled, all of them.
   if (log2_cap >= 1u) {
     uint p = 1u << (log2_cap - 1u);
+    uint log2p = log2_cap - 1u;
     while (p >= 1u) {
       uint q = 1u << (log2_cap - 1u);
       uint r = 0u;
       uint d = p;
       while (d >= 1u) {
-        for (uint idx = tid; idx + d < cap; idx += threads) {
-          if ((idx & p) == r) {
-            uint partner = idx + d;
-            uint a = s_packed[idx];
-            uint b = s_packed[partner];
-            if (a > b) {
-              s_packed[idx] = b;
-              s_packed[partner] = a;
-            }
+        uint two_p = p << 1u;
+        uint region_below = cap - d;
+        uint full_periods = region_below >> (log2p + 1u);
+        uint remainder = region_below & (two_p - 1u);
+        int partial_signed = int(remainder) - int(r);
+        uint partial = uint(clamp(partial_signed, 0, int(p)));
+        uint n_active = full_periods * p + partial;
+        for (uint c = tid; c < n_active; c += threads) {
+          uint idx = ((c >> log2p) << (log2p + 1u)) | r | (c & (p - 1u));
+          uint partner = idx + d;
+          uint a = s_packed[idx];
+          uint b = s_packed[partner];
+          if (a > b) {
+            s_packed[idx] = b;
+            s_packed[partner] = a;
           }
         }
         memoryBarrierShared();
@@ -213,6 +240,7 @@ void main() {
         }
       }
       p >>= 1u;
+      log2p -= 1u;
     }
   }
 
