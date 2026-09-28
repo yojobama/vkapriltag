@@ -27,15 +27,32 @@
 >   from A1 - the two device classes genuinely disagree here and both
 >   directions are kept.
 >
+> - **`gx_sum`/`gy_sum` atomic packing (never attempted before, A7):**
+>   implemented and shipped. RX 9060 XT (forced-scalar-atomic64, not the
+>   default there): extents span −9.8%/−3.0%. **Mali-G610 (this is the
+>   default path there):** GPU total −0.7% (d1, unanimous) / −1.3% (d2,
+>   weaker but no regression).
+> - **Sort comparator enumeration (A3, was "bounded, not attempted"):** the
+>   closed form for the remaining round type WAS found on a second pass -
+>   verified exhaustively against all 354 rounds the shader's whole cap
+>   range ever visits. **One of the largest single wins this campaign on
+>   the RX 9060 XT: sort span −27% to −49%, GPU total −3.6% to −8.0%,
+>   unanimous at every decimation.** Neutral on Mali (+0.2%/+0.4%, coin-flip
+>   direction, not a regression) - Mali's `sort` span is barrier/latency-
+>   bound, not divergent-branch-bound the way RDNA's wider SIMD is, so this
+>   optimization's mechanism doesn't apply there, but it costs nothing
+>   either. Shipped ungated.
+>
 > **Rejected on both devices, now a general finding, not an RDNA quirk:**
 > lane-based extents copy selection (+11.8% RX 9060 XT forced-scalar path,
 > +5.4% Mali, where scalar/atomic64 is the *only* path since integrated GPUs
 > never take the subgroup variant). The mechanism is `blob_diff`'s own
 > append-order locality, not anything architecture-specific.
 >
-> **Not yet re-tested on Mali:** the extents struct padding rejection (A6a)
-> and the deferred sort comparator enumeration (A3, real waste measured at
-> 13-22%, not the ~40% estimated below).
+> **Extents struct padding (A6a):** re-tested on Mali - inconclusive
+> (−1.6% median but only 6/12 rounds favor it, a coin flip), materially
+> different from RDNA's clean unanimous regression. Still not committed on
+> either device; no evidence of a win to set against RDNA's clear loss.
 
 Merged 2026-09-26 from the `## Conclusions` of `01`–`08` (219 source entries
 in total). Each item cites the category file where its evidence lives.
