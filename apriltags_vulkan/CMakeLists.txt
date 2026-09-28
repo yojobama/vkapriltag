@@ -43,3 +43,37 @@ if(VKAPRILTAG_BUILD_TOOLS)
 endif()
 
 enable_testing()
+
+# ---------------------------------------------------------------------------
+# CPack: packages exactly what library/CMakeLists.txt's install() rules
+# cover (static lib, public headers, compiled SPIR-V shader corpus, CMake
+# package config) - no tools/apps, matching the release workflow's
+# -DVKAPRILTAG_BUILD_APPS=OFF -DVKAPRILTAG_BUILD_TOOLS=OFF. This block is
+# inert unless `cpack` is actually invoked.
+# ---------------------------------------------------------------------------
+set(CPACK_PACKAGE_NAME "vkapriltag")
+# Overridable via -DCPACK_PACKAGE_VERSION=X.Y.Z at configure time (the
+# release workflow derives this from the pushed git tag rather than the
+# in-tree development version above). A plain set() here would shadow that
+# command-line cache value for the rest of this configure run regardless of
+# how CPACK_PACKAGE_VERSION was set, so only default it when unset.
+if(NOT CPACK_PACKAGE_VERSION)
+  set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+endif()
+set(CPACK_PACKAGE_VENDOR "vkapriltag")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+  "Vulkan-compute AprilTag detection pipeline for embedded/mobile GPUs")
+set(CPACK_PACKAGE_CONTACT "https://github.com/yojobama/vkapriltag")
+set(CPACK_GENERATOR "DEB")
+# dpkg-shlibdeps-derived Depends: (e.g. libvulkan1); requires dpkg-dev on
+# the packaging host.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_SECTION "libdevel")
+# Standard <name>_<version>_<arch>.deb naming; CPACK_DEBIAN_PACKAGE_ARCHITECTURE
+# is left unset so CPack auto-detects it from `dpkg --print-architecture` on
+# the build host - correct as long as packaging always happens natively
+# (amd64 host -> amd64 package, arm64 host -> arm64 package), never
+# cross-compiled.
+set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+include(CPack)

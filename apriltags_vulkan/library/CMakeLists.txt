@@ -51,6 +51,14 @@ FetchContent_Declare(
         "-DPATCHES=${APRILTAG_PATCH_FILE},${APRILTAG_MINGW_PATCH_FILE}"
         -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/ApplyPatches.cmake
 )
+# Upstream's own CMakeLists.txt defaults BUILD_EXAMPLES to ON and installs
+# its apriltag_demo/opencv_demo example binaries unconditionally when it is
+# - swept into *our* install()/CPack output otherwise (opencv_demo in
+# particular then pulls a spurious OpenCV runtime dependency onto every
+# vkapriltag package, on any host that happens to have OpenCV's dev package
+# available, regardless of whether OUR build wants it). We only ever need
+# the apriltag library itself.
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(apriltag)
 
 # Newer GCC (15+) defaults to a C standard where implicit/incompatible
