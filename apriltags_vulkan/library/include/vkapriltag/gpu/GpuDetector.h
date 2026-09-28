@@ -297,19 +297,11 @@ class GpuDetector {
   bool extents_direct_read_ = false;
   // True when the last three submissions are recorded as one (requires both direct-read paths).
   bool fused_submits_ = false;
-  // True when each labelling chunk's last uf_compress is predicated on
-  // uf_changed_buf_ with VK_EXT_conditional_rendering, so a pass after a
-  // merge that joined nothing is skipped outright instead of launching every
-  // workgroup just to read the flag and return. Where the extension is
-  // absent (Mali-G610) uf_compress.comp's own honour_changed_flag guard does
-  // the same job at a smaller saving. See PERFORMANCE.md section 6c.
+  // True when each labelling chunk's last uf_compress is predicated on uf_changed_buf_ with
+  // VK_EXT_conditional_rendering; otherwise uf_compress.comp's honour_changed_flag guard applies.
   bool predicated_compress_ = false;
-  // True when reduce_extents_hash_atomic64.comp is this frame's reduction
-  // shader (set once in CreatePipelines, read again in Detect() when
-  // building select_blobs_pl_'s push constants): that variant packs
-  // gx_sum/gy_sum into one biased 64-bit atomic, so select_blobs.comp has
-  // to unbias them - see reduce_extents_hash_body.glsl's and
-  // select_blobs.comp's own comments.
+  // True when reduce_extents_hash_atomic64.comp is the reduction shader; select_blobs.comp then
+  // unbiases gx_sum/gy_sum.
   bool extents_atomic64_ = false;
   // Backs last_line_fit_points only on the staging path.
   std::vector<RawLineFitPoint> linefit_scratch_;

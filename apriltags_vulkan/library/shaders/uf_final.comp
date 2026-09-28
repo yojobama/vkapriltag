@@ -1,7 +1,5 @@
 #version 450
-// 32-bit-per-pixel Thresholded - the always-safe default. See
-// uf_final_body.glsl for the shader itself, and uf_final_u8.comp for the
-// variant GpuDetector picks on devices with storageBuffer8BitAccess.
+// Per-blob pixel counter with 32-bit Thresholded; see uf_final_body.glsl.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 

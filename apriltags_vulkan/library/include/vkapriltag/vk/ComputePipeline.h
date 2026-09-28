@@ -20,11 +20,9 @@ enum class BarrierKind {
   Compute,
   // Also orders against transfer operations on either side.
   ComputeAndTransfer,
-  // Compute / ComputeAndTransfer, plus the conditional-rendering predicate
-  // read on both sides: a shader write becomes visible to a later
-  // Context::CmdBeginConditionalRendering, and an earlier predicate read is
-  // ordered before a later write of the same buffer. Only valid when
-  // caps().has_conditional_rendering - the stage bit is illegal otherwise.
+  // As Compute / ComputeAndTransfer, and also orders shader writes before a later
+  // Context::CmdBeginConditionalRendering predicate read and earlier predicate reads before
+  // later writes. Requires caps().has_conditional_rendering.
   ComputeAndPredicate,
   ComputeTransferAndPredicate,
 };

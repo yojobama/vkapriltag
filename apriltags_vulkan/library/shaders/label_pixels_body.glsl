@@ -1,60 +1,22 @@
-// Shared body for label_pixels.comp / label_pixels_u8.comp. The two differ
-// only in Thresholded's element type (uint vs uint8_t, the
-// storageBuffer8BitAccess axis) - the wrapper #including this declares
-// Thresholded's binding and a THRESHOLDED_AT(i) accessor macro before this
-// point, exactly as blob_diff_body.glsl is parametrized.
+// Shared body for label_pixels.comp / label_pixels_u8.comp; the wrapper declares Thresholded and
+// THRESHOLDED_AT(i).
 //
-// Folds three things into a single spatially-local per-pixel word, written
-// back into `parent[]` itself: which blob this pixel belongs to, whether
-// that blob is big enough to matter, and the pixel's three-valued threshold.
-// See common.glsl's PixelLabel/PixelThreshCode for the layout and the bit
-// budget, and for why the code mapping's monotonicity makes blob_diff's
-// rewritten tests bit-identical rather than merely equivalent.
-//
-// Rewriting parent[] in place is safe because each invocation reads and
-// writes only its OWN entry - no thread reads another thread's parent[]
-// entry here - so there is no separate buffer to allocate, zero, bind or
-// read. Next frame's uf_init overwrites every entry unconditionally, so the
-// repurposed encoding cannot leak across frames.
-//
-// Why this exists: blob_diff.comp used to look up blob_size[parent[n]] for
-// the pixel and each of its five neighbours - six RANDOM gathers into a 2 MB
-// array per interior pixel - plus two more per emitted point to translate
-// roots into dense ids. That became ONE random gather here. This pass then
-// also absorbed the threshold read, taking blob_diff from twelve loads per
-// interior pixel across two arrays down to six from one; the cost here is
-// one extra streaming read of thresholded[i], at the same index this
-// invocation already owns.
+// Rewrites each pixel's parent[] entry in place as a packed word holding its blob label (0 when
+// the blob is below min_blob_pixels or the pixel is ambiguous) and its threshold code. See
+// common.glsl's PixelLabel/PixelThreshCode for the layout.
 
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
 layout(std430, binding = 1) readonly buffer BlobSize { uint blob_size[]; };
-// Read only when honour_changed_flag is set - see the guard below and
-// GpuDetector's finish_frame comment on the fused fast path.
+// Read only when honour_changed_flag is set.
 layout(std430, binding = 3) readonly buffer Changed { uint changed_flag; };
 
 layout(push_constant) uniform PushConstants {
   uint count;
-  // Must equal uf_final.comp's min_blob_pixels - that shader saturates its
-  // counter at this same floor, and the two agreeing is what makes the
-  // comparison below exact. See uf_final.comp's proof.
+  // Must equal uf_final.comp's min_blob_pixels.
   uint min_blob_pixels;
-  // Set only by the fused fast path's SPECULATIVE first attempt, where
-  // labelling might not actually have converged yet - see GpuDetector's
-  // finish_frame. When set and changed_flag is nonzero, this invocation
-  // returns without touching parent[] at all.
-  //
-  // This guard exists because this shader's own write below is
-  // DESTRUCTIVE: it overwrites parent[] with a packed (label, threshold
-  // code) word, permanently discarding the raw union-find parent pointer
-  // that lived there. If that happened before labelling had genuinely
-  // converged, a retry's uf_merge/uf_compress passes would resume
-  // find()-walking a buffer that no longer holds valid parent pointers -
-  // in the worst case a cycle, which hangs the GPU (observed as
-  // VK_ERROR_DEVICE_LOST while developing this). Skipping here instead
-  // leaves parent[] exactly as the labelling chunk left it: incomplete,
-  // but a valid union-find structure a retry can safely keep converging.
+  // When set and changed_flag is nonzero, returns without modifying parent[].
   uint honour_changed_flag;
 } pc;
 
@@ -63,20 +25,11 @@ void main() {
   if (i >= pc.count) return;
   if (pc.honour_changed_flag != 0u && changed_flag != 0u) return;
   uint code = PackThreshCode(uint(THRESHOLDED_AT(i)));
-  // Ambiguous (127, code 1) pixels never merge with anything (uf_init.comp/
-  // uf_merge_body.glsl), so pixel i is always its own root here, and
-  // uf_final.comp's saturating blob_size[i] can only ever be 0 or 1 for it
-  // (touched by exactly one atomicAdd, from this same pixel, nothing else
-  // ever routes to that slot - see uf_final.comp's proof). Both values
-  // compare false against min_blob_pixels >= 2 (asserted host-side, see
-  // GpuDetector's config handling), so label is always 0 either way -
-  // skipping the blob_size load entirely is exact, not approximate.
+  // Ambiguous (code 1) pixels always get label 0 without reading blob_size.
   uint label = 0u;
   if (code != 1u) {
     uint r = parent[i];
-    // The "+1" biasing is what lets label 0 mean "no usable blob",
-    // collapsing blob_diff's two separate rejections (ambiguous pixel,
-    // blob too small) into one comparison.
+    // Labels are root + 1 so that 0 means no usable blob.
     label = (blob_size[r] >= pc.min_blob_pixels) ? (r + 1u) : 0u;
   }
   parent[i] = label | (code << kPixelLabelBits);

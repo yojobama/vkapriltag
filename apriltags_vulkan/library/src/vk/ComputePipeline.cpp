@@ -254,8 +254,7 @@ void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
   }
   if (kind == BarrierKind::ComputeAndPredicate ||
       kind == BarrierKind::ComputeTransferAndPredicate) {
-    // On the source side this is only an execution dependency (the predicate
-    // read writes nothing), which is all a write-after-read needs.
+    // The predicate read writes nothing, so the source side is an execution dependency only.
     stages |= VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT;
     barrier.dstAccessMask |= VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT;
   }

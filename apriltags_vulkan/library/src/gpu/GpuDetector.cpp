@@ -25,9 +25,8 @@ double MsSince(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
-// Prefers SPIR-V compiled into the binary, falling back to SHADER_DIR when
-// this build has none (VKAPRILTAG_EMBED_SHADERS=OFF). Embedding is what lets
-// the library run somewhere with no install prefix - see EmbeddedShaders.h.
+// Prefers SPIR-V embedded in the binary, falling back to SHADER_DIR when the build has none
+// (VKAPRILTAG_EMBED_SHADERS=OFF).
 vk::ShaderSource ShaderPath(const char *name) {
   if (const vk::EmbeddedShader *embedded = vk::FindEmbeddedShader(name)) {
     return vk::ShaderSource(embedded->code, embedded->bytes, name);
@@ -72,38 +71,22 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   if (config_.width % config_.decimation != 0 || config_.height % config_.decimation != 0) {
     throw std::runtime_error("width and height must each be evenly divisible by decimation");
   }
-  // QBPoint/IPoint pack a boundary coordinate into 14 bits per axis (see
-  // common.glsl's PackXY). That coordinate is the *doubled* decimated index
-  // (x2 = 2*decimated_x +/- 1, so boundaries land on half-integers), whose
-  // maximum is 2*width/decimation - not width. The two coincide only at
-  // decimation 2, which is why a bare `width <= 16383` test was right while
-  // decimation was hardcoded and is off by 2x at decimation 1. Checked
-  // against the real packed range so a lossy configuration is rejected up
-  // front instead of silently truncating coordinates.
+  // QBPoint/IPoint pack the doubled decimated coordinate (at most 2*width/decimation) into 14 bits
+  // per axis; rejects configurations that would truncate it.
   const uint32_t max_packed_x = 2u * (config_.width / config_.decimation);
   const uint32_t max_packed_y = 2u * (config_.height / config_.decimation);
   if (max_packed_x > 16383 || max_packed_y > 16383) {
     throw std::runtime_error(
         "2*(width/decimation) and 2*(height/decimation) must each be <= 16383");
   }
-  // label_pixels.comp packs `1 + root` into the low 30 bits of parent[] and
-  // the pixel's threshold code into the top 2 (see common.glsl). The check
-  // above already implies this - it bounds the decimated grid at 8191x8191 =
-  // 67,092,481 pixels, under 2^26 - so this is executable documentation of
-  // the coupling rather than a reachable failure, and it will fire first if
-  // the packing above is ever widened.
+  // label_pixels.comp packs `1 + root` into the low 30 bits of parent[]; guards the pixel count.
   if (VkDeviceSize(config_.width / config_.decimation) *
           (config_.height / config_.decimation) >=
       (1u << 30)) {
     throw std::runtime_error(
         "decimated pixel count must be < 2^30 to fit label_pixels.comp's packed label");
   }
-  // RawLineFitPoint packs blob_index into 22 bits and W into 10 (see
-  // common.glsl). blob_index is bounded by max_blobs, itself clamped to
-  // max_raw_blobs below, and W is bounded at 361 by construction - so
-  // neither can overflow unless max_raw_blobs is widened past 2^22. Checked
-  // here rather than left implicit, because the failure mode would be a
-  // silently mis-grouped point rather than a crash.
+  // RawLineFitPoint packs blob_index into 22 bits (see common.glsl), bounding max_raw_blobs.
   static_assert(sizeof(RawLineFitPoint) == 8, "RawLineFitPoint packing changed");
   if (config_.max_raw_blobs > (1u << 22)) {
     throw std::runtime_error(
@@ -113,44 +96,31 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   // --- Environment overrides. These must all be applied before any capacity
   // or launch geometry is derived from the config. ---
 
-  // The boundary-point cap is the main device-memory lever on unified-memory
-  // parts, where the dense worst-case sizing is expensive.
+  // Caps the boundary-point count, and with it device memory.
   if (const char *cap = std::getenv("APRILTAG_VK_MAX_POINTS")) {
     const long parsed = std::strtol(cap, nullptr, 10);
     if (parsed > 0) config_.max_boundary_points = static_cast<uint32_t>(parsed);
   }
-  // Labelling chunk size. Smaller chunks detect convergence more precisely at
-  // the cost of an extra round trip when they guess low.
+  // Labelling iterations per chunk.
   if (const char *chunk = std::getenv("APRILTAG_VK_UF_CHUNK")) {
     const long parsed = std::strtol(chunk, nullptr, 10);
     if (parsed > 0) config_.uf_iterations_per_chunk = static_cast<uint32_t>(parsed);
   }
   if (config_.uf_iterations_per_chunk == 0) config_.uf_iterations_per_chunk = 1;
 
-  // Scale-relative minimum cluster size: derives a floor for
-  // min_cluster_pixels from the smallest tag side (full-resolution pixels)
-  // the caller declares, then raises min_cluster_pixels to that floor (never
-  // lowers it, so an explicit min_cluster_pixels always still applies).
+  // Derives a minimum cluster size from the smallest tag side (full-resolution pixels) and raises
+  // min_cluster_pixels to it if lower.
   if (const char *min_tag_px = std::getenv("APRILTAG_VK_MIN_TAG_PX")) {
     const long parsed = std::strtol(min_tag_px, nullptr, 10);
     if (parsed > 0) config_.min_tag_pixels = static_cast<uint32_t>(parsed);
   }
   if (config_.min_tag_pixels > 0) {
-    // Perimeter, in decimated-grid boundary points, of a square tag whose
-    // full-resolution side is min_tag_pixels, at this detector's decimation:
-    // 4 sides x (min_tag_pixels / decimation) decimated pixels each.
+    // Perimeter, in decimated pixels, of a square tag whose side is min_tag_pixels.
     const uint32_t derived_min_cluster = 4u * (config_.min_tag_pixels / config_.decimation);
     config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, derived_min_cluster);
   }
-  // uf_final.comp/label_pixels.comp's ambiguous-pixel fast path (see their
-  // own comments) is exact only when this floor is at least 2: a 127 pixel
-  // is provably always a size-1 singleton root, so its saturating
-  // blob_size counter can only ever read as 0 or 1, and both compare false
-  // against any floor >= 2. A floor of 0 or 1 would instead make an
-  // ambiguous pixel's own (never legitimately sized) blob pass the "big
-  // enough" test - not a crash, but a behavior change neither shader path
-  // intends. min_cluster_pixels defaults to 24 and nothing sane sets it
-  // below 2, so this only guards a pathological configuration.
+  // Floors min_cluster_pixels at 2, as the ambiguous-pixel paths in uf_final.comp and
+  // label_pixels.comp require.
   config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, 2u);
 
   // Launch geometry comes from the device, never from a literal.
@@ -163,32 +133,8 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   decimated_width_ = config_.width / config_.decimation;
   decimated_height_ = config_.height / config_.decimation;
 
-  // Resolve max_blobs == 0 ("auto") to a ceiling that tracks the frame,
-  // because the number of blobs a frame produces does. It goes as the
-  // DECIMATED pixel count - area/decimation^2 - so a flat ceiling silently
-  // loses its margin as either the sensor grows or decimation is lowered,
-  // and overflowing it is not a graceful degradation: select_blobs.comp
-  // discards the excess in atomicAdd order, so the frame's detections stop
-  // being reproducible (see DetectProfile::selected_blob_drops).
-  //
-  // Anchored on 1080p at decimation 2 - the configuration the old flat 2048
-  // was chosen and validated against - so every frame at or below that size
-  // resolves to exactly 2048 and keeps today's measured cost bit for bit.
-  // Only larger sensors or finer decimation ask for more.
-  //
-  // The headroom this leaves is deliberate and cheap. Blob density is
-  // scene-dependent (texture produces blobs; a flat wall does not), so the
-  // linear-in-pixels estimate has to sit well above the typical case for the
-  // atypical one to still fit - measured, a 12 MP frame at decimation 2
-  // qualifies 1878 blobs against the 12042 this resolves to. The cost of
-  // that slack is one dispatch and one scan over the capacity
-  // (extract_blob_counts + RunInclusiveScan; the per-frame READBACK is sized
-  // by the actual count, not this), measured at +2.2 us for a 24x capacity
-  // increase - 0.06% of a 3.6 ms frame. Silent irreproducibility is not
-  // worth trading for microseconds.
-  //
-  // Clamped to max_raw_blobs: a selected blob is always a subset of the raw
-  // blobs, so capacity beyond that can never be reached.
+  // Resolves max_blobs == 0 (auto) in proportion to the decimated pixel count, anchored at 2048 for
+  // 1080p at decimation 2 and clamped to max_raw_blobs.
   if (config_.max_blobs == 0) {
     constexpr uint64_t kAnchorDecimatedPx = 1920ull * 1080ull / 4ull;  // 1080p at decimation 2
     constexpr uint64_t kAnchorMaxBlobs = 2048ull;
@@ -198,12 +144,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     config_.max_blobs = static_cast<uint32_t>(
         std::min<uint64_t>(std::max<uint64_t>(scaled, kAnchorMaxBlobs), config_.max_raw_blobs));
   }
-  // Rounded up rather than floored: width/height are only guaranteed
-  // divisible by decimation, not by a further factor of 4, so
-  // decimated_width_/height_ need not be a multiple of 4.
-  // block_minmax.comp/threshold.comp handle the resulting ragged trailing
-  // block explicitly (edge-clamped sampling / an explicit block_width push
-  // constant) rather than assuming block_width_ * 4 == decimated_width_.
+  // Rounded up; block_minmax.comp and threshold.comp handle the ragged trailing block.
   block_width_ = (decimated_width_ + 3) / 4;
   block_height_ = (decimated_height_ + 3) / 4;
   interior_width_ = decimated_width_ - 2;
@@ -216,55 +157,21 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   }
   ipoint_capacity_ = qbp_capacity_;
 
-  // The grayscale frame is uploaded packed, four 8-bit pixels per uint32.
-  // width and height are each guaranteed even (checked above), so their
-  // product is guaranteed divisible by four.
+  // The grayscale frame is uploaded packed, four 8-bit pixels per uint32 (width and height are
+  // even, so the product divides by four).
   gray_words_ = (config_.width * config_.height) / 4u;
 
-  // sort_points_local.comp handles one selected blob per workgroup, sorting
-  // its points entirely in shared memory (1 word/point: key and local index
-  // share a word, packed key-high/index-low - see that shader's comment).
-  // local_sort_cap_ is the workgroup's thread count, bounded by the device's
-  // max workgroup invocation count (a real dispatch limit); it no longer
-  // needs to also bound the shared array size (see local_sort_virtual_cap_
-  // below), but 1024 remains a sane ceiling matching radix_wg_/wg1d_'s
-  // derivation from caps below.
+  // sort_points_local.comp workgroup size: the device's maximum invocation count rounded down to a
+  // power of two.
   local_sort_cap_ = PrevPow2(std::max(caps.max_workgroup_invocations, 1u));
-  // 256 rather than the device maximum. Once the bitonic network is sized to
-  // the blob (see sort_points_local.comp) the typical network is ~256 slots
-  // wide, so a 1024-thread workgroup leaves three quarters of its lanes idle
-  // in every stage while still reserving the full shared-memory allocation.
-  // Measured on Mali-G610 at 1080p: 1024 threads 4.03 ms, 512 threads 3.08 ms,
-  // 256 threads 3.08 ms, 128 threads 3.83 ms, 64 threads 5.71 ms.
+  // Limited to 256 threads.
   local_sort_cap_ = std::min(local_sort_cap_, 256u);
 
-  // The shader's virtual per-blob capacity is decoupled from the workgroup's
-  // thread count (each thread handles multiple elements in a strided
-  // pattern), so it only needs to fit the shared-memory budget - not the
-  // device's max workgroup invocation count. This lets blobs bigger than the
-  // device can run as a single workgroup (e.g. a large tag's own border)
-  // still get properly angle-sorted instead of falling back to the unsorted
-  // identity copy in sort_points_local_body.glsl - a fallback that yields
-  // geometrically meaningless quads, since FitQuadForBlob consumes these
-  // points as an ordered walk around the perimeter.
-  //
-  // The ceiling has to scale with decimation. A blob's perimeter in
-  // decimated points goes as 1/decimation, so the ~1200-point border of a
-  // 1080p tag at decimation 2 is ~2400 points at decimation 1. 2048 slots
-  // (the old fixed ceiling) covered the former and silently mis-sorted the
-  // latter. Anchor on the value validated at decimation 2 and scale it, but
-  // never request less than that anchor: coarser decimation keeps exactly
-  // today's geometry - and therefore today's measured cost - while only
-  // decimation 1 pays for the larger shared array.
+  // Sort slots per blob: 2048 at decimation 2, scaling with 1/decimation and never below 2048.
   const uint32_t kCapAtDecimation2 = 2048u;
   const uint32_t scaled_cap = (kCapAtDecimation2 * 2u) / config_.decimation;
-  // Hard-capped at 4096 regardless of the shared-memory budget:
-  // sort_points_local.comp packs the local sort index into the low 12 bits
-  // of its shared word (kLocalIndexBits), so 4096 slots is the most the
-  // packing itself can address, not merely a budget choice - this must stay
-  // in sync with that shader's kLocalIndexBits. On every real device
-  // (Vulkan guarantees >= 16 KiB of shared memory, this device has 32 KiB)
-  // the /4u budget bound is already looser than the 4096 index cap.
+  // At most 4096, the limit of sort_points_local_body.glsl's 12-bit local index (kLocalIndexBits),
+  // and bounded by shared memory.
   local_sort_virtual_cap_ =
       std::min(std::max(scaled_cap, kCapAtDecimation2), 4096u);
   local_sort_virtual_cap_ = std::min(
@@ -273,16 +180,10 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
   CreateBuffers();
   CreatePipelines();
 
-  // Persist any newly-compiled pipelines now rather than relying solely on
-  // ~Context(): a process that gets killed (common for a camera-loop
-  // binary) rather than shut down cleanly would otherwise lose the cache
-  // every time. Cheap when nothing changed - see PipelineCache::Save().
+  // Persists newly compiled pipelines immediately rather than only at ~Context().
   ctx_.FlushPipelineCache();
 
-  // Opt-in per-shader GPU timing (see DetectProfile::gpu_stage_ms /
-  // kGpuStageNames). Off by default: a query pool costs nothing idle, but
-  // constructing one and threading the reset/write/read calls through every
-  // frame is pure overhead a normal run shouldn't pay for.
+  // Opt-in per-shader GPU timing (see DetectProfile::gpu_stage_ms / kGpuStageNames).
   if (const char *ts = std::getenv("APRILTAG_VK_TIMESTAMPS")) {
     if (std::strtol(ts, nullptr, 10) != 0 && caps.timestamps_supported) {
       timestamp_pool_ = vk::QueryPool(ctx_.device(), kNumGpuStageSpans * 2);
@@ -298,11 +199,8 @@ void GpuDetector::CreateBuffers() {
     return b;
   };
 
-  // On unified-memory parts (Mali and other integrated GPUs) the grayscale
-  // buffer is host-visible device memory written directly by the CPU, which
-  // removes the staging copy entirely. On discrete cards there is no such
-  // memory type (absent resizable BAR), so Buffer falls back to device-local
-  // and we DMA through a persistently mapped staging buffer instead.
+  // Host-visible device memory written directly on unified-memory parts; otherwise device-local,
+  // filled through a persistently mapped staging buffer.
   gray_buf_ = vk::Buffer(
       ctx_, VkDeviceSize(gray_words_) * 4,
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -318,12 +216,8 @@ void GpuDetector::CreateBuffers() {
   counter_staging_ = vk::Buffer(ctx_, kCounterStagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 vk::MemoryKind::HostVisibleCached);
 
-  // 1 byte/pixel on devices with storageBuffer8BitAccess (see
-  // decimate_u8.comp's comment), else the 4-byte-per-pixel fallback layout
-  // every shader in the base corpus assumes. Shared by decimated_buf_ and
-  // thresholded_buf_: threshold.comp/threshold_u8.comp reads the former and
-  // writes the latter in the same dispatch, so the two switch together, not
-  // independently.
+  // 1 byte per pixel with storageBuffer8BitAccess, else 4. decimated_buf_ and thresholded_buf_ share
+  // the setting.
   const VkDeviceSize decimated_bytes_per_pixel = ctx_.caps().has_8bit_storage ? 1 : 4;
   decimated_buf_ =
       ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
@@ -334,8 +228,7 @@ void GpuDetector::CreateBuffers() {
 
   parent_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
   blob_size_buf_ = ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * 4);
-  // Also the conditional-rendering predicate for the in-chunk uf_compress
-  // passes when the device has the extension - see predicated_compress_.
+  // Also the conditional-rendering predicate for uf_compress (see predicated_compress_).
   predicated_compress_ = ctx_.caps().has_conditional_rendering;
   {
     const VkBufferUsageFlags usage =
@@ -345,45 +238,16 @@ void GpuDetector::CreateBuffers() {
     uf_changed_buf_ = std::move(b);
   }
 
-  // QBPoint is packed into one uint32 on the GPU side (see common.glsl); no
-  // C++ mirror struct exists since nothing on the host ever reads one back.
+  // QBPoint is packed into one uint32 on the GPU (see common.glsl); there is no host mirror.
   qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(uint32_t));
   qbp_counter_buf_ = ssbo(4);
-  // Only the grouping hash reads this now, so it is sized to the actual point
-  // capacity rather than the power of two a bitonic network needed. One
-  // interleaved uvec2 per point rather than two parallel uint arrays: the
-  // hash's probe loop compares a whole (rep0, rep1) key, so split arrays cost
-  // two random gathers into two separate buffers per probe. Same total bytes.
+  // Sized to the point capacity; one interleaved (rep0, rep1) uvec2 key per point.
   qbp_keys_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 8);
 
   extents_buf_ = ssbo(VkDeviceSize(ExtentsSlotCount(config_.max_raw_blobs)) *
                       sizeof(MinMaxExtentsGpu));
-  // Allocated readback-capable for the same reason as line_fit_points_buf_:
-  // where the memory type comes back host-visible AND cached, QuadDecode
-  // reads it in place. That is not about the copy's size - it is a few KB -
-  // but about its SIZE BEING KNOWN AT RECORD TIME: a staged copy needs
-  // num_selected_blobs on the host, which is exactly the readback that used
-  // to force a mid-frame SubmitAndWait. Reading in place removes the last
-  // host dependency in the frame's tail; see fused_submits_.
-  //
-  // HostVisibleCached rather than DeviceLocalReadback: the latter REQUIRES
-  // device-local, which on a discrete card without a cached BAR type (no
-  // memory type is both DEVICE_LOCAL and HOST_CACHED on an RX 9060 XT -
-  // verified via vulkaninfo's raw memory-type dump) falls back to plain
-  // DeviceLocal, i.e. the staged path, keeping fused_submits_ permanently
-  // false there. HostVisibleCached drops the device-local requirement (kept
-  // only as a preference), so it lands on the device's host-cached system-
-  // RAM type instead where no device-local+cached type exists, and on a
-  // unified-memory part it still lands on the same ideal device-local +
-  // host-visible + cached type DeviceLocalReadback would have found (the
-  // "want" bitmask check only requires the bits it asks for, not an exact
-  // match) - so this is not a Mali/RDNA fork, one kind serves both. The
-  // trade this exposes on a discrete card: these buffers are also WRITTEN
-  // by GPU shaders every frame (select_blobs.comp, sort_points_local.comp),
-  // so moving them off the BAR/VRAM heap onto system RAM could slow those
-  // writes even as it removes the submission overhead fused_submits_
-  // exists to cut - see PERFORMANCE.md section 3c/8 for the two device
-  // measurements this was A/B'd against before shipping.
+  // Host-visible and cached where available, so QuadDecode reads it in place (see fused_submits_);
+  // otherwise staged.
   {
     vk::Buffer b(ctx_, VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu), kSsboUsage,
                  vk::MemoryKind::HostVisibleCached);
@@ -398,19 +262,7 @@ void GpuDetector::CreateBuffers() {
   index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
   blob_point_offsets_buf_ = ssbo(VkDeviceSize(config_.max_blobs) * 4);
 
-  // The one buffer big enough for its readback path to matter: ~1.6 MB per
-  // frame at 1080p. It used to be plain DeviceLocal, copied on-device into
-  // readback_staging_ and then memcpy'd again into a std::vector - two full
-  // copies of the same bytes on a unified-memory part. Asking for
-  // device-local + host-visible + cached lets QuadDecode read it in place.
-  //
-  // Conditional on the memory type that actually came back being CACHED, not
-  // merely host-visible: reading 1.6 MB through an uncached mapping is much
-  // slower than the copy it would replace (Buffer.h records a measured 4x on
-  // Mali for exactly that mistake). Discrete parts without resizable BAR
-  // fall back to DeviceLocal and keep the staging path.
-  // See selected_extents_buf_'s comment just above for why this is
-  // HostVisibleCached rather than DeviceLocalReadback.
+  // Host-visible and cached where available, so QuadDecode reads it in place; otherwise staged.
   {
     vk::Buffer b(ctx_, VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint), kSsboUsage,
                  vk::MemoryKind::HostVisibleCached);
@@ -419,26 +271,15 @@ void GpuDetector::CreateBuffers() {
   }
   linefit_direct_read_ = line_fit_points_buf_.host_visible() && line_fit_points_buf_.host_cached();
 
-  // Both readbacks in place => nothing in the frame's tail needs a host-side
-  // count at record time, so the last three submissions collapse into one.
-  // See fused_submits_ in the header, and build_indirect_args.comp for the
-  // device-side dispatch sizing that replaces the readbacks.
+  // With both readbacks in place, the last three submissions record as one (see fused_submits_ and
+  // build_indirect_args.comp).
   fused_submits_ = linefit_direct_read_ && extents_direct_read_;
   if (const char *v = std::getenv("APRILTAG_VK_FUSE_SUBMITS")) {
     fused_submits_ = (v[0] != '0') && linefit_direct_read_ && extents_direct_read_;
   }
 
-  // Open-addressing table for the (rep0, rep1) grouping, sized to
-  // max_raw_blobs itself (previously 4x, for a 25% worst-case load factor -
-  // but that worst case is the same defensive margin every other capacity
-  // clamp in this pipeline already provides: a frame that actually reaches
-  // max_raw_blobs distinct pairs degrades to dropping the excess via the
-  // probe-cap fallback in hash_group.comp, exactly like select_blobs.comp's
-  // counter clamp or qbp_compacted_buf_'s capacity does elsewhere). A real
-  // 1080p frame's raw blob count is a couple orders of magnitude below
-  // max_raw_blobs (734 of 65536, measured), so this table is sparse at
-  // realistic load either way - the 4x only mattered for a pathological
-  // frame this table's own probe-cap fallback already covers.
+  // Open-addressing table for the (rep0, rep1) grouping, sized to max_raw_blobs; hash_group.comp
+  // drops points beyond its probe cap.
   hash_table_size_ = NextPow2(std::max(config_.max_raw_blobs, 1u));
   hash_owner_buf_ = ssbo(VkDeviceSize(hash_table_size_) * 4);
   slot_dense_buf_ = ssbo(VkDeviceSize(hash_table_size_) * 4);
@@ -448,13 +289,9 @@ void GpuDetector::CreateBuffers() {
   hash_drop_counter_buf_ = ssbo(4);
   oversized_sort_counter_buf_ = ssbo(4);
 
-  // VkDispatchIndirectCommand (groupCountX/Y/Z), built on-device from
-  // raw_blob_counter_buf_ by build_indirect_args_pl_ so init_extents_pl_ /
-  // select_blobs_pl_ dispatch over the frame's actual raw blob count instead
-  // of the worst-case max_raw_blobs - see build_indirect_args.comp.
+  // VkDispatchIndirectCommands built on the device by build_indirect_args_pl_.
   {
-    // Three VkDispatchIndirectCommands: raw blobs, boundary points,
-    // selected blobs. See build_indirect_args.comp for what each feeds.
+    // Raw blobs, boundary points, selected blobs.
     vk::Buffer b(ctx_, 3 * 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                 vk::MemoryKind::DeviceLocal);
     device_bytes_ += b.size();
@@ -463,9 +300,7 @@ void GpuDetector::CreateBuffers() {
 
   blob_scan_chain_ = BuildScanChain(std::max(config_.max_blobs, 1u));
 
-  // Readback staging starts at a size that covers the extents plus a healthy
-  // number of line-fit points, and grows on demand. Steady state therefore
-  // performs no allocation at all.
+  // Readback staging starts at a fixed size and grows on demand.
   const VkDeviceSize initial_readback =
       VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu) + 16 +
       VkDeviceSize(std::min<uint32_t>(ipoint_capacity_, 1u << 16)) * sizeof(RawLineFitPoint);
@@ -474,8 +309,7 @@ void GpuDetector::CreateBuffers() {
 
 void GpuDetector::EnsureReadbackCapacity(VkDeviceSize bytes) {
   if (bytes <= readback_capacity_) return;
-  // Grow geometrically so a slowly rising point count cannot cause a
-  // reallocation every frame.
+  // Grows geometrically.
   VkDeviceSize new_capacity = std::max<VkDeviceSize>(readback_capacity_ * 2, bytes);
   readback_staging_ = vk::Buffer(ctx_, new_capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  vk::MemoryKind::HostVisibleCached);
@@ -485,8 +319,7 @@ void GpuDetector::EnsureReadbackCapacity(VkDeviceSize bytes) {
 GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
   ScanChain chain;
   uint32_t size = capacity;
-  // Fan-out per level is the scan block size, which is device dependent - it
-  // must match scan_block.comp's specialized local_size_x exactly.
+  // Fan-out per level is the scan block size, matching scan_block.comp's local_size_x.
   while (size > scan_wg_) {
     uint32_t next = (size + scan_wg_ - 1) / scan_wg_;
     chain.level_capacities.push_back(next);
@@ -500,78 +333,21 @@ GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
 }
 
 void GpuDetector::CreatePipelines() {
-  // Picks the "_u8" shader variant when the device supports
-  // storageBuffer8BitAccess, else the 32-bit-per-pixel fallback every other
-  // device uses - see decimate_u8.comp's comment. Covers every consumer of
-  // decimated_buf_ (decimate/block_minmax/sort_points_local) and
-  // thresholded_buf_ (threshold/uf_init/uf_merge/label_pixels) - the two
-  // switch together (threshold(_u8).comp reads the former and writes the
-  // latter in one dispatch, so they can't vary independently).
-  // blob_diff is no longer on that list: it reads the threshold out of
-  // parent[]'s spare bits instead (see common.glsl).
+  // Picks the _u8 shader variant with storageBuffer8BitAccess; decimated_buf_ and thresholded_buf_
+  // switch together. blob_diff reads the threshold from parent[] and has no variant.
   const bool u8 = ctx_.caps().has_8bit_storage;
   auto pick = [u8](const char *base_name, const char *u8_name) {
     return u8 ? u8_name : base_name;
   };
 
-  // Subgroup aggregation survives at ONE site: reduce_extents_hash. It used
-  // to be applied at three, gated together, and measuring the three
-  // separately on an RX 9060 XT (min of 12, three sessions, each result
-  // reproducing within 1%) says that was wrong at two of them:
-  //
-  //   uf_final   subgroup 0.1035 ms  vs  scalar 0.0291 ms   scalar -72%
-  //   blob_diff  subgroup 0.0437 ms  vs  scalar 0.0330 ms   scalar -24%
-  //   extents    subgroup 0.0702 ms  vs  scalar 0.1028 ms   SUBGROUP -45%
-  //
-  // For uf_final that confirms a case OPTIMIZATION_NOTES.md had already
-  // built from the other side: on an MX230 the scalar variant with its
-  // saturating guard beat the aggregated one 3x, and the note says only
-  // that the hardware to re-test on a bigger discrete part was not
-  // available. It is now, and it agrees. Both aggregated variants are
-  // retired; reduce_extents_hash keeps its own, which earns it.
-  //
-  // What distinguishes the survivor: it reduces per-point VALUES across
-  // lanes sharing a key, collapsing eight atomics per point into eight per
-  // distinct key per subgroup. The two retired ones only ever aggregated a
-  // COUNTER - one atomicAdd per lane becoming one per subgroup - which is
-  // exactly the contention a modern discrete part's atomic unit handles
-  // well on its own, so the ballot/shuffle sequence bought nothing and cost
-  // its own issue slots.
-  //
-  // Excludes integrated GPUs outright, regardless of what they report
-  // supporting: measured on the Orange Pi 5's Mali-G610 (which reports all
-  // three capabilities and produces bit-correct results with them), this is
-  // a catastrophic regression, not a wash - pipeline_total went from
-  // 11.5 ms to 18.1 ms, with reduce_extents_hash_subgroup.comp's "extents"
-  // span alone going from 0.91 ms to 6.04 ms, reproduced consistently
-  // across repeated runs. The same class of result OPTIMIZATION_NOTES.md
-  // already recorded for tile-local shared-memory union-find: Mali
-  // (Valhall) has no dedicated hardware for these GPU-compute patterns the
-  // way discrete parts do, so software-costly ballot/shuffle/arithmetic
-  // sequences can cost far more than the plain atomics they replace. On the
-  // Windows/RX 9060 XT test machine (a discrete GPU, subgroupSize=64) the
-  // same code measures a small but real and repeatable win instead
-  // (pipeline_total best 1.40 -> 1.33 ms), so this is excluded specifically
-  // for integrated GPUs, not disabled outright.
-  // BALLOT + ARITHMETIC + SHUFFLE: reduce_extents_hash's reduce-by-key loop
-  // needs all three - SHUFFLE to read a runtime-computed leader lane's value
-  // (subgroupBroadcast's id must be a compile-time constant, a real SPIR-V
-  // restriction) and ARITHMETIC to reduce per-point values, not just counts.
+  // Subgroup aggregation is used only for reduce_extents_hash, and not on integrated GPUs. Needs
+  // ballot, arithmetic and shuffle.
   const bool subgroup = ctx_.caps().has_subgroup_ballot && ctx_.caps().has_subgroup_arithmetic &&
                         ctx_.caps().has_subgroup_shuffle &&
                         ctx_.caps().type != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
 
-  // 2D so the shader recovers its (x, y) from gl_GlobalInvocationID.xy rather
-  // than a runtime `%`/`/` by a push-constant width - see each shader's own
-  // comment. Mali (Valhall) has no integer divide instruction.
-  // decimation is baked in as a specialization constant (id 3, right after
-  // the workgroup size's 0/1/2) rather than read from the push constant
-  // block: it is fixed for this detector's whole lifetime, so resolving it
-  // at pipeline-creation time lets the compiler fold `dx * decimation` into
-  // a shift when decimation is a power of two, exactly as the literal `2`
-  // it replaces already did - a runtime (push-constant) value would not get
-  // that treatment, and Mali (Valhall) has no integer divide instruction to
-  // fall back on.
+  // 2D dispatches recover (x, y) from gl_GlobalInvocationID.xy without a divide. decimation is
+  // specialization constant 3, after the workgroup size's 0-2.
   decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick("decimate", "decimate_u8")),
                                      {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_,
                                      {config_.decimation});
@@ -588,37 +364,14 @@ void GpuDetector::CreatePipelines() {
   uf_init_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
       8, wg2d_);
-  // Dispatched 2D over (x, y) but with a workgroup that is still one row
-  // tall, so consecutive threads keep walking consecutive columns and the
-  // two row streams stay as coalesced as they were under the old 1D
-  // dispatch. The shader needs x for its run-overlap test and recovering it
-  // from a linear index would cost a runtime integer division, which Valhall
-  // has no instruction for. See uf_merge_body.glsl.
-  // Path splitting in find() (see uf_merge_body.glsl's own comment): -17.0%/
-  // -2.7% labelling (decimation 1/2) on the RX 9060 XT. Originally defaulted
-  // off on unified-memory parts on the theory that the extra stores share
-  // the CPU's own memory bus there - measured on the Mali-G610 and that
-  // theory didn't hold: labelling -1.7%/-3.2%, GPU total -0.6%/-0.9%,
-  // unanimous in both directions across 32 ABBA rounds at each decimation.
-  // Smaller than on the RX 9060 XT because Mali's frame is far more
-  // dominated by other costs (bandwidth, dispatch/barrier overhead) - see
-  // PERFORMANCE.md section 3a - but no regression anywhere it's been
-  // tried, so this is unconditional now. Override with
-  // APRILTAG_VK_FIND_MODE=0 (naive) or =1 (split) to re-A/B on new hardware.
+  // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
+  // APRILTAG_VK_FIND_MODE overrides.
   uint32_t find_mode = 1u;
   if (const char *v = std::getenv("APRILTAG_VK_FIND_MODE")) {
     find_mode = (v[0] != '0') ? 1u : 0u;
   }
-  // Convergence-flag write mode (see uf_merge_body.glsl's own comment):
-  // 0 = shared-memory aggregation (cheap where dedicated shared memory
-  // exists), 1 = read-guarded global atomicOr (wins where it doesn't -
-  // Mali has no dedicated shared memory at all, backing `shared` with L2).
-  // Opposite polarity from find_mode: mode 1 is the unified-memory choice
-  // here. Measured -3.0% GPU total at decimation 1 on the Mali-G610,
-  // neutral at decimation 2, unanimous either way; measured a genuine
-  // regression on the RX 9060 XT at decimation 1 (+11.1%), so this one DOES
-  // still need the device gate that find_mode's own history showed isn't
-  // always warranted.
+  // Convergence-flag write mode (see uf_merge_body.glsl): 1 (read-guarded global atomicOr) on
+  // unified memory, otherwise 0 (shared-memory aggregation).
   uint32_t merge_flag_mode = ctx_.caps().unified_memory ? 1u : 0u;
   if (const char *v = std::getenv("APRILTAG_VK_MERGE_FLAG_MODE")) {
     merge_flag_mode = (v[0] != '0') ? 1u : 0u;
@@ -631,22 +384,13 @@ void GpuDetector::CreatePipelines() {
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_compress"), {parent_buf_.get(), uf_changed_buf_.get()}, 12, wg1d_);
-  // Binding 2 is thresholded_buf_, added so this shader can skip ambiguous
-  // (127) pixels without touching parent[]/blob_size[] at all - see
-  // uf_final_body.glsl's comment for why that's exact.
+  // Binding 2 lets the shader skip ambiguous (127) pixels.
   uf_final_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_final", "uf_final_u8")),
       {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()}, 12, wg1d_);
 
-  // Two-way now, not four: blob_diff used to be parametrized on the u8 axis
-  // as well, because it read thresholded_buf_ directly. label_pixels.comp
-  // folds the threshold into the parent[] word instead (see common.glsl), so
-  // blob_diff has no thresholded binding at all and the u8 axis moved to
-  // label_pixels - where it costs 2 variants instead of doubling 2 into 4.
-  // Binding 4 (blob_diff) / binding 3 (label_pixels) is uf_changed_buf_,
-  // read only by the fused fast path's speculative attempt - see
-  // finish_frame's `speculative` parameter and each shader's own comment
-  // on honour_changed_flag.
+  // Binding 4 (blob_diff) / binding 3 (label_pixels) is uf_changed_buf_, read only by the fused
+  // path's speculative attempt.
   blob_diff_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("blob_diff"),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
@@ -669,11 +413,8 @@ void GpuDetector::CreatePipelines() {
        remap_buf_.get()},
       44, wg1d_);
 
-  // Per-blob point base-offset assignment: extract_blob_counts.comp copies
-  // each selected blob's point count into blob_point_offsets_buf_, then the
-  // same chain-scan pattern turns it into an inclusive prefix sum so
-  // rewrite_index_points.comp / sort_points_local.comp can place/find each
-  // blob's points at a deterministic, contiguous range.
+  // Per-blob point base offsets: extract_blob_counts.comp copies each selected blob's count, then a
+  // chain scan makes the inclusive prefix sum.
   extract_blob_counts_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("extract_blob_counts"),
       {selected_extents_buf_.get(), selected_counter_buf_.get(), blob_point_offsets_buf_.get()}, 4,
@@ -705,8 +446,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
        decimated_buf_.get(), line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
-       // binding 6: the device-side selected-blob count, so this dispatch can
-       // be issued indirectly in the same submission that produced it.
+       // binding 6: the device-side selected-blob count.
        selected_counter_buf_.get()},
       20, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
 
@@ -728,17 +468,11 @@ void GpuDetector::CreatePipelines() {
   build_sort_args_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("build_indirect_args"),
       {selected_counter_buf_.get(), indirect_args_buf_.get()}, 16, vk::WorkgroupSize{1, 1, 1});
-  // Three-way choice, in priority order: the subgroup-aggregated variant
-  // where that is enabled (discrete parts only - see the `subgroup` comment
-  // above), else the 64-bit-atomic variant where the device supports it,
-  // else the plain 32-bit one. The int64 variant binds extents_buf_ a
-  // SECOND time at binding 4 as a uint64_t view; the two views address
-  // disjoint fields of the struct, so this is aliasing in name only.
+  // Reduction variant priority: subgroup, then 64-bit atomic, then plain 32-bit. The atomic64
+  // variant views extents_buf_ again at binding 4 as uint64_t words.
   const bool extents_atomic64 = !subgroup && ctx_.caps().has_int64_atomics;
   extents_atomic64_ = extents_atomic64;
-  // Binding 4 is the uint64_t view of extents_buf_, declared only by the
-  // atomic64 variant; it is bound unconditionally so that binding 5 (the
-  // device-side boundary-point count) lands at the same index in all three.
+  // Binding 4 is bound for all three variants so binding 5 (boundary-point count) keeps its index.
   std::vector<VkBuffer> reduce_extents_buffers{qbp_compacted_buf_.get(), point_slot_buf_.get(),
                                                slot_dense_buf_.get(),   extents_buf_.get(),
                                                extents_buf_.get(),      qbp_counter_buf_.get()};
@@ -822,8 +556,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const VkDeviceSize gray_bytes = VkDeviceSize(config_.width) * config_.height;
 
   // ------------------------------------------------------------------
-  // Upload. One memcpy of the raw 8-bit frame - no widening loop, and a
-  // quarter of the bytes the uint32-per-pixel layout used to move.
+  // Upload: one memcpy of the raw 8-bit frame.
   // ------------------------------------------------------------------
   const auto t_upload0 = Clock::now();
   if (gray_direct_write_) {
@@ -834,13 +567,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const auto t_upload1 = Clock::now();
 
   // Push constants shared across several stages.
-  // decimate_pl_'s only consumer of this: the decimated dimensions are
-  // already known host-side (decimated_width_/height_ are also this
-  // dispatch's own launch geometry, just below), so passing them directly
-  // avoids the shader recomputing width/decimation on every invocation -
-  // decimation is a specialization constant now, not a push constant, so
-  // that recomputation would otherwise be a genuine runtime divide instead
-  // of the free (compile-time-constant) one the literal `2` used to be.
+  // decimate_pl_ takes the decimated dimensions directly; decimation is a specialization constant.
   struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
   struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
@@ -853,16 +580,12 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // them can be sized on the device. See fused_submits_ in the header.
   const bool fuse = fused_submits_;
   if (fuse) {
-    // The tail is one submission now; only the labelling readback still
-    // splits the frame.
+    // The tail is a single submission; only the labelling readback splits the frame.
     last_profile_.gap_crosses_submit[kSpanBoundary] = false;   // boundary -> hash_group
     last_profile_.gap_crosses_submit[kSpanScatter] = false;    // scatter -> sort
   }
   VkCommandBuffer cmd = BeginTimedCommands();
-  // One reset covers every span's timestamp pair for the whole frame: every
-  // later submission this frame runs strictly after this one's fence has
-  // signaled (SubmitAndWait blocks), so nothing after this point can race a
-  // query this reset just cleared. See vk::QueryPool's own comment.
+  // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
   if (!gray_direct_write_) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
@@ -894,55 +617,32 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
   uf_init_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
-  // Flatten the run chains uf_init.comp just built before the first merge
-  // pass walks them. Without this the vertical unions pay an O(run length)
-  // find() each, which cancels out exactly what the run-based init saved.
-  //
-  // honour_changed_flag = 0: no merge has run yet, so the flag is still zero
-  // from the frame's clear, and skipping on it would skip exactly the pass
-  // OPTIMIZATION_NOTES.md item 8 measured at 1.0 ms.
+  // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
+  // because the flag is still zero from the clear.
   struct UfCompressPc { uint32_t dw, dh, honour_changed_flag; };
   const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
   uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
 
-  // Records `iterations` labelling passes. The convergence flag is cleared
-  // immediately before the LAST merge of the chunk, so a zero readback means
-  // "the final pass changed nothing", i.e. genuinely converged - clearing it
-  // once at the start of the chunk instead would conflate "converged" with
-  // "changed something earlier in this chunk" and never terminate tightly.
-  //
-  // If a merge joined nothing, parent[] is untouched and was already flat
-  // (every chunk ends with a compression), so the compression after it has
-  // provably nothing to do. uf_compress.comp's honour_changed_flag guard
-  // returns early on that; with conditional rendering the LAST compression
-  // of the chunk is instead predicated on the flag and skipped outright.
-  // Only the last: every earlier one reads a flag accumulated since the
-  // previous clear, which is nonzero in practice, and on the RX 9060 XT a
-  // predicate that never skips measured +5% labelling at a chunk of 8 -
-  // the front end has to wait for the flag before it can issue the dispatch.
-  // Same flag, read at the same point, so both paths are bit-identical.
+  // Records `iterations` labelling passes. The flag is cleared before the last merge, so zero
+  // afterwards means converged. The last uf_compress is predicated on it when available.
   auto record_uf_chunk = [&](VkCommandBuffer c, uint32_t iterations) {
     for (uint32_t iter = 0; iter < iterations; ++iter) {
       const bool last = iter + 1 == iterations;
       const bool predicate = last && predicated_compress_;
       if (last) {
-        // With predication this also orders an earlier chunk's predicate
-        // read of the flag before the fill overwrites it.
+        // Also orders an earlier predicate read of the flag before the fill.
         vk::ComputePipeline::Barrier(c, predicated_compress_
                                             ? BarrierKind::ComputeTransferAndPredicate
                                             : BarrierKind::ComputeAndTransfer);
         uf_changed_buf_.FillZero(c);
         vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
       }
-      // The merge's barrier is what makes its flag write visible to the
-      // compression - to the shader's guard, or to the predicate read, which
-      // happens at its own pipeline stage and needs that stage named.
+      // The barrier makes the merge's flag write visible to the compression's guard or predicate read.
       uf_merge_pl_.Dispatch2D(c, decimated_width_, decimated_height_, &dwdh_pc,
                               predicate ? BarrierKind::ComputeAndPredicate
                                         : BarrierKind::Compute);
       if (predicate) {
-        // honour_changed_flag = 0: the dispatch only runs when the flag is
-        // nonzero, so the guard could never fire - skip its load.
+        // Runs only when the flag is nonzero, so the guard is skipped.
         const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
         ctx_.CmdBeginConditionalRendering(c, uf_changed_buf_.get(), 0);
         uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc, BarrierKind::None);
@@ -955,98 +655,45 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     }
   };
 
-  // Seed the first chunk with however many iterations converged last frame, so
-  // steady-state video settles in one chunk plus its verification rather than
-  // rediscovering the count in 8-iteration steps every frame.
+  // Seeds the first chunk with last frame's converged iteration count.
   uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
   chunk = std::min(chunk, config_.max_uf_iterations);
   record_uf_chunk(cmd, chunk);
-  // "labelling" ends here even if a rare extra convergence chunk follows
-  // below (see the while loop) - a query can't be rewritten without an
-  // intervening reset, and the common case (this corpus, default config)
-  // always converges within the first chunk. The wall-clock
-  // threshold_label_ms figure still includes any extra chunks; only this
-  // per-shader breakdown misses them.
+  // The labelling span ends here; any extra convergence chunks are not attributed to it.
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
-  // record_uf_chunk's last dispatch (uf_compress_pl_) uses the DEFAULT
-  // BarrierKind::Compute, whose stage mask is COMPUTE_SHADER only. The copy
-  // below is a vkCmdCopyBuffer - a TRANSFER-stage read - which that barrier
-  // does not synchronize against: its dst stage is compute, not transfer,
-  // so a transfer command recorded after it is not guaranteed to see the
-  // write. This was invisible for years because the unfused path submits
-  // right after (see below), and an otherwise-idle submission gives the
-  // hardware no incentive to run the copy early; fusing the tail behind it
-  // gave the scheduler real work to overlap it with, and a chunk small
-  // enough to have little preceding compute work made the race reliably
-  // lose (APRILTAG_VK_UF_CHUNK=1 reproduced it every time, matching or
-  // exceeding the default chunk size never did). All three sites that
-  // follow record_uf_chunk with this same copy need the same barrier - see
-  // the other two below.
+  // Orders the compute writes before the transfer read below; the default Compute barrier does not
+  // cover the transfer stage.
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
-  // This copy is what both paths below use to learn whether `chunk`
-  // iterations converged: for the unfused path it feeds an immediate
-  // readback (unchanged from before); for the fused path it rides along in
-  // the same submission as the entire tail (see `fuse` below), and
-  // finish_frame reads it back only once that one submission returns.
+  // Copies the convergence flag, read back at once (unfused) or after the fused tail returns.
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
 
   uint32_t uf_iterations = chunk;
   bool converged = false;
 
   // ------------------------------------------------------------------
-  // Submit 2 (unfused) / rest of the frame (fused): blob sizes, boundary
-  // point extraction, compaction, grouping, selection, sort and line-fit,
-  // and every readback. Wrapped in a lambda (capturing everything by
-  // reference, `cmd` as an explicit parameter, matching record_uf_chunk's
-  // convention above) so it can be invoked either once, immediately after
-  // the labelling chunk with no intervening submit (the fused fast path
-  // below), or twice, when that optimistic assumption turns out wrong and
-  // the whole tail has to be discarded and rerun against a genuinely
-  // converged parent[] (the retry branch below). For the unfused path this
-  // is called exactly once, exactly where "Submit 2" used to begin - a
-  // pure extraction, not a behavior change.
+  // Submit 2 (unfused) / rest of the frame (fused): blob sizes, boundary extraction, grouping,
+  // selection, sort, line-fit and every readback. A lambda so the fused path can run it twice.
   //
-  // Returns whether the uf_changed copy recorded before this call (either
-  // the one right above, for the fused fast path's first attempt, or the
-  // catch-up loop's own last copy, for everyone else) showed convergence.
-  // The unfused caller and the fused retry's second call both ignore this -
-  // by the time they call finish_frame, convergence is either already
-  // established or being accepted as "gave up at max_uf_iterations", the
-  // same acceptance the pre-existing while loop below already makes.
-  // `speculative` is true only for the fused fast path's first, optimistic
-  // attempt (see below): it gates label_pixels_pl_ and blob_diff_pl_ so
-  // neither runs ahead of a confirmed convergence. It is false for the
-  // unfused path (convergence is already confirmed by the time this is
-  // called) and for the fused retry's second, authoritative call (by then
-  // parent[] is genuinely converged, or max_uf_iterations was hit and we
-  // proceed with whatever's there - the same acceptance the pre-existing
-  // while loop already makes).
+  // Returns whether the uf_changed copy recorded before the call showed convergence. `speculative`
+  // (fused first attempt only) stops label_pixels_pl_ and blob_diff_pl_ acting on unconverged labels.
   auto finish_frame = [&](VkCommandBuffer cmd, bool speculative) -> bool {
   const auto t_label = Clock::now();
 
-  // uf_final needs the min-size floor too, to saturate its counter at the
-  // same threshold label_pixels tests against (see uf_final.comp), so it
-  // can't share dwdh_pc with uf_init/uf_merge/uf_compress. The floor is
-  // deliberately the same value label_pc carries below - they must stay
-  // equal or the saturation stops matching the predicate.
+  // uf_final also takes the size floor, which must equal label_pc's.
   struct { uint32_t dw, dh, min_blob; } uf_final_pc{decimated_width_, decimated_height_,
                                                     config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
   uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
-  // Fold blob identity and the min-size test into one spatially-local value
-  // per pixel, so blob_diff.comp does no random gathers at all. See
-  // label_pixels.comp.
+  // Folds blob identity and the size test into one value per pixel; see label_pixels.comp.
   struct { uint32_t count, min_blob, honour_changed_flag; } label_pc{
       pixels, config_.min_cluster_pixels, speculative ? 1u : 0u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelPixels));
   label_pixels_pl_.Dispatch1D(cmd, pixels, &label_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelPixels));
 
-  // blob_diff appends valid boundary points (with their sort keys) directly
-  // into the compacted buffer, so there is no dense intermediate array and no
-  // separate full-capacity compaction pass.
+  // blob_diff appends valid boundary points directly to the compacted buffer.
   struct { uint32_t w, h, capacity, honour_changed_flag; } blobdiff_pc{
       decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
@@ -1060,22 +707,14 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     SubmitTimedAndWait(cmd);
   }
 
-  // When fusing, the count stays on the device: build_indirect_args.comp
-  // turns qbp_counter_buf_ into a dispatch size and the consuming shaders
-  // take their bound from the same buffer (count_from_buffer = 1). The host
-  // value below is only meaningful on the unfused path; every use of it is
-  // guarded by `fuse`.
+  // When fusing, the count stays on the device; the host value is used only on the unfused path.
   const uint32_t qbp_count =
       fuse ? 0u : std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
   const auto t_boundary = Clock::now();
 
   // ------------------------------------------------------------------
-  // Submit 3: group the boundary points by (rep0, rep1), select plausible tag
-  // quads, and scatter the survivors into per-blob contiguous runs.
-  //
-  // Everything here is dispatched over qbp_count, not qbp_capacity_ - at 1080p
-  // a couple of hundred thousand real points rather than the ~2M dense bound.
-  // ------------------------------------------------------------------
+  // Submit 3: group boundary points by (rep0, rep1), select plausible quads, and scatter the
+  // survivors into per-blob runs.
   // ------------------------------------------------------------------
   if (!fuse) cmd = BeginTimedCommands();
   // Slot 1 of the indirect args: ceil(boundary points / wg1d), for
@@ -1086,9 +725,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   }
   if (fuse || qbp_count > 0) {
-    // Group the boundary points by (rep0, rep1) with a hash table instead of
-    // sorting them. See hash_group.comp: the pipeline only ever needed the
-    // grouping, never the order.
+    // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
     struct { uint32_t count, table_mask, max_probes, count_from_buffer; } hash_pc{
         qbp_count, hash_table_size_ - 1u, 128u, fuse ? 1u : 0u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
@@ -1099,15 +736,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     }
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
-    // init_extents and select_blobs used to be dispatched over max_raw_blobs
-    // rather than the frame's actual raw blob count, which only exists on
-    // the device at this point - about 6 MB of wasted traffic. Building the
-    // dispatch arguments on the device (from raw_blob_counter_buf_, which
-    // hash_group_pl_'s default Compute-kind barrier already made visible)
-    // avoids the host round-trip that made buying the exact count a wash
-    // before. Both consumers still bounds-check every invocation against
-    // max_raw_blobs (unchanged, passed as before), so a rounded-up overshoot
-    // from build_indirect_args.comp's ceiling division is harmless.
+    // Builds the dispatch arguments on the device from raw_blob_counter_buf_; both consumers
+    // bounds-check against max_raw_blobs.
     struct { uint32_t wg, slot, divide, clamp; } build_indirect_pc{wg1d_.x, 0u, 1u,
                                                                   config_.max_raw_blobs};
     build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
@@ -1125,9 +755,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
       reduce_extents_hash_pl_.Dispatch1D(cmd, qbp_count, &reduce_pc);
     }
 
-    // Fold the per-workgroup copies back into the canonical entries before
-    // select_blobs.comp reads them. Indirect over the same raw blob count as
-    // init_extents, so this is a few hundred invocations.
+    // Folds the per-workgroup copies into the canonical entries, indirect over the raw blob count.
     merge_extents_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &extentscap_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
@@ -1164,20 +792,12 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     }
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
 
-    // raw_blob_counter_buf_ is now the number of distinct (rep0, rep1) pairs
-    // this frame - assigned directly by hash_group.comp's winning CAS thread
-    // (see its comment), so this is the frame's raw blob count with no scan
-    // needed. Profiling only.
+    // The number of distinct (rep0, rep1) pairs this frame; profiling only.
     RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
     RecordCounterCopy(cmd, hash_drop_counter_buf_, kSlotHashDrops);
 
-    // No separate output counter for scatter_index_points.comp's write count
-    // (see its comment): blob_point_offsets_buf_[max_blobs - 1] is the
-    // inclusive scan's final running total, which already equals the sum of
-    // every selected blob's point count - entries beyond num_selected_blobs
-    // are zero-padded by extract_blob_counts.comp, so this static offset
-    // (known at record time, unlike num_selected_blobs) gives the exact same
-    // total regardless of how many blobs were actually selected this frame.
+    // blob_point_offsets_buf_[max_blobs - 1] is the inclusive scan total, the sum of every selected
+    // blob's point count.
     blob_point_offsets_buf_.RecordCopyTo(
         cmd, counter_staging_, 4, VkDeviceSize(std::max(config_.max_blobs, 1u) - 1u) * 4,
         VkDeviceSize(kSlotPointCount) * 4);
@@ -1192,11 +812,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
       fuse ? 0u : ((qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0);
   const uint32_t hash_probe_drops =
       fuse ? 0u : ((qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0);
-  // The counter select_blobs.comp incremented is the number of blobs that
-  // PASSED the filters, which can exceed max_blobs; the shader drops the
-  // overflow (`if (pos >= pc.max_blobs) return;`) to stay inside the output
-  // buffer. Keep the unclamped value so the drop is reported rather than
-  // silently absorbed by the std::min below - see selected_blob_drops.
+  // Blobs that passed the filters, which can exceed max_blobs; kept unclamped to report
+  // selected_blob_drops.
   const uint32_t qualifying_blobs = fuse ? 0u : ReadCounterSlot(kSlotSelectedCount);
   const uint32_t num_selected_blobs = fuse ? 0u : std::min(qualifying_blobs, config_.max_blobs);
   const uint32_t selected_blob_drops = fuse ? 0u : (qualifying_blobs - num_selected_blobs);
@@ -1206,12 +823,10 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   const auto t_sort_group = Clock::now();
 
   // ------------------------------------------------------------------
-  // Submit 4: sort the surviving points around each blob's perimeter, compute
-  // per-point line-fit moments, and stage both payloads for readback.
+  // Submit 4: sort each blob's points around its perimeter, compute line-fit moments, and stage
+  // both payloads for readback.
   // ------------------------------------------------------------------
-  // Staging sizes, and therefore this whole block, only exist on the unfused
-  // path: fusing requires both readbacks to be read in place (see
-  // fused_submits_), so there is nothing to stage and no size to know yet.
+  // Staging sizes are needed only on the unfused path; the fused path reads both in place.
   const VkDeviceSize extents_bytes =
       fuse ? 0 : VkDeviceSize(num_selected_blobs) * sizeof(MinMaxExtentsGpu);
   const VkDeviceSize linefit_offset = (extents_bytes + 15) & ~VkDeviceSize(15);
@@ -1220,23 +835,15 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (!fuse) EnsureReadbackCapacity(linefit_offset + linefit_bytes);
 
   if (!fuse) cmd = BeginTimedCommands();
-  // Slot 2: one workgroup per selected blob, clamped exactly as the host's
-  // std::min(qualifying_blobs, max_blobs) did.
+  // Slot 2: one workgroup per selected blob, clamped to max_blobs.
   if (fuse) {
     struct { uint32_t wg, slot, divide, clamp; } sort_args_pc{wg1d_.x, 2u, 0u, config_.max_blobs};
     build_sort_args_pl_.DispatchRaw(cmd, 1, 1, 1, &sort_args_pc, BarrierKind::Compute);
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   }
   if (fuse || num_points > 0) {
-    // rewrite_index_points.comp already packed every selected blob's points
-    // into one contiguous range, so sorting each blob's own points into
-    // angular order is a one-workgroup-per-blob shared-memory sort - no
-    // composite (blob_index, theta) key, no separate gather pass. Fused with
-    // the line-fit moment computation (see sort_points_local.comp's own
-    // comment): once a blob's points are in final order each thread already
-    // knows which source point lands at its output position, so it samples
-    // the decimated image and writes the RawLineFitPoint directly instead of
-    // a separate dispatch re-reading a sorted intermediate.
+    // One workgroup per blob sorts its points by angle in shared memory and writes the
+    // RawLineFitPoints (see sort_points_local.comp).
     struct { uint32_t num_selected_blobs, count_from_buffer, max_blobs; int dw, dh; } sort_pc{
         num_selected_blobs, fuse ? 1u : 0u, config_.max_blobs,
         static_cast<int>(decimated_width_), static_cast<int>(decimated_height_)};
@@ -1254,24 +861,20 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (extents_bytes > 0 && !extents_direct_read_) {
     selected_extents_buf_.RecordCopyTo(cmd, readback_staging_, extents_bytes, 0, 0);
   }
-  // Skipped entirely on parts where the line-fit buffer is itself
-  // host-visible and cached: QuadDecode reads it in place instead. See
-  // CreateBuffers.
+  // Skipped when the line-fit buffer is host-visible and cached; QuadDecode reads it in place.
   if (linefit_bytes > 0 && !linefit_direct_read_) {
     line_fit_points_buf_.RecordCopyTo(cmd, readback_staging_, linefit_bytes, 0, linefit_offset);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanReadbackCopy));
-  // Counted by sort_points_local, so this is the first submit that can carry
-  // it back.
+  // Counted by sort_points_local, so this is the first submit that can carry it back.
   RecordCounterCopy(cmd, oversized_sort_counter_buf_, kSlotOversizedSortBlobs);
   vk::ComputePipeline::HostReadBarrier(cmd);
   SubmitTimedAndWait(cmd);
   const auto t_linefit = Clock::now();
   const uint32_t oversized_sort_blobs = ReadCounterSlot(kSlotOversizedSortBlobs);
 
-  // On the fused path every count above was deferred: the GPU consumed them
-  // directly and the host only needs them now, for the readback spans and
-  // the profile. All four counters rode home in the same submission.
+  // On the fused path the counts were consumed on the device; read them now for the readback spans
+  // and the profile.
   const uint32_t final_qbp_count =
       fuse ? std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_) : qbp_count;
   const uint32_t final_raw_blobs =
@@ -1310,13 +913,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     }
   }
   if (linefit_direct_read_) {
-    // Zero copies: the shader wrote these bytes straight into host-visible,
-    // host-cached device memory, so hand QuadDecode a view of them. Valid
-    // until the next Detect() overwrites the buffer.
-    //
-    // The mapping is coherent on every type seen so far, but invalidate when
-    // it isn't - Buffer::Read() would have done this, and skipping the copy
-    // must not also skip the invalidate.
+    // Zero-copy view of the mapping, valid until the next Detect(); invalidates first when the
+    // memory is not coherent.
     if (!line_fit_points_buf_.coherent()) {
       line_fit_points_buf_.InvalidateRange(0, final_linefit_bytes);
     }
@@ -1349,13 +947,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.hash_probe_drops = final_hash_drops;
   last_profile_.selected_blob_drops = final_blob_drops;
   last_profile_.oversized_sort_blobs = oversized_sort_blobs;
-  // uf_iterations and uf_converged are NOT set here: on the fused fast
-  // path this lambda's own return value is what determines whether the
-  // `converged` this call ran with was ultimately correct, so both fields
-  // are set once, after the caller has resolved that (see the end of
-  // Detect()) - setting them from inside this call would report the fast
-  // path's OWN not-yet-checked guess for uf_converged, which is wrong on
-  // exactly the frames this whole mechanism exists to handle.
+  // uf_iterations and uf_converged are set at the end of Detect(), once the fused retry is resolved.
   last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);
 
   if (timestamps_enabled_) {
@@ -1364,16 +956,12 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     for (uint32_t s = 0; s < kNumGpuStageSpans; ++s) {
       const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
       const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
-      // Both ends of a span are always written together (see the WriteTimestamp
-      // call sites above), so either both are available or neither is - this
-      // is a defensive check, not an expected partial-write case.
+      // Both ends of a span are written together, so both are available or neither.
       if (start.available && end.available && end.ticks >= start.ticks) {
         last_profile_.gpu_stage_ms[s] = double(end.ticks - start.ticks) * ns_per_tick / 1.0e6;
       }
     }
-    // Gap g is between span g's end and span (g+1)'s start - see
-    // DetectProfile::gpu_gap_ms's comment for why this is worth computing
-    // separately from gpu_stage_ms itself.
+    // Gap g is between span g's end and span g+1's start; see DetectProfile::gpu_gap_ms.
     for (uint32_t g = 0; g + 1 < kNumGpuStageSpans; ++g) {
       const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(g))];
       const vk::QueryPool::Result &next_start =
@@ -1393,37 +981,18 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   };  // finish_frame
 
   if (fuse) {
-    // Fast path: assume `chunk` iterations converged (it is seeded from
-    // last frame's actual count, see the comment above chunk's derivation),
-    // and record the entire tail into the same command buffer as the
-    // labelling chunk, with no submit in between. This is the frame's
-    // remaining submit boundary from PERFORMANCE.md section 3c, and it
-    // collapses to zero exactly when the assumption holds - which, for
-    // continuous video, is every frame after the first.
+    // Fast path: assumes `chunk` iterations converged (seeded from last frame's count) and records
+    // the whole tail into the labelling command buffer with no submit between.
     converged = finish_frame(cmd, /*speculative=*/true);
     if (!converged) {
-      // Rare: chunk undershot what this frame actually needed (most
-      // commonly the very first Detect() call, before last_uf_iterations_
-      // has a real value; occasionally a genuine scene change). Everything
-      // finish_frame just computed is invalid - it read labels that had
-      // not finished merging - and is discarded outright, not patched up.
-      //
-      // parent[] itself is not invalid, only incomplete: uf_merge and
-      // uf_compress are safe to keep calling on a partially-converged
-      // state (that is the whole point of chunking), so this resumes the
-      // convergence process rather than restarting from uf_init. This is
-      // exactly the loop the unfused path below already runs after its
-      // first chunk; here it just starts from a later point, and runs
-      // rarely enough that going back to a plain submit-per-chunk loop for
-      // it is the right trade.
+      // The chunk undershot: discards the tail's results and resumes convergence from the current
+      // parent[], which uf_merge and uf_compress can continue from.
       while (!converged && uf_iterations < config_.max_uf_iterations) {
         const uint32_t next =
             std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
         cmd = BeginTimedCommands();
         record_uf_chunk(cmd, next);
-        // Same missing-barrier hazard as the first copy above: uf_compress's
-        // default barrier does not cover the transfer-stage read this copy
-        // performs.
+        // The default compute barrier does not cover the transfer read of this copy.
         vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
         RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
         vk::ComputePipeline::HostReadBarrier(cmd);
@@ -1432,25 +1001,9 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
         converged = ReadCounterSlot(kSlotUfChanged) == 0;
       }
 
-      // parent[] is now genuinely converged (or max_uf_iterations was hit,
-      // the same "accept whatever is there" behaviour the unfused path
-      // already allows). Re-zero exactly the buffers the discarded
-      // speculative tail dirtied - the same set "clear" zeroes at the top
-      // of this function, minus uf_changed_buf_, which record_uf_chunk
-      // already re-zeroes internally before its last iteration - and run
-      // the tail again, for real this time.
-      //
-      // The timestamp pool is reset again here rather than selectively:
-      // Reset() only supports resetting every query at once, and writing a
-      // timestamp to an index the discarded attempt already wrote, without
-      // an intervening reset, is exactly the hazard QueryPool's own comment
-      // warns about. The cost is that this frame's per-span GPU breakdown
-      // (APRILTAG_VK_TIMESTAMPS=1 only - detection itself is unaffected)
-      // reports clear/threshold/labelling as unavailable rather than their
-      // real values, on this one frame; wall-clock timing is untouched,
-      // since it never depended on the query pool. The same loss of
-      // per-span attribution for a rare extra convergence pass is already
-      // accepted above for the unfused path's own catch-up chunks.
+      // parent[] is converged (or max_uf_iterations was hit). Re-zeroes the buffers the discarded tail
+      // dirtied (record_uf_chunk re-zeroes uf_changed_buf_) and reruns the tail. The timestamp pool
+      // is reset, so this frame has no per-span breakdown.
       cmd = BeginTimedCommands();
       timestamp_pool_.Reset(cmd);
       qbp_counter_buf_.FillZero(cmd);
@@ -1465,10 +1018,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
       finish_frame(cmd, /*speculative=*/false);
     }
   } else {
-    // Unfused: unchanged from before this change, modulo the extraction
-    // above - submit the labelling chunk, read back convergence, run any
-    // extra chunks needed, then record and submit the tail as its own,
-    // separate submission.
+    // Unfused: submits the labelling chunk, reads back convergence, runs any extra chunks, then
+    // submits the tail separately.
     vk::ComputePipeline::HostReadBarrier(cmd);
     SubmitTimedAndWait(cmd);
     converged = ReadCounterSlot(kSlotUfChanged) == 0;
@@ -1477,9 +1028,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
           std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
       cmd = BeginTimedCommands();
       record_uf_chunk(cmd, next);
-      // Same missing-barrier hazard as the first copy above: uf_compress's
-      // default barrier does not cover the transfer-stage read this copy
-      // performs.
+      // The default compute barrier does not cover the transfer read of this copy.
       vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
       RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
       vk::ComputePipeline::HostReadBarrier(cmd);
@@ -1506,10 +1055,7 @@ std::string GpuDetector::DescribeSizing() const {
   os << ", blob capacity " << config_.max_blobs;
   os << ", device memory " << (device_bytes_ / (1024 * 1024)) << " MiB";
   os << ", gray upload " << (gray_direct_write_ ? "direct (unified memory)" : "staged");
-  // Worth logging next to the upload path: whether the line-fit readback
-  // avoided its copies depends on a HOST_CACHED memory type existing, which
-  // varies by driver even among unified-memory parts, so a run that silently
-  // took the staging path would otherwise be indistinguishable.
+  // Whether the line-fit readback avoided its copies depends on a host-cached memory type.
   os << ", linefit readback " << (linefit_direct_read_ ? "direct (host-cached)" : "staged");
   os << ", uf_compress skip "
      << (predicated_compress_ ? "predicated (conditional rendering)" : "in-shader");

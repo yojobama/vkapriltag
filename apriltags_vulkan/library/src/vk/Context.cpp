@@ -94,7 +94,6 @@ bool SupportsInt64Atomics(VkPhysicalDevice physical_device) {
 }
 
 // Queries VK_EXT_conditional_rendering and its conditionalRendering feature.
-// Widely exposed by desktop drivers, not by the Mali-G610's.
 bool SupportsConditionalRendering(VkPhysicalDevice physical_device) {
   if (!DeviceHasExtension(physical_device, "VK_EXT_conditional_rendering")) return false;
 
@@ -486,9 +485,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   supports_int64_atomics_ =
       !options.force_no_int64_atomics && SupportsInt64Atomics(physical_device_);
 
-  // No shader variant behind this one: it predicates dispatches whose
-  // shaders already carry an in-shader early-out, and that early-out is the
-  // fallback. See GpuDetector's predicated_compress_.
+  // Enabled when supported and not forced off.
   supports_conditional_rendering_ = !options.force_no_conditional_rendering &&
                                     SupportsConditionalRendering(physical_device_);
 
@@ -556,8 +553,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
         vkGetDeviceProcAddr(device_, "vkCmdBeginConditionalRenderingEXT"));
     end_conditional_rendering_ = reinterpret_cast<PFN_vkCmdEndConditionalRenderingEXT>(
         vkGetDeviceProcAddr(device_, "vkCmdEndConditionalRenderingEXT"));
-    // An enabled extension must resolve, but a driver that gets this wrong
-    // should cost the optimization, not the device.
+    // Disables the feature if either entry point fails to resolve.
     if (begin_conditional_rendering_ == nullptr || end_conditional_rendering_ == nullptr) {
       supports_conditional_rendering_ = false;
     }
