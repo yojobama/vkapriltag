@@ -79,6 +79,24 @@ void main() {
 #else
   atomicAdd(extents[s].count, 1u);
 #endif
+#ifdef USE_INT64_ATOMIC
+  // Same packing trick as count+pxgx_plus_pygy_sum above, applied to the
+  // struct's OTHER 64-bit word (gx_sum/gy_sum, word index 3: bytes 24-31).
+  // Biased by +1 so every per-point contribution to the packed word is in
+  // {0,1,2} - always nonnegative - which is what stops the low half (gx)
+  // ever carrying into the high half (gy). This is NOT the same as packing
+  // the raw signed deltas: gx/gy individually wander through zero across a
+  // frame's points, so an unbiased low half would legitimately wrap through
+  // its own 0/0xFFFFFFFF boundary and spuriously carry into gy - the bias
+  // keeps the running low-half total strictly monotonic and bounded well
+  // under 2^32 (at most 2x the point capacity), exactly like count's own
+  // argument above. Unconditional (unlike the scalar path below), because
+  // the bias needs every point's contribution, not just the nonzero ones -
+  // unbiased once, in select_blobs.comp right after reading extents[i], by
+  // subtracting count from each half there. See that shader's own comment.
+  atomicAdd(extents_u64[s * 4u + 3u],
+            (uint64_t(uint(p.gy + 1)) << 32) | uint64_t(uint(p.gx + 1)));
+#else
   // gx and gy are STRUCTURALLY zero for two of the four connection types -
   // blob_diff_body.glsl emits E as (+/-1, 0) and S as (0, +/-1), only the
   // SE/SW diagonals carry both - so roughly half these points would issue an
@@ -87,7 +105,6 @@ void main() {
   // tests a value already in a register rather than loading one.
   if (p.gx != 0) atomicAdd(extents[s].gx_sum, p.gx);
   if (p.gy != 0) atomicAdd(extents[s].gy_sum, p.gy);
-#ifndef USE_INT64_ATOMIC
   atomicAdd(extents[s].pxgx_plus_pygy_sum, x * p.gx + y * p.gy);
 #endif
 }

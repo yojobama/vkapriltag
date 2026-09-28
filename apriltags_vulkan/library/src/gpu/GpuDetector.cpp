@@ -667,7 +667,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("select_blobs"),
       {extents_buf_.get(), selected_extents_buf_.get(), selected_counter_buf_.get(),
        remap_buf_.get()},
-      40, wg1d_);
+      44, wg1d_);
 
   // Per-blob point base-offset assignment: extract_blob_counts.comp copies
   // each selected blob's point count into blob_point_offsets_buf_, then the
@@ -735,6 +735,7 @@ void GpuDetector::CreatePipelines() {
   // SECOND time at binding 4 as a uint64_t view; the two views address
   // disjoint fields of the struct, so this is aliasing in name only.
   const bool extents_atomic64 = !subgroup && ctx_.caps().has_int64_atomics;
+  extents_atomic64_ = extents_atomic64;
   // Binding 4 is the uint64_t view of extents_buf_, declared only by the
   // atomic64 variant; it is bound unconditionally so that binding 5 (the
   // device-side boundary-point count) lands at the same index in all three.
@@ -1131,12 +1132,13 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
     struct {
-      uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal;
+      uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal,
+          gx_gy_biased;
       float aspect_max, fill_min, fill_max;
     } select_pc{config_.max_raw_blobs,      config_.max_blobs,
                 config_.tag_width,          config_.min_cluster_pixels,
                 config_.max_cluster_pixels, config_.reversed_border ? 1u : 0u,
-                config_.normal_border ? 1u : 0u,
+                config_.normal_border ? 1u : 0u, extents_atomic64_ ? 1u : 0u,
                 config_.aspect_max,         config_.fill_min,
                 config_.fill_max};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));

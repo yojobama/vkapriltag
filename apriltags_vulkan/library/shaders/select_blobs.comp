@@ -26,6 +26,14 @@ layout(push_constant) uniform PushConstants {
   uint max_cluster_pixels;
   uint reversed_border; // bool as uint
   uint normal_border;   // bool as uint
+  // Set only when reduce_extents_hash_atomic64.comp produced this frame's
+  // extents[] (see GpuDetector's extents_atomic64): that variant packs
+  // gx_sum/gy_sum into one 64-bit atomic, biased by +1 per point per field
+  // so the packed word never wraps (see its own comment), so what's stored
+  // is (true_sum + count), not the true sum. Unbiased once, below, right
+  // after reading extents[i] - the scalar and subgroup variants write the
+  // true sum directly and need no correction.
+  uint gx_gy_biased;
   // Geometric prefilters (item 2): 0 disables the corresponding test, so the
   // default config is a no-op here. See DetectorConfig::aspect_max/fill_min/
   // fill_max for the derivation and the corpus measurements behind them.
@@ -70,6 +78,10 @@ void main() {
   remap[i] = 0xFFFFFFFFu;
 
   MinMaxExtentsGpu e = extents[i];
+  if (pc.gx_gy_biased != 0u) {
+    e.gx_sum -= int(e.count);
+    e.gy_sum -= int(e.count);
+  }
   if (e.count < pc.min_cluster_pixels) return;
   if (e.count > pc.max_cluster_pixels) return;
 

@@ -1755,3 +1755,52 @@ nothing to reclaim - the same shape of finding
 `PERFORMANCE.md` section 3a already made for Mali's own `extents`/`sort`
 spans (atomic- and latency-bound there, immune to a 4x memory-clock
 sweep), just for a different mechanism. Not committed.
+
+## 17. Pack `gx_sum`/`gy_sum` into one biased 64-bit atomic
+
+`reduce_extents_hash_atomic64.comp` - Mali's default reduction shader
+(`extents_atomic64 = !subgroup && has_int64_atomics`, and integrated GPUs
+never take the subgroup path) - already folds `count` and
+`pxgx_plus_pygy_sum` into one 64-bit atomic (item 4 of the third pass).
+`gx_sum`/`gy_sum` sit in the struct's *other* 64-bit word (bytes 24-31,
+word index 3) but were still two separate conditional 32-bit atomics.
+
+Packed the same way, with one difference the `count`/`pxgx_plus_pygy_sum`
+trick didn't need: **the packed word is biased by +1 per field per point**
+(`(gy+1)` high, `(gx+1)` low, each landing in {0,1,2}), and the add is
+unconditional. This is *not* the same trick as before - `count` is safe
+unbiased because it is monotonic (always +1, never negative), but `gx_sum`/
+`gy_sum` individually wander through zero across a frame's points, so an
+unbiased signed low half would legitimately wrap its own 0/0xFFFFFFFF
+boundary and spuriously carry into the high half. The bias keeps the
+running low-half total strictly monotonic and bounded (at most 2x the
+point capacity), restoring the same safety argument `count` already has.
+Unbiased once, in `select_blobs.comp`, right after `e = extents[i]` is
+read: `e.gx_sum -= e.count; e.gy_sum -= e.count;`, gated on a new
+`gx_gy_biased` push-constant flag set from the same `extents_atomic64`
+bool that picks the shader (stored as `extents_atomic64_`, since
+`CreatePipelines` and `Detect`/`select_blobs`'s dispatch are different
+functions). `merge_extents.comp` needs no change - biased sums still fold
+associatively across the privatized copies exactly like `count` does,
+since bias-per-copy sums to `bias x total-count` regardless of which copy
+a point landed in.
+
+Net: removes the second atomic entirely for SE/SW diagonal boundary points
+(both `gx` and `gy` nonzero), a wash for E/S points (already one atomic
+either way, since one of `gx`/`gy` was structurally zero).
+
+Bit-identical over 36 configurations on both devices, and separately on
+the forced-scalar-atomic64 path (`APRILTAG_VK_FORCE_NO_SUBGROUP=1` on the
+RX 9060 XT, where this is not the default; unconditional on Mali) and the
+plain-32-bit scalar path (`+APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1`, which
+this change never touches).
+
+**Measured on the RX 9060 XT** (forced-scalar-atomic64, ABBA-interleaved,
+12 rounds x 300 iterations, 1280x800): `extents` span **-9.8%** (d1,
+12/12 rounds) / **-3.0%** (d2, 11/12), GPU total -1.3% (11/12) / -0.6%
+(9/12).
+
+**Measured on the Mali-G610** (this is the default path there, no force
+flag needed), same protocol: GPU total **-0.7%** (d1, unanimous 12/12) /
+-1.3% (d2, 7/12 - a plausible small win, noisier). No regression at
+either decimation on either device. Shipped on.
