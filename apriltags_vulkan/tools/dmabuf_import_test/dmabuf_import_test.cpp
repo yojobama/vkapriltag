@@ -156,7 +156,7 @@ struct CamBuf {
 };
 
 int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int frames,
-              apriltag_family_t *tf) {
+              apriltag_family_t *tf, int sync_mode) {
   const int fd = open(dev.c_str(), O_RDWR);
   if (fd < 0) {
     std::cerr << "cannot open " << dev << std::endl;
@@ -248,6 +248,13 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
       return 1;
     }
     CamBuf &cb = bufs[b.index];
+    // The kernel filled the buffer through the CPU cache; flush it for the GPU (which is not
+    // cache-coherent with the CPU).
+    if (sync_mode == 1) SyncDmaBuf(cb.dmabuf, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
+    if (sync_mode == 2) {
+      SyncDmaBuf(cb.dmabuf, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW);
+      SyncDmaBuf(cb.dmabuf, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
+    }
 
     auto t0 = Clock::now();  // current path: CPU luma extraction + copy upload
     for (size_t p = 0; p < gray.size(); ++p) gray[p] = cb.start[2 * p];
@@ -280,7 +287,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
 
 int main(int argc, char **argv) {
   std::string pgm, camera;
-  int iterations = 200, frames = 60;
+  int iterations = 200, frames = 60, sync_mode = 1;
   uint32_t width = 640, height = 480;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -289,6 +296,7 @@ int main(int argc, char **argv) {
     else if (arg == "--camera") camera = next();
     else if (arg == "--iterations") iterations = std::stoi(next());
     else if (arg == "--frames") frames = std::stoi(next());
+    else if (arg == "--sync") sync_mode = std::stoi(next());
     else if (arg == "--width") width = static_cast<uint32_t>(std::stoi(next()));
     else if (arg == "--height") height = static_cast<uint32_t>(std::stoi(next()));
     else {
@@ -299,7 +307,7 @@ int main(int argc, char **argv) {
   apriltag_family_t *tf = nullptr;
   if (!setup_tag_family(&tf, "tag36h11")) return 1;
   try {
-    if (!camera.empty()) return RunCamera(camera, width, height, frames, tf);
+    if (!camera.empty()) return RunCamera(camera, width, height, frames, tf, sync_mode);
     if (!pgm.empty()) return RunHeap(pgm, iterations, tf);
   } catch (const std::exception &e) {
     std::cerr << "Failed: " << e.what() << std::endl;
