@@ -1,7 +1,7 @@
 // Simulates several cameras sharing one GPU: one Context (one VkDevice), and per stream a Lane
 // (queue), GpuDetector, QuadDecode, TagDecoder and FramePipeline, fed by its own thread.
 // Usage: bench_multiqueue --pgm <file> [--streams N] [--mode single|per-stream|alternate]
-//   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N]
+//   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N]
 // single: every stream shares queue 0. per-stream: one queue per stream on the primary family.
 // alternate: queues interleaved across both compute families. --fps paces each stream like a
 // camera (0 = free-running).
@@ -75,7 +75,7 @@ void CheckResult(const zarray_t *dets) {
 
 int main(int argc, char **argv) {
   std::string pgm_path, mode = "per-stream";
-  int streams = 1, iterations = 300, cpu_threads = 0;
+  int streams = 1, iterations = 300, cpu_threads = 0, family = -1;
   double fps = 0.0;
   uint32_t decimation = 2;
 
@@ -96,6 +96,8 @@ int main(int argc, char **argv) {
       cpu_threads = std::max(1, std::stoi(next()));
     } else if (arg == "--fps") {
       fps = std::stod(next());
+    } else if (arg == "--family") {
+      family = std::stoi(next());
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -104,7 +106,7 @@ int main(int argc, char **argv) {
   if (pgm_path.empty() || (mode != "single" && mode != "per-stream" && mode != "alternate")) {
     std::cerr << "Usage: bench_multiqueue --pgm <file> [--streams N] "
                  "[--mode single|per-stream|alternate] [--iterations N] [--decimation N] "
-                 "[--cpu-threads N] [--fps N]\n";
+                 "[--cpu-threads N] [--fps N] [--family N]\n";
     return 1;
   }
   if (cpu_threads == 0) {
@@ -133,6 +135,7 @@ int main(int argc, char **argv) {
   size_t queue_count = 0;
   try {
     apriltag_vulkan::vk::ContextOptions opts;
+    opts.queue_family = family;
     opts.queues_per_family = static_cast<uint32_t>(streams);
     opts.use_secondary_compute_family = (mode == "alternate");
     apriltag_vulkan::vk::Context ctx(opts);

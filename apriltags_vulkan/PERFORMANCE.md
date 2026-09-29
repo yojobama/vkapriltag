@@ -830,13 +830,26 @@ RX 9060 XT, total frames/s (12 logical CPUs):
 
 - With `exact` refinement the CPU tail is the bottleneck (about 2.9k fps) and queue layout makes no
   difference.
-- With the tail made cheap (`ultrafast`) the GPU limits: one queue per stream on the same family
-  gives no gain over sharing one queue (about 3.9k fps). The gain comes only from using the second,
-  compute-only family: `alternate` reaches about 6.0k fps, 1.5x. The earlier multi-device result
-  (8b) came from the same effect.
-- Paced at 60 fps per stream, 32 streams (1,920 fps total) were sustained with either refine mode.
+- With the tail made cheap (`ultrafast`) the GPU limits. On the graphics+compute family (0), one
+  queue per stream gives no gain over sharing one queue (about 3.9k fps). Using the second,
+  compute-only family (1) helps, and there a queue per stream matters (table below); `alternate`
+  across both families reaches about 6.0k fps. The earlier multi-device result (8b) came from the
+  same effect.
+- Paced at 60 fps per stream- Paced at 60 fps per stream, 32 streams (1,920 fps total) were sustained with either refine mode.
   The reported latency and late-frame counts are not reliable on Windows: results return one
   `Push()` late by design and `sleep_until` granularity is coarse.
+
+Compute-only family (1) alone, same setup (`--family 1`), total fps:
+
+| Streams | Mode | `exact` refine | `ultrafast` refine |
+| --- | --- | --- | --- |
+| 1 | single | 2,095 | 2,121 |
+| 2 | single / per-stream | 2,774 / 2,707 | 3,671 / 3,724 |
+| 4 | single / per-stream | 2,932 / 2,961 | 3,793 / 5,240 |
+| 8 | single / per-stream | 2,650 / 2,667 | 3,715 / 5,233 |
+
+With a cheap tail, a queue per stream on family 1 reaches 5.2k fps (1.4x over one shared queue),
+close to the 6.0k of alternating across both families; on family 0 the same layout gave nothing.
 
 Orange Pi 5 Plus (Mali-G610: one family, 2 queues; governors pinned then restored), total fps:
 
