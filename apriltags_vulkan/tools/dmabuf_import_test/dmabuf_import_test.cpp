@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -23,6 +24,7 @@
 #include "vkapriltag/apriltag_family.h"
 #include "vkapriltag/common/pgm_io.h"
 #include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
 
 extern "C" {
@@ -43,10 +45,29 @@ void SyncDmaBuf(int fd, uint64_t flags) {
   ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
 }
 
-bool SamePoints(const apriltag_vulkan::GpuDetector &a, const std::vector<apriltag_vulkan::RawLineFitPoint> &b) {
-  const auto pts = a.last_line_fit_points;
-  return pts.size() == b.size() &&
-         (b.empty() || std::memcmp(pts.data(), b.data(), pts.size_bytes()) == 0);
+// Point append order varies between runs, so paths are compared by their fitted quads, which do
+// not depend on it.
+using Quads = std::vector<apriltag_vulkan::DetectedQuad>;
+
+Quads SortedQuads(const Quads &q) {
+  Quads out = q;
+  std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) {
+    return a.p[0][0] != b.p[0][0] ? a.p[0][0] < b.p[0][0] : a.p[0][1] < b.p[0][1];
+  });
+  return out;
+}
+
+bool SameQuads(const Quads &x, const Quads &y) {
+  if (x.size() != y.size()) return false;
+  const Quads a = SortedQuads(x), b = SortedQuads(y);
+  for (size_t i = 0; i < a.size(); ++i) {
+    for (int k = 0; k < 4; ++k) {
+      for (int c = 0; c < 2; ++c) {
+        if (std::abs(a[i].p[k][c] - b[i].p[k][c]) > 1e-3) return false;
+      }
+    }
+  }
+  return true;
 }
 
 apriltag_vulkan::DetectorConfig MakeConfig(uint32_t w, uint32_t h, const apriltag_family_t *tf) {
@@ -94,7 +115,9 @@ int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf) {
   SyncDmaBuf(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 
   apriltag_vulkan::vk::Context ctx;
-  apriltag_vulkan::GpuDetector detector(ctx, MakeConfig(w, h, tf));
+  const apriltag_vulkan::DetectorConfig config = MakeConfig(w, h, tf);
+  apriltag_vulkan::GpuDetector detector(ctx, config);
+  const apriltag_vulkan::QuadDecode quad_decode(config);
   if (!ctx.caps().has_external_memory_dma_buf) {
     std::cerr << "device lacks dma-buf import\n";
     return 1;
@@ -107,12 +130,11 @@ int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf) {
     auto t0 = Clock::now();
     detector.Detect(gray.data());
     const double c = MsSince(t0);
-    const std::vector<apriltag_vulkan::RawLineFitPoint> ref(detector.last_line_fit_points.begin(),
-                                                            detector.last_line_fit_points.end());
+    const Quads ref = quad_decode.Decode(detector.last_line_fit_points);
     t0 = Clock::now();
     detector.Detect(mapped);
     const double m = MsSince(t0);
-    identical = identical && SamePoints(detector, ref);
+    identical = identical && SameQuads(ref, quad_decode.Decode(detector.last_line_fit_points));
     if (i >= 5) {
       copy_ms.push_back(c);
       import_ms.push_back(m);
@@ -188,7 +210,9 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
   }
 
   apriltag_vulkan::vk::Context ctx;
-  apriltag_vulkan::GpuDetector detector(ctx, MakeConfig(w, h, tf));
+  const apriltag_vulkan::DetectorConfig config = MakeConfig(w, h, tf);
+  apriltag_vulkan::GpuDetector detector(ctx, config);
+  const apriltag_vulkan::QuadDecode quad_decode(config);
   if (!ctx.caps().has_external_memory_dma_buf) {
     std::cerr << "device lacks dma-buf import\n";
     return 1;
@@ -229,8 +253,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
     for (size_t p = 0; p < gray.size(); ++p) gray[p] = cb.start[2 * p];
     detector.Detect(gray.data());
     const double c = MsSince(t0);
-    const std::vector<apriltag_vulkan::RawLineFitPoint> ref(detector.last_line_fit_points.begin(),
-                                                            detector.last_line_fit_points.end());
+    const Quads ref = quad_decode.Decode(detector.last_line_fit_points);
     t0 = Clock::now();  // zero-copy path: the GPU reads the capture buffer in place
     detector.Detect(cb.start);
     const double m = MsSince(t0);
@@ -238,7 +261,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
       copy_ms.push_back(c);
       import_ms.push_back(m);
       points += static_cast<double>(ref.size());
-      (SamePoints(detector, ref) ? identical : differing)++;
+      (SameQuads(ref, quad_decode.Decode(detector.last_line_fit_points)) ? identical : differing)++;
     }
     ioctl(fd, VIDIOC_QBUF, &b);
   }
