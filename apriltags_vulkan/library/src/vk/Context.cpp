@@ -268,10 +268,7 @@ Context::~Context() {
     vkDeviceWaitIdle(device_);
     // Must precede vkDestroyDevice; the member's own destructor would run after the device is gone.
     pipeline_cache_.ReleaseBeforeDeviceDestruction();
-    for (size_t i = 0; i < kCommandRing; ++i) {
-      if (fence_ring_[i]) vkDestroyFence(device_, fence_ring_[i], nullptr);
-    }
-    if (command_pool_) vkDestroyCommandPool(device_, command_pool_, nullptr);
+    default_lane_.reset();
     vkDestroyDevice(device_, nullptr);
   }
   if (instance_) vkDestroyInstance(instance_, nullptr);
@@ -475,12 +472,28 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     throw std::runtime_error("No compute queue family found");
   }
 
-  float priority = 1.0f;
-  VkDeviceQueueCreateInfo queue_info{};
-  queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  queue_info.queueFamilyIndex = queue_family_;
-  queue_info.queueCount = 1;
-  queue_info.pQueuePriorities = &priority;
+  std::vector<uint32_t> families{queue_family_};
+  if (options.use_secondary_compute_family) {
+    for (uint32_t i = 0; i < qf_count; ++i) {
+      if (i != queue_family_ && (qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+        families.push_back(i);
+        break;
+      }
+    }
+  }
+  const uint32_t wanted_queues = std::max(1u, options.queues_per_family);
+  std::vector<uint32_t> queue_counts;
+  for (uint32_t f : families) queue_counts.push_back(std::min(wanted_queues, qfs[f].queueCount));
+  const std::vector<float> priorities(*std::max_element(queue_counts.begin(), queue_counts.end()),
+                                      1.0f);
+  std::vector<VkDeviceQueueCreateInfo> queue_infos(families.size());
+  for (size_t k = 0; k < families.size(); ++k) {
+    queue_infos[k] = {};
+    queue_infos[k].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue_infos[k].queueFamilyIndex = families[k];
+    queue_infos[k].queueCount = queue_counts[k];
+    queue_infos[k].pQueuePriorities = priorities.data();
+  }
 
   // Shaders target core Vulkan 1.1 compute with no optional features, except the optional
   // 8-bit-storage variants selected via caps().has_8bit_storage.
@@ -543,15 +556,26 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   VkDeviceCreateInfo device_info{};
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   device_info.pNext = &features2;
-  device_info.queueCreateInfoCount = 1;
-  device_info.pQueueCreateInfos = &queue_info;
+  device_info.queueCreateInfoCount = static_cast<uint32_t>(queue_infos.size());
+  device_info.pQueueCreateInfos = queue_infos.data();
   device_info.pEnabledFeatures = nullptr;
   device_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
   device_info.ppEnabledExtensionNames =
       enabled_extensions.empty() ? nullptr : enabled_extensions.data();
 
   CheckVk(vkCreateDevice(physical_device_, &device_info, nullptr, &device_), "vkCreateDevice");
-  vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+  for (uint32_t index = 0; index < priorities.size(); ++index) {
+    for (size_t k = 0; k < families.size(); ++k) {
+      if (index >= queue_counts[k]) continue;
+      QueueSlot slot;
+      slot.family = families[k];
+      slot.index = index;
+      vkGetDeviceQueue(device_, slot.family, slot.index, &slot.queue);
+      slot.submit_mutex = std::make_unique<std::mutex>();
+      queues_.push_back(std::move(slot));
+    }
+  }
+  queue_ = queues_.front().queue;
 
   if (supports_conditional_rendering_) {
     begin_conditional_rendering_ = reinterpret_cast<PFN_vkCmdBeginConditionalRenderingEXT>(
@@ -864,10 +888,21 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
 }
 
 void Context::CreateCommandResources() {
+  default_lane_ = CreateLane(0);
+}
+
+std::unique_ptr<Lane> Context::CreateLane(size_t slot) const {
+  if (slot >= queues_.size()) throw std::runtime_error("Queue slot out of range");
+  const QueueSlot &q = queues_[slot];
+  return std::unique_ptr<Lane>(new Lane(device_, q.queue, q.family, q.submit_mutex.get()));
+}
+
+Lane::Lane(VkDevice device, VkQueue queue, uint32_t family, std::mutex *submit_mutex)
+    : device_(device), queue_(queue), family_(family), submit_mutex_(submit_mutex) {
   VkCommandPoolCreateInfo pool_info{};
   pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  pool_info.queueFamilyIndex = queue_family_;
+  pool_info.queueFamilyIndex = family_;
   CheckVk(vkCreateCommandPool(device_, &pool_info, nullptr, &command_pool_),
           "vkCreateCommandPool");
 
@@ -886,6 +921,13 @@ void Context::CreateCommandResources() {
   for (size_t i = 0; i < kCommandRing; ++i) {
     CheckVk(vkCreateFence(device_, &fence_info, nullptr, &fence_ring_[i]), "vkCreateFence");
   }
+}
+
+Lane::~Lane() {
+  for (size_t i = 0; i < kCommandRing; ++i) {
+    if (fence_ring_[i]) vkDestroyFence(device_, fence_ring_[i], nullptr);
+  }
+  if (command_pool_) vkDestroyCommandPool(device_, command_pool_, nullptr);
 }
 
 uint32_t Context::FindMemoryType(uint32_t type_bits, VkMemoryPropertyFlags required,
@@ -912,7 +954,11 @@ uint32_t Context::FindMemoryTypeOrThrow(uint32_t type_bits, VkMemoryPropertyFlag
   return index;
 }
 
-VkCommandBuffer Context::BeginCommands() const {
+VkCommandBuffer Context::BeginCommands() const { return default_lane_->BeginCommands(); }
+
+void Context::SubmitAndWait(VkCommandBuffer cmd) const { default_lane_->SubmitAndWait(cmd); }
+
+VkCommandBuffer Lane::BeginCommands() {
   const size_t i = ring_next_ % kCommandRing;
   ring_next_ = (ring_next_ + 1) % kCommandRing;
   ring_active_ = i;
@@ -930,7 +976,7 @@ VkCommandBuffer Context::BeginCommands() const {
   return cmd_ring_[i];
 }
 
-void Context::SubmitAndWait(VkCommandBuffer cmd) const {
+void Lane::SubmitAndWait(VkCommandBuffer cmd) {
   const size_t i = ring_active_;
   CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
@@ -939,7 +985,10 @@ void Context::SubmitAndWait(VkCommandBuffer cmd) const {
   submit_info.commandBufferCount = 1;
   submit_info.pCommandBuffers = &cmd;
 
-  CheckVk(vkQueueSubmit(queue_, 1, &submit_info, fence_ring_[i]), "vkQueueSubmit");
+  {
+    std::lock_guard<std::mutex> lock(*submit_mutex_);
+    CheckVk(vkQueueSubmit(queue_, 1, &submit_info, fence_ring_[i]), "vkQueueSubmit");
+  }
   ++submit_count;
   CheckVk(vkWaitForFences(device_, 1, &fence_ring_[i], VK_TRUE, UINT64_MAX),
           "vkWaitForFences");

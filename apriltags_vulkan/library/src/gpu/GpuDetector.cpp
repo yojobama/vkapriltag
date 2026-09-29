@@ -64,7 +64,10 @@ constexpr VkDeviceSize kCounterStagingBytes = 64;
 }  // namespace
 
 GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
-    : ctx_(ctx), config_(config) {
+    : GpuDetector(ctx, ctx.default_lane(), config) {}
+
+GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig &config)
+    : ctx_(ctx), lane_(lane), config_(config) {
   if (config_.decimation == 0) {
     throw std::runtime_error("decimation must be >= 1");
   }
@@ -535,14 +538,14 @@ uint32_t GpuDetector::ReadCounterSlot(uint32_t slot) {
 
 VkCommandBuffer GpuDetector::BeginTimedCommands() {
   const auto t0 = Clock::now();
-  VkCommandBuffer cmd = ctx_.BeginCommands();
+  VkCommandBuffer cmd = lane_.BeginCommands();
   last_profile_.cpu_begin_ms += MsSince(t0, Clock::now());
   return cmd;
 }
 
 void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
   const auto t0 = Clock::now();
-  ctx_.SubmitAndWait(cmd);
+  lane_.SubmitAndWait(cmd);
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
 
@@ -550,7 +553,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   using vk::BarrierKind;
   const auto t_begin = Clock::now();
   last_profile_ = DetectProfile{};
-  const uint64_t submits_at_start = ctx_.submit_count;
+  const uint64_t submits_at_start = lane_.submit_count;
 
   const uint32_t pixels = decimated_width_ * decimated_height_;
   const VkDeviceSize gray_bytes = VkDeviceSize(config_.width) * config_.height;
@@ -948,7 +951,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   last_profile_.selected_blob_drops = final_blob_drops;
   last_profile_.oversized_sort_blobs = oversized_sort_blobs;
   // uf_iterations and uf_converged are set at the end of Detect(), once the fused retry is resolved.
-  last_profile_.submits = static_cast<uint32_t>(ctx_.submit_count - submits_at_start);
+  last_profile_.submits = static_cast<uint32_t>(lane_.submit_count - submits_at_start);
 
   if (timestamps_enabled_) {
     const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();

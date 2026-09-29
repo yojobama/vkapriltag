@@ -180,6 +180,8 @@ class GpuDetector {
   };
 
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
+  // As above, submitting through `lane`, which must outlive the detector.
+  GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig &config);
 
   // Runs the GPU pipeline on one grayscale frame; results land in last_selected_extents and
   // last_line_fit_points.
@@ -217,7 +219,7 @@ class GpuDetector {
   // Non-const: adds its cost to last_profile_.
   uint32_t ReadCounterSlot(uint32_t slot);
 
-  // Wrappers for ctx_.BeginCommands()/SubmitAndWait() that add host-side cost to last_profile_.
+  // Wrappers for lane_.BeginCommands()/SubmitAndWait() that add host-side cost to last_profile_.
   VkCommandBuffer BeginTimedCommands();
   void SubmitTimedAndWait(VkCommandBuffer cmd);
 
@@ -226,6 +228,7 @@ class GpuDetector {
   void EnsureReadbackCapacity(VkDeviceSize bytes);
 
   vk::Context &ctx_;
+  vk::Lane &lane_;
   DetectorConfig config_;
 
   // Launch geometry, taken from the device's limits.

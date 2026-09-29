@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,6 +36,11 @@ struct ContextOptions {
 
   // Queue family to create the compute queue on; -1 picks the first compute-capable family.
   int queue_family = -1;
+
+  // Compute queues created per family (clamped to what the family offers); each can back a Lane.
+  uint32_t queues_per_family = 1;
+  // Also creates queues on the first other compute-capable family.
+  bool use_secondary_compute_family = false;
 
   // Enable VK_LAYER_KHRONOS_validation when it is installed.
   // Env override: APRILTAG_VK_VALIDATION=1
@@ -114,8 +120,10 @@ struct DeviceCaps {
   bool is_cpu_device() const { return type == VK_PHYSICAL_DEVICE_TYPE_CPU; }
 };
 
-// Owns the Vulkan instance, device, one compute+transfer queue, a command pool, and a ring of
-// reusable command buffers and fences. Requires only Vulkan 1.1.
+class Lane;
+
+// Owns the Vulkan instance, device, compute+transfer queues, and a default Lane. Requires only
+// Vulkan 1.1.
 class Context {
 public:
   explicit Context(const ContextOptions &options = ContextOptions{});
@@ -130,7 +138,6 @@ public:
   VkDevice device() const { return device_; }
   VkQueue queue() const { return queue_; }
   uint32_t queue_family() const { return queue_family_; }
-  VkCommandPool command_pool() const { return command_pool_; }
   const DeviceCaps &caps() const { return caps_; }
 
   // VK_NULL_HANDLE when pipeline caching is disabled.
@@ -153,10 +160,18 @@ public:
     return mem_props_.memoryTypes[type_index].propertyFlags;
   }
 
-  // Begins recording into a pooled command buffer, first waiting for its previous submission.
-  VkCommandBuffer BeginCommands() const;
+  // The queue table, interleaved across families (family A queue 0, family B queue 0, A 1, ...).
+  size_t queue_count() const { return queues_.size(); }
+  uint32_t queue_slot_family(size_t slot) const { return queues_[slot].family; }
 
-  // Ends, submits and waits on a fence; the command buffer is recycled.
+  // A submission lane on queue `slot`. Must be destroyed before the Context.
+  std::unique_ptr<Lane> CreateLane(size_t slot) const;
+
+  // The lane on queue 0, used by the forwarding functions below.
+  Lane &default_lane() const { return *default_lane_; }
+
+  // Forward to the default lane.
+  VkCommandBuffer BeginCommands() const;
   void SubmitAndWait(VkCommandBuffer cmd) const;
 
   // Brackets commands that are skipped when the 32-bit value at `offset` in `buffer` is zero
@@ -180,14 +195,20 @@ public:
   void QueryCaps(const ContextOptions &options);
   void CreateCommandResources();
 
-  static constexpr size_t kCommandRing = 4;
+  struct QueueSlot {
+    uint32_t family = 0;
+    uint32_t index = 0;
+    VkQueue queue = VK_NULL_HANDLE;
+    std::unique_ptr<std::mutex> submit_mutex;  // vkQueueSubmit needs external synchronisation
+  };
 
   VkInstance instance_ = VK_NULL_HANDLE;
   VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   uint32_t queue_family_ = 0;
-  VkCommandPool command_pool_ = VK_NULL_HANDLE;
+  std::vector<QueueSlot> queues_;
+  std::unique_ptr<Lane> default_lane_;
 
   VkPhysicalDeviceMemoryProperties mem_props_{};
   DeviceCaps caps_;
@@ -200,15 +221,43 @@ public:
   PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering_ = nullptr;
   PipelineCache pipeline_cache_;
 
-  // Reusable command buffers with the fence tracking each submission.
-  mutable VkCommandBuffer cmd_ring_[kCommandRing] = {};
-  mutable VkFence fence_ring_[kCommandRing] = {};
-  mutable size_t ring_next_ = 0;
-  mutable size_t ring_active_ = 0;
+};
 
+// One queue's submission state: a command pool, a ring of reusable command buffers and the fence
+// tracking each submission. Used by one thread at a time.
+class Lane {
  public:
+  ~Lane();
+  Lane(const Lane &) = delete;
+  Lane &operator=(const Lane &) = delete;
+
+  VkQueue queue() const { return queue_; }
+  uint32_t queue_family() const { return family_; }
+
+  // Begins recording into a pooled command buffer, first waiting for its previous submission.
+  VkCommandBuffer BeginCommands();
+
+  // Ends, submits and waits on a fence; the command buffer is recycled.
+  void SubmitAndWait(VkCommandBuffer cmd);
+
   // Queue submissions since construction.
-  mutable uint64_t submit_count = 0;
+  uint64_t submit_count = 0;
+
+ private:
+  friend class Context;
+  Lane(VkDevice device, VkQueue queue, uint32_t family, std::mutex *submit_mutex);
+
+  static constexpr size_t kCommandRing = 4;
+
+  VkDevice device_;
+  VkQueue queue_;
+  uint32_t family_;
+  std::mutex *submit_mutex_;
+  VkCommandPool command_pool_ = VK_NULL_HANDLE;
+  VkCommandBuffer cmd_ring_[kCommandRing] = {};
+  VkFence fence_ring_[kCommandRing] = {};
+  size_t ring_next_ = 0;
+  size_t ring_active_ = 0;
 };
 
 // Throws std::runtime_error if `result` is not VK_SUCCESS.
