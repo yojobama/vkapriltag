@@ -92,14 +92,14 @@ int AllocHeap(size_t bytes) {
   return r < 0 ? -1 : static_cast<int>(alloc.fd);
 }
 
-int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf) {
+int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf, bool yuyv) {
   std::vector<uint8_t> gray;
   uint32_t w = 0, h = 0;
   if (!apriltag_vulkan::LoadGrayPgm(pgm, &gray, &w, &h)) {
     std::cerr << "Failed to load " << pgm << std::endl;
     return 1;
   }
-  const size_t bytes = (gray.size() + 4095) / 4096 * 4096;
+  const size_t bytes = ((yuyv ? 2 : 1) * gray.size() + 4095) / 4096 * 4096;
   const int fd = AllocHeap(bytes);
   if (fd < 0) {
     std::cerr << "dma-heap allocation failed\n";
@@ -111,7 +111,14 @@ int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf) {
     return 1;
   }
   SyncDmaBuf(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-  std::memcpy(mapped, gray.data(), gray.size());
+  if (yuyv) {
+    for (size_t p = 0; p < gray.size(); ++p) {
+      mapped[2 * p] = gray[p];
+      mapped[2 * p + 1] = 128;
+    }
+  } else {
+    std::memcpy(mapped, gray.data(), gray.size());
+  }
   SyncDmaBuf(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 
   apriltag_vulkan::vk::Context ctx;
@@ -122,7 +129,7 @@ int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf) {
     std::cerr << "device lacks dma-buf import\n";
     return 1;
   }
-  detector.ImportDmaBufFrame(mapped, fd, bytes);
+  detector.ImportDmaBufFrame(mapped, fd, bytes, yuyv);
 
   std::vector<double> copy_ms, import_ms;
   bool identical = true;
@@ -288,6 +295,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
 int main(int argc, char **argv) {
   std::string pgm, camera;
   int iterations = 200, frames = 60, sync_mode = 1;
+  bool yuyv_heap = false;
   uint32_t width = 640, height = 480;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -295,6 +303,7 @@ int main(int argc, char **argv) {
     if (arg == "--pgm") pgm = next();
     else if (arg == "--camera") camera = next();
     else if (arg == "--iterations") iterations = std::stoi(next());
+    else if (arg == "--yuyv") yuyv_heap = true;
     else if (arg == "--frames") frames = std::stoi(next());
     else if (arg == "--sync") sync_mode = std::stoi(next());
     else if (arg == "--width") width = static_cast<uint32_t>(std::stoi(next()));
@@ -308,7 +317,7 @@ int main(int argc, char **argv) {
   if (!setup_tag_family(&tf, "tag36h11")) return 1;
   try {
     if (!camera.empty()) return RunCamera(camera, width, height, frames, tf, sync_mode);
-    if (!pgm.empty()) return RunHeap(pgm, iterations, tf);
+    if (!pgm.empty()) return RunHeap(pgm, iterations, tf, yuyv_heap);
   } catch (const std::exception &e) {
     std::cerr << "Failed: " << e.what() << std::endl;
     return 1;
