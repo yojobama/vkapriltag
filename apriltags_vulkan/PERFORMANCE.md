@@ -808,6 +808,48 @@ no gain, so the GPU is already saturated by one stream:
 With the CPU tail on and one decode thread per stream: 149 / 267 / 313 fps for 1 / 2 / 4 streams,
 limited by the 8 CPU cores.
 
+## 8c. Several cameras on one device: queue-per-stream, with frame pipelining
+
+`vk::Lane` (a queue plus its own command pool and fence ring) lets several `GpuDetector`s share one
+`VkDevice`; `ContextOptions::queues_per_family` and `use_secondary_compute_family` create the
+queues. `tools/bench_multiqueue` now builds one `Context` and, per stream, a `Lane`, `GpuDetector`,
+`QuadDecode`, `TagDecoder` and `FramePipeline` fed by its own thread, so the CPU tail is hidden as in
+a real multi-camera setup. Modes: `single` (all streams share queue 0), `per-stream` (one queue per
+stream on the primary family), `alternate` (queues interleaved across both compute families).
+Every result is checked against the reference tag IDs (no mismatches in any run below). Median of
+4 rounds, order reversed on alternate rounds, `grayimage.pgm`, CPU threads split evenly per stream.
+
+RX 9060 XT, total frames/s (12 logical CPUs):
+
+| Streams | Mode | `exact` refine | `ultrafast` refine |
+| --- | --- | --- | --- |
+| 1 | single | 1,687 | 1,905 |
+| 2 | single / per-stream / alternate | 2,779 / 2,815 / 2,793 | 3,814 / 3,854 / 4,117 |
+| 4 | single / per-stream / alternate | 2,943 / 2,933 / 2,930 | 3,944 / 3,852 / 6,064 |
+| 8 | single / per-stream / alternate | 2,696 / 2,641 / 2,692 | 3,878 / 3,747 / 5,908 |
+
+- With `exact` refinement the CPU tail is the bottleneck (about 2.9k fps) and queue layout makes no
+  difference.
+- With the tail made cheap (`ultrafast`) the GPU limits: one queue per stream on the same family
+  gives no gain over sharing one queue (about 3.9k fps). The gain comes only from using the second,
+  compute-only family: `alternate` reaches about 6.0k fps, 1.5x. The earlier multi-device result
+  (8b) came from the same effect.
+- Paced at 60 fps per stream, 32 streams (1,920 fps total) were sustained with either refine mode.
+  The reported latency and late-frame counts are not reliable on Windows: results return one
+  `Push()` late by design and `sleep_until` granularity is coarse.
+
+Orange Pi 5 Plus (Mali-G610: one family, 2 queues; governors pinned then restored), total fps:
+
+| Streams | Mode | `exact` refine | `ultrafast` refine |
+| --- | --- | --- | --- |
+| 1 | single | 351 | 340 |
+| 2 | single / per-stream | 442 / 385 | 444 / 381 |
+| 4 | single / per-stream | 444 / 420 | 446 / 432 |
+
+The GPU saturates at about 440 fps with one queue; a queue per stream is no better and is slightly
+worse (the two queues contend for the same hardware). At 30 fps per stream with `ultrafast`, 12
+streams (360 fps total) were sustained.
+
 ## 9. Measuring
 
 ```
