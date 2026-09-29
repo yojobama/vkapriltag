@@ -7,6 +7,11 @@
 // camera (0 = free-running).
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -29,6 +34,14 @@ extern "C" {
 
 namespace {
 
+void *AlignedAlloc(size_t alignment, size_t bytes) {
+#ifdef _WIN32
+  return _aligned_malloc(bytes, alignment);
+#else
+  return std::aligned_alloc(alignment, bytes);
+#endif
+}
+
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::duration<double, std::milli>;
 
@@ -39,7 +52,8 @@ struct Stream {
   apriltag_detector_t *td = nullptr;
   std::unique_ptr<apriltag_vulkan::TagDecoder> tag_decoder;
   std::unique_ptr<apriltag_vulkan::FramePipeline> pipeline;
-  std::vector<uint8_t> frames[2];
+  uint8_t *frames[2] = {nullptr, nullptr};  // aligned so they can be imported
+  size_t frame_alloc = 0;
   std::vector<double> latency_ms;
   int late = 0;
 };
@@ -77,6 +91,8 @@ int main(int argc, char **argv) {
   std::string pgm_path, mode = "per-stream";
   int streams = 1, iterations = 300, cpu_threads = 0, family = -1;
   double fps = 0.0;
+  bool import_frames = false;  // zero-copy host-pointer import of the frame buffers
+  int mosaic = 1;  // cameras composed into each frame (1, 2 or 4)
   uint32_t decimation = 2;
 
   for (int i = 1; i < argc; ++i) {
@@ -98,6 +114,10 @@ int main(int argc, char **argv) {
       fps = std::stod(next());
     } else if (arg == "--family") {
       family = std::stoi(next());
+    } else if (arg == "--import") {
+      import_frames = true;
+    } else if (arg == "--mosaic") {
+      mosaic = std::stoi(next());
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -117,6 +137,29 @@ int main(int argc, char **argv) {
   uint32_t width = 0, height = 0;
   if (!apriltag_vulkan::LoadGrayPgm(pgm_path, &gray, &width, &height)) {
     std::cerr << "Failed to load PGM: " << pgm_path << std::endl;
+    return 1;
+  }
+  if (mosaic == 2 || mosaic == 4) {
+    // Tiles the camera image into one larger frame with a 16-pixel mid-grey gap between images, so
+    // one dispatch covers several cameras.
+    constexpr uint32_t kGap = 16;
+    const uint32_t cols = 2, rows = mosaic / 2;
+    const uint32_t mw = cols * width + (cols - 1) * kGap, mh = rows * height + (rows - 1) * kGap;
+    std::vector<uint8_t> big(static_cast<size_t>(mw) * mh, 128);
+    for (uint32_t r = 0; r < rows; ++r) {
+      for (uint32_t c = 0; c < cols; ++c) {
+        for (uint32_t y = 0; y < height; ++y) {
+          std::copy_n(&gray[static_cast<size_t>(y) * width],
+                      width, &big[static_cast<size_t>(r * (height + kGap) + y) * mw +
+                                  c * (width + kGap)]);
+        }
+      }
+    }
+    gray = std::move(big);
+    width = mw;
+    height = mh;
+  } else if (mosaic != 1) {
+    std::cerr << "--mosaic must be 1, 2 or 4\n";
     return 1;
   }
 
@@ -160,14 +203,20 @@ int main(int argc, char **argv) {
           st.td, decimation, static_cast<uint32_t>(cpu_threads));
       st.pipeline = std::make_unique<apriltag_vulkan::FramePipeline>(*st.detector, *st.quad_decode,
                                                                      *st.tag_decoder);
-      st.frames[0] = gray;
-      st.frames[1] = gray;
+      const size_t align = std::max<size_t>(4096, ctx.caps().min_host_pointer_alignment);
+      st.frame_alloc = (gray.size() + align - 1) / align * align;
+      for (int b = 0; b < 2; ++b) {
+        st.frames[b] = static_cast<uint8_t *>(AlignedAlloc(align, st.frame_alloc));
+        std::memset(st.frames[b], 0, st.frame_alloc);
+        std::memcpy(st.frames[b], gray.data(), gray.size());
+        if (import_frames) st.detector->ImportHostFrame(st.frames[b], st.frame_alloc);
+      }
       st.latency_ms.reserve(static_cast<size_t>(iterations));
     }
 
     for (Stream &st : pool) {  // warm-up, serial
       for (int i = 0; i < 20; ++i) {
-        zarray_t *r = st.pipeline->Push(st.frames[i & 1].data(), width, height,
+        zarray_t *r = st.pipeline->Push(st.frames[i & 1], width, height,
                                         config.reversed_border);
         if (r != nullptr) CheckResult(r);
       }
@@ -191,7 +240,7 @@ int main(int argc, char **argv) {
             if (Ms(Clock::now() - due).count() > 0.5 * period_ms) ++sp->late;
           }
           pushed[static_cast<size_t>(k)] = Clock::now();
-          zarray_t *r = sp->pipeline->Push(sp->frames[k & 1].data(), width, height,
+          zarray_t *r = sp->pipeline->Push(sp->frames[k & 1], width, height,
                                            config.reversed_border);
           if (r != nullptr && k > 0) {
             sp->latency_ms.push_back(Ms(Clock::now() - pushed[static_cast<size_t>(k - 1)]).count());
@@ -220,7 +269,10 @@ int main(int argc, char **argv) {
     const double total_fps = static_cast<double>(streams) * iterations / wall_s;
     std::cout << "mode=" << mode << " streams=" << streams << " queues=" << queue_count
               << " cpu_threads=" << cpu_threads << " target_fps=" << fps
-              << " total_fps=" << total_fps << " per_stream_fps=" << total_fps / streams
+              << " import=" << import_frames << " mosaic=" << mosaic << " tags_per_frame=" << g_expected_ids.size()
+              << " total_fps=" << total_fps
+              << " cameras_per_s=" << total_fps * mosaic
+              << " per_stream_fps=" << total_fps / streams
               << " latency_med_ms=" << all[all.size() / 2]
               << " latency_p99_ms=" << all[static_cast<size_t>(all.size() * 0.99)]
               << " late=" << late << " mismatches=" << g_mismatches.load() << std::endl;

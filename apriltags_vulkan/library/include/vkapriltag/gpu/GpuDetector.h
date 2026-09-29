@@ -187,6 +187,14 @@ class GpuDetector {
   // last_line_fit_points.
   void Detect(const uint8_t *gray_frame);
 
+  // Registers an external frame buffer so Detect(key) reads it in place, without the upload copy.
+  // The buffer holds the packed 8-bit frame, `bytes` >= width * height, and must outlive the
+  // detector. Host pointer: `ptr` and `bytes` aligned to caps().min_host_pointer_alignment (the
+  // pointer is also the key). dma-buf: `key` is any unique pointer the caller later passes to
+  // Detect; the descriptor is duplicated.
+  void ImportHostFrame(const uint8_t *ptr, size_t bytes);
+  void ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t bytes);
+
   const DetectorConfig &config() const { return config_; }
   const DetectProfile &last_profile() const { return last_profile_; }
 
@@ -318,6 +326,13 @@ class GpuDetector {
 
   // --- Pipelines ---
   vk::ComputePipeline decimate_pl_;
+  struct ImportedFrame {
+    const uint8_t *key = nullptr;
+    vk::Buffer buffer;
+    vk::ComputePipeline decimate;
+  };
+  std::vector<ImportedFrame> imported_frames_;
+  void AddImportedFrame(const uint8_t *key, vk::Buffer buffer);
   vk::ComputePipeline block_minmax_pl_;
   vk::ComputePipeline block_filter_pl_;
   vk::ComputePipeline threshold_pl_;

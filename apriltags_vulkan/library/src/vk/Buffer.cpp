@@ -5,6 +5,10 @@
 #include <stdexcept>
 #include <utility>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 namespace apriltag_vulkan::vk {
 
 namespace {
@@ -88,6 +92,98 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
 }
 
 Buffer::~Buffer() { Destroy(); }
+
+namespace {
+
+VkBuffer CreateExternalBuffer(VkDevice device, VkDeviceSize size, VkBufferUsageFlags usage,
+                              VkExternalMemoryHandleTypeFlagBits handle_type) {
+  VkExternalMemoryBufferCreateInfo external{};
+  external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+  external.handleTypes = handle_type;
+  VkBufferCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  info.pNext = &external;
+  info.size = size;
+  info.usage = usage;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  CheckVk(vkCreateBuffer(device, &info, nullptr, &buffer), "vkCreateBuffer (external)");
+  return buffer;
+}
+
+uint32_t LowestSetBit(uint32_t bits) {
+  for (uint32_t i = 0; i < 32; ++i) {
+    if (bits & (1u << i)) return i;
+  }
+  return UINT32_MAX;
+}
+
+}  // namespace
+
+Buffer Buffer::ImportHostPointer(const Context &ctx, void *ptr, VkDeviceSize size,
+                                 VkBufferUsageFlags usage) {
+  Buffer b;
+  b.device_ = ctx.device();
+  b.size_ = size;
+  b.buffer_ = CreateExternalBuffer(b.device_, size, usage,
+                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
+  VkMemoryRequirements reqs{};
+  vkGetBufferMemoryRequirements(b.device_, b.buffer_, &reqs);
+  const uint32_t type = LowestSetBit(reqs.memoryTypeBits & ctx.HostPointerMemoryTypeBits(ptr));
+  if (type == UINT32_MAX) throw std::runtime_error("No memory type can import this host pointer");
+
+  VkImportMemoryHostPointerInfoEXT import_info{};
+  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+  import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  import_info.pHostPointer = ptr;
+  VkMemoryAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  alloc.pNext = &import_info;
+  alloc.allocationSize = size;
+  alloc.memoryTypeIndex = type;
+  CheckVk(vkAllocateMemory(b.device_, &alloc, nullptr, &b.memory_), "vkAllocateMemory (host import)");
+  CheckVk(vkBindBufferMemory(b.device_, b.buffer_, b.memory_, 0), "vkBindBufferMemory");
+  return b;
+}
+
+Buffer Buffer::ImportDmaBuf(const Context &ctx, int fd, VkDeviceSize size,
+                            VkBufferUsageFlags usage) {
+#ifdef _WIN32
+  (void)ctx; (void)fd; (void)size; (void)usage;
+  throw std::runtime_error("dma-buf import is not available on Windows");
+#else
+  Buffer b;
+  b.device_ = ctx.device();
+  b.size_ = size;
+  b.buffer_ = CreateExternalBuffer(b.device_, size, usage,
+                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+  VkMemoryRequirements reqs{};
+  vkGetBufferMemoryRequirements(b.device_, b.buffer_, &reqs);
+  const uint32_t type = LowestSetBit(reqs.memoryTypeBits & ctx.DmaBufMemoryTypeBits(fd));
+  if (type == UINT32_MAX) throw std::runtime_error("No memory type can import this dma-buf");
+
+  const int owned_fd = dup(fd);  // Vulkan takes ownership of the descriptor on success
+  if (owned_fd < 0) throw std::runtime_error("dup() of the dma-buf descriptor failed");
+  VkImportMemoryFdInfoKHR import_info{};
+  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+  import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+  import_info.fd = owned_fd;
+  VkMemoryDedicatedAllocateInfo dedicated{};
+  dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+  dedicated.buffer = b.buffer_;
+  import_info.pNext = &dedicated;
+  VkMemoryAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  alloc.pNext = &import_info;
+  alloc.allocationSize = reqs.size;
+  alloc.memoryTypeIndex = type;
+  const VkResult r = vkAllocateMemory(b.device_, &alloc, nullptr, &b.memory_);
+  if (r != VK_SUCCESS) close(owned_fd);
+  CheckVk(r, "vkAllocateMemory (dma-buf import)");
+  CheckVk(vkBindBufferMemory(b.device_, b.buffer_, b.memory_, 0), "vkBindBufferMemory");
+  return b;
+#endif
+}
 
 void Buffer::Destroy() {
   if (mapped_ != nullptr && memory_ != VK_NULL_HANDLE) {

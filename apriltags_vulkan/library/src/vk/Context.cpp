@@ -507,6 +507,10 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   supports_conditional_rendering_ = !options.force_no_conditional_rendering &&
                                     SupportsConditionalRendering(physical_device_);
 
+  supports_external_memory_host_ = DeviceHasExtension(physical_device_, "VK_EXT_external_memory_host");
+  supports_dma_buf_ = DeviceHasExtension(physical_device_, "VK_EXT_external_memory_dma_buf") &&
+                      DeviceHasExtension(physical_device_, "VK_KHR_external_memory_fd");
+
   VkPhysicalDevice8BitStorageFeaturesKHR storage8bit{};
   storage8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
   storage8bit.storageBuffer8BitAccess = VK_TRUE;
@@ -552,6 +556,13 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   if (supports_conditional_rendering_) {
     enabled_extensions.push_back("VK_EXT_conditional_rendering");
   }
+  if (supports_external_memory_host_) {
+    enabled_extensions.push_back("VK_EXT_external_memory_host");
+  }
+  if (supports_dma_buf_) {
+    enabled_extensions.push_back("VK_KHR_external_memory_fd");
+    enabled_extensions.push_back("VK_EXT_external_memory_dma_buf");
+  }
 
   VkDeviceCreateInfo device_info{};
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -576,6 +587,17 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     }
   }
   queue_ = queues_.front().queue;
+
+  if (supports_external_memory_host_) {
+    get_host_pointer_properties_ = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+        vkGetDeviceProcAddr(device_, "vkGetMemoryHostPointerPropertiesEXT"));
+    if (get_host_pointer_properties_ == nullptr) supports_external_memory_host_ = false;
+  }
+  if (supports_dma_buf_) {
+    get_fd_properties_ = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+        vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
+    if (get_fd_properties_ == nullptr) supports_dma_buf_ = false;
+  }
 
   if (supports_conditional_rendering_) {
     begin_conditional_rendering_ = reinterpret_cast<PFN_vkCmdBeginConditionalRenderingEXT>(
@@ -619,6 +641,17 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.has_8bit_storage = supports_8bit_storage_;
   caps_.has_int64_atomics = supports_int64_atomics_;
   caps_.has_conditional_rendering = supports_conditional_rendering_;
+  caps_.has_external_memory_host = supports_external_memory_host_;
+  caps_.has_external_memory_dma_buf = supports_dma_buf_;
+  if (supports_external_memory_host_) {
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props{};
+    host_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &host_props;
+    vkGetPhysicalDeviceProperties2(physical_device_, &props2);
+    caps_.min_host_pointer_alignment = host_props.minImportedHostPointerAlignment;
+  }
 
   // Subgroup properties via the VkPhysicalDeviceProperties2 pNext chain (core 1.1).
   {
@@ -891,6 +924,25 @@ void Context::CreateCommandResources() {
   default_lane_ = CreateLane(0);
 }
 
+uint32_t Context::HostPointerMemoryTypeBits(const void *ptr) const {
+  if (!supports_external_memory_host_) throw std::runtime_error("External host memory unsupported");
+  VkMemoryHostPointerPropertiesEXT props{};
+  props.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+  CheckVk(get_host_pointer_properties_(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                       const_cast<void *>(ptr), &props),
+          "vkGetMemoryHostPointerPropertiesEXT");
+  return props.memoryTypeBits;
+}
+
+uint32_t Context::DmaBufMemoryTypeBits(int fd) const {
+  if (!supports_dma_buf_) throw std::runtime_error("dma-buf import unsupported");
+  VkMemoryFdPropertiesKHR props{};
+  props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+  CheckVk(get_fd_properties_(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &props),
+          "vkGetMemoryFdPropertiesKHR");
+  return props.memoryTypeBits;
+}
+
 std::unique_ptr<Lane> Context::CreateLane(size_t slot) const {
   if (slot >= queues_.size()) throw std::runtime_error("Queue slot out of range");
   const QueueSlot &q = queues_[slot];
@@ -1012,6 +1064,8 @@ std::string Context::DescribeDevice() const {
      << ", 8bit_storage=" << (caps_.has_8bit_storage ? "yes" : "no")
      << ", int64_atomics=" << (caps_.has_int64_atomics ? "yes" : "no")
      << ", conditional_rendering=" << (caps_.has_conditional_rendering ? "yes" : "no")
+     << ", external_memory_host=" << (caps_.has_external_memory_host ? "yes" : "no")
+     << ", external_memory_dma_buf=" << (caps_.has_external_memory_dma_buf ? "yes" : "no")
      << ", subgroup_ballot=" << (caps_.has_subgroup_ballot ? "yes" : "no")
      << ", subgroup_arithmetic=" << (caps_.has_subgroup_arithmetic ? "yes" : "no");
   os << "\n  chosen geometry: wg1d=" << caps_.wg1d << ", wg2d=" << caps_.wg2d_x << "x"

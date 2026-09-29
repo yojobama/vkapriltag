@@ -549,6 +549,28 @@ void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
 
+void GpuDetector::AddImportedFrame(const uint8_t *key, vk::Buffer buffer) {
+  const bool u8 = ctx_.caps().has_8bit_storage;
+  ImportedFrame frame;
+  frame.key = key;
+  frame.decimate = vk::ComputePipeline(
+      ctx_, ShaderPath(u8 ? "decimate_u8" : "decimate"), {buffer.get(), decimated_buf_.get()}, 8,
+      wg2d_, {config_.decimation});
+  frame.buffer = std::move(buffer);
+  imported_frames_.push_back(std::move(frame));
+}
+
+void GpuDetector::ImportHostFrame(const uint8_t *ptr, size_t bytes) {
+  AddImportedFrame(ptr, vk::Buffer::ImportHostPointer(
+                            ctx_, const_cast<uint8_t *>(ptr), bytes,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+}
+
+void GpuDetector::ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t bytes) {
+  AddImportedFrame(key, vk::Buffer::ImportDmaBuf(ctx_, dmabuf_fd, bytes,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+}
+
 void GpuDetector::Detect(const uint8_t *gray_frame) {
   using vk::BarrierKind;
   const auto t_begin = Clock::now();
@@ -562,7 +584,12 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Upload: one memcpy of the raw 8-bit frame.
   // ------------------------------------------------------------------
   const auto t_upload0 = Clock::now();
-  if (gray_direct_write_) {
+  const ImportedFrame *imported = nullptr;
+  for (const ImportedFrame &f : imported_frames_) {
+    if (f.key == gray_frame) imported = &f;
+  }
+  if (imported != nullptr) {
+  } else if (gray_direct_write_) {
     gray_buf_.Write(gray_frame, gray_bytes);
   } else {
     upload_staging_.Write(gray_frame, gray_bytes);
@@ -590,7 +617,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   VkCommandBuffer cmd = BeginTimedCommands();
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
-  if (!gray_direct_write_) {
+  if (!gray_direct_write_ && imported == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanClear));
@@ -609,7 +636,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  (imported != nullptr ? imported->decimate : decimate_pl_)
+      .Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
   block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 

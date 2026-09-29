@@ -37,6 +37,15 @@ class Buffer {
  public:
   Buffer() = default;
   Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, MemoryKind kind);
+
+  // A buffer backed by caller memory (VK_EXT_external_memory_host). `ptr` and `size` must be
+  // multiples of caps().min_host_pointer_alignment and the memory must outlive the buffer.
+  static Buffer ImportHostPointer(const Context &ctx, void *ptr, VkDeviceSize size,
+                                  VkBufferUsageFlags usage);
+
+  // A buffer backed by a dma-buf. `fd` is duplicated, so the caller keeps its own descriptor.
+  static Buffer ImportDmaBuf(const Context &ctx, int fd, VkDeviceSize size,
+                             VkBufferUsageFlags usage);
   ~Buffer();
 
   Buffer(const Buffer &) = delete;

@@ -92,6 +92,13 @@ struct DeviceCaps {
   bool has_int64_atomics = false;
   // VK_EXT_conditional_rendering + conditionalRendering; enabled at device creation.
   bool has_conditional_rendering = false;
+  // VK_EXT_external_memory_host: caller memory can back a buffer; imports must be aligned to
+  // min_host_pointer_alignment.
+  bool has_external_memory_host = false;
+  VkDeviceSize min_host_pointer_alignment = 0;
+  // VK_EXT_external_memory_dma_buf + VK_KHR_external_memory_fd: dma-buf file descriptors can back a
+  // buffer.
+  bool has_external_memory_dma_buf = false;
   // Subgroup capabilities (VkPhysicalDeviceSubgroupProperties); the subgroup shader variants are
   // used when both ballot and arithmetic are set.
   bool has_subgroup_ballot = false;
@@ -160,6 +167,10 @@ public:
     return mem_props_.memoryTypes[type_index].propertyFlags;
   }
 
+  // Memory type bits usable for importing `ptr` (host pointer) or `fd` (dma-buf); throw on failure.
+  uint32_t HostPointerMemoryTypeBits(const void *ptr) const;
+  uint32_t DmaBufMemoryTypeBits(int fd) const;
+
   // The queue table, interleaved across families (family A queue 0, family B queue 0, A 1, ...).
   size_t queue_count() const { return queues_.size(); }
   uint32_t queue_slot_family(size_t slot) const { return queues_[slot].family; }
@@ -219,6 +230,10 @@ public:
   // Extension entry points, loaded only when supports_conditional_rendering_.
   PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering_ = nullptr;
   PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering_ = nullptr;
+  bool supports_external_memory_host_ = false;
+  bool supports_dma_buf_ = false;
+  PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties_ = nullptr;
+  PFN_vkGetMemoryFdPropertiesKHR get_fd_properties_ = nullptr;
   PipelineCache pipeline_cache_;
 
 };
