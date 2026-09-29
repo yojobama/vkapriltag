@@ -256,7 +256,7 @@ int main(int argc, char **argv) {
   int width = 1280, height = 800;
   double tagsize = 0.1651;
   double blur_sigma = 0.7, noise_sigma = 3.0;
-  std::string dump_dir;
+  std::string dump_dir, csv_path;
   std::vector<uint32_t> decimations = {1, 2};
   std::vector<uint32_t> ids = {0, 5};
 
@@ -272,6 +272,7 @@ int main(int argc, char **argv) {
     else if (arg == "--blur-sigma") blur_sigma = std::stod(next("--blur-sigma"));
     else if (arg == "--noise-sigma") noise_sigma = std::stod(next("--noise-sigma"));
     else if (arg == "--dump-dir") dump_dir = next("--dump-dir");
+    else if (arg == "--csv") csv_path = next("--csv");
     else if (arg == "--refine-edges") refine_edges = true;
     else {
       std::cerr << "Unknown argument: " << arg << std::endl;
@@ -279,6 +280,12 @@ int main(int argc, char **argv) {
     }
   }
   if (!dump_dir.empty()) std::filesystem::create_directories(dump_dir);
+  // Per-case results: case,decimation,id,target_px,tilt,spin,offset,px_size,lib_decoded,vk_decoded,
+  // lib_rot_err,vk_rot_err,mutual_rot (errors in degrees, -1 when unavailable).
+  std::FILE *csv = csv_path.empty() ? nullptr : std::fopen(csv_path.c_str(), "w");
+  if (csv != nullptr) {
+    std::fprintf(csv, "case,decimation,id,target_px,tilt_deg,spin_deg,off_frac,px_size,lib_decoded,vk_decoded,lib_rot_err,vk_rot_err,mutual_rot\n");
+  }
 
   CameraIntrinsics intr{static_cast<double>(width), static_cast<double>(width), width / 2.0,
                         height / 2.0};
@@ -442,6 +449,17 @@ int main(int argc, char **argv) {
                 break;
               }
 
+              if (csv != nullptr) {
+                const bool lib_ok = lib.decoded && lib.pose_valid;
+                const bool vk_ok = vk.decoded && vk.pose_valid;
+                std::fprintf(csv, "%d,%u,%u,%.6g,%.6g,%.6g,%.6g,%.4f,%d,%d,%.4f,%.4f,%.4f\n",
+                             case_index, decimation, id, target_px, tilt_deg, spin_deg, off_frac,
+                             sc.px_size, lib.decoded, vk.decoded,
+                             lib_ok ? RotationAngleDeg(lib.R, sc.truth_R) : -1.0,
+                             vk_ok ? RotationAngleDeg(vk.R, sc.truth_R) : -1.0,
+                             lib_ok && vk_ok ? RotationAngleDeg(lib.R, vk.R) : -1.0);
+              }
+
               Bucket &bucket = BucketFor(sc.px_size);
               if (!lib.decoded) ++bucket.lib_missed;
               if (!vk.decoded) ++bucket.vk_missed;
@@ -473,6 +491,7 @@ int main(int argc, char **argv) {
     apriltag_detector_destroy(td_ours);
     apriltag_detector_destroy(td_ref);
   }
+  if (csv != nullptr) std::fclose(csv);
   teardown_tag_family(&tf, family_name.c_str());
 
   std::printf("%-9s %6s %8s %8s | %11s %11s %11s | %11s %11s | %10s %10s\n", "bucket", "n",
