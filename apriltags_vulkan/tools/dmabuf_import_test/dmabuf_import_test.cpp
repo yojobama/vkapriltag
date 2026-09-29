@@ -39,6 +39,22 @@ double MsSince(Clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
+// Cleans and invalidates the CPU data cache for [p, p + bytes) down to DRAM (arm64 EL0 `dc civac`),
+// for producers that fill a buffer through the CPU (such as uvcvideo) whose dma-buf exporter does
+// not implement begin/end_cpu_access.
+void FlushCpuCache(const void *p, size_t bytes) {
+#if defined(__aarch64__)
+  const uintptr_t line = 64;
+  uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(line - 1);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(p) + bytes;
+  for (; a < end; a += line) asm volatile("dc civac, %0" : : "r"(a) : "memory");
+  asm volatile("dsb sy" : : : "memory");
+#else
+  (void)p;
+  (void)bytes;
+#endif
+}
+
 void SyncDmaBuf(int fd, uint64_t flags) {
   dma_buf_sync sync{};
   sync.flags = flags;
@@ -257,6 +273,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
     CamBuf &cb = bufs[b.index];
     // The kernel filled the buffer through the CPU cache; flush it for the GPU (which is not
     // cache-coherent with the CPU).
+    if (sync_mode == 3) FlushCpuCache(cb.start, cb.length);
     if (sync_mode == 1) SyncDmaBuf(cb.dmabuf, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
     if (sync_mode == 2) {
       SyncDmaBuf(cb.dmabuf, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW);
