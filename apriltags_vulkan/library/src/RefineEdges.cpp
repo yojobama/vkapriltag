@@ -271,6 +271,7 @@ RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured) {
     if (method == "upstream") return RefineEdgesMethod::kUpstream;
     if (method == "exact") return RefineEdgesMethod::kExact;
     if (method == "fast") return RefineEdgesMethod::kFast;
+    if (method == "ultrafast") return RefineEdgesMethod::kUltraFast;
   }
   return configured;
 }
@@ -282,6 +283,7 @@ void RefineEdges(RefineEdgesMethod method, apriltag_detector_t *td, image_u8_t *
       RefineEdgesT<double>(td->quad_decimate, im, quad);
       return;
     case RefineEdgesMethod::kFast:
+    case RefineEdgesMethod::kUltraFast:
       RefineEdgesFast(td->quad_decimate, im, quad);
       return;
     case RefineEdgesMethod::kUpstream:

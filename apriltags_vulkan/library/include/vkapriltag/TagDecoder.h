@@ -50,7 +50,7 @@ class TagDecoder {
   zarray_t *detections_;
   // One scratch zarray per candidate quad; grown, never shrunk, and truncated when reused.
   std::vector<zarray_t *> per_quad_;
-  // Per-thread scratch for the unrefined decode that gates kFast refinement.
+  // Per-thread scratch for the unrefined decode that gates kUltraFast refinement.
   std::vector<zarray_t *> probe_;
 };
 

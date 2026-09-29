@@ -68,7 +68,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2). |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
 | `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
-| `APRILTAG_VK_REFINE=exact\|fast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
+| `APRILTAG_VK_REFINE=exact\|fast\|ultrafast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
 | `APRILTAG_VK_FORCE_NO_8BIT=1` | Force the 32-bit-per-pixel shader variants even where `VK_KHR_8bit_storage` is available. |
 | `APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1` | Force the 32-bit-atomic extents reduction even where `VK_KHR_shader_atomic_int64` is available. See section 3b. |
@@ -422,14 +422,15 @@ implementations:
   sample's search profile is evaluated once per position (the far gradient tap
   is the near tap eight steps earlier), the weighting pass is branch-free with
   independent accumulators, and the line fit uses moments centred on the edge
-  midpoint, which removes the cancellation that previously forced double. In
-  addition `TagDecoder` refines only quads that already decode unrefined.
+  midpoint, which removes the cancellation that previously forced double.
   Measured on the RX 9060 XT (`grayimage.pgm`, 75 quads, 1 tag): `tag_decode`
-  0.27 -> 0.24 ms from the float/profile changes alone, -> 0.095 ms with the
-  gate. The gate costs recall on the synthetic sweep (663 vs 687 decoded of
-  768 with `--refine-edges`) because marginal small tags that only decode after
-  refinement are rejected; with the gate off, recall and pose accuracy match
+  0.27 -> 0.24 ms; recall and pose accuracy on the synthetic sweep match
   `exact`.
+- **`ultrafast`** — `fast`, plus `TagDecoder` refines only quads that already
+  decode unrefined. `tag_decode` -> 0.095 ms on the same image. The gate costs
+  recall on the synthetic sweep (663 vs 687 decoded of 768 with
+  `--refine-edges`) because marginal small tags that only decode after
+  refinement are rejected.
 - **`upstream`** — calls upstream's compiled function. Use it to isolate any
   suspected corner-accuracy regression to this code.
 

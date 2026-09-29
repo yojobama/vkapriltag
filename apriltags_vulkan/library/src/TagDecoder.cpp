@@ -94,8 +94,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     quad_original.H = nullptr;
     quad_original.Hinv = nullptr;
 
-    // kFast refines only quads that already decode unrefined; the rest are rejected here.
-    if (td_->refine_edges && refine_method_ == RefineEdgesMethod::kFast) {
+    // kUltraFast refines only quads that already decode unrefined; the rest are rejected here.
+    if (td_->refine_edges && refine_method_ == RefineEdgesMethod::kUltraFast) {
       zarray_t *probe = probe_[slot];
       zarray_truncate(probe, 0);
       quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, probe);
