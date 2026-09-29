@@ -248,6 +248,7 @@ Stat3 Summarize(std::vector<double> v) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  bool refine_edges = false;  // enables refine_edges on both detectors
   // Fixed seed so cv::randn() output, and hence the CI gate, is reproducible.
   cv::theRNG() = cv::RNG(0x5eed);
 
@@ -271,6 +272,7 @@ int main(int argc, char **argv) {
     else if (arg == "--blur-sigma") blur_sigma = std::stod(next("--blur-sigma"));
     else if (arg == "--noise-sigma") noise_sigma = std::stod(next("--noise-sigma"));
     else if (arg == "--dump-dir") dump_dir = next("--dump-dir");
+    else if (arg == "--refine-edges") refine_edges = true;
     else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -337,14 +339,14 @@ int main(int argc, char **argv) {
 
     apriltag_detector_t *td_ours = apriltag_detector_create();
     apriltag_detector_add_family(td_ours, tf);
-    td_ours->refine_edges = false;  // RefineEdges is not ported - see README.md.
+    td_ours->refine_edges = refine_edges;
     apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
 
     apriltag_detector_t *td_ref = apriltag_detector_create();
     apriltag_detector_add_family(td_ref, tf);
     td_ref->quad_decimate = static_cast<float>(decimation);
     td_ref->nthreads = 1;
-    td_ref->refine_edges = false;  // apples-to-apples: see validate_pose_e2e's default.
+    td_ref->refine_edges = refine_edges;
 
     const PoseEstimator est(intr, tagsize);
 

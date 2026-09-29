@@ -46,6 +46,9 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   poly0_ = g2d_polygon_create_zeros(4);
   poly1_ = g2d_polygon_create_zeros(4);
   detections_ = zarray_create(sizeof(apriltag_detection_t *));
+  for (unsigned i = 0; i < pool_->threads(); ++i) {
+    probe_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
+  }
 }
 
 TagDecoder::~TagDecoder() {
@@ -53,6 +56,9 @@ TagDecoder::~TagDecoder() {
   ClearDetections(detections_);
   zarray_destroy(detections_);
   for (zarray_t *z : per_quad_) {
+    zarray_destroy(z);
+  }
+  for (zarray_t *z : probe_) {
     zarray_destroy(z);
   }
   zarray_destroy(poly1_);
@@ -77,7 +83,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
   // Only [0, quads.size()): entries beyond hold stale pointers from earlier frames.
   for (size_t i = 0; i < quads.size(); ++i) ResetScratch(per_quad_[i]);
 
-  pool_->ParallelFor(quads.size(), [&](size_t i, unsigned /*slot*/) {
+  pool_->ParallelFor(quads.size(), [&](size_t i, unsigned slot) {
     const DetectedQuad &q = quads[i];
     struct quad quad_original;
     for (int k = 0; k < 4; ++k) {
@@ -87,6 +93,20 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     quad_original.reversed_border = reversed_border;
     quad_original.H = nullptr;
     quad_original.Hinv = nullptr;
+
+    // kFast refines only quads that already decode unrefined; the rest are rejected here.
+    if (td_->refine_edges && refine_method_ == RefineEdgesMethod::kFast) {
+      zarray_t *probe = probe_[slot];
+      zarray_truncate(probe, 0);
+      quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, probe);
+      const bool decodes = zarray_size(probe) > 0;
+      ClearDetections(probe);
+      if (quad_original.H) matd_destroy(quad_original.H);
+      if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
+      quad_original.H = nullptr;
+      quad_original.Hinv = nullptr;
+      if (!decodes) return;
+    }
 
     // Refine (if enabled) before decode; both are safe to run concurrently across quads.
     if (td_->refine_edges) {

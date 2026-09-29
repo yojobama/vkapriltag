@@ -12,7 +12,8 @@ enum class RefineEdgesMethod {
   kUpstream,
   // Upstream's arithmetic in double with modf() replaced by trunc()+subtract; bit-identical.
   kExact,
-  // As kExact, with the inner sampling loop in float; the line-fit accumulators stay double.
+  // Single-precision refinement (reused search profile, centred moments) applied only to quads that
+  // already decode unrefined; not bit-identical to kExact.
   kFast,
 };
 

@@ -50,6 +50,8 @@ class TagDecoder {
   zarray_t *detections_;
   // One scratch zarray per candidate quad; grown, never shrunk, and truncated when reused.
   std::vector<zarray_t *> per_quad_;
+  // Per-thread scratch for the unrefined decode that gates kFast refinement.
+  std::vector<zarray_t *> probe_;
 };
 
 }  // namespace apriltag_vulkan
