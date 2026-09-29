@@ -259,7 +259,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
   ioctl(fd, VIDIOC_STREAMON, &type);
 
   std::vector<uint8_t> gray(static_cast<size_t>(w) * h);
-  std::vector<double> copy_ms, import_ms;
+  std::vector<double> copy_ms, import_ms, flush_ms;
   int identical = 0, differing = 0;
   double points = 0;
   for (int i = 0; i < frames + 5; ++i) {
@@ -273,7 +273,11 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
     CamBuf &cb = bufs[b.index];
     // The kernel filled the buffer through the CPU cache; flush it for the GPU (which is not
     // cache-coherent with the CPU).
-    if (sync_mode == 3) FlushCpuCache(cb.start, cb.length);
+    if (sync_mode == 3) {
+      const auto tf0 = Clock::now();
+      FlushCpuCache(cb.start, cb.length);
+      if (i >= 5) flush_ms.push_back(MsSince(tf0));
+    }
     if (sync_mode == 1) SyncDmaBuf(cb.dmabuf, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW);
     if (sync_mode == 2) {
       SyncDmaBuf(cb.dmabuf, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW);
@@ -303,7 +307,12 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
             << identical + differing << " (mean " << points / std::max(1, identical + differing)
             << " line-fit points per frame)\n  host time per frame (median): copy path (luma + upload + Detect)="
             << copy_ms[copy_ms.size() / 2] << " ms, import path (Detect)="
-            << import_ms[import_ms.size() / 2] << " ms\n";
+            << import_ms[import_ms.size() / 2] << " ms";
+  if (!flush_ms.empty()) {
+    std::sort(flush_ms.begin(), flush_ms.end());
+    std::cout << "; cache flush before import (median)=" << flush_ms[flush_ms.size() / 2] << " ms";
+  }
+  std::cout << "\n";
   return differing == 0 ? 0 : 2;
 }
 
