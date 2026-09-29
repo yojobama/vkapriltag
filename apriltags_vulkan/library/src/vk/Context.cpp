@@ -460,11 +460,16 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
 
   // A COMPUTE-capable family implicitly supports transfer, which is all that is needed.
   queue_family_ = UINT32_MAX;
-  for (uint32_t i = 0; i < qf_count; ++i) {
-    if (qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-      queue_family_ = i;
-      break;
+  if (options.queue_family >= 0) {
+    const uint32_t requested = static_cast<uint32_t>(options.queue_family);
+    if (requested >= qf_count || !(qfs[requested].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+      throw std::runtime_error("Requested queue family " + std::to_string(requested) +
+                               " does not support compute");
     }
+    queue_family_ = requested;
+  }
+  for (uint32_t i = 0; i < qf_count && queue_family_ == UINT32_MAX; ++i) {
+    if (qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) queue_family_ = i;
   }
   if (queue_family_ == UINT32_MAX) {
     throw std::runtime_error("No compute queue family found");

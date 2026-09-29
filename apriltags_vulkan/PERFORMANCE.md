@@ -772,6 +772,29 @@ obvious ideas are in the rejected column. The short version:
    invariant that the scan's grand total sits at
    `blob_point_offsets[max_blobs - 1]`.
 
+## 8b. Concurrent streams on separate queue families (experiment)
+
+`tools/bench_multiqueue` runs N independent `Context` + `GpuDetector` pairs, one per thread, on
+the same GPU, each optionally pinned to a queue family (`ContextOptions::queue_family`). GPU pass
+only, `grayimage.pgm` (1280x800, decimation 2), 300 iterations per stream, 6 rounds with the
+order reversed on alternate rounds. RX 9060 XT: family 0 is graphics+compute (8 queues), family 1
+is compute-only (8 queues). Median of rounds:
+
+| Streams | Family 0 | Family 1 | Alternating 0/1 |
+| --- | --- | --- | --- |
+| 1 | 2,293 fps | 2,380 fps | - |
+| 2 | 3,791 | 3,844 | 4,345 |
+| 4 | 3,770 | 5,179 | 6,147 |
+| 8 | 3,855 | 5,679 | 6,083 |
+
+A single stream leaves the GPU under-used: four streams alternating between the two families give
+2.7x the throughput, at 0.64 ms median per frame against 0.42 ms alone. Family 0 saturates near
+1.7x; the compute-only family scales further. Caveats: the streams are separate `VkDevice`s, not
+several queues of one device, so this shows the hardware overlaps independent work rather than
+what one shared device would achieve; other GPUs (Mali, integrated) were not measured. With the
+CPU tail on and one decode thread per stream, throughput scales with CPU cores instead (387 fps
+for one stream, 2,529 for eight).
+
 ## 9. Measuring
 
 ```

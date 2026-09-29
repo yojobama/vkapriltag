@@ -33,6 +33,9 @@ struct ContextOptions {
   // Env override: APRILTAG_VK_DEVICE=<n>
   int device_index = -1;
 
+  // Queue family to create the compute queue on; -1 picks the first compute-capable family.
+  int queue_family = -1;
+
   // Enable VK_LAYER_KHRONOS_validation when it is installed.
   // Env override: APRILTAG_VK_VALIDATION=1
   bool enable_validation = false;

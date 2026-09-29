@@ -51,6 +51,11 @@ endif()
 
 install(TARGETS apriltag_vulkan_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# Throughput of concurrent detector streams on one GPU, each on a chosen queue family. Needs no OpenCV.
+add_executable(bench_multiqueue bench_multiqueue/bench_multiqueue.cpp)
+target_link_libraries(bench_multiqueue PRIVATE vkapriltag::vkapriltag)
+install(TARGETS bench_multiqueue RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # Pose verification: compares PoseEstimator with libapriltag's apriltag_pose.c stage by stage over a synthetic sweep,
 # degenerate geometry and (with --data) real detections. Needs no OpenCV.
 add_executable(apriltag_pose_validate validate_pose/validate_pose.cpp)
