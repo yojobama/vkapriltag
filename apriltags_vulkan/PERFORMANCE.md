@@ -863,6 +863,61 @@ The GPU saturates at about 440 fps with one queue; a queue per stream is no bett
 worse (the two queues contend for the same hardware). At 30 fps per stream with `ultrafast`, 12
 streams (360 fps total) were sustained.
 
+## 8d. Frame ingest: batching, a transfer queue and zero-copy import (experiment)
+
+All runs use `bench_multiqueue` (one device, `FramePipeline` per stream, `ultrafast` refine so the
+GPU is the limit), ABBA-ordered, median of 6 rounds, every result checked against the reference
+detections (no mismatches).
+
+**Batching** (`--mosaic K`: K camera images tiled into one frame, one dispatch; all K tags found).
+Cameras per second:
+
+| | RX 9060 XT | Mali-G610 |
+| --- | --- | --- |
+| K separate streams (4 / 8 on RX, 4 on Mali) | 5,956 / 5,925 | 428 |
+| 1 stream, single camera | 2,121 | 340 |
+| 1 stream, mosaic of 4 | 3,659 | 433 |
+| 2 streams, mosaic of 4 (8 cameras) | 5,377 | - |
+| 2 streams, mosaic of 2 (4 cameras) | 5,397 | 441 |
+
+Batching helps a lone stream (1.7x on the RX, 1.27x on the Mali) but not beyond what concurrent
+streams already reach; both GPUs saturate at the same level either way.
+
+**Transfer-only queue** (RX 9060 XT; `--async-upload`: the staged copy runs on family 2, the first
+compute submission waits on a semaphore). Total fps, alternating compute families:
+
+| Streams | staged copy in submission | transfer-queue upload | host-pointer import |
+| --- | --- | --- | --- |
+| 1 | 2,112 | 1,842 | 2,672 |
+| 4 | 6,129 | 6,593 | 7,836 |
+| 8 | 5,975 | 7,678 | 7,688 |
+
+The transfer queue helps once several streams are in flight (+8% at 4, +28% at 8) and costs a
+little for a single stream (extra submission). Removing the copy entirely bounds the gain: with the
+GPU copy skipped, 4 streams reached 7,687 fps, and with the host memcpy skipped too, 8,901.
+The Mali has no transfer-only family and writes frames straight into mapped device memory, so this
+option does not apply there.
+
+**Zero-copy import.** The RX 9060 XT imports the caller's aligned buffer with
+`VK_EXT_external_memory_host` (`Buffer::ImportHostPointer`, `GpuDetector::ImportHostFrame`): +28%
+at 4 streams, +29% at 8, +26% for one stream. On the Orange Pi the Mali driver (g24p0) does **not**
+expose `VK_EXT_external_memory_host`; it exposes `VK_EXT_external_memory_dma_buf` and
+`VK_KHR_external_memory_fd`, so `Buffer::ImportDmaBuf` / `GpuDetector::ImportDmaBufFrame` import a
+dma-buf instead (`tools/dmabuf_import_test`). A dma-heap buffer produced identical quads to the copy
+path and cut `Detect()` from 2.79 to 2.60 ms. UVC capture buffers (V4L2 `mmap`, `VIDIOC_EXPBUF`)
+import successfully as well, and `decimate_yuyv` reads the luma out of the YUYV frame on the GPU.
+The catch is cache coherency: uvcvideo fills its buffers with the CPU and its vmalloc dma-buf
+exporter has no CPU-access sync, so `DMA_BUF_IOCTL_SYNC` does nothing and the GPU read stale data
+(0-39% of frames matched the copy path). Cleaning the CPU cache first with `dc civac` over the buffer
+(EL0-legal on arm64) made 100 of 100 frames identical at 640x480, 1280x720 and 1920x1080, for a
+flush cost of 0.03 / 0.08 / 0.17 ms. Host time per frame, copy path (CPU luma extraction, upload,
+`Detect`) versus import (`Detect`): 2.07 vs 1.52 ms at 640x480, 3.86 vs 2.98 at 1280x720 and 8.66 vs
+6.02 at 1920x1080 (governors pinned).
+
+Combining: batching adds nothing on top of concurrent streams, and import subsumes the transfer
+queue (no staged copy is left to move), so the practical combination is import plus alternating
+families.
+
 ## 9. Measuring
 
 ```
