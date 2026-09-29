@@ -869,19 +869,10 @@ All runs use `bench_multiqueue` (one device, `FramePipeline` per stream, `ultraf
 GPU is the limit), ABBA-ordered, median of 6 rounds, every result checked against the reference
 detections (no mismatches).
 
-**Batching** (`--mosaic K`: K camera images tiled into one frame, one dispatch; all K tags found).
-Cameras per second:
-
-| | RX 9060 XT | Mali-G610 |
-| --- | --- | --- |
-| K separate streams (4 / 8 on RX, 4 on Mali) | 5,956 / 5,925 | 428 |
-| 1 stream, single camera | 2,121 | 340 |
-| 1 stream, mosaic of 4 | 3,659 | 433 |
-| 2 streams, mosaic of 4 (8 cameras) | 5,377 | - |
-| 2 streams, mosaic of 2 (4 cameras) | 5,397 | 441 |
-
-Batching helps a lone stream (1.7x on the RX, 1.27x on the Mali) but not beyond what concurrent
-streams already reach; both GPUs saturate at the same level either way.
+**Batching** (several cameras tiled into one frame and detected in one dispatch) was tried with a
+throwaway mosaic mode and removed: it raised a lone stream's cameras/s by 1.7x (RX 9060 XT) and
+1.27x (Mali-G610), but concurrent streams already reach the same saturation level, so it adds
+nothing to a multi-camera setup and nothing for a single camera.
 
 **Transfer-only queue** (RX 9060 XT; `--async-upload`: the staged copy runs on family 2, the first
 compute submission waits on a semaphore). Total fps, alternating compute families:
@@ -892,11 +883,18 @@ compute submission waits on a semaphore). Total fps, alternating compute familie
 | 4 | 6,129 | 6,593 | 7,836 |
 | 8 | 5,975 | 7,678 | 7,688 |
 
-The transfer queue helps once several streams are in flight (+8% at 4, +28% at 8) and costs a
-little for a single stream (extra submission). Removing the copy entirely bounds the gain: with the
-GPU copy skipped, 4 streams reached 7,687 fps, and with the host memcpy skipped too, 8,901.
-The Mali has no transfer-only family and writes frames straight into mapped device memory, so this
-option does not apply there.
+The transfer queue helps once several streams are in flight (+8% at 4, +28% at 8) and costs about
+10% for a single stream (extra submission), so it is opt-in (`--async-upload`,
+`ContextOptions::use_transfer_family` plus the `GpuDetector` overload taking a transfer `Lane`).
+It is a fallback for discrete GPUs where import is unavailable: the driver lacks
+`VK_EXT_external_memory_host`, or the caller's buffer cannot be imported (host-pointer import needs
+the pointer and size aligned to `minImportedHostPointerAlignment`, 4096 on this card, which arbitrary
+buffers such as JNI or `cv::Mat` data are not). The GPU-side semaphore that orders the copy before
+the first compute submission is worth 5-7% at 1-4 streams and 1.5% at 8 over waiting for the copy's
+fence on the CPU (1,829 vs 1,715 fps at 1 stream, 6,381 vs 6,069 at 4, 7,636 vs 7,520 at 8).
+Removing the copy entirely bounds the gain: with the GPU copy skipped, 4 streams reached 7,687 fps,
+and with the host memcpy skipped too, 8,901. The Mali has no transfer-only family and writes frames
+straight into mapped device memory, so this option does not apply there.
 
 **Zero-copy import.** The RX 9060 XT imports the caller's aligned buffer with
 `VK_EXT_external_memory_host` (`Buffer::ImportHostPointer`, `GpuDetector::ImportHostFrame`): +28%
@@ -914,9 +912,9 @@ flush cost of 0.03 / 0.08 / 0.17 ms. Host time per frame, copy path (CPU luma ex
 `Detect`) versus import (`Detect`): 2.07 vs 1.52 ms at 640x480, 3.86 vs 2.98 at 1280x720 and 8.66 vs
 6.02 at 1920x1080 (governors pinned).
 
-Combining: batching adds nothing on top of concurrent streams, and import subsumes the transfer
-queue (no staged copy is left to move), so the practical combination is import plus alternating
-families.
+Combining: import subsumes the transfer queue (no staged copy is left to move), so the practical
+combination is import plus alternating families, with the transfer queue as the fallback when
+import is unavailable.
 
 ## 9. Measuring
 

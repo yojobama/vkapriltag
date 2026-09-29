@@ -1,7 +1,8 @@
 // Simulates several cameras sharing one GPU: one Context (one VkDevice), and per stream a Lane
 // (queue), GpuDetector, QuadDecode, TagDecoder and FramePipeline, fed by its own thread.
 // Usage: bench_multiqueue --pgm <file> [--streams N] [--mode single|per-stream|alternate]
-//   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N]
+//   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N] [--import]
+//   [--async-upload]
 // single: every stream shares queue 0. per-stream: one queue per stream on the primary family.
 // alternate: queues interleaved across both compute families. --fps paces each stream like a
 // camera (0 = free-running).
@@ -94,7 +95,6 @@ int main(int argc, char **argv) {
   double fps = 0.0;
   bool async_upload = false;  // stage-copy the frame on a transfer-only queue
   bool import_frames = false;  // zero-copy host-pointer import of the frame buffers
-  int mosaic = 1;  // cameras composed into each frame (1, 2 or 4)
   uint32_t decimation = 2;
 
   for (int i = 1; i < argc; ++i) {
@@ -120,8 +120,6 @@ int main(int argc, char **argv) {
       import_frames = true;
     } else if (arg == "--async-upload") {
       async_upload = true;
-    } else if (arg == "--mosaic") {
-      mosaic = std::stoi(next());
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -143,30 +141,6 @@ int main(int argc, char **argv) {
     std::cerr << "Failed to load PGM: " << pgm_path << std::endl;
     return 1;
   }
-  if (mosaic == 2 || mosaic == 4) {
-    // Tiles the camera image into one larger frame with a 16-pixel mid-grey gap between images, so
-    // one dispatch covers several cameras.
-    constexpr uint32_t kGap = 16;
-    const uint32_t cols = 2, rows = mosaic / 2;
-    const uint32_t mw = cols * width + (cols - 1) * kGap, mh = rows * height + (rows - 1) * kGap;
-    std::vector<uint8_t> big(static_cast<size_t>(mw) * mh, 128);
-    for (uint32_t r = 0; r < rows; ++r) {
-      for (uint32_t c = 0; c < cols; ++c) {
-        for (uint32_t y = 0; y < height; ++y) {
-          std::copy_n(&gray[static_cast<size_t>(y) * width],
-                      width, &big[static_cast<size_t>(r * (height + kGap) + y) * mw +
-                                  c * (width + kGap)]);
-        }
-      }
-    }
-    gray = std::move(big);
-    width = mw;
-    height = mh;
-  } else if (mosaic != 1) {
-    std::cerr << "--mosaic must be 1, 2 or 4\n";
-    return 1;
-  }
-
   apriltag_family_t *tf = nullptr;
   if (!setup_tag_family(&tf, "tag36h11")) return 1;
 
@@ -283,9 +257,8 @@ int main(int argc, char **argv) {
     const double total_fps = static_cast<double>(streams) * iterations / wall_s;
     std::cout << "mode=" << mode << " streams=" << streams << " queues=" << queue_count
               << " cpu_threads=" << cpu_threads << " target_fps=" << fps
-              << " import=" << import_frames << " async_upload=" << async_upload << " mosaic=" << mosaic << " tags_per_frame=" << g_expected_ids.size()
+              << " import=" << import_frames << " async_upload=" << async_upload
               << " total_fps=" << total_fps
-              << " cameras_per_s=" << total_fps * mosaic
               << " per_stream_fps=" << total_fps / streams
               << " latency_med_ms=" << all[all.size() / 2]
               << " latency_p99_ms=" << all[static_cast<size_t>(all.size() * 0.99)]
