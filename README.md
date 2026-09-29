@@ -35,7 +35,8 @@ optional fourth for pose:
    Which implementation runs is `APRILTAG_VK_REFINE`'s choice: `exact` (the
    default) is bit-identical to upstream *by construction* but drops the libm
    `modf()` call from the inner loop, worth 25% of this stage on ARM; `fast`
-   additionally narrows the innermost sampling loop to float; `upstream` calls
+   is a single-precision variant that also skips refinement for quads that
+   do not decode unrefined (faster, slightly lower recall on marginal tags); `upstream` calls
    upstream's actual compiled function, so any suspected corner-accuracy
    regression can be isolated with one environment variable.
 

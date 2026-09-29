@@ -418,9 +418,18 @@ implementations:
   to upstream *by construction*, not by measurement: `modf(x, &i)` is defined
   to return `x - trunc(x)` and both results are exactly representable. What it
   removes is a non-inlinable libm call from the innermost loop.
-- **`fast`** — additionally narrows the innermost sampling loop to float. The
-  per-edge line fit stays double regardless: it builds a covariance from raw
-  second moments, a near-total cancellation that float would destroy.
+- **`fast`** — single-precision refinement, not bit-identical to `exact`. Each
+  sample's search profile is evaluated once per position (the far gradient tap
+  is the near tap eight steps earlier), the weighting pass is branch-free with
+  independent accumulators, and the line fit uses moments centred on the edge
+  midpoint, which removes the cancellation that previously forced double. In
+  addition `TagDecoder` refines only quads that already decode unrefined.
+  Measured on the RX 9060 XT (`grayimage.pgm`, 75 quads, 1 tag): `tag_decode`
+  0.27 -> 0.24 ms from the float/profile changes alone, -> 0.095 ms with the
+  gate. The gate costs recall on the synthetic sweep (663 vs 687 decoded of
+  768 with `--refine-edges`) because marginal small tags that only decode after
+  refinement are rejected; with the gate off, recall and pose accuracy match
+  `exact`.
 - **`upstream`** — calls upstream's compiled function. Use it to isolate any
   suspected corner-accuracy regression to this code.
 
@@ -608,8 +617,8 @@ mantissa makes integers above 2048 round to even, and `x2` reaches 3839 at
 of the frame, feeding straight into corner positions. Integer packing has no
 such cliff. Storing the *moments* as fp16 is further out still: the CPU
 rebuilds `Mxx/Mxy/Myy` in native `int64` precisely because the covariance is
-a near-total cancellation, the same reason section 4's `fast` refinement
-keeps its line fit in double.
+a near-total cancellation, the same reason `exact` refinement keeps
+its line fit in double.
 
 ### 6c. `uf_compress` skips its read pass when the labelling has converged
 
