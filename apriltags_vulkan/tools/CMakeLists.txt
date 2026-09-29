@@ -56,6 +56,12 @@ add_executable(bench_multiqueue bench_multiqueue/bench_multiqueue.cpp)
 target_link_libraries(bench_multiqueue PRIVATE vkapriltag::vkapriltag)
 install(TARGETS bench_multiqueue RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+if(UNIX)
+  # Imports a dma-buf (dma-heap allocation or V4L2 capture buffer) as the detector's input frame.
+  add_executable(dmabuf_import_test dmabuf_import_test/dmabuf_import_test.cpp)
+  target_link_libraries(dmabuf_import_test PRIVATE vkapriltag::vkapriltag)
+endif()
+
 # Pose verification: compares PoseEstimator with libapriltag's apriltag_pose.c stage by stage over a synthetic sweep,
 # degenerate geometry and (with --data) real detections. Needs no OpenCV.
 add_executable(apriltag_pose_validate validate_pose/validate_pose.cpp)

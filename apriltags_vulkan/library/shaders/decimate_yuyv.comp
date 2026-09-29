@@ -1,0 +1,27 @@
+#version 450
+// decimate.comp reading the luma of a packed YUYV (Y0 U Y1 V) frame; two bytes per pixel, so pixel
+// p's luma is byte 2 * p.
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+// Specialisation constant, resolved at pipeline creation.
+layout(constant_id = 3) const uint kDecimation = 2u;
+
+layout(std430, binding = 0) readonly buffer YuyvImage { uint yuyv_packed[]; };
+layout(std430, binding = 1) writeonly buffer DecimatedImage { uint decimated[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint decimated_width;
+  uint decimated_height;
+} pc;
+
+void main() {
+  uint dx = gl_GlobalInvocationID.x;
+  uint dy = gl_GlobalInvocationID.y;
+  if (dx >= pc.decimated_width || dy >= pc.decimated_height) return;
+
+  uint sx = dx * kDecimation;
+  uint sy = dy * kDecimation;
+
+  uint byte_offset = 2u * (sy * (pc.decimated_width * kDecimation) + sx);
+  uint word = yuyv_packed[byte_offset >> 2u];
+  decimated[dy * pc.decimated_width + dx] = (word >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}

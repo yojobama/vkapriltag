@@ -193,7 +193,9 @@ class GpuDetector {
   // pointer is also the key). dma-buf: `key` is any unique pointer the caller later passes to
   // Detect; the descriptor is duplicated.
   void ImportHostFrame(const uint8_t *ptr, size_t bytes);
-  void ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t bytes);
+  // With `yuyv`, the buffer is a packed YUYV frame (2 bytes per pixel, no row padding) and only its
+  // luma is read.
+  void ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t bytes, bool yuyv = false);
 
   const DetectorConfig &config() const { return config_; }
   const DetectProfile &last_profile() const { return last_profile_; }
@@ -332,7 +334,7 @@ class GpuDetector {
     vk::ComputePipeline decimate;
   };
   std::vector<ImportedFrame> imported_frames_;
-  void AddImportedFrame(const uint8_t *key, vk::Buffer buffer);
+  void AddImportedFrame(const uint8_t *key, vk::Buffer buffer, bool yuyv);
   vk::ComputePipeline block_minmax_pl_;
   vk::ComputePipeline block_filter_pl_;
   vk::ComputePipeline threshold_pl_;

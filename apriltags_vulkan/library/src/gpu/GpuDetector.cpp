@@ -549,26 +549,29 @@ void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
 
-void GpuDetector::AddImportedFrame(const uint8_t *key, vk::Buffer buffer) {
+void GpuDetector::AddImportedFrame(const uint8_t *key, vk::Buffer buffer, bool yuyv) {
   const bool u8 = ctx_.caps().has_8bit_storage;
   ImportedFrame frame;
   frame.key = key;
   frame.decimate = vk::ComputePipeline(
-      ctx_, ShaderPath(u8 ? "decimate_u8" : "decimate"), {buffer.get(), decimated_buf_.get()}, 8,
-      wg2d_, {config_.decimation});
+      ctx_,
+      ShaderPath(yuyv ? (u8 ? "decimate_yuyv_u8" : "decimate_yuyv") : (u8 ? "decimate_u8" : "decimate")),
+      {buffer.get(), decimated_buf_.get()}, 8, wg2d_, {config_.decimation});
   frame.buffer = std::move(buffer);
   imported_frames_.push_back(std::move(frame));
 }
 
 void GpuDetector::ImportHostFrame(const uint8_t *ptr, size_t bytes) {
-  AddImportedFrame(ptr, vk::Buffer::ImportHostPointer(
-                            ctx_, const_cast<uint8_t *>(ptr), bytes,
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+  AddImportedFrame(ptr,
+                   vk::Buffer::ImportHostPointer(ctx_, const_cast<uint8_t *>(ptr), bytes,
+                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
+                   false);
 }
 
-void GpuDetector::ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t bytes) {
-  AddImportedFrame(key, vk::Buffer::ImportDmaBuf(ctx_, dmabuf_fd, bytes,
-                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
+void GpuDetector::ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t bytes, bool yuyv) {
+  AddImportedFrame(key,
+                   vk::Buffer::ImportDmaBuf(ctx_, dmabuf_fd, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT),
+                   yuyv);
 }
 
 void GpuDetector::Detect(const uint8_t *gray_frame) {
