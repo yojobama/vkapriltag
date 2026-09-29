@@ -41,6 +41,8 @@ struct ContextOptions {
   uint32_t queues_per_family = 1;
   // Also creates queues on the first other compute-capable family.
   bool use_secondary_compute_family = false;
+  // Also creates queues on a transfer-only family (if the device has one), for Context::CreateTransferLane.
+  bool use_transfer_family = false;
 
   // Enable VK_LAYER_KHRONOS_validation when it is installed.
   // Env override: APRILTAG_VK_VALIDATION=1
@@ -178,6 +180,13 @@ public:
   // A submission lane on queue `slot`. Must be destroyed before the Context.
   std::unique_ptr<Lane> CreateLane(size_t slot) const;
 
+  // Lanes on the transfer-only family (see ContextOptions::use_transfer_family); index wraps.
+  size_t transfer_queue_count() const { return transfer_queues_.size(); }
+  std::unique_ptr<Lane> CreateTransferLane(size_t index) const;
+
+  // Every queue family the device was created with.
+  const std::vector<uint32_t> &queue_families() const { return queue_families_; }
+
   // The lane on queue 0, used by the forwarding functions below.
   Lane &default_lane() const { return *default_lane_; }
 
@@ -219,6 +228,8 @@ public:
   VkQueue queue_ = VK_NULL_HANDLE;
   uint32_t queue_family_ = 0;
   std::vector<QueueSlot> queues_;
+  std::vector<QueueSlot> transfer_queues_;
+  std::vector<uint32_t> queue_families_;
   std::unique_ptr<Lane> default_lane_;
 
   VkPhysicalDeviceMemoryProperties mem_props_{};
@@ -252,8 +263,14 @@ class Lane {
   // Begins recording into a pooled command buffer, first waiting for its previous submission.
   VkCommandBuffer BeginCommands();
 
-  // Ends, submits and waits on a fence; the command buffer is recycled.
-  void SubmitAndWait(VkCommandBuffer cmd);
+  // Ends, submits and waits on a fence; the command buffer is recycled. Optionally waits on
+  // `wait` at `wait_stage` first.
+  void SubmitAndWait(VkCommandBuffer cmd, VkSemaphore wait = VK_NULL_HANDLE,
+                     VkPipelineStageFlags wait_stage = 0);
+
+  // Ends and submits, signalling `signal`, without waiting; the command buffer's ring slot is
+  // reused only after its fence signals (checked by the next BeginCommands on this slot).
+  void SubmitSignal(VkCommandBuffer cmd, VkSemaphore signal);
 
   // Queue submissions since construction.
   uint64_t submit_count = 0;

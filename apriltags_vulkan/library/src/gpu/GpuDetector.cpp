@@ -67,7 +67,24 @@ GpuDetector::GpuDetector(vk::Context &ctx, const DetectorConfig &config)
     : GpuDetector(ctx, ctx.default_lane(), config) {}
 
 GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig &config)
-    : ctx_(ctx), lane_(lane), config_(config) {
+    : GpuDetector(ctx, lane, nullptr, config) {}
+
+GpuDetector::~GpuDetector() {
+  if (upload_semaphore_ != VK_NULL_HANDLE) {
+    vkDeviceWaitIdle(ctx_.device());
+    vkDestroySemaphore(ctx_.device(), upload_semaphore_, nullptr);
+  }
+}
+
+GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_lane,
+                         const DetectorConfig &config)
+    : ctx_(ctx), lane_(lane), transfer_lane_(transfer_lane), config_(config) {
+  if (transfer_lane_ != nullptr) {
+    VkSemaphoreCreateInfo sem_info{};
+    sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    vk::CheckVk(vkCreateSemaphore(ctx_.device(), &sem_info, nullptr, &upload_semaphore_),
+            "vkCreateSemaphore");
+  }
   if (config_.decimation == 0) {
     throw std::runtime_error("decimation must be >= 1");
   }
@@ -208,7 +225,8 @@ void GpuDetector::CreateBuffers() {
       ctx_, VkDeviceSize(gray_words_) * 4,
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
       ctx_.caps().unified_memory ? vk::MemoryKind::DeviceLocalMapped
-                                 : vk::MemoryKind::DeviceLocal);
+                                 : vk::MemoryKind::DeviceLocal,
+      transfer_lane_ != nullptr ? ctx_.queue_families() : std::vector<uint32_t>{});
   device_bytes_ += gray_buf_.size();
   gray_direct_write_ = gray_buf_.host_visible();
 
@@ -545,7 +563,8 @@ VkCommandBuffer GpuDetector::BeginTimedCommands() {
 
 void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
   const auto t0 = Clock::now();
-  lane_.SubmitAndWait(cmd);
+  lane_.SubmitAndWait(cmd, pending_wait_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  pending_wait_ = VK_NULL_HANDLE;
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
 
@@ -598,6 +617,13 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     upload_staging_.Write(gray_frame, gray_bytes);
   }
   const auto t_upload1 = Clock::now();
+  if (transfer_lane_ != nullptr && !gray_direct_write_ && imported == nullptr) {
+    // The staged frame is copied on the transfer queue; the first compute submission waits for it.
+    VkCommandBuffer tcmd = transfer_lane_->BeginCommands();
+    gray_buf_.RecordCopyFrom(tcmd, upload_staging_, gray_bytes);
+    transfer_lane_->SubmitSignal(tcmd, upload_semaphore_);
+    pending_wait_ = upload_semaphore_;
+  }
 
   // Push constants shared across several stages.
   // decimate_pl_ takes the decimated dimensions directly; decimation is a specialization constant.
@@ -620,7 +646,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   VkCommandBuffer cmd = BeginTimedCommands();
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
-  if (!gray_direct_write_ && imported == nullptr) {
+  if (!gray_direct_write_ && imported == nullptr && transfer_lane_ == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanClear));

@@ -484,14 +484,33 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   const uint32_t wanted_queues = std::max(1u, options.queues_per_family);
   std::vector<uint32_t> queue_counts;
   for (uint32_t f : families) queue_counts.push_back(std::min(wanted_queues, qfs[f].queueCount));
-  const std::vector<float> priorities(*std::max_element(queue_counts.begin(), queue_counts.end()),
-                                      1.0f);
-  std::vector<VkDeviceQueueCreateInfo> queue_infos(families.size());
-  for (size_t k = 0; k < families.size(); ++k) {
+  uint32_t transfer_family = UINT32_MAX, transfer_count = 0;
+  if (options.use_transfer_family) {
+    for (uint32_t i = 0; i < qf_count; ++i) {
+      const VkQueueFlags f = qfs[i].queueFlags;
+      if ((f & VK_QUEUE_TRANSFER_BIT) && !(f & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT))) {
+        transfer_family = i;
+        transfer_count = std::min(wanted_queues, qfs[i].queueCount);
+        break;
+      }
+    }
+  }
+  const uint32_t max_queues =
+      std::max(*std::max_element(queue_counts.begin(), queue_counts.end()), transfer_count);
+  const std::vector<float> priorities(max_queues, 1.0f);
+  std::vector<uint32_t> all_families = families;
+  std::vector<uint32_t> all_counts = queue_counts;
+  if (transfer_family != UINT32_MAX) {
+    all_families.push_back(transfer_family);
+    all_counts.push_back(transfer_count);
+  }
+  queue_families_ = all_families;
+  std::vector<VkDeviceQueueCreateInfo> queue_infos(all_families.size());
+  for (size_t k = 0; k < all_families.size(); ++k) {
     queue_infos[k] = {};
     queue_infos[k].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queue_infos[k].queueFamilyIndex = families[k];
-    queue_infos[k].queueCount = queue_counts[k];
+    queue_infos[k].queueFamilyIndex = all_families[k];
+    queue_infos[k].queueCount = all_counts[k];
     queue_infos[k].pQueuePriorities = priorities.data();
   }
 
@@ -587,6 +606,16 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     }
   }
   queue_ = queues_.front().queue;
+  if (transfer_family != UINT32_MAX) {
+    for (uint32_t index = 0; index < transfer_count; ++index) {
+      QueueSlot slot;
+      slot.family = transfer_family;
+      slot.index = index;
+      vkGetDeviceQueue(device_, slot.family, slot.index, &slot.queue);
+      slot.submit_mutex = std::make_unique<std::mutex>();
+      transfer_queues_.push_back(std::move(slot));
+    }
+  }
 
   if (supports_external_memory_host_) {
     get_host_pointer_properties_ = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
@@ -943,6 +972,12 @@ uint32_t Context::DmaBufMemoryTypeBits(int fd) const {
   return props.memoryTypeBits;
 }
 
+std::unique_ptr<Lane> Context::CreateTransferLane(size_t index) const {
+  if (transfer_queues_.empty()) throw std::runtime_error("No transfer-only queue family");
+  const QueueSlot &q = transfer_queues_[index % transfer_queues_.size()];
+  return std::unique_ptr<Lane>(new Lane(device_, q.queue, q.family, q.submit_mutex.get()));
+}
+
 std::unique_ptr<Lane> Context::CreateLane(size_t slot) const {
   if (slot >= queues_.size()) throw std::runtime_error("Queue slot out of range");
   const QueueSlot &q = queues_[slot];
@@ -1028,7 +1063,7 @@ VkCommandBuffer Lane::BeginCommands() {
   return cmd_ring_[i];
 }
 
-void Lane::SubmitAndWait(VkCommandBuffer cmd) {
+void Lane::SubmitSignal(VkCommandBuffer cmd, VkSemaphore signal) {
   const size_t i = ring_active_;
   CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
@@ -1036,6 +1071,29 @@ void Lane::SubmitAndWait(VkCommandBuffer cmd) {
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.commandBufferCount = 1;
   submit_info.pCommandBuffers = &cmd;
+  submit_info.signalSemaphoreCount = 1;
+  submit_info.pSignalSemaphores = &signal;
+
+  {
+    std::lock_guard<std::mutex> lock(*submit_mutex_);
+    CheckVk(vkQueueSubmit(queue_, 1, &submit_info, fence_ring_[i]), "vkQueueSubmit");
+  }
+  ++submit_count;
+}
+
+void Lane::SubmitAndWait(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage) {
+  const size_t i = ring_active_;
+  CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+
+  VkSubmitInfo submit_info{};
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &cmd;
+  if (wait != VK_NULL_HANDLE) {
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = &wait;
+    submit_info.pWaitDstStageMask = &wait_stage;
+  }
 
   {
     std::lock_guard<std::mutex> lock(*submit_mutex_);

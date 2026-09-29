@@ -36,7 +36,9 @@ enum class MemoryKind {
 class Buffer {
  public:
   Buffer() = default;
-  Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, MemoryKind kind);
+  // With two or more `concurrent_families`, the buffer is shared between those queue families.
+  Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, MemoryKind kind,
+         const std::vector<uint32_t> &concurrent_families = {});
 
   // A buffer backed by caller memory (VK_EXT_external_memory_host). `ptr` and `size` must be
   // multiples of caps().min_host_pointer_alignment and the memory must outlive the buffer.

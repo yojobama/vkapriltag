@@ -182,6 +182,11 @@ class GpuDetector {
   GpuDetector(vk::Context &ctx, const DetectorConfig &config);
   // As above, submitting through `lane`, which must outlive the detector.
   GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig &config);
+  // As above, and when the frame is staged (discrete GPUs) the upload copy runs on `transfer_lane`
+  // (a transfer-only queue) and the first compute submission waits for it.
+  GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_lane,
+              const DetectorConfig &config);
+  ~GpuDetector();
 
   // Runs the GPU pipeline on one grayscale frame; results land in last_selected_extents and
   // last_line_fit_points.
@@ -239,6 +244,9 @@ class GpuDetector {
 
   vk::Context &ctx_;
   vk::Lane &lane_;
+  vk::Lane *transfer_lane_ = nullptr;
+  VkSemaphore upload_semaphore_ = VK_NULL_HANDLE;
+  VkSemaphore pending_wait_ = VK_NULL_HANDLE;
   DetectorConfig config_;
 
   // Launch geometry, taken from the device's limits.

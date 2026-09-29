@@ -47,6 +47,7 @@ using Ms = std::chrono::duration<double, std::milli>;
 
 struct Stream {
   std::unique_ptr<apriltag_vulkan::vk::Lane> lane;
+  std::unique_ptr<apriltag_vulkan::vk::Lane> transfer_lane;
   std::unique_ptr<apriltag_vulkan::GpuDetector> detector;
   std::unique_ptr<apriltag_vulkan::QuadDecode> quad_decode;
   apriltag_detector_t *td = nullptr;
@@ -91,6 +92,7 @@ int main(int argc, char **argv) {
   std::string pgm_path, mode = "per-stream";
   int streams = 1, iterations = 300, cpu_threads = 0, family = -1;
   double fps = 0.0;
+  bool async_upload = false;  // stage-copy the frame on a transfer-only queue
   bool import_frames = false;  // zero-copy host-pointer import of the frame buffers
   int mosaic = 1;  // cameras composed into each frame (1, 2 or 4)
   uint32_t decimation = 2;
@@ -116,6 +118,8 @@ int main(int argc, char **argv) {
       family = std::stoi(next());
     } else if (arg == "--import") {
       import_frames = true;
+    } else if (arg == "--async-upload") {
+      async_upload = true;
     } else if (arg == "--mosaic") {
       mosaic = std::stoi(next());
     } else {
@@ -180,6 +184,7 @@ int main(int argc, char **argv) {
     apriltag_vulkan::vk::ContextOptions opts;
     opts.queue_family = family;
     opts.queues_per_family = static_cast<uint32_t>(streams);
+    opts.use_transfer_family = async_upload;
     opts.use_secondary_compute_family = (mode == "alternate");
     apriltag_vulkan::vk::Context ctx(opts);
     queue_count = ctx.queue_count();
@@ -194,7 +199,16 @@ int main(int argc, char **argv) {
       Stream &st = pool[static_cast<size_t>(s)];
       const size_t slot = (mode == "single") ? 0 : slots[static_cast<size_t>(s) % slots.size()];
       st.lane = ctx.CreateLane(slot);
-      st.detector = std::make_unique<apriltag_vulkan::GpuDetector>(ctx, *st.lane, config);
+      if (async_upload) {
+        if (ctx.transfer_queue_count() == 0) {
+          std::cerr << "warning: no transfer-only queue family; --async-upload ignored\n";
+          async_upload = false;
+        } else {
+          st.transfer_lane = ctx.CreateTransferLane(static_cast<size_t>(s));
+        }
+      }
+      st.detector = std::make_unique<apriltag_vulkan::GpuDetector>(
+          ctx, *st.lane, st.transfer_lane.get(), config);
       st.quad_decode = std::make_unique<apriltag_vulkan::QuadDecode>(config);
       st.td = apriltag_detector_create();
       apriltag_detector_add_family(st.td, tf);
@@ -269,7 +283,7 @@ int main(int argc, char **argv) {
     const double total_fps = static_cast<double>(streams) * iterations / wall_s;
     std::cout << "mode=" << mode << " streams=" << streams << " queues=" << queue_count
               << " cpu_threads=" << cpu_threads << " target_fps=" << fps
-              << " import=" << import_frames << " mosaic=" << mosaic << " tags_per_frame=" << g_expected_ids.size()
+              << " import=" << import_frames << " async_upload=" << async_upload << " mosaic=" << mosaic << " tags_per_frame=" << g_expected_ids.size()
               << " total_fps=" << total_fps
               << " cameras_per_s=" << total_fps * mosaic
               << " per_stream_fps=" << total_fps / streams

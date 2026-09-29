@@ -47,13 +47,19 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
 
 }  // namespace
 
-Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, MemoryKind kind)
+Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, MemoryKind kind,
+               const std::vector<uint32_t> &concurrent_families)
     : device_(ctx.device()), size_(std::max<VkDeviceSize>(size, 4)) {
   VkBufferCreateInfo buffer_info{};
   buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   buffer_info.size = size_;
   buffer_info.usage = usage;
   buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (concurrent_families.size() >= 2) {
+    buffer_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(concurrent_families.size());
+    buffer_info.pQueueFamilyIndices = concurrent_families.data();
+  }
   CheckVk(vkCreateBuffer(device_, &buffer_info, nullptr, &buffer_), "vkCreateBuffer");
 
   VkMemoryRequirements mem_reqs{};
