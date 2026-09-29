@@ -795,6 +795,19 @@ what one shared device would achieve; other GPUs (Mali, integrated) were not mea
 CPU tail on and one decode thread per stream, throughput scales with CPU cores instead (387 fps
 for one stream, 2,529 for eight).
 
+On the Orange Pi 5 Plus (Mali-G610, one graphics+compute family with 2 queues, DRAM and GPU
+governors pinned to `performance` for the run and then restored) the same experiment shows almost
+no gain, so the GPU is already saturated by one stream:
+
+| Streams | GPU-pass fps (median of 6 rounds) | Frame median |
+| --- | --- | --- |
+| 1 | 365 | 2.76 ms |
+| 2 | 390 | 2.93 ms |
+| 4 | 377 | 3.21 ms |
+
+With the CPU tail on and one decode thread per stream: 149 / 267 / 313 fps for 1 / 2 / 4 streams,
+limited by the 8 CPU cores.
+
 ## 9. Measuring
 
 ```
