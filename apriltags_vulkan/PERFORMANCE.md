@@ -912,6 +912,35 @@ flush cost of 0.03 / 0.08 / 0.17 ms. Host time per frame, copy path (CPU luma ex
 `Detect`) versus import (`Detect`): 2.07 vs 1.52 ms at 640x480, 3.86 vs 2.98 at 1280x720 and 8.66 vs
 6.02 at 1920x1080 (governors pinned).
 
+**Re-measured with the tracer (RX 9060 XT, `apriltag_vulkan_validate --import`).** The tool detects
+the same frame from a plain buffer (staged copy) and from an aligned, imported copy, ABBA-ordered in
+one process (4 rounds x 2 x 500 frames per path, three repeats; GPU spans need
+`APRILTAG_VK_TIMESTAMPS=1` or `--profile`). `scale_1` (1280x800), median ms:
+
+| | copy | import | |
+| --- | --- | --- | --- |
+| `Detect()` | 0.565 | 0.484 | -14.2 to -14.4% |
+| host memcpy | 0.054 | 0.000 | -100% |
+| GPU span `threshold` | 0.013 | 0.035 | +21 us |
+| `pipeline_total` | 1.02 | 0.94 | -7.6 to -7.9% |
+
+At 640x400 the gain is smaller: `Detect()` -6.1%, `pipeline_total` -3.4%. The saving is the memcpy
+(55 us) plus the staging-to-device copy, minus 21 us that `decimate` now spends reading the frame
+across PCIe, which is why `threshold` grows. The staging copy is recorded before the `clear` span
+starts, so no span shows it. Output is bit-identical: every frame's quads match the first
+copy-path frame's with a worst corner deviation of 0 px on both paths, and 5 of 5 corpus images
+match libapriltag.
+
+`bench_multiqueue --import` (`ultrafast` refine, `single` mode, 1,500 frames per stream, ABBA, three
+rounds, `grayimage.pgm`), total fps, median: 1 stream 2,079 -> 2,773 (+33.4%), 4 streams 4,421 ->
+4,806 (+8.7%), 8 streams 4,437 -> 4,845 (+9.2%), no mismatches. The multi-stream gain is below the
++28% above, but that table used alternating queue families and this one a shared queue, so the
+baselines differ.
+
+Determinism note from building this check: the GPU does not emit candidate quads in a fixed order.
+Across frames of the same image the 75 quads are identical in value but arrive in a different
+order, so comparing frames needs an order-insensitive match, not a byte compare.
+
 Combining: import subsumes the transfer queue (no staged copy is left to move), so the practical
 combination is import plus alternating families, with the transfer queue as the fallback when
 import is unavailable.

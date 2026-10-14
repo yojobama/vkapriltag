@@ -4,17 +4,26 @@
 // header-only and OpenCV-free.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/common/Profiler.h"
 #include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/QuadDecode.h"
 
 extern "C" {
 #include "apriltag.h"
@@ -274,6 +283,156 @@ inline void AppendCsvRow(const std::string &path, const ImageMetrics &m) {
     << m.uf_iterations << ',' << (m.uf_converged ? 1 : 0) << ',' << (m.ids_match ? 1 : 0) << ','
     << m.corners.compared_tags << ',' << m.corners.mean_rms << ',' << m.corners.max_rms << ','
     << m.dp_attempts << ',' << m.dp_fallbacks << '\n';
+}
+
+// A zero-padded copy of a frame in memory that VK_EXT_external_memory_host can import: the pointer
+// and the allocation are multiples of `alignment`. data() holds the frame; alloc_bytes() is the
+// size to pass to GpuDetector::ImportHostFrame.
+class AlignedFrame {
+ public:
+  AlignedFrame(const uint8_t *src, size_t bytes, size_t alignment) {
+    alloc_bytes_ = (bytes + alignment - 1) / alignment * alignment;
+#ifdef _WIN32
+    data_ = static_cast<uint8_t *>(_aligned_malloc(alloc_bytes_, alignment));
+#else
+    data_ = static_cast<uint8_t *>(std::aligned_alloc(alignment, alloc_bytes_));
+#endif
+    if (data_ == nullptr) throw std::bad_alloc();
+    std::memset(data_, 0, alloc_bytes_);
+    std::memcpy(data_, src, bytes);
+  }
+  ~AlignedFrame() {
+#ifdef _WIN32
+    _aligned_free(data_);
+#else
+    std::free(data_);
+#endif
+  }
+  AlignedFrame(const AlignedFrame &) = delete;
+  AlignedFrame &operator=(const AlignedFrame &) = delete;
+
+  uint8_t *data() const { return data_; }
+  size_t alloc_bytes() const { return alloc_bytes_; }
+
+ private:
+  uint8_t *data_ = nullptr;
+  size_t alloc_bytes_ = 0;
+};
+
+// Largest corner distance, in pixels, between each quad in `a` and its nearest quad in `b`
+// (order-insensitive: the GPU does not emit quads in a fixed order). Negative if the counts differ.
+inline double MaxQuadDeviation(const std::vector<apriltag_vulkan::DetectedQuad> &a,
+                               const std::vector<apriltag_vulkan::DetectedQuad> &b) {
+  if (a.size() != b.size()) return -1.0;
+  double worst = 0.0;
+  for (const apriltag_vulkan::DetectedQuad &qa : a) {
+    double best = std::numeric_limits<double>::infinity();
+    for (const apriltag_vulkan::DetectedQuad &qb : b) {
+      double d = 0.0;
+      for (int k = 0; k < 4; ++k) {
+        d = std::max(d, std::hypot(qa.p[k][0] - qb.p[k][0], qa.p[k][1] - qb.p[k][1]));
+      }
+      best = std::min(best, d);
+    }
+    worst = std::max(worst, best);
+  }
+  return worst;
+}
+
+// Frame ingest A/B in one process: the same pixels detected from `plain` (copied into the staging
+// buffer on every frame) and from `imported` (already passed to GpuDetector::ImportHostFrame, so
+// the copy is skipped), ABBA-ordered so thermal drift hits both. Every iteration's quads are
+// compared with the first copy-path frame's: the count must match, and the worst corner deviation
+// is printed for both paths. Per-span columns need APRILTAG_VK_TIMESTAMPS=1 or
+// --profile. Returns the number of frames whose quads differed.
+inline int RunIngestAb(apriltag_vulkan::GpuDetector &detector,
+                       apriltag_vulkan::QuadDecode &quad_decode,
+                       apriltag_vulkan::TagDecoder &tag_decoder, const uint8_t *plain,
+                       const uint8_t *imported, uint32_t width, uint32_t height,
+                       bool reversed_border, int iterations, int rounds = 4) {
+  using Clock = std::chrono::steady_clock;
+  struct Samples {
+    std::vector<double> gpu_total, upload, clear_span, threshold_span, pipeline;
+  };
+  Samples path[2];  // 0 = copy, 1 = import
+  std::vector<apriltag_vulkan::DetectedQuad> reference;
+  bool have_reference = false;
+  int quad_mismatches = 0;
+  // Per path: frames whose quad count differed from the reference, and the worst corner deviation
+  // (pixels) of any frame whose count matched. The copy path's own figure is the run-to-run
+  // baseline the import path is judged against.
+  int count_differs[2] = {0, 0};
+  double worst_deviation[2] = {0.0, 0.0};
+
+  auto run = [&](int which, int n, bool record) {
+    const uint8_t *frame = which == 0 ? plain : imported;
+    for (int it = 0; it < n; ++it) {
+      const auto t0 = Clock::now();
+      detector.Detect(frame);
+      const auto &profile = detector.last_profile();
+      const double gpu_total = profile.total_ms;
+      const double upload = profile.upload_ms;
+      const double clear_span = profile.gpu_stage_ms[0];
+      const double threshold_span = profile.gpu_stage_ms[1];
+      const std::vector<apriltag_vulkan::DetectedQuad> quads =
+          quad_decode.Decode(detector.last_line_fit_points);
+      tag_decoder.Decode(quads, frame, width, height, reversed_border);
+      const double pipeline = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+      if (!have_reference) {
+        reference = quads;
+        have_reference = true;
+      } else {
+        const double dev = MaxQuadDeviation(quads, reference);
+        if (dev < 0.0) {
+          ++quad_mismatches;
+          ++count_differs[which];
+        } else {
+          worst_deviation[which] = std::max(worst_deviation[which], dev);
+        }
+      }
+      if (!record) continue;
+      Samples &s = path[which];
+      s.gpu_total.push_back(gpu_total);
+      s.upload.push_back(upload);
+      s.clear_span.push_back(clear_span);
+      s.threshold_span.push_back(threshold_span);
+      s.pipeline.push_back(pipeline);
+    }
+  };
+
+  run(0, 50, false);  // warm-up; the first copy-path frame becomes the reference
+  run(1, 50, false);
+  for (int r = 0; r < rounds; ++r) {
+    run(0, iterations, true);
+    run(1, iterations, true);
+    run(1, iterations, true);
+    run(0, iterations, true);
+  }
+
+  const bool have_spans = detector.last_profile().has_gpu_stage_breakdown;
+  auto row = [&](const char *label, std::vector<double> Samples::*field) {
+    const Stats copy = ComputeStats(path[0].*field);
+    const Stats imp = ComputeStats(path[1].*field);
+    const double delta = copy.median > 0 ? 100.0 * (imp.median - copy.median) / copy.median : 0.0;
+    std::printf("  %-22s copy median %8.4f (best %8.4f)   import median %8.4f (best %8.4f)   %+6.1f%%\n",
+                label, copy.median, copy.best, imp.median, imp.best, delta);
+  };
+  std::printf("Ingest A/B, %d rounds x 2 x %d frames per path (ABBA), ms:\n", rounds, iterations);
+  row("Detect() total", &Samples::gpu_total);
+  row("host upload (memcpy)", &Samples::upload);
+  if (have_spans) {
+    row("GPU span: clear", &Samples::clear_span);
+    row("GPU span: threshold", &Samples::threshold_span);
+  } else {
+    std::printf("  (GPU span rows skipped: set APRILTAG_VK_TIMESTAMPS=1 or pass --profile)\n");
+  }
+  row("pipeline_total", &Samples::pipeline);
+  std::printf(
+      "  quads vs the first copy-path frame (%zu quads): frames with a different count: copy %d, "
+      "import %d; worst corner deviation: copy %.3g px, import %.3g px\n",
+      reference.size(), count_differs[0], count_differs[1], worst_deviation[0],
+      worst_deviation[1]);
+  return quad_mismatches;
 }
 
 }  // namespace validate

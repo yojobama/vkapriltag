@@ -24,6 +24,7 @@ extern "C" {
 #include "apriltag.h"
 }
 
+using apriltag_vulkan::validate::AlignedFrame;
 using apriltag_vulkan::validate::AppendCsvRow;
 using apriltag_vulkan::validate::CompareCorners;
 using apriltag_vulkan::validate::ComputeStats;
@@ -33,6 +34,7 @@ using apriltag_vulkan::validate::PrintGpuStageBreakdown;
 using apriltag_vulkan::validate::FinishProfile;
 using apriltag_vulkan::validate::PrintIds;
 using apriltag_vulkan::validate::PrintTagDecodeStats;
+using apriltag_vulkan::validate::RunIngestAb;
 using apriltag_vulkan::validate::ProfileOptions;
 using apriltag_vulkan::validate::SortedIds;
 using apriltag_vulkan::validate::Stats;
@@ -56,6 +58,8 @@ int main(int argc, char **argv) {
   // Matches DetectorConfig::decimation's default; kept equal to td_ref->quad_decimate below.
   uint32_t decimation = 2;
   ProfileOptions profile_opt;
+  // Runs the copy-vs-import frame ingest A/B (needs --iterations of a few hundred to be meaningful).
+  bool ingest_ab = false;
   // 0 = leave DetectorConfig's default; otherwise overrides max_blobs.
   uint32_t max_blobs = 0;
   // Use the frame-pipelined path (FramePipeline) instead of the serial chain; timings are throughput-only.
@@ -83,6 +87,8 @@ int main(int argc, char **argv) {
       decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
     } else if (arg == "--max-blobs") {
       max_blobs = static_cast<uint32_t>(std::max(1, std::stoi(next("--max-blobs"))));
+    } else if (arg == "--import") {
+      ingest_ab = true;
     } else if (arg == "--pipelined") {
       pipelined = true;
     } else {
@@ -163,6 +169,25 @@ int main(int argc, char **argv) {
       apriltag_vulkan::GpuDetector detector(ctx, config);
       apriltag_vulkan::QuadDecode quad_decode(config);
       apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
+
+      if (ingest_ab) {
+        if (!ctx.caps().has_external_memory_host) {
+          std::cout << "--import: VK_EXT_external_memory_host unavailable on this device; "
+                       "skipping the ingest A/B." << std::endl;
+        } else {
+          const size_t alignment =
+              std::max<size_t>(4096, static_cast<size_t>(ctx.caps().min_host_pointer_alignment));
+          const AlignedFrame imported(image.data, size_t(width) * height, alignment);
+          detector.ImportHostFrame(imported.data(), imported.alloc_bytes());
+          const int differing = RunIngestAb(detector, quad_decode, tag_decoder, image.data,
+                                            imported.data(), width, height, config.reversed_border,
+                                            iterations);
+          if (differing > 0) {
+            std::cerr << "INGEST MISMATCH: import path produced different quads" << std::endl;
+            return 1;
+          }
+        }
+      }
 
       ImageMetrics metrics;
       metrics.file = file;
