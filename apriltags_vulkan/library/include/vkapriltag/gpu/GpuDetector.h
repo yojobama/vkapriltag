@@ -352,6 +352,8 @@ class GpuDetector {
   vk::ComputePipeline threshold_pl_;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
   // Also performs the atomic compaction of boundary points.
+  // uf_compress plus uf_final's count, for the last real compression of the first attempt.
+  vk::ComputePipeline uf_compress_count_pl_;
   vk::ComputePipeline blob_diff_pl_;
   vk::ComputePipeline init_extents_pl_;
   vk::ComputePipeline merge_extents_pl_;

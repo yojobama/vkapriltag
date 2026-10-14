@@ -1,0 +1,10 @@
+#version 450
+// Thresholded as uint per pixel; uf_compress_count_u8.comp is the uint8_t variant.
+// The shader is in uf_compress_count_body.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(std430, binding = 2) readonly buffer Thresholded { uint thresholded[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
+
+#include "uf_compress_count_body.glsl"

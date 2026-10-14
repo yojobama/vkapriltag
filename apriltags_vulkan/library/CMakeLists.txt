@@ -50,6 +50,8 @@ set(SHADER_SOURCES
   shaders/uf_merge.comp
   shaders/uf_merge_u8.comp
   shaders/uf_compress.comp
+  shaders/uf_compress_count.comp
+  shaders/uf_compress_count_u8.comp
   shaders/uf_final.comp
   shaders/uf_final_u8.comp
   shaders/blob_diff.comp

@@ -418,6 +418,11 @@ void GpuDetector::CreatePipelines() {
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("uf_compress"), {parent_buf_.get(), uf_changed_buf_.get()}, 12, wg1d_);
+  // As uf_compress plus uf_final's count: bindings 2 and 3 are the thresholded codes and blob_size.
+  uf_compress_count_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath(pick("uf_compress_count", "uf_compress_count_u8")),
+      {parent_buf_.get(), uf_changed_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get()}, 16,
+      wg1d_);
   // Binding 2 lets the shader skip ambiguous (127) pixels.
   uf_final_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_final", "uf_final_u8")),
@@ -610,6 +615,9 @@ namespace {
 struct UfCompressPc {
   uint32_t dw, dh, honour_changed_flag;
 };
+struct UfCountPc {
+  uint32_t dw, dh, honour_changed_flag, min_blob;
+};
 
 }  // namespace
 
@@ -651,7 +659,11 @@ void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool tra
     // The barrier makes the merge's flag write visible to the compression's guard or predicate read.
     uf_merge_pl_.Dispatch2D(c, decimated_width_, decimated_height_, &dwdh_pc,
                             predicate ? BarrierKind::ComputeAndPredicate : BarrierKind::Compute);
-    if (predicate) {
+    if (!trailing_compress && iter + 2 == iterations) {
+      // The last real compression, just before the verification merge: it also counts blob sizes.
+      const UfCountPc count_pc{decimated_width_, decimated_height_, 1u, config_.min_cluster_pixels};
+      uf_compress_count_pl_.Dispatch1D(c, pixels, &count_pc);
+    } else if (predicate) {
       // Runs only when the flag is nonzero, so the guard is skipped.
       const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
       ctx_.CmdBeginConditionalRendering(c, uf_changed_buf_.get(), 0);
@@ -712,8 +724,15 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   uf_init_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
-  const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
-  uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
+  if (chunk == 1) {
+    // The only merge is the verification merge, so this is the last real compression: it also
+    // counts blob sizes (see RecordUfChunk).
+    const UfCountPc count_pc{decimated_width_, decimated_height_, 0u, config_.min_cluster_pixels};
+    uf_compress_count_pl_.Dispatch1D(cmd, pixels, &count_pc);
+  } else {
+    const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
+    uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
+  }
 
   RecordUfChunk(cmd, chunk, /*trailing_compress=*/false);
   // The labelling span ends here; any extra convergence chunks are not attributed to it.
@@ -732,8 +751,10 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   // uf_final counts to the size floor, which must equal blob_diff's.
   struct { uint32_t dw, dh, min_blob; } uf_final_pc{decimated_width_, decimated_height_,
                                                     config_.min_cluster_pixels};
+  // The speculative first attempt counted blob sizes inside its last real compression; the tail
+  // rerun counts here.
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
-  uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
+  if (!speculative) uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
   // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends
