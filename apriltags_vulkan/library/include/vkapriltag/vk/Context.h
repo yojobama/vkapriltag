@@ -41,6 +41,16 @@ struct ContextOptions {
   uint32_t queues_per_family = 1;
   // Also creates queues on the first other compute-capable family.
   bool use_secondary_compute_family = false;
+
+  // How many detector streams (cameras) will run concurrently on this device. Above 1, the Context
+  // also uses the second compute family when the device has one and creates enough queues for one
+  // per stream, interleaved across the families; give stream i the lane on Context::StreamSlot(i).
+  // On the RX 9060 XT this takes 4+ streams from about 4,500 to 8,200 fps against sharing one queue
+  // (PERFORMANCE.md 8j). With 1, or on a single-family device (the Mali, where a queue per stream
+  // is slower), it changes nothing. Explicit queues_per_family / use_secondary_compute_family
+  // values are kept when they ask for more.
+  uint32_t expected_streams = 1;
+
   // Also creates queues on a transfer-only family (if the device has one), for Context::CreateTransferLane.
   bool use_transfer_family = false;
 
@@ -180,6 +190,12 @@ public:
   // A submission lane on queue `slot`. Must be destroyed before the Context.
   std::unique_ptr<Lane> CreateLane(size_t slot) const;
 
+  // The queue slot recommended for detector stream `stream` (0-based). With ContextOptions::
+  // expected_streams > 1 on a device with two compute families: round-robin over the queue table,
+  // which is interleaved across the families, so streams alternate between them. Otherwise slot 0:
+  // on one family (the Mali) a queue per stream measured slower than sharing one (PERFORMANCE.md 8c).
+  size_t StreamSlot(size_t stream) const { return spread_streams_ ? stream % queues_.size() : 0; }
+
   // Lanes on the transfer-only family (see ContextOptions::use_transfer_family); index wraps.
   size_t transfer_queue_count() const { return transfer_queues_.size(); }
   std::unique_ptr<Lane> CreateTransferLane(size_t index) const;
@@ -230,6 +246,7 @@ public:
   std::vector<QueueSlot> queues_;
   std::vector<QueueSlot> transfer_queues_;
   std::vector<uint32_t> queue_families_;
+  bool spread_streams_ = false;  // see StreamSlot()
   std::unique_ptr<Lane> default_lane_;
 
   VkPhysicalDeviceMemoryProperties mem_props_{};
