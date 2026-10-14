@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <string>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -17,7 +18,8 @@ class WorkerPool {
  public:
   // `threads` is the total parallelism including the calling thread (1 runs inline; 0 selects
   // hardware_concurrency).
-  explicit WorkerPool(unsigned threads = 0);
+  // `name` labels the worker threads in profiler traces ("<name> <slot>"); it is copied.
+  explicit WorkerPool(unsigned threads = 0, const char *name = "cpu-worker");
   ~WorkerPool();
 
   WorkerPool(const WorkerPool &) = delete;
@@ -35,6 +37,7 @@ class WorkerPool {
   // Claims indices until the batch is exhausted; used by workers and the calling thread.
   void DrainBatch(unsigned slot);
 
+  std::string name_;
   std::vector<std::thread> workers_;
 
   std::mutex mutex_;

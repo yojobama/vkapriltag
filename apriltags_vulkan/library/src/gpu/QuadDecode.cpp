@@ -1,5 +1,7 @@
 #include "vkapriltag/gpu/QuadDecode.h"
 
+#include "vkapriltag/common/Profiler.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -446,13 +448,14 @@ DetectorConfig::QuadFitMethod ResolveQuadFitMethod(DetectorConfig::QuadFitMethod
 
 QuadDecode::QuadDecode(const DetectorConfig &config)
     : config_(config),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads))),
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker")),
       scratch_(pool_->threads()) {
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
     std::span<const RawLineFitPoint> line_fit_points) const {
+  VKA_PROF_SCOPE("quad.decode_all");
   std::vector<DetectedQuad> output;
 
   // Group the points into contiguous per-blob spans (sorted by blob_index, then theta).
@@ -475,6 +478,8 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   // Fit every blob independently; each entry is written by exactly one task.
   std::vector<FitQuadResult> per_span(spans.size());
   pool_->ParallelFor(spans.size(), [&](size_t s, unsigned slot) {
+    prof::Scope fit_scope("quad.fit_blob");
+    fit_scope.set_arg(static_cast<int64_t>(spans[s].end - spans[s].begin));
     per_span[s] =
         FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
   });
@@ -496,6 +501,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
 
   // UpdateFitQuads: refit lines from the moments, intersect adjacent lines
   // to get corners, and apply geometric sanity checks.
+  VKA_PROF_SCOPE("quad.update_fit");
   const double min_tag_width =
       std::max(3.0, config_.tag_width / static_cast<double>(config_.decimation));
   for (const FitQuadResult &quad : fit_quads) {

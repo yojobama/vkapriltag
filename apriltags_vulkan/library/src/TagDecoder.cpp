@@ -1,5 +1,9 @@
 #include "vkapriltag/TagDecoder.h"
 
+#include <algorithm>
+
+#include "vkapriltag/common/Profiler.h"
+
 extern "C" {
 #include "common/g2d.h"
 #include "common/matd.h"
@@ -15,6 +19,8 @@ void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct quad *qua
 
 namespace apriltag_vulkan {
 namespace {
+
+double NsToMs(prof::Ns ns) { return static_cast<double>(ns) / 1.0e6; }
 
 int DetectionCompare(const void *_a, const void *_b) {
   apriltag_detection_t *a = *(apriltag_detection_t *const *)_a;
@@ -39,7 +45,7 @@ void ResetScratch(zarray_t *scratch) { zarray_truncate(scratch, 0); }
 TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads,
                        RefineEdgesMethod refine_method)
     : td_(td),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads))),
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker")),
       refine_method_(ResolveRefineEdgesMethod(refine_method)) {
   // refine_edges() reads td_->quad_decimate for its search radius.
   td_->quad_decimate = static_cast<float>(decimation);
@@ -49,6 +55,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   for (unsigned i = 0; i < pool_->threads(); ++i) {
     probe_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
   }
+  slot_stats_.assign(pool_->threads(), SlotStats{});
 }
 
 TagDecoder::~TagDecoder() {
@@ -83,7 +90,33 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
   // Only [0, quads.size()): entries beyond hold stale pointers from earlier frames.
   for (size_t i = 0; i < quads.size(); ++i) ResetScratch(per_quad_[i]);
 
+  VKA_PROF_SCOPE("tag.decode_all");
+  const bool timing = prof::Enabled();
+  const prof::Ns wall0 = timing ? prof::NowNs() : 0;
+  if (timing) slot_stats_.assign(pool_->threads(), SlotStats{});
+
   pool_->ParallelFor(quads.size(), [&](size_t i, unsigned slot) {
+    prof::Scope quad_scope("tag.quad");
+    SlotStats &st = slot_stats_[slot];
+    const prof::Ns t_quad = timing ? prof::NowNs() : 0;
+    prof::Ns t_mark = t_quad;
+    // Milliseconds since the previous lap; only called when `timing`.
+    auto lap = [&] {
+      const prof::Ns now = prof::NowNs();
+      const double ms = NsToMs(now - t_mark);
+      t_mark = now;
+      return ms;
+    };
+    // Every exit goes through here exactly once, so each quad is counted once.
+    auto finish = [&](bool decoded, double refine_ms) {
+      quad_scope.set_arg(decoded ? 1 : 0);
+      if (!timing) return;
+      ++st.quads;
+      if (decoded) ++st.decoded;
+      (decoded ? st.refine_ms_decoded : st.refine_ms_rejected) += refine_ms;
+      st.busy_ms += NsToMs(prof::NowNs() - t_quad);
+    };
+
     const DetectedQuad &q = quads[i];
     struct quad quad_original;
     for (int k = 0; k < 4; ++k) {
@@ -96,29 +129,46 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
 
     // kUltraFast refines only quads that already decode unrefined; the rest are rejected here.
     if (td_->refine_edges && refine_method_ == RefineEdgesMethod::kUltraFast) {
-      zarray_t *probe = probe_[slot];
-      zarray_truncate(probe, 0);
-      quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, probe);
-      const bool decodes = zarray_size(probe) > 0;
-      ClearDetections(probe);
-      if (quad_original.H) matd_destroy(quad_original.H);
-      if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
-      quad_original.H = nullptr;
-      quad_original.Hinv = nullptr;
-      if (!decodes) return;
+      bool decodes;
+      {
+        VKA_PROF_SCOPE("tag.probe");
+        zarray_t *probe = probe_[slot];
+        zarray_truncate(probe, 0);
+        quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, probe);
+        decodes = zarray_size(probe) > 0;
+        ClearDetections(probe);
+        if (quad_original.H) matd_destroy(quad_original.H);
+        if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
+        quad_original.H = nullptr;
+        quad_original.Hinv = nullptr;
+      }
+      if (timing) st.probe_ms += lap();
+      if (!decodes) {
+        finish(false, 0.0);
+        return;
+      }
     }
 
     // Refine (if enabled) before decode; both are safe to run concurrently across quads.
+    double refine_ms = 0.0;
     if (td_->refine_edges) {
+      VKA_PROF_SCOPE("tag.refine");
       RefineEdges(refine_method_, td_, &im, &quad_original);
+      if (timing) refine_ms = lap();
     }
 
     // quad_decode_index appends decodes to per_quad_[i] and allocates quad->H/Hinv.
-    quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, per_quad_[i]);
+    {
+      VKA_PROF_SCOPE("tag.decode");
+      quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, per_quad_[i]);
+    }
 
     // Free the homographies allocated on the stack-local quad.
     if (quad_original.H) matd_destroy(quad_original.H);
     if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
+
+    if (timing) st.decode_ms += lap();
+    finish(zarray_size(per_quad_[i]) > 0, refine_ms);
   });
 
   // Merge in quad order over [0, quads.size()), as in the reset loop above.
@@ -133,6 +183,28 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
 
   reconcile_detections(detections_, poly0_, poly1_);
   zarray_sort(detections_, DetectionCompare);
+
+  if (timing) {
+    Stats stats;
+    stats.wall_ms = NsToMs(prof::NowNs() - wall0);
+    unsigned active = 0;
+    double busy_sum = 0.0;
+    for (const SlotStats &st : slot_stats_) {
+      stats.quads += st.quads;
+      stats.decoded += st.decoded;
+      stats.probe_ms += st.probe_ms;
+      stats.refine_ms_decoded += st.refine_ms_decoded;
+      stats.refine_ms_rejected += st.refine_ms_rejected;
+      stats.decode_ms += st.decode_ms;
+      stats.busy_ms_max = std::max(stats.busy_ms_max, st.busy_ms);
+      if (st.busy_ms > 0.0) {
+        ++active;
+        busy_sum += st.busy_ms;
+      }
+    }
+    stats.busy_ms_mean = active > 0 ? busy_sum / active : 0.0;
+    last_stats_ = stats;
+  }
   return detections_;
 }
 

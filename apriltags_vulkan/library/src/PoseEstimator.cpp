@@ -668,7 +668,7 @@ PoseEstimator::PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32
     : intrinsics_(intrinsics),
       tagsize_(tagsize),
       convergence_tol_(convergence_tol > 0.0 ? convergence_tol : 0.0),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads))) {}
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "pose-worker")) {}
 
 TagPose PoseEstimator::EstimateSeed(const double H[3][3]) const {
   TagPose out;

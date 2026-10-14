@@ -377,6 +377,10 @@ class GpuDetector {
   // WriteTimestamp() is a no-op.
   vk::QueryPool timestamp_pool_;
   bool timestamps_enabled_ = false;
+  // Tracing (common/Profiler.h): the "GPU" track id, and steady_clock ns of this frame's first
+  // submission, which anchors the GPU timestamps to the host timeline.
+  uint32_t gpu_track_ = 0;
+  int64_t frame_first_submit_ns_ = 0;
   enum GpuStageSpan {
     kSpanClear = 0,
     kSpanThreshold,

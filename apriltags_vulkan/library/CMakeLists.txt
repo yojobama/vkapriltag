@@ -115,6 +115,7 @@ add_library(vkapriltag STATIC
   src/PoseEstimator.cpp
   src/common/pgm_io.cpp
   src/common/WorkerPool.cpp
+  src/common/Profiler.cpp
 )
 add_library(vkapriltag::vkapriltag ALIAS vkapriltag)
 
@@ -135,6 +136,14 @@ target_link_libraries(vkapriltag PUBLIC
   Threads::Threads
   apriltag
 )
+
+# Tracing hooks (common/Profiler.h); OFF compiles every scope away.
+option(VKAPRILTAG_ENABLE_PROFILING "Build the CPU/GPU tracing hooks" ON)
+if(VKAPRILTAG_ENABLE_PROFILING)
+  target_compile_definitions(vkapriltag PUBLIC VKAPRILTAG_PROFILING=1)
+else()
+  target_compile_definitions(vkapriltag PUBLIC VKAPRILTAG_PROFILING=0)
+endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(vkapriltag PRIVATE -Wall -Wextra -Wno-unused-parameter)

@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "vkapriltag/TagDecoder.h"
+#include "vkapriltag/common/Profiler.h"
 #include "vkapriltag/gpu/GpuDetector.h"
 
 extern "C" {
@@ -20,6 +22,59 @@ extern "C" {
 
 namespace apriltag_vulkan {
 namespace validate {
+
+// --profile / --trace handling shared by the validate tools. Call Begin() before constructing the
+// GpuDetector (it decides at construction whether to create the GPU timestamp pool).
+struct ProfileOptions {
+  bool summary = false;
+  std::string trace_path;
+
+  bool enabled() const { return summary || !trace_path.empty(); }
+  void Begin() const {
+    if (!enabled()) return;
+#if VKAPRILTAG_PROFILING
+    prof::Enable(true);
+    prof::SetThreadName("main");
+#else
+    std::cerr << "--profile/--trace ignored: built with VKAPRILTAG_ENABLE_PROFILING=OFF" << std::endl;
+#endif
+  }
+};
+
+// The per-quad CPU-tail breakdown from TagDecoder::Stats (last Decode()).
+inline void PrintTagDecodeStats(const apriltag_vulkan::TagDecoder::Stats &s) {
+  if (s.quads == 0) return;
+  const double refine = s.refine_ms_decoded + s.refine_ms_rejected;
+  std::cout << "  tag_decode breakdown (last iteration): quads=" << s.quads
+            << ", decoded=" << s.decoded << ", wall=" << s.wall_ms << " ms, cpu=" << s.cpu_ms()
+            << " ms (parallelism x" << (s.wall_ms > 0 ? s.cpu_ms() / s.wall_ms : 0.0) << ")\n"
+            << "    refine: decoded quads " << s.refine_ms_decoded << " ms, quads that never decode "
+            << s.refine_ms_rejected << " ms";
+  if (refine > 0) {
+    std::cout << " (" << (100.0 * s.refine_ms_rejected / refine) << "% of refine time)";
+  }
+  std::cout << "\n    probe=" << s.probe_ms << " ms, final decode=" << s.decode_ms
+            << " ms, busiest thread=" << s.busy_ms_max << " ms vs mean " << s.busy_ms_mean
+            << " ms" << std::endl;
+}
+
+// Prints the span summary and writes the trace, as requested. Call once the instrumented work has
+// finished.
+inline void FinishProfile(const ProfileOptions &opt) {
+  if (!opt.enabled() || !prof::Enabled()) return;
+  if (opt.summary) {
+    std::cout << "Profile summary (all iterations, all threads; spans nest, so totals overlap):\n"
+              << prof::Summary();
+  }
+  if (!opt.trace_path.empty()) {
+    if (prof::WriteTrace(opt.trace_path)) {
+      std::cout << "Wrote trace (" << prof::EventCount() << " events) to " << opt.trace_path
+                << " - open at https://ui.perfetto.dev" << std::endl;
+    } else {
+      std::cerr << "Failed to write trace to " << opt.trace_path << std::endl;
+    }
+  }
+}
 
 // Prints the per-dispatch GPU span breakdown and the gaps between spans.
 // Returns the summed span time, used to report the residual against the host-observed submit+wait cost.

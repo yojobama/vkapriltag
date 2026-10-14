@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "vkapriltag/common/Profiler.h"
+
 namespace apriltag_vulkan {
 
 FramePipeline::FramePipeline(GpuDetector &detector, QuadDecode &quad_decode,
@@ -28,6 +30,7 @@ FramePipeline::~FramePipeline() {
 }
 
 void FramePipeline::WorkerLoop() {
+  prof::SetThreadName("gpu-driver");
   for (;;) {
     const uint8_t *frame = nullptr;
     {
@@ -39,6 +42,7 @@ void FramePipeline::WorkerLoop() {
 
     std::exception_ptr error;
     try {
+      VKA_PROF_SCOPE("pipeline.gpu_pass");
       detector_.Detect(frame);
     } catch (...) {
       error = std::current_exception();
@@ -57,6 +61,9 @@ void FramePipeline::WorkerLoop() {
 void FramePipeline::HarvestInFlight() {
   std::exception_ptr error;
   {
+    // Time the CPU tail finished ahead of the GPU pass and so waited for it; nonzero means the
+    // GPU, not the tail, limits throughput.
+    VKA_PROF_SCOPE("pipeline.wait_gpu");
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait(lock, [this] { return finished_; });
     finished_ = false;
@@ -85,6 +92,7 @@ void FramePipeline::HarvestInFlight() {
 
 zarray_t *FramePipeline::DecodeHarvested() {
   if (!have_done_) return nullptr;
+  VKA_PROF_SCOPE("pipeline.cpu_tail");
   quads_ = quad_decode_.Decode(done_points_);
   return tag_decoder_.Decode(quads_, done_frame_, done_width_, done_height_,
                              done_reversed_border_);

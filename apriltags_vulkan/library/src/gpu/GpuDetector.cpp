@@ -1,5 +1,6 @@
 #include "vkapriltag/gpu/GpuDetector.h"
 
+#include "vkapriltag/common/Profiler.h"
 #include "vkapriltag/vk/EmbeddedShaders.h"
 
 #include <algorithm>
@@ -23,6 +24,11 @@ using Clock = std::chrono::steady_clock;
 
 double MsSince(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+// Same timeline as prof::NowNs().
+prof::Ns ToNs(Clock::time_point t) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
 }
 
 // Prefers SPIR-V embedded in the binary, falling back to SHADER_DIR when the build has none
@@ -203,13 +209,17 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // Persists newly compiled pipelines immediately rather than only at ~Context().
   ctx_.FlushPipelineCache();
 
-  // Opt-in per-shader GPU timing (see DetectProfile::gpu_stage_ms / kGpuStageNames).
+  // Opt-in per-shader GPU timing (see DetectProfile::gpu_stage_ms / kGpuStageNames). Tracing
+  // (prof::Enabled() when this is constructed) wants the spans for its GPU track too.
+  bool want_timestamps = prof::Enabled();
   if (const char *ts = std::getenv("APRILTAG_VK_TIMESTAMPS")) {
-    if (std::strtol(ts, nullptr, 10) != 0 && caps.timestamps_supported) {
-      timestamp_pool_ = vk::QueryPool(ctx_.device(), kNumGpuStageSpans * 2);
-      timestamps_enabled_ = timestamp_pool_.valid();
-    }
+    want_timestamps = want_timestamps || std::strtol(ts, nullptr, 10) != 0;
   }
+  if (want_timestamps && caps.timestamps_supported) {
+    timestamp_pool_ = vk::QueryPool(ctx_.device(), kNumGpuStageSpans * 2);
+    timestamps_enabled_ = timestamp_pool_.valid();
+  }
+  if (VKAPRILTAG_PROFILING) gpu_track_ = prof::Track("GPU");
 }
 
 void GpuDetector::CreateBuffers() {
@@ -547,6 +557,7 @@ void GpuDetector::RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &count
 }
 
 uint32_t GpuDetector::ReadCounterSlot(uint32_t slot) {
+  VKA_PROF_SCOPE("gpu.counter_read");
   const auto t0 = Clock::now();
   uint32_t value = 0;
   counter_staging_.Read(&value, 4, VkDeviceSize(slot) * 4);
@@ -555,6 +566,7 @@ uint32_t GpuDetector::ReadCounterSlot(uint32_t slot) {
 }
 
 VkCommandBuffer GpuDetector::BeginTimedCommands() {
+  VKA_PROF_SCOPE("gpu.begin_commands");
   const auto t0 = Clock::now();
   VkCommandBuffer cmd = lane_.BeginCommands();
   last_profile_.cpu_begin_ms += MsSince(t0, Clock::now());
@@ -562,7 +574,9 @@ VkCommandBuffer GpuDetector::BeginTimedCommands() {
 }
 
 void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
+  VKA_PROF_SCOPE("gpu.submit_wait");
   const auto t0 = Clock::now();
+  if (prof::Enabled() && frame_first_submit_ns_ == 0) frame_first_submit_ns_ = ToNs(t0);
   lane_.SubmitAndWait(cmd, pending_wait_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   pending_wait_ = VK_NULL_HANDLE;
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
@@ -596,6 +610,7 @@ void GpuDetector::ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t by
 void GpuDetector::Detect(const uint8_t *gray_frame) {
   using vk::BarrierKind;
   const auto t_begin = Clock::now();
+  frame_first_submit_ns_ = 0;
   last_profile_ = DetectProfile{};
   const uint64_t submits_at_start = lane_.submit_count;
 
@@ -989,6 +1004,18 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   }
   const auto t_end = Clock::now();
 
+  if (prof::Enabled()) {
+    // Host-side phases of this frame, from the timestamps already taken above.
+    prof::CompleteHere("gpu.detect", ToNs(t_begin), ToNs(t_end),
+                       static_cast<int64_t>(lane_.submit_count - submits_at_start));
+    prof::CompleteHere("gpu.host.upload", ToNs(t_upload0), ToNs(t_upload1));
+    prof::CompleteHere("gpu.host.threshold_label", ToNs(t_upload1), ToNs(t_label));
+    prof::CompleteHere("gpu.host.boundary", ToNs(t_label), ToNs(t_boundary));
+    prof::CompleteHere("gpu.host.sort_group", ToNs(t_boundary), ToNs(t_sort_group));
+    prof::CompleteHere("gpu.host.linefit", ToNs(t_sort_group), ToNs(t_linefit));
+    prof::CompleteHere("gpu.host.readback", ToNs(t_linefit), ToNs(t_end));
+  }
+
   last_profile_.upload_ms = MsSince(t_upload0, t_upload1);
   last_profile_.threshold_label_ms = MsSince(t_upload1, t_label);
   last_profile_.boundary_ms = MsSince(t_label, t_boundary);
@@ -1032,6 +1059,34 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
       }
     }
     last_profile_.has_gpu_stage_breakdown = true;
+
+    // GPU spans onto the trace's timeline. The GPU clock has no fixed relation to the host's, so
+    // the first available span start is pinned to the first submission's host time; later spans
+    // keep their GPU-clock spacing. Expect a constant offset of the submit-to-start latency
+    // (tens of microseconds), not drift.
+    if (prof::Enabled() && frame_first_submit_ns_ != 0) {
+      uint64_t base_ticks = 0;
+      bool have_base = false;
+      for (uint32_t s = 0; s < kNumGpuStageSpans && !have_base; ++s) {
+        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
+        if (start.available) {
+          base_ticks = start.ticks;
+          have_base = true;
+        }
+      }
+      auto to_host_ns = [&](uint64_t ticks) {
+        return frame_first_submit_ns_ + static_cast<prof::Ns>(double(ticks - base_ticks) * ns_per_tick);
+      };
+      for (uint32_t s = 0; s < kNumGpuStageSpans && have_base; ++s) {
+        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
+        const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
+        if (start.available && end.available && end.ticks >= start.ticks &&
+            start.ticks >= base_ticks) {
+          prof::Complete(gpu_track_, kGpuStageNames[s], to_host_ns(start.ticks),
+                         to_host_ns(end.ticks));
+        }
+      }
+    }
   }
 
   // Quad fitting itself happens in QuadDecode (CPU tail); Detect() only runs

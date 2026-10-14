@@ -1,8 +1,12 @@
 #include "vkapriltag/common/WorkerPool.h"
 
+#include <string>
+
+#include "vkapriltag/common/Profiler.h"
+
 namespace apriltag_vulkan {
 
-WorkerPool::WorkerPool(unsigned threads) {
+WorkerPool::WorkerPool(unsigned threads, const char *name) : name_(name) {
   unsigned total = threads;
   if (total == 0) total = std::thread::hardware_concurrency();
   if (total == 0) total = 1;
@@ -33,14 +37,20 @@ void WorkerPool::DrainBatch(unsigned slot) {
   if (fn == nullptr) return;
   const size_t count = count_;
 
+  // arg = items this thread claimed; a thread that claims none shows how late it woke.
+  prof::Scope drain("pool.drain");
+  int64_t claimed = 0;
   for (;;) {
     const size_t i = next_.fetch_add(1, std::memory_order_relaxed);
     if (i >= count) break;
     (*fn)(i, slot);
+    ++claimed;
   }
+  drain.set_arg(claimed);
 }
 
 void WorkerPool::WorkerMain(unsigned slot) {
+  prof::SetThreadName((name_ + " " + std::to_string(slot)).c_str());
   uint64_t seen = 0;
   for (;;) {
     {
@@ -82,6 +92,8 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
   DrainBatch(0);
 
   {
+    // The tail of the batch: time the caller idles while a worker finishes its last item.
+    VKA_PROF_SCOPE("pool.join_wait");
     std::unique_lock<std::mutex> lock(mutex_);
     batch_done_.wait(lock, [this] { return outstanding_ == 0; });
     // Every participant has returned from DrainBatch().

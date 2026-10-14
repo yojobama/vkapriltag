@@ -916,6 +916,62 @@ Combining: import subsumes the transfer queue (no staged copy is left to move), 
 combination is import plus alternating families, with the transfer queue as the fallback when
 import is unavailable.
 
+## 8e. Where the CPU tail goes (measured with the tracer)
+
+`apriltag_vulkan_validate --profile` now reports, per `TagDecoder::Decode()`, how refinement time
+splits between quads that go on to decode and quads that never do (`TagDecoder::Stats`). RX 9060 XT,
+1280x800 `scale_1`, decimation 2, `exact` refine, 12 threads, 100 iterations, one tag in the scene:
+
+| | |
+| --- | --- |
+| candidate quads / decoded | 75 / 1 |
+| CPU time in the tail, summed over threads | 2.75 ms (parallelism x9.7, wall 0.28 ms) |
+| refine, quads that never decode | 2.32 ms = **96.8% of refine time** |
+| refine, the quad that decodes | 0.08 ms |
+| final `quad_decode_index` | 0.35 ms |
+| busiest thread vs mean | 0.256 ms vs 0.250 ms |
+
+Single-threaded `tag_decode` by refine mode on the same image (median of 400): `upstream` 2.29 ms,
+`exact` 1.79, `fast` 1.43, `ultrafast` 0.23. The thread sweep scales almost linearly (1.78 ms at 1
+thread, 0.90 at 2, 0.46 at 4, 0.31 at 8, 0.27 at 12), so this is compute, not pool wake-up cost, and
+the load is already balanced, so scheduling (largest-first ordering, finer chunks) has nothing to
+recover on this scene.
+
+What follows from it: on a cluttered scene the tail is almost entirely refinement of rejects, and
+`ultrafast` is the only mode that avoids it, at the recall cost recorded in section 4. Any gate that
+rejects hopeless quads before refining is therefore worth more than a faster refine kernel. The scene
+here is one image; the 96.8% figure will be lower on a scene with many real tags, and
+`--profile` will say by how much.
+
+### Candidates not yet tried
+
+Measured only where stated; everything else is a hypothesis with its reason and its risk.
+
+Device-agnostic (CPU tail):
+
+- **A cheaper, recall-preserving gate than `ultrafast`'s.** Skip refinement when the unrefined quad's
+  four edges show no gradient (mean cross-edge contrast below a threshold), instead of requiring a
+  full unrefined decode. Not bit-identical to `exact`; needs the synthetic sweep
+  (`apriltag_synth_ground_truth`) to pick a threshold that keeps the 687/768 recall.
+- **Bit-identical refine kernel.** `exact` is scalar double with upstream's operation order, so only
+  lane-wise vectorisation across samples keeps it identical (no FMA contraction, same four-tap
+  order). AVX2 gives 4 double lanes on x86 but NEON gives 2 on the Orange Pi, so the deployment target
+  would see little. `fast` (float) already removes 20% on x86.
+- **`final quad_decode_index` is 0.35 ms CPU for 75 quads** (4.7 us each). The likely cost is the homography and
+  `matd` allocations upstream makes per call, but that was not profiled; confirm before patching
+  upstream to reuse buffers.
+
+Device-specific (not measurable on the hardware available when this was written):
+
+- **Mali-G610:** `labelling` is the largest GPU span on the RX 9060 XT too (172 us of ~330 us summed).
+  The notes already record tiling and vectorised merges as losses on Valhall; the untested remainder is
+  workgroup-size/occupancy sweeps of `uf_merge` per `APRILTAG_VK_UF_CHUNK`, which the tracer's GPU
+  track can now time per frame on the Pi.
+- **Mali, dma-buf ingest:** section 8d measured the copy path against dma-buf import at 1.52 vs 2.07 ms
+  host time; whether the sample app's V4L2 path uses `ImportDmaBufFrame` was not checked.
+- **RDNA4:** the GPU phase is ~0.33 ms of a ~1.0 ms frame, so GPU shader work is no longer the limit;
+  the tail and the host-side `submit_wait` (0.54 ms median, mostly waiting on the GPU) are.
+
 ## 9. Measuring
 
 ```
@@ -966,3 +1022,23 @@ what makes it work for a headless compute app with no `vkQueuePresentKHR`).
 RenderDoc needs an artificial frame boundary for the same reason, and Mali
 exposes no external GPU profiler at all — there, attribute cost by external
 wall-clock deltas while varying a knob or the input size.
+
+### Tracing and per-quad profiling
+
+`--profile` prints a per-span table (count, total, mean, p50, p99, max; spans nest, so totals
+overlap) plus the `TagDecoder` refine breakdown, and `--trace out.json` writes a Chrome Trace Event
+file for https://ui.perfetto.dev. Both work in either validate tool and with `--pipelined`, where
+`pipeline.gpu_pass`, `pipeline.cpu_tail` and `pipeline.wait_gpu` show which side limits throughput.
+
+- Each pool worker, the GPU-driver thread and a "GPU" track get their own rows. The GPU track is the
+  existing `APRILTAG_VK_TIMESTAMPS` spans placed on the host timeline by pinning the first span to the
+  first submission's host time, so expect a constant offset of tens of microseconds, not drift.
+- Library users call `prof::Enable(true)` (or set `APRILTAG_VK_TRACE=<path>` and call
+  `prof::EnableFromEnv()`) **before constructing `GpuDetector`**, which creates the timestamp pool at
+  construction, then `prof::Summary()` / `prof::WriteTrace()` while no frame is in flight.
+- Cost: a disabled scope is one relaxed atomic load. A before/after comparison on the RX 9060 XT showed
+  no difference outside run-to-run noise (median 0.99-1.10 ms vs 0.96-1.04 ms). Enabled costs about
+  +0.09 ms per frame (timestamp queries plus roughly 420 events). `VKAPRILTAG_ENABLE_PROFILING=OFF`
+  removes the hooks at compile time; that configuration was not built here.
+- Keep traces to a few hundred frames: each thread's buffer caps at 262,144 events and drops (and
+  reports) the rest.

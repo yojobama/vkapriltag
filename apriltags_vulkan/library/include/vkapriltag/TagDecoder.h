@@ -41,6 +41,27 @@ class TagDecoder {
   zarray_t *Decode(const std::vector<DetectedQuad> &quads, const uint8_t *gray_frame,
                    uint32_t width, uint32_t height, bool reversed_border);
 
+  // Where the last Decode() spent its time. Filled only while prof::Enabled() (the per-quad
+  // timing it needs is otherwise skipped); all zero before that. CPU times are summed over
+  // threads, so cpu_ms() / wall_ms is the achieved parallelism.
+  struct Stats {
+    uint32_t quads = 0;    // candidates received
+    uint32_t decoded = 0;  // candidates that produced a detection (before reconcile_detections)
+    double wall_ms = 0.0;  // Decode() start to return, including the merge and reconcile
+    double probe_ms = 0.0;  // kUltraFast's unrefined decode gate
+    // Refinement is the dominant cost; split by whether the quad went on to decode, since time
+    // spent refining quads that never decode is the part an earlier reject could save.
+    double refine_ms_decoded = 0.0;
+    double refine_ms_rejected = 0.0;
+    double decode_ms = 0.0;      // final quad_decode_index
+    double busy_ms_max = 0.0;    // busiest thread; with busy_ms_mean, the load imbalance
+    double busy_ms_mean = 0.0;   // over the threads that did any work
+    double cpu_ms() const {
+      return probe_ms + refine_ms_decoded + refine_ms_rejected + decode_ms;
+    }
+  };
+  const Stats &last_stats() const { return last_stats_; }
+
  private:
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
@@ -52,6 +73,14 @@ class TagDecoder {
   std::vector<zarray_t *> per_quad_;
   // Per-thread scratch for the unrefined decode that gates kUltraFast refinement.
   std::vector<zarray_t *> probe_;
+
+  // One cache line per thread so the per-quad accumulators do not false-share.
+  struct alignas(64) SlotStats {
+    double probe_ms, refine_ms_decoded, refine_ms_rejected, decode_ms, busy_ms;
+    uint32_t quads, decoded;
+  };
+  std::vector<SlotStats> slot_stats_;
+  Stats last_stats_;
 };
 
 }  // namespace apriltag_vulkan

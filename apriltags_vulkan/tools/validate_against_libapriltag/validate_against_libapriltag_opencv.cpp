@@ -30,7 +30,10 @@ using apriltag_vulkan::validate::ComputeStats;
 using apriltag_vulkan::validate::ExtractDetections;
 using apriltag_vulkan::validate::ImageMetrics;
 using apriltag_vulkan::validate::PrintGpuStageBreakdown;
+using apriltag_vulkan::validate::FinishProfile;
 using apriltag_vulkan::validate::PrintIds;
+using apriltag_vulkan::validate::PrintTagDecodeStats;
+using apriltag_vulkan::validate::ProfileOptions;
 using apriltag_vulkan::validate::SortedIds;
 using apriltag_vulkan::validate::Stats;
 
@@ -52,6 +55,7 @@ int main(int argc, char **argv) {
   int iterations = 1;
   // Matches DetectorConfig::decimation's default; kept equal to td_ref->quad_decimate below.
   uint32_t decimation = 2;
+  ProfileOptions profile_opt;
   // 0 = leave DetectorConfig's default; otherwise overrides max_blobs.
   uint32_t max_blobs = 0;
   // Use the frame-pipelined path (FramePipeline) instead of the serial chain; timings are throughput-only.
@@ -71,6 +75,10 @@ int main(int argc, char **argv) {
       iterations = std::max(1, std::stoi(next("--iterations")));
     } else if (arg == "--csv") {
       csv_path = next("--csv");
+    } else if (arg == "--profile") {
+      profile_opt.summary = true;
+    } else if (arg == "--trace") {
+      profile_opt.trace_path = next("--trace");
     } else if (arg == "--decimation") {
       decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
     } else if (arg == "--max-blobs") {
@@ -85,7 +93,8 @@ int main(int argc, char **argv) {
 
   if (load_path.empty()) {
     std::cerr << "Usage: apriltag_vulkan_validate --data <FileName> [--family tag36h11] "
-                 "[--iterations N] [--csv path.csv] [--decimation N]"
+                 "[--iterations N] [--csv path.csv] [--decimation N] "
+                 "[--profile] [--trace out.json]"
              << std::endl;
     return 1;
   }
@@ -132,6 +141,7 @@ int main(int argc, char **argv) {
       uint32_t width = image.cols, height = image.rows;
 
       // Initialise the vkapriltag pipeline.
+      profile_opt.Begin();
       apriltag_vulkan::vk::Context ctx;
       apriltag_family_t* tf = nullptr;
       if (!setup_tag_family(&tf, family_name.c_str())) {
@@ -276,6 +286,7 @@ int main(int argc, char **argv) {
       PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
       PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
       PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
+      PrintTagDecodeStats(tag_decoder.last_stats());
       if (metrics.dp_attempts > 0) {
         std::cout << "DP corner seeding: " << metrics.dp_fallbacks << "/" << metrics.dp_attempts
             << " blobs fell back to the combinatorial search ("
@@ -336,6 +347,7 @@ int main(int argc, char **argv) {
     }
 
     std::cout << "Final Results: " << match << " matches, " << mismatch << " mismatches." << std::endl;
+    FinishProfile(profile_opt);
 
   // Exit non-zero on any mismatch, or if no image was validated.
   if (mismatch > 0) return 1;

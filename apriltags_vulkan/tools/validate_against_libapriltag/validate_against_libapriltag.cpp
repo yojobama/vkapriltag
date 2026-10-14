@@ -28,7 +28,10 @@ using apriltag_vulkan::validate::ExtractDetections;
 using apriltag_vulkan::validate::ImageMetrics;
 using apriltag_vulkan::validate::PrintGpuStageBreakdown;
 using apriltag_vulkan::validate::PrintHostSubmissionCost;
+using apriltag_vulkan::validate::FinishProfile;
 using apriltag_vulkan::validate::PrintIds;
+using apriltag_vulkan::validate::PrintTagDecodeStats;
+using apriltag_vulkan::validate::ProfileOptions;
 using apriltag_vulkan::validate::SortedIds;
 using apriltag_vulkan::validate::Stats;
 
@@ -50,6 +53,7 @@ int main(int argc, char **argv) {
   int iterations = 1;
   // Matches DetectorConfig::decimation's default; kept equal to td_ref->quad_decimate below.
   uint32_t decimation = 2;
+  ProfileOptions profile_opt;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -65,6 +69,10 @@ int main(int argc, char **argv) {
       iterations = std::max(1, std::stoi(next("--iterations")));
     } else if (arg == "--csv") {
       csv_path = next("--csv");
+    } else if (arg == "--profile") {
+      profile_opt.summary = true;
+    } else if (arg == "--trace") {
+      profile_opt.trace_path = next("--trace");
     } else if (arg == "--decimation") {
       decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
     } else {
@@ -75,7 +83,8 @@ int main(int argc, char **argv) {
 
   if (pgm_path.empty()) {
     std::cerr << "Usage: apriltag_vulkan_validate --pgm <file.pgm> [--family tag36h11] "
-                 "[--iterations N] [--csv path.csv] [--decimation N]"
+                 "[--iterations N] [--csv path.csv] [--decimation N] "
+                 "[--profile] [--trace out.json]"
              << std::endl;
     return 1;
   }
@@ -101,6 +110,7 @@ int main(int argc, char **argv) {
     // td_ref runs with upstream's default config (refine_edges = true), so match it here.
     td_ours->refine_edges = true;
 
+    profile_opt.Begin();
     apriltag_vulkan::vk::Context ctx;
     apriltag_vulkan::DetectorConfig config;
     config.width = width;
@@ -191,6 +201,7 @@ int main(int argc, char **argv) {
     PrintStats("quad_decode", metrics.quad_decode_ms, iterations);
     PrintStats("tag_decode", metrics.tag_decode_ms, iterations);
     PrintStats("pipeline_total", metrics.pipeline_ms, iterations);
+    PrintTagDecodeStats(tag_decoder.last_stats());
     if (metrics.dp_attempts > 0) {
       std::cout << "DP corner seeding: " << metrics.dp_fallbacks << "/" << metrics.dp_attempts
                 << " blobs fell back to the combinatorial search ("
@@ -251,6 +262,7 @@ int main(int argc, char **argv) {
     }
 
     if (!csv_path.empty()) AppendCsvRow(csv_path, metrics);
+    FinishProfile(profile_opt);
 
     apriltag_detections_destroy(ref);
     apriltag_detector_destroy(td_ref);
