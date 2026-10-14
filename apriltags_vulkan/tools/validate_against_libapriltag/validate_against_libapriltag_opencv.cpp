@@ -4,7 +4,9 @@
 #define NOMINMAX
 #endif
 #include <algorithm>
+#include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -60,6 +62,15 @@ int main(int argc, char **argv) {
   ProfileOptions profile_opt;
   // Runs the copy-vs-import frame ingest A/B (needs --iterations of a few hundred to be meaningful).
   bool ingest_ab = false;
+  // Writes every iteration's quads in canonical order (diffable between binaries).
+  std::string dump_quads_path;
+  // Alternates the image with a synthetic frame of the same size on odd iterations (noise, snake,
+  // checker or rings). A frame that needs more labelling iterations than the detector seeded forces
+  // the non-converged retry, which a single static image never does.
+  std::string stress_kind;
+  // 0 = leave DetectorConfig's default (64). 1 makes the first labelling attempt undershoot on every
+  // frame, so the tail is rerun each time: a deterministic way to exercise the retry path.
+  uint32_t max_uf = 0;
   // 0 = leave DetectorConfig's default; otherwise overrides max_blobs.
   uint32_t max_blobs = 0;
   // Use the frame-pipelined path (FramePipeline) instead of the serial chain; timings are throughput-only.
@@ -87,6 +98,12 @@ int main(int argc, char **argv) {
       decimation = static_cast<uint32_t>(std::max(1, std::stoi(next("--decimation"))));
     } else if (arg == "--max-blobs") {
       max_blobs = static_cast<uint32_t>(std::max(1, std::stoi(next("--max-blobs"))));
+    } else if (arg == "--dump-quads") {
+      dump_quads_path = next("--dump-quads");
+    } else if (arg == "--stress") {
+      stress_kind = next("--stress");
+    } else if (arg == "--max-uf") {
+      max_uf = static_cast<uint32_t>(std::max(1, std::stoi(next("--max-uf"))));
     } else if (arg == "--import") {
       ingest_ab = true;
     } else if (arg == "--pipelined") {
@@ -162,6 +179,7 @@ int main(int argc, char **argv) {
       config.height = height;
       config.decimation = decimation;
       if (max_blobs > 0) config.max_blobs = max_blobs;
+      if (max_uf > 0) config.max_uf_iterations = max_uf;
       config.tag_width = static_cast<uint32_t>(tf->width_at_border);
       config.reversed_border = tf->reversed_border;
       config.normal_border = !tf->reversed_border;
@@ -227,11 +245,59 @@ int main(int argc, char **argv) {
         }
         quads = pipe.last_quads();
       } else {
+      cv::Mat stress_frame;
+      if (!stress_kind.empty()) {
+        const int w = image.cols, h = image.rows;
+        if (stress_kind == "noise") {
+          cv::Mat wide, noise(image.size(), CV_16S), sum;
+          image.convertTo(wide, CV_16S);
+          cv::theRNG().state = 12345;  // fixed so the frame is the same in every binary
+          cv::randn(noise, 0, 40);
+          cv::add(wide, noise, sum);
+          sum.convertTo(stress_frame, CV_8U);  // saturates
+        } else if (stress_kind == "snake") {
+          // One long serpentine foreground path: the longest chain a labeller has to merge.
+          stress_frame = cv::Mat(h, w, CV_8U, cv::Scalar(255));
+          const int pitch = 36, thick = 12;
+          for (int y = pitch / 2, row = 0; y < h - pitch / 2; y += pitch, ++row) {
+            cv::line(stress_frame, {pitch / 2, y}, {w - pitch / 2, y}, cv::Scalar(0), thick);
+            const int x = (row & 1) ? pitch / 2 : w - pitch / 2;
+            if (y + pitch < h - pitch / 2) {
+              cv::line(stress_frame, {x, y}, {x, y + pitch}, cv::Scalar(0), thick);
+            }
+          }
+        } else if (stress_kind == "checker") {
+          stress_frame = cv::Mat(h, w, CV_8U);
+          for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+              stress_frame.at<uint8_t>(y, x) = (((x / 6) + (y / 6)) & 1) ? 255 : 0;
+            }
+          }
+        } else if (stress_kind == "rings") {
+          stress_frame = cv::Mat(h, w, CV_8U, cv::Scalar(255));
+          for (int r = 10; r < std::min(w, h) / 2; r += 18) {
+            cv::circle(stress_frame, {w / 2, h / 2}, r, cv::Scalar(0), 6);
+          }
+        } else {
+          throw std::runtime_error("--stress: unknown kind '" + stress_kind +
+                                   "' (noise, snake, checker, rings)");
+        }
+      }
+      std::ofstream dump;
+      if (!dump_quads_path.empty()) dump.open(dump_quads_path, std::ios::trunc);
+      int retry_frames = 0;
+      std::map<uint32_t, int> uf_histogram;
       for (int it = 0; it < iterations; ++it) {
+          // The last iteration is always the clean image, so the reference comparison below still applies.
+          const uint8_t *frame = (!stress_kind.empty() && (it & 1) && it != iterations - 1)
+                                     ? stress_frame.data
+                                     : image.data;
           const auto t0 = std::chrono::steady_clock::now();
-          detector.Detect(image.data);
+          detector.Detect(frame);
           profile = detector.last_profile();
           gpu_totals.push_back(profile.total_ms);
+          if (profile.submits > 1) ++retry_frames;
+          ++uf_histogram[profile.uf_iterations];
 
           const auto t_quad0 = std::chrono::steady_clock::now();
           quads = quad_decode.Decode(detector.last_line_fit_points);
@@ -240,14 +306,19 @@ int main(int argc, char **argv) {
               std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());
 
           const auto t_dec0 = std::chrono::steady_clock::now();
-          ours = tag_decoder.Decode(quads, image.data, width, height, config.reversed_border);
+          ours = tag_decoder.Decode(quads, frame, width, height, config.reversed_border);
           const auto t_dec1 = std::chrono::steady_clock::now();
           tag_decode_totals.push_back(
               std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count());
 
           pipeline_totals.push_back(
               std::chrono::duration<double, std::milli>(t_dec1 - t0).count());
+          if (dump.is_open()) apriltag_vulkan::validate::DumpCanonicalQuads(dump, it, quads);
       }
+      std::cout << "Retry frames (submits > 1): " << retry_frames << " of " << iterations
+                << "; labelling iterations per frame:";
+      for (const auto &[iters, count] : uf_histogram) std::cout << " " << iters << "x" << count;
+      std::cout << std::endl;
       }
 
       metrics.gpu_total_ms = ComputeStats(gpu_totals);

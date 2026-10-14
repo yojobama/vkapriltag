@@ -339,6 +339,25 @@ inline double MaxQuadDeviation(const std::vector<apriltag_vulkan::DetectedQuad> 
   return worst;
 }
 
+// Appends frame `index`'s quads to `out` in a canonical order (sorted by corner values), at full
+// round-trip precision. The GPU emits quads in a varying order, so only a sorted dump can be diffed
+// between runs or between binaries.
+inline void DumpCanonicalQuads(std::ostream &out, int index,
+                               std::vector<apriltag_vulkan::DetectedQuad> quads) {
+  std::sort(quads.begin(), quads.end(),
+            [](const apriltag_vulkan::DetectedQuad &a, const apriltag_vulkan::DetectedQuad &b) {
+              return std::lexicographical_compare(&a.p[0][0], &a.p[0][0] + 8, &b.p[0][0],
+                                                  &b.p[0][0] + 8);
+            });
+  out << "F " << index << ' ' << quads.size() << '\n';
+  char line[320];
+  for (const apriltag_vulkan::DetectedQuad &q : quads) {
+    std::snprintf(line, sizeof line, "%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", q.p[0][0],
+                  q.p[0][1], q.p[1][0], q.p[1][1], q.p[2][0], q.p[2][1], q.p[3][0], q.p[3][1]);
+    out << line;
+  }
+}
+
 // Frame ingest A/B in one process: the same pixels detected from `plain` (copied into the staging
 // buffer on every frame) and from `imported` (already passed to GpuDetector::ImportHostFrame, so
 // the copy is skipped), ABBA-ordered so thermal drift hits both. Every iteration's quads are
