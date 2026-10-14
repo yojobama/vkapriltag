@@ -943,6 +943,19 @@ rejects hopeless quads before refining is therefore worth more than a faster ref
 here is one image; the 96.8% figure will be lower on a scene with many real tags, and
 `--profile` will say by how much.
 
+### Vulkan overhead per frame (RX 9060 XT, tracer, median of 180 frames)
+
+One `Detect()` is 611 us: compute spans 380 us (62%), gaps between dispatches 14 us (2%), submit to
+first span plus last span to fence return 137 us (22%), and host work outside the submit wait 81 us
+(13%: frame memcpy, command recording, readback). The 137 us is the part no span covers; the earlier
+empty submit+fence round trip on this card is 42 us, so roughly 95 us of it is unexplained (GPU
+front-end start-up and end-of-submission flushes are candidates, not measured).
+
+**Rejected: spinning on the fence.** Polling `vkGetFenceStatus` for up to 2 ms before blocking in
+`vkWaitForFences` did nothing: 8 interleaved runs of 500 frames each, `Detect()` median 0.60 ms both
+ways, all matching the reference. The 137 us is therefore not OS wake-up latency, and the experiment
+was not kept.
+
 ### Candidates not yet tried
 
 Measured only where stated; everything else is a hypothesis with its reason and its risk.
