@@ -2,8 +2,9 @@
 // THRESHOLDED_AT(i).
 //
 // Emits up to 4 QuadBoundaryPoint candidates per interior pixel (E, SE, S, SW
-// connections) and appends the valid ones to the compacted output. Append
-// order is nondeterministic and nothing depends on it.
+// connections) and appends the valid ones to the compacted output, reserving a
+// pixel's slots with one counter increment. Append order is nondeterministic
+// and nothing depends on it.
 //
 // A pixel is usable when it is not ambiguous (code 1) and its blob reached
 // min_blob_pixels, the test uf_final.comp's saturating count supports. The
@@ -44,12 +45,9 @@ bool Usable(uint i, out uint root) {
   return blob_size[root] >= pc.min_blob_pixels;
 }
 
-// Appends one boundary point and its (rep0, rep1) grouping key. rep_a/rep_b
-// are raw union-find roots. want_append is a value so that every thread makes
-// all four calls.
-void append(bool want_append, uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
-  if (!want_append) return;
-  uint pos = atomicAdd(counter, 1u);
+// Stores one boundary point and its (rep0, rep1) grouping key at `pos`, dropping it when the
+// output is full. rep_a/rep_b are raw union-find roots.
+void put(uint pos, uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
   if (pos >= pc.capacity) return;
 
   compacted[pos] = PackQBPoint(px, py, gx, gy);
@@ -126,8 +124,12 @@ void main() {
   int gSWx = (cSW > c0) ? -1 : 1;
   int gSWy = (cSW > c0) ? 1 : -1;
 
-  append(wantE, rep0, rE, x * 2u + 1u, y * 2u, (cE > c0) ? 1 : -1, 0);
-  append(wantSE, rep0, rSE, x * 2u + 1u, y * 2u + 1u, gSE, gSE);
-  append(wantS, rep0, rS, x * 2u, y * 2u + 1u, 0, (cS > c0) ? 1 : -1);
-  append(wantSW, rep0, rSW, x * 2u - 1u, y * 2u + 1u, gSWx, gSWy);
+  // One counter increment per pixel, however many of its four connections are valid.
+  uint count = uint(wantE) + uint(wantSE) + uint(wantS) + uint(wantSW);
+  if (count == 0u) return;
+  uint pos = atomicAdd(counter, count);
+  if (wantE) put(pos++, rep0, rE, x * 2u + 1u, y * 2u, (cE > c0) ? 1 : -1, 0);
+  if (wantSE) put(pos++, rep0, rSE, x * 2u + 1u, y * 2u + 1u, gSE, gSE);
+  if (wantS) put(pos++, rep0, rS, x * 2u, y * 2u + 1u, 0, (cS > c0) ? 1 : -1);
+  if (wantSW) put(pos, rep0, rSW, x * 2u - 1u, y * 2u + 1u, gSWx, gSWy);
 }
