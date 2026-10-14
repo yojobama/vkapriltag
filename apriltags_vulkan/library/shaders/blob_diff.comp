@@ -1,7 +1,10 @@
 #version 450
-// Scalar (non-aggregated) append counter variant; the shader is in
-// blob_diff_body.glsl. Reads only the packed parent[] word (see common.glsl).
+// Scalar (non-aggregated) append counter variant, Thresholded as uint per pixel;
+// blob_diff_u8.comp is the uint8_t variant. The shader is in blob_diff_body.glsl.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+
+layout(std430, binding = 6) readonly buffer Thresholded { uint thresholded[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
 
 #include "blob_diff_body.glsl"

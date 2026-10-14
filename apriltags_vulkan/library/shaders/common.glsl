@@ -11,26 +11,14 @@ uint PackXY(uint x, uint y) {
 uint UnpackX(uint xy) { return xy & 0x3FFFu; }
 uint UnpackY(uint xy) { return (xy >> 14u) & 0x3FFFu; }
 
-// --- The per-pixel word label_pixels.comp writes into parent[] ---
+// --- Threshold codes ---
 //
-//   bits [0:29]  label: 0 when the pixel has no usable blob (ambiguous, or its
-//                blob is below min_cluster_pixels), else 1 + the union-find
-//                root's decimated pixel index.
-//   bits [30:31] code: threshold value, 0 = black (0), 1 = ambiguous (127),
-//                2 = white (255).
-//
-// The 30 label bits cover the largest decimated grid the host accepts (< 2^26
-// pixels).
-//
-// The code mapping is monotonic: (vN > v0) is (cN > c0), v0 + vN == 255 is
-// c0 + cN == 2 when c0 != 1, and equality tests are preserved.
-const uint kPixelLabelBits = 30u;
-const uint kPixelLabelMask = (1u << kPixelLabelBits) - 1u;
+// The thresholded buffer holds 0 (black), 127 (ambiguous) or 255 (white) per pixel. Packed into a
+// code, 0 = black, 1 = ambiguous, 2 = white. The mapping is monotonic: (vN > v0) is (cN > c0),
+// v0 + vN == 255 is c0 + cN == 2 when c0 != 1, and equality tests are preserved.
 
 // 0/127/255 -> 0/1/2, branch-free and monotonic.
 uint PackThreshCode(uint v) { return (v + 1u) >> 7u; }
-uint PixelLabel(uint word) { return word & kPixelLabelMask; }
-uint PixelThreshCode(uint word) { return word >> kPixelLabelBits; }
 
 // A boundary candidate point (frc971::apriltag::QuadBoundaryPoint) packed into
 // one uint32: x, y via PackXY, and gx, gy in {-1, 0, 1} stored as +1 in 2 bits

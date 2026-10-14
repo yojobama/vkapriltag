@@ -107,13 +107,6 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     throw std::runtime_error(
         "2*(width/decimation) and 2*(height/decimation) must each be <= 16383");
   }
-  // label_pixels.comp packs `1 + root` into the low 30 bits of parent[]; guards the pixel count.
-  if (VkDeviceSize(config_.width / config_.decimation) *
-          (config_.height / config_.decimation) >=
-      (1u << 30)) {
-    throw std::runtime_error(
-        "decimated pixel count must be < 2^30 to fit label_pixels.comp's packed label");
-  }
   // RawLineFitPoint packs blob_index into 22 bits (see common.glsl), bounding max_raw_blobs.
   static_assert(sizeof(RawLineFitPoint) == 8, "RawLineFitPoint packing changed");
   if (config_.max_raw_blobs > (1u << 22)) {
@@ -148,7 +141,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, derived_min_cluster);
   }
   // Floors min_cluster_pixels at 2, as the ambiguous-pixel paths in uf_final.comp and
-  // label_pixels.comp require.
+  // blob_diff.comp require.
   config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, 2u);
 
   // Launch geometry comes from the device, never from a literal.
@@ -375,7 +368,7 @@ GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
 
 void GpuDetector::CreatePipelines() {
   // Picks the _u8 shader variant with storageBuffer8BitAccess; decimated_buf_ and thresholded_buf_
-  // switch together. blob_diff reads the threshold from parent[] and has no variant.
+  // switch together.
   const bool u8 = ctx_.caps().has_8bit_storage;
   auto pick = [u8](const char *base_name, const char *u8_name) {
     return u8 ? u8_name : base_name;
@@ -430,18 +423,13 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(pick("uf_final", "uf_final_u8")),
       {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()}, 12, wg1d_);
 
-  // Binding 4 (blob_diff) / binding 3 (label_pixels) is uf_changed_buf_, read only by the fused
-  // path's speculative attempt.
+  // Binding 4 is uf_changed_buf_, read only by the fused path's speculative attempt. Bindings 5 and 6
+  // let the shader test a pixel's blob size and read the threshold codes itself.
   blob_diff_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("blob_diff"),
+      ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
-       qbp_keys_buf_.get(), uf_changed_buf_.get()},
-      16, wg2d_);
-
-  label_pixels_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("label_pixels", "label_pixels_u8")),
-      {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()},
-      12, wg1d_);
+       qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()},
+      20, wg2d_);
 
   init_extents_pl_ =
       vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4, wg1d_);
@@ -732,23 +720,18 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
 
-  // uf_final also takes the size floor, which must equal label_pc's.
+  // uf_final counts to the size floor, which must equal blob_diff's.
   struct { uint32_t dw, dh, min_blob; } uf_final_pc{decimated_width_, decimated_height_,
                                                     config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
   uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
-  // Folds blob identity and the size test into one value per pixel; see label_pixels.comp.
-  struct { uint32_t count, min_blob, honour_changed_flag; } label_pc{
-      pixels, config_.min_cluster_pixels, speculative ? 1u : 0u};
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelPixels));
-  label_pixels_pl_.Dispatch1D(cmd, pixels, &label_pc);
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelPixels));
-
-  // blob_diff appends valid boundary points directly to the compacted buffer.
-  struct { uint32_t w, h, capacity, honour_changed_flag; } blobdiff_pc{
-      decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u};
+  // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends
+  // valid boundary points directly to the compacted buffer.
+  struct { uint32_t w, h, capacity, honour_changed_flag, min_blob; } blobdiff_pc{
+      decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u,
+      config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
                            BarrierKind::ComputeAndTransfer);
@@ -1306,27 +1289,22 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // selection, sort, line-fit and every readback. A lambda so the fused path can run it twice.
   //
   // Returns whether the uf_changed copy recorded before the call showed convergence. `speculative`
-  // (fused first attempt only) stops label_pixels_pl_ and blob_diff_pl_ acting on unconverged labels.
+  // (fused first attempt only) stops blob_diff_pl_ acting on unconverged labels.
   auto finish_frame = [&](VkCommandBuffer cmd, bool speculative) -> bool {
   const auto t_label = Clock::now();
 
-  // uf_final also takes the size floor, which must equal label_pc's.
+  // uf_final counts to the size floor, which must equal blob_diff's.
   struct { uint32_t dw, dh, min_blob; } uf_final_pc{decimated_width_, decimated_height_,
                                                     config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
   uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
-  // Folds blob identity and the size test into one value per pixel; see label_pixels.comp.
-  struct { uint32_t count, min_blob, honour_changed_flag; } label_pc{
-      pixels, config_.min_cluster_pixels, speculative ? 1u : 0u};
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelPixels));
-  label_pixels_pl_.Dispatch1D(cmd, pixels, &label_pc);
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelPixels));
-
-  // blob_diff appends valid boundary points directly to the compacted buffer.
-  struct { uint32_t w, h, capacity, honour_changed_flag; } blobdiff_pc{
-      decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u};
+  // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends
+  // valid boundary points directly to the compacted buffer.
+  struct { uint32_t w, h, capacity, honour_changed_flag, min_blob; } blobdiff_pc{
+      decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u,
+      config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
                            BarrierKind::ComputeAndTransfer);

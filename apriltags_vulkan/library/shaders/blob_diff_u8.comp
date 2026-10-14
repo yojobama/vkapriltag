@@ -1,12 +1,11 @@
 #version 450
-// label_pixels.comp with a uint8_t Thresholded; Parent stays uint32 (packed
-// label and threshold code, see common.glsl).
+// As blob_diff.comp, with Thresholded stored as uint8_t per pixel.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #include "common.glsl"
 
-layout(std430, binding = 2) readonly buffer Thresholded { uint8_t thresholded[]; };
+layout(std430, binding = 6) readonly buffer Thresholded { uint8_t thresholded[]; };
 #define THRESHOLDED_AT(i) (thresholded[(i)])
 
-#include "label_pixels_body.glsl"
+#include "blob_diff_body.glsl"

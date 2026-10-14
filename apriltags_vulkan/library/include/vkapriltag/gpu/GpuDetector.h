@@ -93,7 +93,7 @@ class GpuDetector {
  public:
   // Number of named GPU timestamp spans; sizes gpu_stage_ms, gpu_gap_ms (one fewer),
   // kGpuStageNames and kGpuGapCrossesSubmit.
-  static constexpr size_t kNumGpuStages = 13;
+  static constexpr size_t kNumGpuStages = 12;
   static constexpr size_t kNumGpuGaps = kNumGpuStages - 1;
 
   struct DetectProfile {
@@ -157,8 +157,7 @@ class GpuDetector {
       "threshold",      // decimate + block_minmax + block_filter + threshold
       "labelling",      // uf_init + uf_compress + the uf_merge/uf_compress loop
       "uf_final",       // uf_final.comp - per-blob pixel-count histogram
-      "label_pixels",   // label_pixels.comp - per-pixel blob identity and min-size test
-      "boundary",       // blob_diff (append + compaction)
+      "boundary",       // blob_diff (blob-size test, append + compaction)
       "hash_group",     // hash_group.comp (also assigns dense raw blob ids)
       "extents",        // init_extents.comp + reduce_extents_hash.comp
       "select",         // select_blobs.comp
@@ -174,8 +173,7 @@ class GpuDetector {
       false,  // clear -> threshold (submit 1)
       false,  // threshold -> labelling (submit 1)
       true,   // labelling -> uf_final (submit 1 -> 2)
-      false,  // uf_final -> label_pixels (submit 2)
-      false,  // label_pixels -> boundary (submit 2)
+      false,  // uf_final -> boundary (submit 2)
       true,   // boundary -> hash_group (submit 2 -> 3)
       false,  // hash_group -> extents (submit 3)
       false,  // extents -> select (submit 3)
@@ -358,7 +356,6 @@ class GpuDetector {
   vk::ComputePipeline init_extents_pl_;
   vk::ComputePipeline merge_extents_pl_;
   vk::ComputePipeline build_qbp_args_pl_, build_sort_args_pl_;
-  vk::ComputePipeline label_pixels_pl_;
   vk::ComputePipeline select_blobs_pl_;
   // Builds indirect_args_buf_ from raw_blob_counter_buf_.
   vk::ComputePipeline build_indirect_args_pl_;
@@ -426,8 +423,8 @@ class GpuDetector {
   void RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *imported, uint32_t chunk);
   void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations);
   // The fused tail: blob sizes through line-fit moments and every counter copy, ending in the host
-  // read barrier. `speculative` (first attempt only) stops label_pixels and blob_diff acting on
-  // labels that may not have converged.
+  // read barrier. `speculative` (first attempt only) stops blob_diff acting on labels that may not
+  // have converged.
   void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
   void RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations);
   void RecordTailRerun(VkCommandBuffer cmd);
@@ -448,7 +445,6 @@ class GpuDetector {
     kSpanThreshold,
     kSpanLabelling,
     kSpanUfFinal,
-    kSpanLabelPixels,
     kSpanBoundary,
     kSpanHashGroup,
     kSpanExtents,

@@ -13,7 +13,7 @@ layout(std430, binding = 1) buffer BlobSize { uint blob_size[]; };
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
-  // Must equal label_pixels.comp's min_blob_pixels.
+  // Must equal blob_diff.comp's min_blob_pixels.
   uint min_blob_pixels;
 } pc;
 
