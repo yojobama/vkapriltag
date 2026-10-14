@@ -421,11 +421,12 @@ class GpuDetector {
   // Pure recording. The head is shared by every flow: timestamp reset, upload copy, counter clears,
   // decimate and threshold, the first labelling chunk, and the convergence-flag copy.
   void RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *imported, uint32_t chunk);
-  void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations);
+  void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations, bool trailing_compress = true);
   // The fused tail: blob sizes through line-fit moments and every counter copy, ending in the host
   // read barrier. `speculative` (first attempt only) stops blob_diff acting on labels that may not
   // have converged.
   void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
+  void RecordFlatten(VkCommandBuffer cmd);
   void RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations);
   void RecordTailRerun(VkCommandBuffer cmd);
 

@@ -621,23 +621,32 @@ struct GpuDetector::FrameStart {
   VkDeviceSize gray_bytes = 0;
 };
 
-void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations) {
+void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool trailing_compress) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
 
   // Records `iterations` labelling passes. The flag is cleared before the last merge, so zero
   // afterwards means converged. The last uf_compress is predicated on it when available.
+  //
+  // Without `trailing_compress` (the fused first attempt) the last merge is a verification merge
+  // and nothing follows it: when it joins nothing, parent[] is still the flat forest the previous
+  // compression left (the compression after uf_init when there is only one iteration), and when it
+  // does, the attempt is discarded and the continuation resumes from the unflattened forest, which
+  // uf_merge accepts. The caller's barrier orders the merge before everything that follows.
   for (uint32_t iter = 0; iter < iterations; ++iter) {
     const bool last = iter + 1 == iterations;
-    const bool predicate = last && predicated_compress_;
+    const bool predicate = last && predicated_compress_ && trailing_compress;
     if (last) {
       // Also orders an earlier predicate read of the flag before the fill.
-      vk::ComputePipeline::Barrier(c, predicated_compress_
-                                          ? BarrierKind::ComputeTransferAndPredicate
-                                          : BarrierKind::ComputeAndTransfer);
+      vk::ComputePipeline::Barrier(c, predicate ? BarrierKind::ComputeTransferAndPredicate
+                                                : BarrierKind::ComputeAndTransfer);
       uf_changed_buf_.FillZero(c);
       vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
+    }
+    if (last && !trailing_compress) {
+      uf_merge_pl_.Dispatch2D(c, decimated_width_, decimated_height_, &dwdh_pc, BarrierKind::None);
+      continue;
     }
     // The barrier makes the merge's flag write visible to the compression's guard or predicate read.
     uf_merge_pl_.Dispatch2D(c, decimated_width_, decimated_height_, &dwdh_pc,
@@ -706,7 +715,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
   uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
 
-  RecordUfChunk(cmd, chunk);
+  RecordUfChunk(cmd, chunk, /*trailing_compress=*/false);
   // The labelling span ends here; any extra convergence chunks are not attributed to it.
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
   // Orders the compute writes before the transfer read below; the default Compute barrier does not
@@ -834,7 +843,16 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   vk::ComputePipeline::HostReadBarrier(cmd);
 }
 
+// Flattens parent[] unconditionally. The first attempt ends in a verification merge with no
+// compression after it, so when that merge joined something the forest it leaves is valid but not
+// flat, and the rest of the retry path needs it flat.
+void GpuDetector::RecordFlatten(VkCommandBuffer cmd) {
+  const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
+  uf_compress_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, &compress_pc);
+}
+
 void GpuDetector::RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations) {
+  RecordFlatten(cmd);
   RecordUfChunk(cmd, iterations);
   // The default compute barrier does not cover the transfer read of this copy.
   vk::ComputePipeline::Barrier(cmd, vk::BarrierKind::ComputeAndTransfer);
@@ -847,6 +865,8 @@ void GpuDetector::RecordTailRerun(VkCommandBuffer cmd) {
   // dirtied (RecordUfChunk re-zeroes uf_changed_buf_) and reruns the tail. The timestamp pool is
   // reset, so this frame has no per-span breakdown for the head.
   timestamp_pool_.Reset(cmd);
+  // Also needed when no continuation ran (max_uf_iterations reached by the first attempt).
+  RecordFlatten(cmd);
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   blob_size_buf_.FillZero(cmd);
