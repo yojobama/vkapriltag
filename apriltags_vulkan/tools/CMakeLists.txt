@@ -56,6 +56,24 @@ add_executable(bench_multiqueue bench_multiqueue/bench_multiqueue.cpp)
 target_link_libraries(bench_multiqueue PRIVATE vkapriltag::vkapriltag)
 install(TARGETS bench_multiqueue RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# What a pipeline barrier costs: K independent dispatches replayed with no barrier, an execution-only
+# barrier and a memory barrier between them (see the header comment). Needs no OpenCV.
+add_custom_command(
+  OUTPUT ${CMAKE_BINARY_DIR}/shaders/barrier_probe.comp.spv
+  COMMAND ${GLSLANG_VALIDATOR_EXECUTABLE} --target-env vulkan1.1
+          -o ${CMAKE_BINARY_DIR}/shaders/barrier_probe.comp.spv
+          ${CMAKE_CURRENT_SOURCE_DIR}/bench_barrier/barrier_probe.comp
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/bench_barrier/barrier_probe.comp
+  COMMENT "Compiling barrier_probe.comp to SPIR-V"
+  VERBATIM
+)
+add_executable(bench_barrier bench_barrier/bench_barrier.cpp
+  ${CMAKE_BINARY_DIR}/shaders/barrier_probe.comp.spv)
+target_compile_definitions(bench_barrier PRIVATE
+  BARRIER_PROBE_SPV="${CMAKE_BINARY_DIR}/shaders/barrier_probe.comp.spv")
+target_link_libraries(bench_barrier PRIVATE vkapriltag::vkapriltag)
+install(TARGETS bench_barrier RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 if(UNIX)
   # Imports a dma-buf (dma-heap allocation or V4L2 capture buffer) as the detector's input frame.
   add_executable(dmabuf_import_test dmabuf_import_test/dmabuf_import_test.cpp)

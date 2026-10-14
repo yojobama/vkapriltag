@@ -1144,6 +1144,73 @@ reconsider only if such a device turns up.
 against another), `--stress <noise|snake|checker|rings>` and `--max-uf <n>`, and it prints how many
 frames needed more than one submission and the labelling-iteration histogram.
 
+## 8h. Orange Pi baseline of the current code, and what a barrier costs
+
+**Setup.** Orange Pi 5 at `15ef4da` (`Release`), 1280x800 corpus image at decimation 2, 300 frames,
+all CPU clusters, the DRAM controller and the GPU on `performance`, **and the LumenVision service
+stopped** (`systemctl stop lumenvision.service`; it runs at boot and uses about two CPU cores, and it
+was running during the 8g measurements). One tag in the image, 75 candidate quads, 0 retried frames
+(2 labelling iterations per frame).
+
+**GPU stage table** (`APRILTAG_VK_TIMESTAMPS=1`, last iteration; the first complete per-stage table
+for the current code on Mali, and the first one that includes `hash_group`, `scatter` and
+`blob_scan`):
+
+| stage | ms | share of GPU total (2.67) |
+| --- | --- | --- |
+| labelling (`uf_init`/`uf_merge`/`uf_compress`) | 0.730 | 27.3% |
+| boundary (`blob_diff`) | 0.363 | 13.6% |
+| sort (`sort_points_local`) | 0.335 | 12.5% |
+| extents | 0.211 | 7.9% |
+| threshold | 0.147 | 5.5% |
+| `label_pixels` | 0.095 | 3.6% |
+| `uf_final` | 0.087 | 3.3% |
+| scatter | 0.082 | 3.1% |
+| `hash_group` | 0.059 | 2.2% |
+| blob scan | 0.051 | 1.9% |
+| clear | 0.049 | 1.8% |
+| select | 0.015 | 0.6% |
+| readback copy | 0.003 | 0.1% |
+| sum of spans | 2.227 | |
+| inter-span gaps | 0.121 (+0.020 at the submit boundary) | |
+
+The remaining GPU time between the sum of spans and `submit_wait` (0.324 ms in total, 12%) is the
+gaps plus launch and completion. These shares agree with the estimates the 2026-10-14 research notes used
+(labelling ~30%, sort ~13%, boundary ~12%), so its ranking stands.
+
+**Whole pipeline**: `GPU total` median 2.663 ms (timestamps off) / 2.674 (on), `quad_decode` 0.295,
+`tag_decode` 0.731, `pipeline_total` **3.700 ms**. The same image measured 4.20 ms in 8g with the
+service running, so that background process cost about 0.5 ms (12%) of `pipeline_total` and nothing
+measurable on `Detect()` (2.66 against 2.70 ms). CPU-tail numbers from before this section carry
+that contention; the A/B deltas in 8g are unaffected because each pair was interleaved.
+
+`tag_decode` breakdown (last iteration): 75 quads, 1 decoded, wall 0.73 ms, CPU 4.73 ms (parallelism
+6.4x); refine spends 92.7% to 97.7% of its time on quads that never decode (two runs; 8e measured
+96.8% on the desktop); busiest thread 0.656 ms against a mean of 0.592 ms.
+
+**What a barrier costs: `bench_barrier`.** The inter-span gap metric cannot see barriers (each is
+recorded before the span-end timestamp), so "intra-submit fusion has little left" was never
+measured. `bench_barrier` records K independent dispatches of S elements into one persistent command
+buffer and replays it with no barrier, an execution-only barrier, or the library's compute-to-compute
+memory barrier between them; the slope of frame time against K (16 and 144) is the cost per dispatch,
+and the difference between variants is the barrier. Variants are interleaved round-robin, 7 rounds of
+60 replays, and the rounds agree to 0.3%.
+
+| elements per dispatch | RX 9060 XT: execution barrier | memory barrier | Mali-G610: execution barrier | memory barrier |
+| --- | --- | --- | --- | --- |
+| 1 (latency only) | +0.96 us | +0.81 us | +0.78 us | +1.72 us |
+| 16,384 | +1.06 | +0.68 | +0.89 | +1.80 |
+| 262,144 | +0.47 | +1.85 | +0.95 | +2.34 |
+| 1,048,576 | +0.28 | +4.64 | +0.97 | +2.37 |
+
+So a barrier costs about 1 to 2 us on either GPU for small and medium passes: execution drain about
+1 us everywhere, plus a cache-flush part that grows with the data written (0.7 to 4.6 us on the
+desktop, 1.4 us flat on the Mali). A frame has 33 barriers: about **80 us (3% of GPU time) on the
+Mali** and **30 to 100 us on the desktop**, where the ~217 us frame is mostly small, latency-bound
+passes (see the 2026-10-14 research notes on branch `research/perf-survey-2026-10`). That bounds everything that removes barriers
+or dispatches: on the Mali, deleting a third of them is worth about 1%, so they only pay when
+combined with real work removed; on the desktop they are worth testing first.
+
 ## 9. Measuring
 
 ```
