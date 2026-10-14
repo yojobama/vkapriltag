@@ -259,6 +259,13 @@ tails and pose estimation are all CPU work:
   (4x Cortex-A76 + 4x Cortex-A55)
 - **Desktop** — AMD Radeon RX 9060 XT GPU, AMD Ryzen 5 5600X CPU (6 cores)
 
+**Orange Pi: set the CPU governor.** The board boots with `ondemand` on all clusters, which adds
+3 to 4 ms to every frame at camera rates (the cores are idle between frames and ramp up slowly) and
+costs 10% of free-running throughput; `schedutil` is worse (11 to 17 ms). Set the A76 clusters
+(`policy4`, `policy6`) to `performance`, or at least a 1.4 GHz floor, in whatever launches the
+detector. The Orange Pi measurements in `apriltags_vulkan/PERFORMANCE.md` were taken with the
+governors pinned to `performance`; section 8i there has the comparison.
+
 Totals are best/median of 25 iterations; the per-stage GPU rows are single
 figures from one instrumented frame (`APRILTAG_VK_TIMESTAMPS=1`).
 
