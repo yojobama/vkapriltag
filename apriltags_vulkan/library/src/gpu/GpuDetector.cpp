@@ -76,6 +76,8 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig 
     : GpuDetector(ctx, lane, nullptr, config) {}
 
 GpuDetector::~GpuDetector() {
+  // Detect() returns only after its submission completes, so nothing recorded is in flight.
+  for (const RecordedFrame &r : recorded_frames_) lane_.FreePersistentCommands(r.cmd);
   if (upload_semaphore_ != VK_NULL_HANDLE) {
     vkDeviceWaitIdle(ctx_.device());
     vkDestroySemaphore(ctx_.device(), upload_semaphore_, nullptr);
@@ -309,10 +311,12 @@ void GpuDetector::CreateBuffers() {
     fused_submits_ = (v[0] != '0') && linefit_direct_read_ && extents_direct_read_;
   }
 
-  // Opt-in: replay a pre-recorded command buffer for the fused first attempt (see prerecord_). Not
-  // combined with the transfer-queue upload, whose semaphore wait is part of the submission.
+  // On by default where it applies: replay pre-recorded command buffers on the fused path (see
+  // prerecord_). APRILTAG_VK_PRERECORD=0 records every frame instead. Not combined with the
+  // transfer-queue upload, whose semaphore wait is part of the submission.
+  prerecord_ = fused_submits_ && transfer_lane_ == nullptr;
   if (const char *v = std::getenv("APRILTAG_VK_PRERECORD")) {
-    prerecord_ = (v[0] != '0') && fused_submits_ && transfer_lane_ == nullptr;
+    prerecord_ = prerecord_ && v[0] != '0';
   }
 
   // Open-addressing table for the (rep0, rep1) grouping, sized to max_raw_blobs; hash_group.comp

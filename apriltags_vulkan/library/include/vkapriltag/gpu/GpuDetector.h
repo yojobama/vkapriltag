@@ -388,7 +388,7 @@ class GpuDetector {
   uint32_t gpu_track_ = 0;
   int64_t frame_first_submit_ns_ = 0;
 
-  // --- Fused-path recording and pre-recording (APRILTAG_VK_PRERECORD=1) ---
+  // --- Fused-path recording and pre-recording (on by default; APRILTAG_VK_PRERECORD=0 disables) ---
   // On the fused path every dispatch is sized on the device, so a frame is a fixed sequence of
   // commands. The Record* functions below only record (no host state, no clocks), so their output
   // can be cached: with pre-recording on, each distinct recording is made once into a persistent

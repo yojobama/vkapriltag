@@ -67,7 +67,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_MAX_POINTS=<n>` | Cap boundary points per frame. The main device-memory lever - see below. |
 | `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2). |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
-| `APRILTAG_VK_PRERECORD=1` | Replay a pre-recorded command buffer for the fused single-submission frame instead of re-recording it every frame. Off by default; see section 8f. |
+| `APRILTAG_VK_PRERECORD=0` | Pre-recorded command buffers are on by default for the fused single-submission frame; `0` records every frame instead. See sections 8f and 8g. |
 | `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
 | `APRILTAG_VK_REFINE=exact\|fast\|ultrafast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
@@ -1024,15 +1024,13 @@ skipped, section 8d). In pipelined mode the GPU-driver thread idles only 20 us b
 GPU pass (557 of 577 us) is the limit. So the ceiling for removing recording is about 5%, and it
 applies only to the fused single-submission path.
 
-**What it does.** With `APRILTAG_VK_PRERECORD=1`, the fused first attempt is recorded once into a
-persistent command buffer (`Lane::BeginPersistentCommands`) and replayed on later frames
-(`Lane::SubmitPersistentAndWait`). Recordings are cached per (input buffer, labelling chunk size), the
-only things that vary for that attempt; the non-converged retry and the unfused path still record
-per frame. During a replay `GpuDetector::Detect()` runs its ordinary code with a null command buffer,
-and every recording call (dispatch, copy, fill, barrier, timestamp, conditional rendering) treats a
-null handle as "record nothing", so there is one code path for recording and replaying. Not combined
-with the transfer-queue upload. Cached buffers live until the `Lane` is destroyed. The host phase
-timings in `DetectProfile` shrink on a replay, since there is nothing left to record.
+**What it does.** The fused first attempt is recorded once into a persistent command buffer
+(`Lane::BeginPersistentCommands`) and replayed on later frames (`Lane::SubmitPersistentAndWait`),
+cached per (input buffer, labelling chunk size), the only things that vary for that attempt. This
+first version replayed by passing a null command buffer through `Detect()` so that every recording
+call did nothing; section 8g replaced that with an explicit structure and also caches the retry
+path. Not combined with the transfer-queue upload. The host phase timings in `DetectProfile` shrink
+on a replay, since there is nothing left to record.
 
 **Results** (RX 9060 XT, ABBA with the env toggle in one binary):
 
@@ -1055,9 +1053,96 @@ per-stream --import` ran under `VK_LAYER_KHRONOS_validation` with synchronizatio
 no validation errors and no `SYNC-HAZARD` messages, the same as with pre-recording off. The layer was
 confirmed loaded.
 
-Left off by default: the single-stream gain is real and repeatable, but this card cannot show what a
-slower host CPU (the Orange Pi's) gains, and the multi-stream case is neutral. Turning it on by
-default is a separate decision.
+This was first left off by default; section 8g measures the Orange Pi and turns it on.
+
+## 8g. Pre-recording, completed: explicit structure, retry replay, and the Orange Pi
+
+**What changed.** `GpuDetector::Detect()` no longer passes a null command buffer around. It is now a
+shared upload prologue followed by one of two flows. The fused flow (`DetectFused`) is built from
+pure recording functions (`RecordFrameHead`, `RecordFusedTail`, `RecordUfContinuation`,
+`RecordTailRerun`: no host state, no clocks, so they can be cached), a cache lookup
+(`FirstAttempt`, `Continuation`, `TailRerun`), and `FinishFused` for everything after the last
+submission. The 12 null-handle guards are gone. The continuation and tail-rerun buffers are cached
+like the first attempt, so with pre-recording a fused frame never records, including a frame whose
+labelling did not converge. `DetectUnfused` is the previous flow moved out intact: its dispatches are
+sized from host-read counts, so it cannot be pre-recorded, and its `fuse` branches are dead code that
+goes when it does. This is therefore not a net reduction in lines: the structure is cleaner, but the
+file is larger until the unfused flow is removed. `DetectProfile` gained `record_ms` and `replayed`,
+and the tracer a `gpu.record` span. **Pre-recording is now on by default**; `APRILTAG_VK_PRERECORD=0`
+records every frame through the same functions. Cached buffers are freed with the detector.
+
+**Why default on.** The rule set before measuring was: on only if the Orange Pi shows no regression
+and the desktop keeps its win. Both held (tables below), and nothing regressed anywhere.
+
+**Verification** (RX 9060 XT and Orange Pi 5 / Mali-G610, each against a baseline build of the
+previous commit made with the same `CMAKE_BUILD_TYPE`, binaries confirmed different by md5):
+- `--dump-quads` (canonical sorted quads at full precision, every frame) is byte-identical to the
+  baseline in 15 of 15 cases on each machine: four corpus sizes with pre-recording off and on, the
+  unfused path (`APRILTAG_VK_FUSE_SUBMITS=0`), forced retries (`--max-uf 1`, off and on), and four
+  stress frames (`--stress noise|snake|checker|rings`).
+- Retry replay exercised on purpose: with `--max-uf 1` every frame needs two submissions. With
+  pre-recording the ring `begin_commands` span disappears and `gpu.record` falls from a 21 us mean to
+  a 0.2 us median lookup (one 387 us first-frame recording).
+- `apriltag_synth_ground_truth` passes with identical numbers on both builds on both machines
+  (desktop 658/767, Orange Pi 659/767).
+- `VK_LAYER_KHRONOS_validation` with synchronization validation: 0 errors and 0 hazards for the
+  default, retry, stress, unfused and pipelined paths and a 4-stream `bench_multiqueue`, on both
+  machines. On the Orange Pi the layer prints no notice of its own, so it was confirmed loaded from the
+  loader's debug output and shown to be reporting by enabling best-practices checks, which produced a
+  message.
+- Real retries do not occur: every corpus image and every stress pattern converged in exactly 2
+  labelling iterations on both machines (0 of 100 frames retried), so `--max-uf 1` is the only way
+  the retry path runs.
+
+**A measurement trap worth knowing.** The same binary measured 0.55 ms `Detect()` in one process and
+0.68 ms in the next: the GPU's clock state shifts by up to 20% between runs (`submit_wait` moved from
+480 to 598 us). A single ABBA pass briefly showed a spurious "-15%" for a change that does nothing. The
+host overhead, `Detect()` minus time inside submit+wait, is not affected and repeats to a few
+microseconds, so use it (from `--profile`: `gpu.detect` minus `gpu.submit_wait`) for host-side
+changes, and many interleaved runs for anything GPU-side.
+
+**Host overhead per `Detect()`** (median of 6 interleaved runs of 300 frames, 1280x800; base = the
+previous commit, 0/1 = pre-recording off/on):
+
+| | base 0 | base 1 | new 0 | new 1 |
+| --- | --- | --- | --- | --- |
+| RX 9060 XT | 81.5 us | 59.2 us | 83.2 us | 58.0 us |
+| Orange Pi (Mali-G610) | 193 us | 127 us | 197 us | 126 us |
+
+The restructuring is performance-neutral on the path that matters (new 0 against base 0, and new 1
+against base 1, are within the run spread); pre-recording itself saves 22 us on the desktop and
+66 us on the Orange Pi.
+
+**Orange Pi detail** (Armbian 26.8.2, kernel 6.1.115-vendor-rk35xx, Mali g24p0, Vulkan 1.3.276, all
+CPU clusters, the DRAM controller and the GPU pinned to `performance`, `Release`):
+
+| | base 0 | base 1 | new 0 | new 1 |
+| --- | --- | --- | --- | --- |
+| `Detect()` median | 2.790 ms | 2.701 ms | 2.780 ms | 2.694 ms |
+| `pipeline_total` median | 4.292 | 4.204 | 4.286 | 4.202 |
+| 1 stream (fps) | 361 | 380 | 361 | 381 |
+| 2 / 4 streams (fps) | 444 / 445 | 445 / 444 | 446 / 445 | 444 / 445 |
+
+So on the Orange Pi pre-recording is -3.2% on `Detect()`, -2.1% on `pipeline_total` and +5.3% for one
+stream; with two or more streams the GPU is the limit (about 445 fps) and nothing changes. On the
+desktop (`bench_multiqueue --import`, `ultrafast`): 1 stream 2,774 / 2,775 fps off, 2,988 / 3,009 on
+(+7.7% / +8.4%); 4 streams about 4,600 either way; no mismatches in any run.
+
+**Stage 2 gate: not needed.** Making the unfused path obsolete (sizing every dispatch on the device so
+it too can be pre-recorded) was gated on Orange Pi data:
+- G1: the Mali takes the fused path already (`unified_memory=yes, host_cached=yes`, one submission per
+  frame, gray upload written directly).
+- G2: 0 retried frames out of 100 on every corpus image and stress pattern.
+- G5: the unfused path costs +11.5% on `Detect()` (3.09 vs 2.77 ms) and +8.1% on `pipeline_total` on
+  the Mali, so any device stuck on it would pay that.
+
+No measured device is stuck on it. The unfused path stays as the fallback for a device without
+host-visible, cached readback memory (the fused path requires both readbacks to be read in place);
+reconsider only if such a device turns up.
+
+**Tooling added for this.** `apriltag_vulkan_validate` gained `--dump-quads <file>` (diff one build
+against another), `--stress <noise|snake|checker|rings>` and `--max-uf <n>`, and it prints how many
+frames needed more than one submission and the labelling-iteration histogram.
 
 ## 9. Measuring
 

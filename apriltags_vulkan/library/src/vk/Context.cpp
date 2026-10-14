@@ -1125,6 +1125,10 @@ VkCommandBuffer Lane::BeginPersistentCommands() {
   return cmd;
 }
 
+void Lane::FreePersistentCommands(VkCommandBuffer cmd) {
+  vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+}
+
 void Lane::EndCommands(VkCommandBuffer cmd) {
   CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 }
