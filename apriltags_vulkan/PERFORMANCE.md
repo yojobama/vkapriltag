@@ -1263,6 +1263,83 @@ nothing. Disabling the deep idle state helps only a free-running stream (about +
 what a camera does, so it is not worth recommending. The LumenVision service itself costs about
 0.5 ms of `pipeline_total` (8h) while it is running.
 
+## 8k. GPU stage changes from the 2026-10 research: -13.5% `Detect()` on the Mali
+
+Five changes to the GPU stages, each bit-identical to the commit before it, each measured on the
+Orange Pi against the previous commit (ABBA, 10 interleaved runs of 400 frames, governors pinned,
+LumenVision stopped, 1280x800 at decimation 2). The Orange Pi `Detect()` median after each:
+
+| step | change | `Detect()` median | against the previous step |
+| --- | --- | --- | --- |
+| 0 | start (`perf/full-prerecord` plus the 8h baseline) | 2.668 ms | |
+| 1 | `blob_diff` reads the 1-byte threshold codes and gathers `parent[]`/`blob_size[]` only for pixels with an opposite-coloured neighbour; the `label_pixels` pass (a full rewrite of `parent[]`) is deleted | 2.603 ms | -2.4% |
+| 2 | the first attempt's last merge is a verification merge with nothing after it (the guarded compression that followed it was a no-op when it joins nothing) | 2.576 ms | -1.0% |
+| 3 | the last real compression also counts blob sizes (`uf_compress_count`), so the first attempt skips `uf_final` | 2.549 ms | -1.2% |
+| 4 | `blob_diff` reserves a pixel's boundary slots with one atomic increment instead of up to four | 2.337 ms | **-7.8%** |
+| 5 | `sort_points_local`: rank-merge sort (runs of 16 ranked, then merged by binary search) in place of the Batcher network | 2.311 ms | -0.9% |
+
+Original against final in one interleaved run (12 rounds): `Detect()` **2.671 -> 2.311 ms (-13.5%)**,
+`pipeline_total` 3.688 -> 3.331 ms (-9.7%), host overhead unchanged at 112 us.
+
+**Throughput** (`bench_multiqueue --mode single`, 3 rounds of 800 frames, no mismatches):
+
+| streams | Orange Pi, before | after | RX 9060 XT (`--import`, `ultrafast`), before | after |
+| --- | --- | --- | --- | --- |
+| 1 | 379 fps | 452 fps (+19%) | 3,070 | 3,357 (+9.3%) |
+| 2 | 447 | 524 (+17%) | | |
+| 4 | 447 | 524 (+17%) | 4,734 (one queue) | 5,227 (+10.4%) |
+| 4, alternating families | | | 8,361 | 9,137 (+9.3%) |
+
+On the RX 9060 XT `Detect()` falls from 0.533 to 0.473 ms in the clock state both runs share (-11%;
+its clock bimodality of 0.53 or 0.59 ms makes the plain median unreliable, 16 rounds each).
+
+**Per-stage spans on the Orange Pi** (timestamps on, last iteration), before and after:
+
+| stage | before | after |
+| --- | --- | --- |
+| labelling | 0.730 | 0.768 (now includes the blob-size count) |
+| `uf_final` | 0.087 | 0.004 (only the tail rerun counts) |
+| `label_pixels` | 0.095 | deleted |
+| boundary (`blob_diff`) | 0.363 | 0.276 |
+| extents | 0.211 | 0.170 |
+| scatter | 0.082 | 0.066 |
+| hash group | 0.059 | 0.051 |
+| sort | 0.335 | 0.251 |
+| GPU total | 2.67 | 2.31 |
+
+The three stages after `blob_diff` (extents, scatter, hash group) also got faster with the one-atomic
+change; the cause is not established (the points of one pixel are now contiguous in the buffer they
+read).
+
+**The sort.** With the network removed outright (a bound build, wrong output) the sort span fell from
+0.374 to 0.066 ms, so the network cost about 0.31 ms. Replacing it by ranking alone was only a win up
+to 256 points per blob (ranking a blob of n points costs n^2 shared-memory reads: 128 -1.1%, 256
+-1.1%, 512 +1.9%, 1024 +18%). The rank-merge sort sorts runs of 16 by ranking and merges them pairwise,
+each point binary-searching its merged position in the other run, so a blob needs about
+log2(count/16)+1 barriers instead of 28 to 55. Run length sweep (8 rounds): network 2.34 ms, run 4
+2.32, 8 2.31, 16 2.305, 32 2.306, 64 2.34, 128 2.41, 256 2.54. The sort workgroup size stays at 256
+(128 is equal, 64 is +7%, 32 is +22%). Both sorts give the same permutation because every packed key
+carries its local index. `APRILTAG_VK_SORT_CHUNK=0` restores the network, `APRILTAG_VK_SORT_WG`
+sets the workgroup size. The histogram `--profile` now prints shows why the gain is modest: of 136
+selected blobs, 99 have at most 128 points (7,204 of 17,650 points) and 10 have more than 256.
+
+**Tried and dropped.** Deferring the transfer-to-compute barrier after the per-frame fills so that
+decimate and threshold overlap them (research item F3): 2.3103 against 2.3126 ms, a null; the Mali
+runs the fills in order. Not built: the dispatch diet (folding `init_extents`, `merge_extents` and the
+count scan into their neighbours) is bounded by the barrier measurement in 8h to about 8 dispatches at
+roughly 3.5 us each, near 1% of the Mali GPU time, for several shader rewrites; and run-merging
+before the 64-bit extents atomics was already tried as subgroup aggregation and retired on
+integrated GPUs (OPTIMIZATION_NOTES item 6).
+
+**Verification** (each step, both machines): the 15-case canonical-quad matrix (four corpus sizes
+with pre-recording on and off, the unfused path, forced retries on and off, four stress frames) is
+byte-identical to the original in 15 of 15 cases; also `APRILTAG_VK_UF_CHUNK` 1, 3 and 4 (chunk 1
+exercises the count inside the head compression and a real retry), the 32-bit storage variant and the
+sort run length 32 to 2048. `VK_LAYER_KHRONOS_validation` with synchronization validation: 0 errors
+and 0 hazards for the default, forced-retry, pipelined, stress, unfused and 4-stream runs on both
+machines (the Mali layer confirmed loaded by a best-practices control message). `apriltag_synth_
+ground_truth`: 658/767 (RX 9060 XT) and 659/767 (Orange Pi), unchanged.
+
 ## 9. Measuring
 
 ```

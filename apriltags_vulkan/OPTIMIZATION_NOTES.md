@@ -1847,3 +1847,62 @@ this change never touches).
 flag needed), same protocol: GPU total **-0.7%** (d1, unanimous 12/12) /
 -1.3% (d2, 7/12 - a plausible small win, noisier). No regression at
 either decimation on either device. Shipped on.
+
+## 18. `blob_diff` reads the threshold codes itself; `label_pixels` deleted - shipped, on
+
+`label_pixels` rewrote every pixel's `parent[]` entry into a packed (label, threshold code) word so
+that `blob_diff` could read one word per neighbour. `blob_diff` now reads the threshold codes
+(1 byte per pixel) of the pixel and its neighbours first, and gathers `parent[]` and `blob_size[]`
+only for a pixel that has an opposite-coloured neighbour. The blob-size test is the same
+(`blob_size[root] >= min_blob_pixels`), the append set is the same, and the destructive in-place
+rewrite of `parent[]` that once caused a DEVICE_LOST on a not-yet-converged first attempt is gone.
+Bit-identical (15/15 quad dumps, both machines). Orange Pi `Detect()` -2.4%. See PERFORMANCE.md 8k.
+
+## 19. The first attempt's verification merge needs no compression after it, and the count moves into the compression before it - shipped, on
+
+In the fused first attempt the last merge only verifies. When it joins nothing, `parent[]` is the flat
+forest the previous compression left, so the guarded compression after it did nothing; when it joins
+something the attempt is discarded. Two consequences, both exact:
+
+- the trailing compression is not recorded (-1.0%); the retry path now starts with an unconditional
+  flatten (the continuation, and the tail rerun for the case where `max_uf_iterations` was reached
+  by the first attempt, which the `--max-uf 1` runs caught: without it the rerun counted on an
+  unflattened forest);
+- the last real compression (`uf_compress_count`) also does `uf_final`'s saturating count, since the
+  pixel's root is already in a register, so the speculative tail skips the `uf_final` pass (-1.2%).
+  With a single iteration the count happens in the head compression after `uf_init`.
+
+The tail rerun still runs the real `uf_final`. Bit-identical for `APRILTAG_VK_UF_CHUNK` 1, 3 and 4.
+
+## 20. `blob_diff`: one atomic per pixel instead of up to four - shipped, on
+
+A pixel emits up to four boundary points (E, SE, S, SW) and each did its own global `atomicAdd` on
+the append counter, about 65k atomics per frame at decimation 2 on one address. The pixel now counts
+its valid connections and reserves that many slots with one atomic, then stores the points. The
+append order changes (a pixel's points become contiguous) and nothing depends on it. Orange Pi
+`Detect()` **-7.8%**, the largest single step of the 2026-10 research, and it also shortened the
+following `hash_group`, extents and scatter spans. Bit-identical.
+
+## 21. `sort_points_local`: rank-merge sort - shipped, on (small)
+
+The Batcher network cost about 0.31 ms of the sort span (a bound build without it: 0.374 -> 0.066).
+Plain ranking beats it only up to 256 points. The shipped sort ranks runs of 16 and merges runs
+pairwise by binary search, about log2(count/16)+1 barriers instead of 28 to 55: -0.9% `Detect()` on
+the Mali, neutral on the RX 9060 XT. The sort span itself fell from 0.374 to 0.251 ms with timestamps on, but `Detect()` fell by only
+0.02 ms: with the timestamps off part of the saving is hidden by overlap, so the span overstates it.
+Halving the workgroup size does not help (128 equal, 64 +7%), so what limits the rest is not
+established. Further gains would need less work per blob (for example a smaller sort for the 99 of
+136 blobs under 128 points).
+
+## 22. Measured and not shipped (2026-10 research follow-up)
+
+- **Deferring the barrier after the per-frame fills** so decimate and threshold overlap them:
+  2.3103 vs 2.3126 ms on the Orange Pi (10 interleaved runs). Null: the Mali runs the fills in
+  order. Reverted.
+- **Dispatch diet** (fold `init_extents`, `merge_extents`, the count scan and the three argument
+  builders into neighbours): the barrier microbenchmark (`bench_barrier`, PERFORMANCE.md 8h) puts a
+  dispatch plus its barrier at about 3.5 us on the Mali, so the ceiling for the 8 removable pairs is
+  about 28 us, near 1%, for several shader rewrites. Not built.
+- **Run-merge before the 64-bit extents atomics:** the subgroup version of this idea is item 6 (retired
+  on integrated GPUs). Not re-proposed without new evidence.
+
