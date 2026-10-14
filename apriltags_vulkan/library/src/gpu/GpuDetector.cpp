@@ -185,8 +185,15 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // sort_points_local.comp workgroup size: the device's maximum invocation count rounded down to a
   // power of two.
   local_sort_cap_ = PrevPow2(std::max(caps.max_workgroup_invocations, 1u));
-  // Limited to 256 threads.
+  // Limited to 256 threads; APRILTAG_VK_SORT_WG overrides (rounded down to a power of two, at most
+  // the device limit).
   local_sort_cap_ = std::min(local_sort_cap_, 256u);
+  if (const char *v = std::getenv("APRILTAG_VK_SORT_WG")) {
+    const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    if (wanted >= 1u) {
+      local_sort_cap_ = std::min(PrevPow2(wanted), PrevPow2(std::max(caps.max_workgroup_invocations, 1u)));
+    }
+  }
 
   // Sort slots per blob: 2048 at decimation 2, scaling with 1/decimation and never below 2048.
   const uint32_t kCapAtDecimation2 = 2048u;
@@ -476,13 +483,21 @@ void GpuDetector::CreatePipelines() {
     }
   }
 
+  // Rank-merge sort run length (a power of two; see sort_points_local_body.glsl), 0 for the sorting
+  // network. 16 measured best on the Mali-G610 (about -1.5% of Detect()) and neutral on the RX 9060
+  // XT. APRILTAG_VK_SORT_CHUNK overrides.
+  uint32_t sort_chunk = 16u;
+  if (const char *v = std::getenv("APRILTAG_VK_SORT_CHUNK")) {
+    sort_chunk = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    if (sort_chunk != 0u && (sort_chunk & (sort_chunk - 1u)) != 0u) sort_chunk = 0u;
+  }
   sort_points_local_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
        decimated_buf_.get(), line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
        // binding 6: the device-side selected-blob count.
        selected_counter_buf_.get()},
-      20, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_});
+      20, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_, sort_chunk});
 
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),

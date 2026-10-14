@@ -9,6 +9,13 @@ layout(local_size_x_id = 0, local_size_x = 256) in;
 // Per-blob slot capacity (one shared word per point), independent of the workgroup size; see
 // local_sort_virtual_cap_ in GpuDetector.cpp.
 layout(constant_id = 3) const uint kLocalCap = 1024;
+// Non-zero (a power of two) selects the rank-merge sort: runs of kChunk points are sorted by
+// ranking (each point counts the points ahead of it in its run), then runs are merged pairwise,
+// each point finding its merged position by binary search in the other run. The packed words are
+// unique, so every rank is exact. It needs about log2(count / kChunk) + 1 barriers where the
+// sorting network below needs one per round (28 to 55). A blob of at most kChunk points is just
+// ranked. 0 keeps the sorting network.
+layout(constant_id = 4) const uint kChunk = 0;
 
 layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
@@ -58,6 +65,10 @@ const uint kLocalIndexBits = 12u;
 const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
 
 shared uint s_packed[kLocalCap];
+// Ping-pong partner of s_packed for the rank-merge sort.
+shared uint s_merge[kChunk != 0u ? kLocalCap : 1u];
+
+uint SortedAt(bool from_merge, uint i) { return from_merge ? s_merge[i] : s_packed[i]; }
 
 void main() {
   uint blob = gl_WorkGroupID.x;
@@ -74,6 +85,76 @@ void main() {
     if (tid == 0u) atomicAdd(oversized_blobs, 1u);
     for (uint idx = tid; idx < count; idx += threads) {
       output_points[base + idx] = ComputeLineFitPoint(src[base + idx]);
+    }
+    return;
+  }
+
+  if (kChunk != 0u) {
+    for (uint idx = tid; idx < count; idx += threads) {
+      s_packed[idx] = (min(src[base + idx].theta_key, kMaxThetaKey) << kLocalIndexBits) | idx;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    if (count <= kChunk) {
+      for (uint idx = tid; idx < count; idx += threads) {
+        uint v = s_packed[idx];
+        uint rank = 0u;
+        for (uint j = 0u; j < count; ++j) rank += uint(s_packed[j] < v);
+        output_points[base + rank] = ComputeLineFitPoint(src[base + idx]);
+      }
+      return;
+    }
+
+    // Sorts each run of kChunk points by ranking, into s_merge.
+    for (uint idx = tid; idx < count; idx += threads) {
+      uint run_start = idx & ~(kChunk - 1u);
+      uint run_end = min(run_start + kChunk, count);
+      uint v = s_packed[idx];
+      uint rank = 0u;
+      for (uint j = run_start; j < run_end; ++j) rank += uint(s_packed[j] < v);
+      s_merge[run_start + rank] = v;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // Merges pairs of runs, doubling the run length each round; the last round writes the output.
+    bool in_merge = true;
+    for (uint run = kChunk; run < count; run <<= 1u) {
+      const bool last = (run << 1u) >= count;
+      for (uint idx = tid; idx < count; idx += threads) {
+        uint v = SortedAt(in_merge, idx);
+        uint pair_start = idx & ~((run << 1u) - 1u);
+        bool left = (idx - pair_start) < run;
+        uint own_start = left ? pair_start : pair_start + run;
+        uint other_start = left ? pair_start + run : pair_start;
+        // The right run of the last pair can be short or empty; the left run is always full.
+        uint other_len = other_start < count ? min(run, count - other_start) : 0u;
+        uint lo = 0u;
+        uint hi = other_len;
+        while (lo < hi) {
+          uint mid = (lo + hi) >> 1u;
+          if (SortedAt(in_merge, other_start + mid) < v) {
+            lo = mid + 1u;
+          } else {
+            hi = mid;
+          }
+        }
+        uint pos = pair_start + (idx - own_start) + lo;
+        if (last) {
+          output_points[base + pos] =
+              ComputeLineFitPoint(src[base + (v & ((1u << kLocalIndexBits) - 1u))]);
+        } else if (in_merge) {
+          s_packed[pos] = v;
+        } else {
+          s_merge[pos] = v;
+        }
+      }
+      if (!last) {
+        memoryBarrierShared();
+        barrier();
+        in_merge = !in_merge;
+      }
     }
     return;
   }

@@ -366,6 +366,24 @@ int main(int argc, char **argv) {
           << std::endl;
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
+      {
+        // Sort workload: selected blobs and their points by point count (the sort runs one
+        // workgroup per blob, and its cost grows faster than linearly with the count).
+        const uint32_t bounds[] = {16, 32, 64, 128, 256, 512, 1024};
+        uint32_t blobs_in[8] = {}, points_in[8] = {};
+        for (const apriltag_vulkan::MinMaxExtentsGpu &e : detector.last_selected_extents) {
+          size_t b = 0;
+          while (b < 7 && e.count > bounds[b]) ++b;
+          ++blobs_in[b];
+          points_in[b] += e.count;
+        }
+        std::cout << "  selected blob point counts (blobs/points): ";
+        for (size_t b = 0; b < 8; ++b) {
+          std::cout << (b < 7 ? "<=" + std::to_string(bounds[b]) : std::string(">1024")) << ": "
+                    << blobs_in[b] << "/" << points_in[b] << (b < 7 ? ", " : "");
+        }
+        std::cout << std::endl;
+      }
       const double gpu_span_total = PrintGpuStageBreakdown(profile);
       // Host-side cost of driving the GPU (see DetectProfile's cpu_*_ms).
       std::cout << "  Host-side submission cost (last iteration): begin="
