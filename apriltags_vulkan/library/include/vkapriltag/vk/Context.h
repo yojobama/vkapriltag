@@ -272,6 +272,16 @@ class Lane {
   // reused only after its fence signals (checked by the next BeginCommands on this slot).
   void SubmitSignal(VkCommandBuffer cmd, VkSemaphore signal);
 
+  // Pre-recorded work. BeginPersistentCommands() allocates a command buffer outside the ring and
+  // begins it without ONE_TIME_SUBMIT, so it can be submitted again; it lives until the Lane is
+  // destroyed. SubmitPersistentAndWait() ends it first when `end_recording` (the frame it was
+  // recorded in), then submits it and waits on a fence the Lane keeps for this purpose. Not
+  // thread-safe, like the ring: one frame in flight per Lane. Optionally waits on `wait` first.
+  VkCommandBuffer BeginPersistentCommands();
+  void SubmitPersistentAndWait(VkCommandBuffer cmd, bool end_recording,
+                               VkSemaphore wait = VK_NULL_HANDLE,
+                               VkPipelineStageFlags wait_stage = 0);
+
   // Queue submissions since construction.
   uint64_t submit_count = 0;
 
@@ -288,6 +298,7 @@ class Lane {
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkCommandBuffer cmd_ring_[kCommandRing] = {};
   VkFence fence_ring_[kCommandRing] = {};
+  VkFence persistent_fence_ = VK_NULL_HANDLE;  // created on first BeginPersistentCommands()
   size_t ring_next_ = 0;
   size_t ring_active_ = 0;
 };

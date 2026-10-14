@@ -381,6 +381,21 @@ class GpuDetector {
   // submission, which anchors the GPU timestamps to the host timeline.
   uint32_t gpu_track_ = 0;
   int64_t frame_first_submit_ns_ = 0;
+
+  // Pre-recorded frames (APRILTAG_VK_PRERECORD=1, fused path only). The fused first attempt is the
+  // same sequence of commands every frame for a given input buffer and labelling chunk size, so it
+  // is recorded once into a persistent command buffer and later frames replay it. During a replay
+  // Detect() runs its normal code with a null command buffer, which every recording call treats as
+  // "record nothing", and SubmitTimedAndWait() submits the cached buffer instead.
+  struct RecordedFrame {
+    const uint8_t *key = nullptr;  // imported frame's key, or null for the staged copy path
+    uint32_t chunk = 0;            // labelling iterations baked into the recording
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+  };
+  std::vector<RecordedFrame> recorded_frames_;
+  bool prerecord_ = false;
+  VkCommandBuffer replay_cmd_ = VK_NULL_HANDLE;  // non-null only while replaying a frame
+  RecordedFrame recording_;                      // the frame being recorded, once cmd is set
   enum GpuStageSpan {
     kSpanClear = 0,
     kSpanThreshold,

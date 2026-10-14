@@ -67,6 +67,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_MAX_POINTS=<n>` | Cap boundary points per frame. The main device-memory lever - see below. |
 | `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2). |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
+| `APRILTAG_VK_PRERECORD=1` | Replay a pre-recorded command buffer for the fused single-submission frame instead of re-recording it every frame. Off by default; see section 8f. |
 | `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
 | `APRILTAG_VK_REFINE=exact\|fast\|ultrafast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
@@ -1013,6 +1014,50 @@ Device-specific (not measurable on the hardware available when this was written)
   host time; whether the sample app's V4L2 path uses `ImportDmaBufFrame` was not checked.
 - **RDNA4:** the GPU phase is ~0.33 ms of a ~1.0 ms frame, so GPU shader work is no longer the limit;
   the tail and the host-side `submit_wait` (0.54 ms median, mostly waiting on the GPU) are.
+
+## 8f. Pre-recorded command buffers (experiment)
+
+**Gate.** Before building anything, the cost of recording was derived from the tracer (median of
+370 frames, RX 9060 XT, 1280x800): command recording about 22 us plus `begin_commands` (fence wait,
+reset, begin) about 5 us, 27 us in all, 5.4% of a 503 us `Detect()` (5.6% once the frame copy is
+skipped, section 8d). In pipelined mode the GPU-driver thread idles only 20 us between frames and the
+GPU pass (557 of 577 us) is the limit. So the ceiling for removing recording is about 5%, and it
+applies only to the fused single-submission path.
+
+**What it does.** With `APRILTAG_VK_PRERECORD=1`, the fused first attempt is recorded once into a
+persistent command buffer (`Lane::BeginPersistentCommands`) and replayed on later frames
+(`Lane::SubmitPersistentAndWait`). Recordings are cached per (input buffer, labelling chunk size), the
+only things that vary for that attempt; the non-converged retry and the unfused path still record
+per frame. During a replay `GpuDetector::Detect()` runs its ordinary code with a null command buffer,
+and every recording call (dispatch, copy, fill, barrier, timestamp, conditional rendering) treats a
+null handle as "record nothing", so there is one code path for recording and replaying. Not combined
+with the transfer-queue upload. Cached buffers live until the `Lane` is destroyed. The host phase
+timings in `DetectProfile` shrink on a replay, since there is nothing left to record.
+
+**Results** (RX 9060 XT, ABBA with the env toggle in one binary):
+
+| | off | on | |
+| --- | --- | --- | --- |
+| `Detect()`, staged copy, 4 rounds x 500 frames | 0.605 ms | 0.577 ms | -4.7% |
+| `Detect()`, imported frame | 0.536 | 0.508 | -5.2% |
+| `pipeline_total`, staged copy / imported | 1.022 / 0.952 | 0.995 / 0.921 | -2.6% / -3.3% |
+| `bench_multiqueue --import`, 1 stream (fps) | 2,699 | 2,958 | +9.6% |
+| 4 streams / 8 streams (fps) | 4,502 / 4,521 | 4,470 / 4,520 | -0.7% / 0% |
+
+The `Detect()` saving (28 us) matches the gate's 27 us estimate. The single-stream throughput gain is
+larger than that (the 12 runs per setting do not overlap: off 2,565-2,715, on 2,875-3,006); a plausible
+cause is less driver work competing with the 12 tail threads, which was not verified. With four or more
+streams the GPU is saturated and there is no gain. Output is unchanged: 5 of 5 corpus images match
+libapriltag, and `bench_multiqueue` reports no mismatches in any run.
+
+**Synchronisation.** `apriltag_vulkan_validate --import` and `bench_multiqueue --streams 4 --mode
+per-stream --import` ran under `VK_LAYER_KHRONOS_validation` with synchronization validation enabled:
+no validation errors and no `SYNC-HAZARD` messages, the same as with pre-recording off. The layer was
+confirmed loaded.
+
+Left off by default: the single-stream gain is real and repeatable, but this card cannot show what a
+slower host CPU (the Orange Pi's) gains, and the multi-stream case is neutral. Turning it on by
+default is a separate decision.
 
 ## 9. Measuring
 

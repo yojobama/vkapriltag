@@ -41,13 +41,13 @@ QueryPool &QueryPool::operator=(QueryPool &&other) noexcept {
 }
 
 void QueryPool::Reset(VkCommandBuffer cmd) const {
-  if (pool_ == VK_NULL_HANDLE) return;
+  if (pool_ == VK_NULL_HANDLE || cmd == VK_NULL_HANDLE) return;
   vkCmdResetQueryPool(cmd, pool_, 0, count_);
 }
 
 void QueryPool::WriteTimestamp(VkCommandBuffer cmd, uint32_t index,
                                VkPipelineStageFlagBits stage) const {
-  if (pool_ == VK_NULL_HANDLE || index >= count_) return;
+  if (pool_ == VK_NULL_HANDLE || cmd == VK_NULL_HANDLE || index >= count_) return;
   vkCmdWriteTimestamp(cmd, stage, pool_, index);
 }
 

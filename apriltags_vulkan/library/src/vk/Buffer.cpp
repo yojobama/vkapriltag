@@ -303,7 +303,7 @@ void Buffer::InvalidateRange(VkDeviceSize offset, VkDeviceSize bytes) const {
 
 void Buffer::RecordCopyFrom(VkCommandBuffer cmd, const Buffer &src, VkDeviceSize bytes,
                             VkDeviceSize src_offset, VkDeviceSize dst_offset) const {
-  if (bytes == 0) return;
+  if (bytes == 0 || cmd == VK_NULL_HANDLE) return;  // null cmd: replaying a pre-recorded frame
   VkBufferCopy region{};
   region.srcOffset = src_offset;
   region.dstOffset = dst_offset;
@@ -313,7 +313,7 @@ void Buffer::RecordCopyFrom(VkCommandBuffer cmd, const Buffer &src, VkDeviceSize
 
 void Buffer::RecordCopyTo(VkCommandBuffer cmd, const Buffer &dst, VkDeviceSize bytes,
                           VkDeviceSize src_offset, VkDeviceSize dst_offset) const {
-  if (bytes == 0) return;
+  if (bytes == 0 || cmd == VK_NULL_HANDLE) return;  // null cmd: replaying a pre-recorded frame
   VkBufferCopy region{};
   region.srcOffset = src_offset;
   region.dstOffset = dst_offset;
@@ -322,11 +322,12 @@ void Buffer::RecordCopyTo(VkCommandBuffer cmd, const Buffer &dst, VkDeviceSize b
 }
 
 void Buffer::FillZero(VkCommandBuffer cmd) const {
+  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   vkCmdFillBuffer(cmd, buffer_, 0, size_, 0);
 }
 
 void Buffer::FillZeroRange(VkCommandBuffer cmd, VkDeviceSize offset, VkDeviceSize bytes) const {
-  if (bytes == 0) return;
+  if (bytes == 0 || cmd == VK_NULL_HANDLE) return;  // null cmd: replaying a pre-recorded frame
   // vkCmdFillBuffer needs a 4-byte aligned offset and size.
   const VkDeviceSize aligned_offset = offset & ~VkDeviceSize(3);
   VkDeviceSize aligned_bytes = (bytes + (offset - aligned_offset) + 3) & ~VkDeviceSize(3);

@@ -642,6 +642,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
 
 void Context::CmdBeginConditionalRendering(VkCommandBuffer cmd, VkBuffer buffer,
                                            VkDeviceSize offset, bool inverted) const {
+  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   VkConditionalRenderingBeginInfoEXT info{};
   info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
   info.buffer = buffer;
@@ -651,6 +652,7 @@ void Context::CmdBeginConditionalRendering(VkCommandBuffer cmd, VkBuffer buffer,
 }
 
 void Context::CmdEndConditionalRendering(VkCommandBuffer cmd) const {
+  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   end_conditional_rendering_(cmd);
 }
 
@@ -1014,6 +1016,7 @@ Lane::~Lane() {
   for (size_t i = 0; i < kCommandRing; ++i) {
     if (fence_ring_[i]) vkDestroyFence(device_, fence_ring_[i], nullptr);
   }
+  if (persistent_fence_) vkDestroyFence(device_, persistent_fence_, nullptr);
   if (command_pool_) vkDestroyCommandPool(device_, command_pool_, nullptr);
 }
 
@@ -1101,6 +1104,50 @@ void Lane::SubmitAndWait(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageF
   }
   ++submit_count;
   CheckVk(vkWaitForFences(device_, 1, &fence_ring_[i], VK_TRUE, UINT64_MAX),
+          "vkWaitForFences");
+}
+
+VkCommandBuffer Lane::BeginPersistentCommands() {
+  if (persistent_fence_ == VK_NULL_HANDLE) {
+    VkFenceCreateInfo fence_info{};
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    CheckVk(vkCreateFence(device_, &fence_info, nullptr, &persistent_fence_), "vkCreateFence");
+  }
+  VkCommandBufferAllocateInfo alloc_info{};
+  alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  alloc_info.commandPool = command_pool_;
+  alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  alloc_info.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  CheckVk(vkAllocateCommandBuffers(device_, &alloc_info, &cmd), "vkAllocateCommandBuffers");
+
+  VkCommandBufferBeginInfo begin_info{};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  CheckVk(vkBeginCommandBuffer(cmd, &begin_info), "vkBeginCommandBuffer");
+  return cmd;
+}
+
+void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, bool end_recording, VkSemaphore wait,
+                                   VkPipelineStageFlags wait_stage) {
+  if (end_recording) CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+
+  VkSubmitInfo submit_info{};
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &cmd;
+  if (wait != VK_NULL_HANDLE) {
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = &wait;
+    submit_info.pWaitDstStageMask = &wait_stage;
+  }
+
+  CheckVk(vkResetFences(device_, 1, &persistent_fence_), "vkResetFences");
+  {
+    std::lock_guard<std::mutex> lock(*submit_mutex_);
+    CheckVk(vkQueueSubmit(queue_, 1, &submit_info, persistent_fence_), "vkQueueSubmit");
+  }
+  ++submit_count;
+  CheckVk(vkWaitForFences(device_, 1, &persistent_fence_, VK_TRUE, UINT64_MAX),
           "vkWaitForFences");
 }
 

@@ -309,6 +309,12 @@ void GpuDetector::CreateBuffers() {
     fused_submits_ = (v[0] != '0') && linefit_direct_read_ && extents_direct_read_;
   }
 
+  // Opt-in: replay a pre-recorded command buffer for the fused first attempt (see prerecord_). Not
+  // combined with the transfer-queue upload, whose semaphore wait is part of the submission.
+  if (const char *v = std::getenv("APRILTAG_VK_PRERECORD")) {
+    prerecord_ = (v[0] != '0') && fused_submits_ && transfer_lane_ == nullptr;
+  }
+
   // Open-addressing table for the (rep0, rep1) grouping, sized to max_raw_blobs; hash_group.comp
   // drops points beyond its probe cap.
   hash_table_size_ = NextPow2(std::max(config_.max_raw_blobs, 1u));
@@ -577,7 +583,19 @@ void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
   VKA_PROF_SCOPE("gpu.submit_wait");
   const auto t0 = Clock::now();
   if (prof::Enabled() && frame_first_submit_ns_ == 0) frame_first_submit_ns_ = ToNs(t0);
-  lane_.SubmitAndWait(cmd, pending_wait_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  if (cmd == VK_NULL_HANDLE) {
+    // Replay: nothing was recorded this frame; submit the cached buffer.
+    lane_.SubmitPersistentAndWait(replay_cmd_, /*end_recording=*/false, pending_wait_,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  } else if (cmd == recording_.cmd) {
+    // The recording frame: ends the buffer, submits it, and caches it for later frames.
+    lane_.SubmitPersistentAndWait(cmd, /*end_recording=*/true, pending_wait_,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    recorded_frames_.push_back(recording_);
+    recording_ = RecordedFrame{};
+  } else {
+    lane_.SubmitAndWait(cmd, pending_wait_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
   pending_wait_ = VK_NULL_HANDLE;
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
@@ -658,7 +676,28 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     last_profile_.gap_crosses_submit[kSpanBoundary] = false;   // boundary -> hash_group
     last_profile_.gap_crosses_submit[kSpanScatter] = false;    // scatter -> sort
   }
-  VkCommandBuffer cmd = BeginTimedCommands();
+  // Seeds the first labelling chunk with last frame's converged iteration count.
+  uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
+  chunk = std::min(chunk, config_.max_uf_iterations);
+
+  // A cached recording for this input buffer and chunk size is replayed with a null `cmd`, so none
+  // of the recording below does anything; otherwise the frame is recorded as before, into a
+  // persistent buffer when pre-recording is on so the next frame can replay it.
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  replay_cmd_ = VK_NULL_HANDLE;
+  recording_ = RecordedFrame{};
+  if (prerecord_) {
+    const uint8_t *key = imported != nullptr ? imported->key : nullptr;
+    for (const RecordedFrame &r : recorded_frames_) {
+      if (r.key == key && r.chunk == chunk) replay_cmd_ = r.cmd;
+    }
+    if (replay_cmd_ == VK_NULL_HANDLE) {
+      cmd = lane_.BeginPersistentCommands();
+      recording_ = RecordedFrame{key, chunk, cmd};
+    }
+  } else {
+    cmd = BeginTimedCommands();
+  }
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
   if (!gray_direct_write_ && imported == nullptr && transfer_lane_ == nullptr) {
@@ -730,9 +769,6 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
     }
   };
 
-  // Seeds the first chunk with last frame's converged iteration count.
-  uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
-  chunk = std::min(chunk, config_.max_uf_iterations);
   record_uf_chunk(cmd, chunk);
   // The labelling span ends here; any extra convergence chunks are not attributed to it.
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
