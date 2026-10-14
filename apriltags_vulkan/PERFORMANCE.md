@@ -1211,6 +1211,58 @@ passes (see the 2026-10-14 research notes on branch `research/perf-survey-2026-1
 or dispatches: on the Mali, deleting a third of them is worth about 1%, so they only pay when
 combined with real work removed; on the desktop they are worth testing first.
 
+## 8i. Orange Pi: CPU frequency policy and wake-up settings
+
+Everything in 8c to 8h was measured with the CPU governors pinned to `performance`. That is not how
+the board runs: it boots with `ondemand` on all three clusters, and the LumenVision service holds
+the A55 cluster at 1.8 GHz. This section measures what that costs and which settings matter.
+
+**Method.** `bench_multiqueue`, one stream, `grayimage.pgm`, paced at 30 and 60 fps (a camera) and
+free-running; GPU and DRAM on `performance`; LumenVision stopped; ABBA across 4 to 5 rounds with
+every setting applied and verified between runs (`pi_env.sh` records the originals and restores
+them). The latency column is the reported latency minus the frame period, because the pipeline
+returns a frame's result one `Push()` later by design; it is the extra time a frame spends in the
+detector, so a constant of about 1 ms is the floor with the CPU always fast.
+
+| setting | 30 fps | 60 fps | free-running fps |
+| --- | --- | --- | --- |
+| `ondemand` (the board's default) | 4.7-4.9 ms | 4.2-4.3 ms | 349 |
+| `ondemand`, `up_threshold` 20 | 3.2 ms | 3.7 ms | 390 |
+| `ondemand`, `up_threshold` 20, 2 ms sampling | 3.4 ms | 3.7 ms | 387 |
+| `ondemand`, A76 floor 1.416 GHz | 1.9 ms | 2.0 ms | 347 |
+| `schedutil` | 17.2 ms | 11.1 ms | 332 |
+| **`performance`** | **1.07 ms** | **1.07 ms** | **384-387** |
+| `performance`, process pinned to the A76 cores (`taskset -c 4-7`, 4 CPU threads) | 1.14 ms | 1.13 ms | **408** |
+
+- At camera rates the board's default governor adds **3 to 4 ms to every frame**, more than the
+  whole `Detect()` call (2.7 ms): the CPU idles between frames and `ondemand` samples every 10 ms
+  at a 95% threshold, so each frame's CPU tail runs while the cores climb from 600 MHz. `schedutil`
+  is far worse (11 to 17 ms). Tuning `ondemand` recovers a third; a 1.4 GHz floor on the A76
+  clusters recovers most of it (1.9 to 2.0 ms) at the cost of a higher idle clock; only
+  `performance` reaches the floor.
+- Free-running, `performance` is +10% fps over the default, and pinning to the A76 cores adds
+  another +6% (408 fps) by keeping the tail off the A55 cores. Pinning does nothing for paced
+  latency.
+- **Deployment recommendation:** set the A76 clusters (policy 4 and 6) to `performance`, or at least
+  a 1.4 GHz floor, in whatever starts the detector; it is a system setting, not something the
+  library can safely do for an application.
+
+Settings that **did not matter** (paced: within the 0.15 ms run spread, so no effect found):
+
+| setting | free-running fps | paced latency |
+| --- | --- | --- |
+| baseline `performance` | 383 | 1.06-1.27 ms |
+| CPU deep idle (`cpu-sleep`, 220 us exit) disabled | 401 (+4.8%) | no consistent change |
+| GPU interrupts (CPU0, an A55) moved to the A76 cores | 383 | none |
+| both of the above | 397 | none |
+| Mali `power_policy=always_on` (default `coarse_demand`) | 382 | none |
+
+So the fence-wake and GPU power-down hypotheses from the research notes are **not** supported on
+this load at 30 and 60 fps: the GPU shows no power-up penalty, and moving the interrupt does
+nothing. Disabling the deep idle state helps only a free-running stream (about +5%), which is not
+what a camera does, so it is not worth recommending. The LumenVision service itself costs about
+0.5 ms of `pipeline_total` (8h) while it is running.
+
 ## 9. Measuring
 
 ```
