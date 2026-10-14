@@ -190,7 +190,6 @@ void ComputePipeline::DispatchRaw(VkCommandBuffer cmd, uint32_t gx, uint32_t gy,
       gz > max_workgroup_count_[2]) {
     throw std::runtime_error("Compute dispatch exceeds maxComputeWorkGroupCount");
   }
-  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
   if (descriptor_set_ != VK_NULL_HANDLE) {
@@ -208,7 +207,6 @@ void ComputePipeline::DispatchRaw(VkCommandBuffer cmd, uint32_t gx, uint32_t gy,
 void ComputePipeline::DispatchIndirect(VkCommandBuffer cmd, VkBuffer indirect_buffer,
                                        VkDeviceSize offset, const void *push_constants,
                                        BarrierKind barrier) const {
-  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
   if (descriptor_set_ != VK_NULL_HANDLE) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1,
@@ -238,7 +236,7 @@ void ComputePipeline::Dispatch2D(VkCommandBuffer cmd, uint32_t width, uint32_t h
 }
 
 void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
-  if (kind == BarrierKind::None || cmd == VK_NULL_HANDLE) return;
+  if (kind == BarrierKind::None) return;
 
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -265,7 +263,6 @@ void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
 }
 
 void ComputePipeline::HostReadBarrier(VkCommandBuffer cmd) {
-  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -275,7 +272,6 @@ void ComputePipeline::HostReadBarrier(VkCommandBuffer cmd) {
 }
 
 void ComputePipeline::IndirectDispatchBarrier(VkCommandBuffer cmd) {
-  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

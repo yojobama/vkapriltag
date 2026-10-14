@@ -4,6 +4,7 @@
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -143,6 +144,11 @@ class GpuDetector {
     double cpu_begin_ms = 0.0;        // BeginCommands: ring fence wait + resets
     double cpu_submit_wait_ms = 0.0;  // EndCommandBuffer + QueueSubmit + WaitForFences
     double cpu_counter_read_ms = 0.0; // ReadCounterSlot invalidate + read
+
+    // Fused path only. record_ms is the host time spent recording commands (about 0 on a replay);
+    // replayed is true when the frame submitted only pre-recorded buffers (APRILTAG_VK_PRERECORD).
+    double record_ms = 0.0;
+    bool replayed = false;
   };
 
   // Names for DetectProfile::gpu_stage_ms, in index order (one timestamp pair per span).
@@ -382,20 +388,61 @@ class GpuDetector {
   uint32_t gpu_track_ = 0;
   int64_t frame_first_submit_ns_ = 0;
 
-  // Pre-recorded frames (APRILTAG_VK_PRERECORD=1, fused path only). The fused first attempt is the
-  // same sequence of commands every frame for a given input buffer and labelling chunk size, so it
-  // is recorded once into a persistent command buffer and later frames replay it. During a replay
-  // Detect() runs its normal code with a null command buffer, which every recording call treats as
-  // "record nothing", and SubmitTimedAndWait() submits the cached buffer instead.
+  // --- Fused-path recording and pre-recording (APRILTAG_VK_PRERECORD=1) ---
+  // On the fused path every dispatch is sized on the device, so a frame is a fixed sequence of
+  // commands. The Record* functions below only record (no host state, no clocks), so their output
+  // can be cached: with pre-recording on, each distinct recording is made once into a persistent
+  // command buffer and later frames just submit it. With it off, the same functions record into a
+  // ring buffer every frame. The unfused path (DetectUnfused) sizes dispatches from host-read
+  // counts and always records.
+  enum class RecordingKind : uint8_t {
+    kFirstAttempt,   // head + speculative tail; keyed by (input buffer, labelling chunk)
+    kContinuation,   // `n` more labelling iterations plus the convergence-flag copy
+    kTailRerun,      // zero the tail's counters and rerun the tail non-speculatively
+  };
   struct RecordedFrame {
+    RecordingKind kind = RecordingKind::kFirstAttempt;
     const uint8_t *key = nullptr;  // imported frame's key, or null for the staged copy path
-    uint32_t chunk = 0;            // labelling iterations baked into the recording
+    uint32_t n = 0;                // chunk size (kFirstAttempt) or iteration count (kContinuation)
     VkCommandBuffer cmd = VK_NULL_HANDLE;
   };
   std::vector<RecordedFrame> recorded_frames_;
   bool prerecord_ = false;
-  VkCommandBuffer replay_cmd_ = VK_NULL_HANDLE;  // non-null only while replaying a frame
-  RecordedFrame recording_;                      // the frame being recorded, once cmd is set
+  // Whether this frame recorded anything (false when every submission was a cached replay).
+  bool recorded_this_frame_ = false;
+
+  // A command buffer ready to submit, and whether it is a persistent (pre-recorded) one.
+  struct Submission {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool persistent = false;
+  };
+  // Detect() is the shared prologue (upload) followed by one of the two flows below.
+  struct FrameStart;
+  void DetectFused(const FrameStart &frame, uint32_t chunk);
+  void DetectUnfused(const uint8_t *gray_frame);
+
+  // Pure recording. The head is shared by every flow: timestamp reset, upload copy, counter clears,
+  // decimate and threshold, the first labelling chunk, and the convergence-flag copy.
+  void RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *imported, uint32_t chunk);
+  void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations);
+  // The fused tail: blob sizes through line-fit moments and every counter copy, ending in the host
+  // read barrier. `speculative` (first attempt only) stops label_pixels and blob_diff acting on
+  // labels that may not have converged.
+  void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
+  void RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations);
+  void RecordTailRerun(VkCommandBuffer cmd);
+
+  // Return the command buffer for each kind: replayed from the cache, or recorded now.
+  Submission FirstAttempt(const ImportedFrame *imported, uint32_t chunk);
+  Submission Continuation(uint32_t iterations);
+  Submission TailRerun();
+  VkCommandBuffer FindRecorded(RecordingKind kind, const uint8_t *key, uint32_t n) const;
+  // Submits and waits; adds the host-side cost to last_profile_.
+  void SubmitTimed(const Submission &s);
+
+  // Everything after the last submission of a fused frame: counter reads, host views of the
+  // readback buffers, the profile and the GPU-timestamp spans.
+  void FinishFused(const FrameStart &frame, std::chrono::steady_clock::time_point t_submitted);
   enum GpuStageSpan {
     kSpanClear = 0,
     kSpanThreshold,

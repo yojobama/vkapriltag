@@ -642,7 +642,6 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
 
 void Context::CmdBeginConditionalRendering(VkCommandBuffer cmd, VkBuffer buffer,
                                            VkDeviceSize offset, bool inverted) const {
-  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   VkConditionalRenderingBeginInfoEXT info{};
   info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
   info.buffer = buffer;
@@ -652,7 +651,6 @@ void Context::CmdBeginConditionalRendering(VkCommandBuffer cmd, VkBuffer buffer,
 }
 
 void Context::CmdEndConditionalRendering(VkCommandBuffer cmd) const {
-  if (cmd == VK_NULL_HANDLE) return;  // recording disabled: a pre-recorded frame is being replayed
   end_conditional_rendering_(cmd);
 }
 
@@ -1127,10 +1125,12 @@ VkCommandBuffer Lane::BeginPersistentCommands() {
   return cmd;
 }
 
-void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, bool end_recording, VkSemaphore wait,
-                                   VkPipelineStageFlags wait_stage) {
-  if (end_recording) CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+void Lane::EndCommands(VkCommandBuffer cmd) {
+  CheckVk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+}
 
+void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, VkSemaphore wait,
+                                   VkPipelineStageFlags wait_stage) {
   VkSubmitInfo submit_info{};
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.commandBufferCount = 1;
