@@ -10,6 +10,23 @@ every step was checked against the unmodified libapriltag CPU detector: the
 candidate quad count stayed at **97** and the decoded tag set at **[554]**
 throughout.
 
+## Summary of 1.7.0 (items 18 to 22 and the follow-up measurements)
+
+Against 1.6.0, same build type, interleaved (PERFORMANCE.md 8m): `Detect()` -14.8% on the Orange Pi
+and -16% on the RX 9060 XT, with unchanged detections.
+
+| Change | Result |
+| --- | --- |
+| `blob_diff` reads threshold codes; `label_pixels` deleted (item 18) | -2.4% `Detect()` (Mali) |
+| no compression after the first attempt's verification merge (19) | -1.0% |
+| blob-size count inside the last compression, no `uf_final` (19) | -1.2% |
+| `blob_diff` one atomic per pixel (20) | **-7.8%** |
+| rank-merge sort (21) | -0.9% |
+| pre-recorded command buffers (PERFORMANCE.md 8f, 8g) | host overhead; on by default |
+| `expected_streams` / `StreamSlot` (8j) | +82% at 4 streams on two families |
+| margin gate (8l, opt-in) | `pipeline_total` -12.5% (Mali); +40% to +65% `exact` fps (desktop) |
+| rejected: tensor/ray-tracing cores, work graphs, Hamming probe, A6 (0.5% bound), A8 (slower), dispatch folding (~1%), `cpuidle`/IRQ/Mali power policy | item 22 |
+
 ## Summary
 
 | Step | Change | GPU total |

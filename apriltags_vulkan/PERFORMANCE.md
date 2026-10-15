@@ -9,6 +9,26 @@ For the history of what was tried and what was rejected, with numbers, see
 `OPTIMIZATION_NOTES.md` — that file is the record of *why* the pipeline looks
 like this; this one is the record of *how to run and measure it*.
 
+## What changed in 1.7.0
+
+Everything since 1.6.0 is in sections 8d to 8n; the results against 1.6.0 are in 8m. In short:
+
+- `Detect()` is **14.8% faster on the Orange Pi (2.487 -> 2.118 ms) and 16% on the RX 9060 XT
+  (0.573 -> 0.480 ms)**, with identical detections (15 of 15 canonical quad dumps, the synthetic
+  sweep, every validate run). Throughput with `ultrafast` refine is +13% to +20% for one stream and
+  +11% to +18% for four.
+- Pre-recorded command buffers (8f, 8g) and the GPU stage changes (8k): the `label_pixels` pass is
+  deleted, the first attempt drops one compression and the `uf_final` pass, `blob_diff` uses one
+  atomic per pixel, and the sort is a rank-merge sort.
+- `expected_streams` and `StreamSlot` (8j): +82% to +84% with 4 to 8 streams on the RX 9060 XT.
+- The margin gate (8l), opt-in: `pipeline_total` -12.5% on the Orange Pi, +40% to +65% `exact`
+  throughput on the RX 9060 XT, identical detections on the sweep.
+- Orange Pi guidance (8i): the `performance` governor is worth 3 to 4 ms per frame at camera rates.
+- Rejected with numbers (8e to 8n and `OPTIMIZATION_NOTES.md` section 22): fence spinning, tensor and
+  ray-tracing cores, a Hamming probe, `cpuidle`/IRQ/Mali power settings, the `blob_diff` atomic (A6)
+  and the small-blob sort (A8).
+- Fallback matrix (8n): every optional-feature switch gives byte-identical output on both machines.
+
 ## 1. First: make sure you are actually on the GPU
 
 This is by far the largest single performance factor, and it is a
@@ -68,6 +88,11 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2). |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
 | `APRILTAG_VK_PRERECORD=0` | Pre-recorded command buffers are on by default for the fused single-submission frame; `0` records every frame instead. See sections 8f and 8g. |
+| `APRILTAG_VK_SORT_CHUNK=<n>` | Rank-merge sort run length (a power of two, default 16); `0` selects the Batcher sorting network. See section 8k. |
+| `APRILTAG_VK_SORT_WG=<n>` | Workgroup size of the point sort (default 256, the maximum). |
+| `APRILTAG_VK_PROBE_MARGIN=<grey levels>` | Margin gate before edge refinement (default off); overrides `TagDecoder`'s `probe_margin`. See section 8l. |
+| `APRILTAG_VK_PROBE_STATS=1`, `APRILTAG_VK_PROBE_CSV=<file>` | Per-quad probe histograms and one CSV row per quad (analysis aid). |
+| `APRILTAG_VK_TRACE=<file>` | Write a Chrome-trace JSON of the CPU and GPU spans. See section 9. |
 | `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
 | `APRILTAG_VK_REFINE=exact\|fast\|ultrafast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |

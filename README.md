@@ -288,6 +288,48 @@ figures from one instrumented frame (`APRILTAG_VK_TIMESTAMPS=1`).
 | `tag_decode` (bit sampling + hamming) | **CPU** | 0.33 / 0.38 ms | 0.08 / 0.10 ms |
 | **Pipeline total** (GPU + both CPU tails) | GPU + CPU | **10.08 / 10.73 ms** | **2.04 / 2.20 ms** |
 
+### What changed in 1.7.0 (against 1.6.0)
+
+Same detections, less work. On both development targets the canonical quad dumps, the synthetic
+ground-truth sweep (658/767 on the RX 9060 XT, 659/767 on the Orange Pi; 687/768 with
+`--refine-edges`) and every validate run are identical to 1.6.0. 1280x800, decimation 2, interleaved
+runs, same build type on both sides (details in `apriltags_vulkan/PERFORMANCE.md` section 8m):
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| `Detect()` median | 2.487 -> 2.118 ms (-14.8%) | 0.573 -> 0.480 ms (-16%) |
+| `pipeline_total` median | 3.497 -> 3.125 ms (-10.6%) | 0.994 -> 0.889 ms (-10.6%) |
+| 1 stream, `ultrafast` | 387 -> 439 fps (+13%) | 2,760 -> 3,310 fps (+20%) |
+| 4 streams, `ultrafast` | 446 -> 525 fps (+18%) | 4,745 -> 5,271 fps (+11%) |
+| 4 streams, alternating queue families | | 8,347 -> 9,096 fps (+9%) |
+| 1 stream, `exact` refine | 350 -> 432 fps (+23%) | 2,278 -> 2,331 fps (+2%) |
+
+- **GPU stages:** `blob_diff` reads the threshold codes itself and the `label_pixels` pass is gone;
+  the first attempt skips the compression after its verification merge and counts blob sizes inside
+  the last compression (no `uf_final`); `blob_diff` reserves a pixel's boundary slots with one atomic
+  instead of up to four (the largest single step, -7.8%); the point sort is a rank-merge sort.
+- **Pre-recorded command buffers** for the fused frame, retry path included, on by default
+  (`APRILTAG_VK_PRERECORD=0` turns them off).
+- **Queue families:** `ContextOptions::expected_streams` and `Context::StreamSlot(i)` spread several
+  streams over both compute families when the device has two (RX 9060 XT, 4 streams: +82% over one
+  queue). It changes nothing with one stream or one family, as on the Mali.
+- **Margin gate (opt-in):** `TagDecoder(..., probe_margin)` / `SetProbeMargin()` /
+  `APRILTAG_VK_PROBE_MARGIN` skips edge refinement for quads whose unrefined decision margin is
+  below the gate. It was identical to the ungated run on the whole synthetic sweep at gate 4 and 8
+  and takes `pipeline_total` on the Orange Pi from 3.125 to 2.706 ms; with `exact` refine on the
+  RX 9060 XT it gives +40% (1 stream) and +65% (4 streams), because the CPU tail is the limit there.
+  A risk exists only for a real tag whose unrefined margin is under the gate.
+- **Tooling:** `Profiler`/`--trace` and `--profile` (GPU spans and CPU-tail split), `--dump-quads`,
+  `--stress`, `--max-uf`, `bench_barrier`, `bench_multiqueue --mode auto` and `--probe-margin`,
+  `apriltag_synth_ground_truth --contrast`.
+- **Measured and not built:** tensor and ray-tracing cores, work graphs, a Hamming-distance probe
+  (loses 9-20% of tags that only decode after refinement), the `blob_diff` append atomic (bound:
+  0.5%), the small-blob rank sort (slower), dispatch folding (about 1%), `cpuidle`/IRQ/Mali power
+  settings (no effect at 30 and 60 fps). Section 22 of `OPTIMIZATION_NOTES.md` has the numbers.
+- **Fallback paths** (no 8-bit storage, subgroups, 64-bit atomics or conditional rendering, small
+  workgroups) give byte-identical output on both machines; see section 8n of `PERFORMANCE.md`.
+  Only the two development GPUs were available, so other vendors remain untested.
+
 ### What the current branch changed, at decimation 1
 
 The table above is the steady state. This is the before/after for the work on
@@ -439,7 +481,8 @@ apriltags_vulkan/
     include/   public headers (vkapriltag::vkapriltag target)
   apps/        interactive V4L2 sample app (Linux)
   tools/       validation tools (ID/corner, end-to-end pose, synthetic
-               ground truth, pose solver) and the corpus generator
+               ground truth, pose solver), the corpus generator, and the
+               benchmarks (bench_multiqueue, bench_barrier)
   cmake/       the upstream apriltag patch, shader-embedding machinery
   OPTIMIZATION_NOTES.md   detailed performance history and rejected approaches
   PERFORMANCE.md          how to configure, run and measure it per device
