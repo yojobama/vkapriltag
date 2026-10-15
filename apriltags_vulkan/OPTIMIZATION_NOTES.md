@@ -1,31 +1,17 @@
 # Optimization notes: grouping, sorting and line fitting
 
-Measured end to end on the intended deployment target — an Orange Pi 5
-(RK3588, Mali-G610, 8 GB LPDDR), Ubuntu 6.1.0-1025-rockchip, Arm proprietary
-Vulkan driver `g6p0-01eac0`, Vulkan 1.2.165 — running the tracked
-`colorImage.pgm` at 1920x1080 through `apriltag_vulkan_validate`.
+The record of what each optimisation of the pipeline did, in five passes, and of
+everything measured and rejected. The first pass (items 1 to 8) was measured on
+an Orange Pi 5 (RK3588, Mali-G610, 8 GB LPDDR), Ubuntu 6.1.0-1025-rockchip, Arm
+proprietary Vulkan driver `g6p0-01eac0`, Vulkan 1.2.165, running `colorImage.pgm`
+at 1920x1080 with `APRILTAG_VK_MAX_POINTS=200000` (best of 20 to 25); every step
+was checked against the unmodified libapriltag CPU detector (97 candidate quads,
+decoded tag set [554]). The later passes use `grayimage.pgm` or the 1280x800
+corpus image on the Orange Pi and an RX 9060 XT, and say so where they start.
 
-Every number below is best-of-20-to-25 with `APRILTAG_VK_MAX_POINTS=200000`, and
-every step was checked against the unmodified libapriltag CPU detector: the
-candidate quad count stayed at **97** and the decoded tag set at **[554]**
-throughout.
-
-## Summary of 1.7.0 (items 18 to 22 and the follow-up measurements)
-
-Against 1.6.0, same build type, interleaved (PERFORMANCE.md 8m): `Detect()` -14.8% on the Orange Pi
-and -16% on the RX 9060 XT, with unchanged detections.
-
-| Change | Result |
-| --- | --- |
-| `blob_diff` reads threshold codes; `label_pixels` deleted (item 18) | -2.4% `Detect()` (Mali) |
-| no compression after the first attempt's verification merge (19) | -1.0% |
-| blob-size count inside the last compression, no `uf_final` (19) | -1.2% |
-| `blob_diff` one atomic per pixel (20) | **-7.8%** |
-| rank-merge sort (21) | -0.9% |
-| pre-recorded command buffers (PERFORMANCE.md 8f, 8g) | host overhead; on by default |
-| `expected_streams` / `StreamSlot` (8j) | +82% at 4 streams on two families |
-| margin gate (8l, opt-in) | `pipeline_total` -12.5% (Mali); +40% to +65% `exact` fps (desktop) |
-| rejected: tensor/ray-tracing cores, work graphs, Hamming probe, A6 (0.5% bound), A8 (slower), dispatch folding (~1%), `cpuidle`/IRQ/Mali power policy | item 22 |
+Where the current code stands (1.7.0, Orange Pi 5, 1280x800, decimation 2):
+`Detect()` 2.12 ms, serial pipeline 3.13 ms, against 2.49 and 3.50 ms at 1.6.0
+with identical detections (the fifth pass and `PERFORMANCE.md` section 8m).
 
 ## Summary
 
@@ -427,7 +413,10 @@ echo performance > /sys/class/devfreq/dmc/governor
 
 ## Remaining opportunities, largest first
 
-Where the 16.1 ms now goes: CPU `quad_decode` 3.7, sort+group 3.01, linefit
+This list is the state after the first pass (1920x1080, 16.1 ms). The current
+list, at 1.7.0, is in `PERFORMANCE.md` section 8.
+
+Where the 16.1 ms went then: CPU `quad_decode` 3.7, sort+group 3.01, linefit
 3.05, threshold+label 2.59, boundary 1.73, readback 1.09, tag_decode 0.66,
 upload 0.22.
 
@@ -1053,7 +1042,7 @@ contention a modern discrete part's atomic unit already handles, so the
 ballot sequence bought nothing and cost its own issue slots.
 
 `blob_diff` is retired on one device's evidence rather than two. It is
-recoverable from this branch's history if a part ever makes the case.
+recoverable from the repository history if a part ever makes the case.
 
 ## 7. Run-level vertical merging - the transferable half of HA4 - shipped, on
 
@@ -1864,6 +1853,25 @@ this change never touches).
 flag needed), same protocol: GPU total **-0.7%** (d1, unanimous 12/12) /
 -1.3% (d2, 7/12 - a plausible small win, noisier). No regression at
 either decimation on either device. Shipped on.
+
+# A fifth pass: the 2026-10 research round, Orange Pi and RX 9060 XT
+
+Six surveys (`research/2026-10-14/`) ranked the remaining options; each was measured before
+anything was built, against the previous commit, ABBA-interleaved, with the Orange Pi governors
+pinned and LumenVision stopped (1280x800 corpus image, decimation 2), and kept only if the
+canonical quad dumps stayed byte-identical (15 cases on both machines, validation layer with
+synchronisation validation clean). Result against 1.6.0: `Detect()` 2.487 -> 2.118 ms (-14.8%) on
+the Mali and 0.573 -> 0.480 ms (-16%) on the RX 9060 XT (`PERFORMANCE.md` 8m). Items 18 to 21 are
+the changes that shipped, in the order of the measured gains below; item 22 is everything measured
+and not shipped, with pre-recorded command buffers (`PERFORMANCE.md` 8f and 8g), queue-family
+spreading (8j) and the margin gate (8l) covered there.
+
+| Change | `Detect()` on the Mali |
+| --- | --- |
+| item 18: `blob_diff` reads threshold codes; `label_pixels` deleted | -2.4% |
+| item 19: no compression after the verification merge; count inside the last compression | -1.0%, -1.2% |
+| item 20: `blob_diff` one atomic per pixel | **-7.8%** |
+| item 21: rank-merge sort | -0.9% |
 
 ## 18. `blob_diff` reads the threshold codes itself; `label_pixels` deleted - shipped, on
 

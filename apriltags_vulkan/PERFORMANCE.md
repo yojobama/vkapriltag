@@ -2,32 +2,16 @@
 
 Targets: embedded ARM Mali-G610 (the deployment target), discrete AMD
 (Radeon RX 9060 XT / RDNA4), and discrete NVIDIA. The pipeline needs **only
-core Vulkan 1.1** and enables **zero optional device features**.
+core Vulkan 1.1**. Optional extensions (8-bit storage, 64-bit atomics,
+conditional rendering, host-pointer import, dma-buf import) and subgroup
+operations are used when the device has them, and every one has a fallback
+that gives byte-identical detections (section 8n); the `APRILTAG_VK_FORCE_NO_*`
+variables in section 2 force each fallback.
 
 This file covers configuration, per-device behaviour, and how to measure.
 For the history of what was tried and what was rejected, with numbers, see
 `OPTIMIZATION_NOTES.md` — that file is the record of *why* the pipeline looks
 like this; this one is the record of *how to run and measure it*.
-
-## What changed in 1.7.0
-
-Everything since 1.6.0 is in sections 8d to 8n; the results against 1.6.0 are in 8m. In short:
-
-- `Detect()` is **14.8% faster on the Orange Pi (2.487 -> 2.118 ms) and 16% on the RX 9060 XT
-  (0.573 -> 0.480 ms)**, with identical detections (15 of 15 canonical quad dumps, the synthetic
-  sweep, every validate run). Throughput with `ultrafast` refine is +13% to +20% for one stream and
-  +11% to +18% for four.
-- Pre-recorded command buffers (8f, 8g) and the GPU stage changes (8k): the `label_pixels` pass is
-  deleted, the first attempt drops one compression and the `uf_final` pass, `blob_diff` uses one
-  atomic per pixel, and the sort is a rank-merge sort.
-- `expected_streams` and `StreamSlot` (8j): +82% to +84% with 4 to 8 streams on the RX 9060 XT.
-- The margin gate (8l), opt-in: `pipeline_total` -12.5% on the Orange Pi, +40% to +65% `exact`
-  throughput on the RX 9060 XT, identical detections on the sweep.
-- Orange Pi guidance (8i): the `performance` governor is worth 3 to 4 ms per frame at camera rates.
-- Rejected with numbers (8e to 8n and `OPTIMIZATION_NOTES.md` section 22): fence spinning, tensor and
-  ray-tracing cores, a Hamming probe, `cpuidle`/IRQ/Mali power settings, the `blob_diff` atomic (A6)
-  and the small-blob sort (A8).
-- Fallback matrix (8n): every optional-feature switch gives byte-identical output on both machines.
 
 ## 1. First: make sure you are actually on the GPU
 
@@ -108,36 +92,40 @@ removed along with the radix/bitonic sorts it selected).
 
 ## 3. Measured performance
 
-`grayimage.pgm` (1280x800), decimation 2, otherwise default config, medians
-over 300-400 iterations. **These are not the same conditions as the tables in
-`README.md`**, which use `colorImage.pgm` (1920x1080) with
-`APRILTAG_VK_MAX_POINTS=200000` — do not compare the two directly.
+The 1280x800 corpus image (`tools/make_corpus`), one tag, 75 candidate quads, decimation 2,
+otherwise default config, medians over 300 to 600 iterations; Orange Pi 5 with the governors
+pinned to `performance` (section 8i) and LumenVision stopped, `Release`; desktop `RelWithDebInfo`.
+The RX 9060 XT alternates between two clock states from one process to the next, so its GPU rows
+are a range. The per-stage GPU table, the throughput tables and the comparison with 1.6.0 are in
+`README.md` and sections 8k to 8m.
 
-| Stage | Runs on | Orange Pi 5 Plus (Mali-G610) | Desktop (RX 9060 XT) |
+| Stage | Runs on | Orange Pi 5 (Mali-G610) | Desktop (RX 9060 XT) |
 | --- | --- | --- | --- |
-| `GpuDetector` | GPU | 3.76 ms | 0.66 ms |
-| `quad_decode` | CPU | 0.44 ms | 0.09 ms |
-| `tag_decode` | CPU | 0.79 ms | 0.29 ms |
-| **Pipeline total, serial** | GPU + CPU | **5.00 ms** | **1.04 ms** |
-| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **3.52 ms** | **0.78 ms** |
+| `GpuDetector` | GPU | 2.12 ms | 0.38 to 0.55 ms |
+| `quad_decode` | CPU | 0.29 ms | 0.12 ms |
+| `tag_decode` | CPU | 0.72 ms | 0.27 ms |
+| **Pipeline total, serial** | GPU + CPU | **3.13 ms** | **0.76 to 0.94 ms** |
+| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.30 ms** | **0.45 to 0.49 ms** |
 
-The GPU phase dominates on the deployment target (75% of a serial frame) and
+The GPU phase dominates on the deployment target (68% of a serial frame) and
 is essentially all real shader execution. Two things it is *not*:
 
 - **Not submit-bound.** An empty `vkQueueSubmit` + `vkWaitForFences` round trip
   measures **19 us on Mali** and **42 us on the RX 9060 XT** — the Mali is the
-  *cheaper* of the two, having no PCIe hop. All four of a frame's submits are
-  ~1.5% of a Mali frame. Collapsing them is not worth the complexity; it was
-  tried and reverted (`OPTIMIZATION_NOTES.md`).
+  *cheaper* of the two, having no PCIe hop. A frame is one submission on parts
+  with host-cached readback memory (section 3c), so submit cost is under 1% of a
+  Mali frame; collapsing the remaining boundaries was tried and is not worth it
+  (`OPTIMIZATION_NOTES.md`).
 - **Not barrier-bound on the discrete part.** A barrier costs a fixed ~1.6 us
   on RDNA4 regardless of in-flight work, and is free when there is nothing to
   drain; all ~31 of a frame's barriers total ~48 us. On Mali the cost instead
   *scales* with in-flight work (2.6 us between trivial dispatches, 18.7 us
   between large ones), so barrier count matters there and only there.
 
-What the Mali GPU phase *is* bound by is memory traffic across its ~11
-full-image passes. Sweeping the input over 320x200 / 640x400 / 1280x800 gives
-a consistent marginal rate:
+What the Mali GPU phase *is* bound by is memory traffic across its full-image
+passes (ten now that `label_pixels` is gone). Sweeping the input over 320x200 /
+640x400 / 1280x800 gave a consistent marginal rate (measured before the
+section 8k stage changes, which lowered both terms; the shape holds):
 
 ```
 GPU time ~= 560 us fixed + 3.3 us per 1k source pixels
@@ -253,7 +241,7 @@ A/B'd on one binary with `APRILTAG_VK_FORCE_NO_INT64_ATOMIC`:
 
 ### Net effect on the deployment target
 
-Stock `7587f1b` against everything on this branch, on the Mali-G610,
+Stock `7587f1b` against everything in the third pass, on the Mali-G610,
 ABBA-interleaved, min of 12, **both binaries built `Release`**, timestamps
 off:
 
@@ -477,8 +465,9 @@ finding with a controlled wall-clock A/B.
 `Detect` -> `QuadDecode` -> `TagDecoder` runs strictly serially, so the GPU
 idles through the whole CPU tail and vice versa. `FramePipeline` runs the GPU
 pass for frame N on its own thread while the caller decodes frame N-1, making
-a frame cost `max(GPU, CPU)` rather than the sum — the 5.00 -> 3.52 ms and
-1.04 -> 0.78 ms rows in section 3.
+a frame cost `max(GPU, CPU)` rather than the sum — the last two rows of the
+table in section 3 (3.13 -> 2.30 ms on the Orange Pi, about 0.85 -> 0.47 ms on
+the desktop).
 
 Three things callers must know:
 
@@ -739,7 +728,22 @@ rather than `atomicAdd`, at some cost.
 
 `OPTIMIZATION_NOTES.md` holds the full list with numbers, including everything
 already tried and rejected — read it before proposing work, since most of the
-obvious ideas are in the rejected column. The short version:
+obvious ideas are in the rejected column. Where it stands at 1.7.0 on the Orange Pi:
+2.12 ms of GPU work and about 1.0 ms of CPU tail per frame (3.13 ms serial). Open items,
+largest first:
+
+- **CPU edge refinement.** `tag_decode` is 0.72 ms, and 97% of the refinement time goes to
+  quads that never decode. The margin gate (section 8l) removes most of it with no change to the
+  detections on the sweep, but it is opt-in because a real tag below the gate would be lost.
+- **Labelling** is 40% of the GPU stages; only a structurally different algorithm would move it
+  (items 1 to 3 below).
+- **Ingest.** Hardware JPEG decode into a dma-buf is outside the library and needs stride and
+  offset on `ImportDmaBufFrame` (section 8d).
+- **Double-buffering the `FramePipeline` readback** so the GPU thread can chain frames: not measured.
+
+Measured and closed: the `blob_diff` append atomic and the small-blob sort (section 8n), dispatch
+folding, run-merging before the 64-bit atomics, deferring the post-fill barrier (section 8k), and
+the CPU idle, interrupt and Mali power settings (section 8i). The earlier conclusions, still valid:
 
 0. ~~**The one remaining submit boundary**, before `uf_final`~~ **Closed** -
    all three of the original four-submit frame's mid-frame readbacks are now
@@ -798,7 +802,7 @@ obvious ideas are in the rejected column. The short version:
    invariant that the scan's grand total sits at
    `blob_point_offsets[max_blobs - 1]`.
 
-## 8b. Concurrent streams on separate queue families (experiment)
+## 8b. Concurrent streams on separate queue families
 
 `tools/bench_multiqueue` runs N independent `Context` + `GpuDetector` pairs, one per thread, on
 the same GPU, each optionally pinned to a queue family (`ContextOptions::queue_family`). GPU pass
@@ -1040,7 +1044,7 @@ Device-specific (not measurable on the hardware available when this was written)
 - **RDNA4:** the GPU phase is ~0.33 ms of a ~1.0 ms frame, so GPU shader work is no longer the limit;
   the tail and the host-side `submit_wait` (0.54 ms median, mostly waiting on the GPU) are.
 
-## 8f. Pre-recorded command buffers (experiment)
+## 8f. Pre-recorded command buffers: the first version
 
 **Gate.** Before building anything, the cost of recording was derived from the tracer (median of
 370 frames, RX 9060 XT, 1280x800): command recording about 22 us plus `begin_commands` (fence wait,
@@ -1458,18 +1462,15 @@ governors pinned, LumenVision stopped, `APRILTAG_VK_PROBE_MARGIN` 0 against 4): 
 **3.331 -> 2.915 ms (-12.5%)**, `Detect()` unchanged (2.305 against 2.312 ms).
 
 
-## 8m. The combined branch against v1.6.0
+## 8m. Against v1.6.0
 
-`perf/session-combined` merges every branch of the 2026-10 sessions (pre-recorded command buffers,
-tracer and CPU-tail instrumentation, zero-copy import tooling, the Orange Pi measurements and
-`bench_barrier`, the GPU stage changes of 8k, `expected_streams`, the margin gate and the research
-notes) on top of v1.6.0 (`5f578a0`, the tip of `main`). Both sides were built from clean trees with the
-same build type (RelWithDebInfo on the RX 9060 XT, Release on the Orange Pi) and run interleaved,
-1280x800 at decimation 2. "Gate 4" is the combined build with `APRILTAG_VK_PROBE_MARGIN=4`.
+Version 1.7.0 against v1.6.0 (`5f578a0`). Both sides were built from clean trees with the same
+build type (RelWithDebInfo on the RX 9060 XT, Release on the Orange Pi) and run interleaved,
+1280x800 at decimation 2. "Gate 4" is 1.7.0 with `APRILTAG_VK_PROBE_MARGIN=4`.
 
 **Orange Pi 5** (Mali-G610; governors pinned, LumenVision stopped; 6 rounds of 400 frames):
 
-| | v1.6.0 | combined | combined, gate 4 |
+| | v1.6.0 | 1.7.0 | 1.7.0, gate 4 |
 | --- | --- | --- | --- |
 | `Detect()` median | 2.487 ms | 2.118 ms (-14.8%) | 2.120 ms |
 | `pipeline_total` median | 3.497 ms | 3.125 ms (-10.6%) | 2.706 ms (-22.6%) |
@@ -1481,7 +1482,7 @@ same build type (RelWithDebInfo on the RX 9060 XT, Release on the Orange Pi) and
 
 **RX 9060 XT** (5 rounds; `bench_multiqueue --import`, 3,000 frames):
 
-| | v1.6.0 | combined | combined, gate 4 |
+| | v1.6.0 | 1.7.0 | 1.7.0, gate 4 |
 | --- | --- | --- | --- |
 | `Detect()` median | 0.573 ms | 0.480 ms (-16%) | 0.460 ms |
 | `pipeline_total` median | 0.994 ms | 0.889 ms (-10.6%) | 0.695 ms (-30%) |
@@ -1496,11 +1497,11 @@ With `exact` refinement the CPU tail is the limit, so only the margin gate moves
 which already has its own unrefined-decode gate.
 
 **Results are unchanged.** `apriltag_synth_ground_truth` prints the same figures on v1.6.0 and the
-combined build, with and without `--refine-edges` (658/767 and 687/768 decoded, identical mean and
+1.7.0 build, with and without `--refine-edges` (658/767 and 687/768 decoded, identical mean and
 worst rotation and translation errors against ground truth and against libapriltag), every
 validate run reports MATCH, and no `bench_multiqueue` run had a mismatch. Everything else is
 verified against the previous commits in 8g, 8k and 8l (canonical quad dumps, validation layer).
-The combined build's defaults differ from v1.6.0's in pre-recorded command buffers, the 8k GPU stage
+1.7.0's defaults differ from v1.6.0's in pre-recorded command buffers, the 8k GPU stage
 changes (including the rank-merge sort) and the removal of `label_pixels`, all on; the margin gate and
 `expected_streams` are opt-in.
 
