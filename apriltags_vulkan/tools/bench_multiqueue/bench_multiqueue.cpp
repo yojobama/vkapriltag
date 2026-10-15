@@ -1,11 +1,12 @@
 // Simulates several cameras sharing one GPU: one Context (one VkDevice), and per stream a Lane
 // (queue), GpuDetector, QuadDecode, TagDecoder and FramePipeline, fed by its own thread.
-// Usage: bench_multiqueue --pgm <file> [--streams N] [--mode single|per-stream|alternate]
+// Usage: bench_multiqueue --pgm <file> [--streams N] [--mode single|per-stream|alternate|auto]
 //   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N] [--import]
 //   [--async-upload]
 // single: every stream shares queue 0. per-stream: one queue per stream on the primary family.
-// alternate: queues interleaved across both compute families. --fps paces each stream like a
-// camera (0 = free-running).
+// alternate: queues interleaved across both compute families. auto: ContextOptions::expected_streams
+// and Context::StreamSlot (what the library recommends; should match alternate). --fps paces each
+// stream like a camera (0 = free-running).
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -125,9 +126,9 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  if (pgm_path.empty() || (mode != "single" && mode != "per-stream" && mode != "alternate")) {
+  if (pgm_path.empty() || (mode != "single" && mode != "per-stream" && mode != "alternate" && mode != "auto")) {
     std::cerr << "Usage: bench_multiqueue --pgm <file> [--streams N] "
-                 "[--mode single|per-stream|alternate] [--iterations N] [--decimation N] "
+                 "[--mode single|per-stream|alternate|auto] [--iterations N] [--decimation N] "
                  "[--cpu-threads N] [--fps N] [--family N]\n";
     return 1;
   }
@@ -157,21 +158,25 @@ int main(int argc, char **argv) {
   try {
     apriltag_vulkan::vk::ContextOptions opts;
     opts.queue_family = family;
-    opts.queues_per_family = static_cast<uint32_t>(streams);
+    opts.queues_per_family = (mode == "auto") ? 1u : static_cast<uint32_t>(streams);
     opts.use_transfer_family = async_upload;
     opts.use_secondary_compute_family = (mode == "alternate");
+    if (mode == "auto") opts.expected_streams = static_cast<uint32_t>(streams);
     apriltag_vulkan::vk::Context ctx(opts);
     queue_count = ctx.queue_count();
 
     // Queue slot per stream.
     std::vector<size_t> slots;
     for (size_t q = 0; q < ctx.queue_count(); ++q) {
-      if (mode == "alternate" || ctx.queue_slot_family(q) == ctx.queue_family()) slots.push_back(q);
+      if (mode == "alternate" || mode == "auto" || ctx.queue_slot_family(q) == ctx.queue_family())
+        slots.push_back(q);
     }
 
     for (int s = 0; s < streams; ++s) {
       Stream &st = pool[static_cast<size_t>(s)];
-      const size_t slot = (mode == "single") ? 0 : slots[static_cast<size_t>(s) % slots.size()];
+      const size_t slot = (mode == "single") ? 0
+                          : (mode == "auto")  ? ctx.StreamSlot(static_cast<size_t>(s))
+                                              : slots[static_cast<size_t>(s) % slots.size()];
       st.lane = ctx.CreateLane(slot);
       if (async_upload) {
         if (ctx.transfer_queue_count() == 0) {

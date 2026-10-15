@@ -473,7 +473,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   }
 
   std::vector<uint32_t> families{queue_family_};
-  if (options.use_secondary_compute_family) {
+  if (options.use_secondary_compute_family || options.expected_streams > 1) {
     for (uint32_t i = 0; i < qf_count; ++i) {
       if (i != queue_family_ && (qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
         families.push_back(i);
@@ -481,7 +481,14 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
       }
     }
   }
-  const uint32_t wanted_queues = std::max(1u, options.queues_per_family);
+  // One queue per expected stream, spread over the families in use, but only when there is a second
+  // family to spread over: on a single family one shared queue is faster than several.
+  spread_streams_ = options.expected_streams > 1 && families.size() > 1;
+  const uint32_t per_stream_queues =
+      spread_streams_ ? (options.expected_streams + static_cast<uint32_t>(families.size()) - 1) /
+                            static_cast<uint32_t>(families.size())
+                      : 1u;
+  const uint32_t wanted_queues = std::max({1u, options.queues_per_family, per_stream_queues});
   std::vector<uint32_t> queue_counts;
   for (uint32_t f : families) queue_counts.push_back(std::min(wanted_queues, qfs[f].queueCount));
   uint32_t transfer_family = UINT32_MAX, transfer_count = 0;

@@ -1263,6 +1263,40 @@ nothing. Disabling the deep idle state helps only a free-running stream (about +
 what a camera does, so it is not worth recommending. The LumenVision service itself costs about
 0.5 ms of `pipeline_total` (8h) while it is running.
 
+## 8j. Desktop: queue families for one stream and for several
+
+`bench_multiqueue --import` with `ultrafast` refine (GPU-limited), RX 9060 XT (family 0 graphics +
+compute, family 1 compute-only), pre-recorded command buffers on, 3,000 frames per run, ABBA, zero
+mismatches in every run.
+
+One stream, 12 rounds: family 0 **3,253 fps**, family 1 3,121 fps (-4.1%). The compute-only family
+helped a single stream in the tables of section 8c (+10% to +24%); that no longer holds with
+pre-recording and import, so the single-stream default stays on the first compute family.
+
+Several streams, median of 5 to 6 rounds, total fps:
+
+| streams | all on family 0, one queue | family 0, queue per stream | family 1, queue per stream | alternating, `mode=auto` |
+| --- | --- | --- | --- | --- |
+| 2 | 4,576 | 4,551 | 5,842 | 5,593 / 5,598 |
+| 4 | 4,527 | 4,513 | 7,582 | 8,325 / 8,332 |
+| 8 | 4,487 | 4,486 | 7,350 | 8,171 / 8,178 |
+
+(`alternating` is the existing `--mode alternate`; the second figure is the new library helper,
+below.) Sharing one queue, or giving every stream its own queue on the graphics family, tops out at
+about 4,500 fps; the same card reaches 8,300 fps with the streams spread over both families, +82%
+at four streams and +84% at eight. With two streams, both on the compute-only family is 4% faster
+than one on each.
+
+**Library change.** `ContextOptions::expected_streams` (default 1) makes the Context also create the
+second compute family and one queue per stream spread over the families, and `Context::StreamSlot(i)`
+returns the recommended queue slot for stream `i`. With `expected_streams` 1, or on a device with a
+single compute family, it changes nothing: `StreamSlot` returns 0, because on the Mali a queue per
+stream is slower than a shared one (8c). On the Orange Pi `--mode auto` therefore matches
+`--mode single` (2 streams 446 against 446 fps, 4 streams 447 against 447, 1 stream within the run
+spread, no mismatches). `bench_multiqueue --mode auto` exercises it and matches `alternate` on the
+desktop. `VK_LAYER_KHRONOS_validation` with synchronization validation reports 0 errors and 0 hazards
+for `auto`, `alternate` and `single` at 4 streams (the layer was confirmed loaded by its own startup
+message).
 ## 8k. GPU stage changes from the 2026-10 research: -13.5% `Detect()` on the Mali
 
 Five changes to the GPU stages, each bit-identical to the commit before it, each measured on the
