@@ -1905,4 +1905,7 @@ established. Further gains would need less work per blob (for example a smaller 
   about 28 us, near 1%, for several shader rewrites. Not built.
 - **Run-merge before the 64-bit extents atomics:** the subgroup version of this idea is item 6 (retired
   on integrated GPUs). Not re-proposed without new evidence.
-
+- **`blob_diff` append atomic (A6):** removing it outright (bound build) moves the span from 0.275 to
+  0.264 ms on the Mali, 0.5% of the GPU time. Not worth a rewrite.
+- **Small-blob rank sort (A8):** leaving blobs of up to 128 points unsorted bounds the gain at 2.4%;
+  ranking them in a single pass is slower than the rank-merge (sort +0.02 to +0.09 ms). Rejected.

@@ -1479,6 +1479,47 @@ The combined build's defaults differ from v1.6.0's in pre-recorded command buffe
 changes (including the rank-merge sort) and the removal of `label_pixels`, all on; the margin gate and
 `expected_streams` are opt-in.
 
+## 8n. The two remaining GPU items, measured, and the fallback matrix
+
+**`blob_diff` counter (A6) and the small-blob sort (A8).** Bound builds on the Orange Pi (3 interleaved
+rounds of 300 frames, governors pinned, LumenVision stopped, output wrong by design):
+
+| build | span | original | bound |
+| --- | --- | --- | --- |
+| `blob_diff` without the append atomic (one thread sets the counter) | boundary | 0.275 ms | 0.264 ms |
+| blobs of up to 128 points left unsorted | sort | 0.30 ms | 0.22 ms |
+| same | GPU total (median) | 2.299 ms | 2.244 ms |
+
+The atomic is worth at most 0.011 ms (0.5% of the GPU time), inside the run spread: **A6 is rejected**.
+Not sorting the small blobs bounds A8 at 2.4%. The one buildable form, ranking every blob of up to 128
+points in one pass (no merge rounds), measured slower: sort 0.245-0.265 -> 0.273-0.321 ms and GPU
+median 2.30 -> 2.30-2.39 ms, so **A8 is rejected** (the n^2 reads cost more than the barriers saved,
+as in 8k). The desktop was not measured.
+
+**Fallback matrix.** The 15-case canonical-quad matrix (as in 8g) is byte-identical to the golden
+dumps in 15 of 15 cases for each setting below on both machines, and `apriltag_synth_ground_truth` is
+unchanged (658/767 RX 9060 XT, 659/767 Orange Pi):
+
+| setting | what it forces |
+| --- | --- |
+| `APRILTAG_VK_FORCE_NO_8BIT=1` | 32-bit image storage instead of `u8` shaders |
+| `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | no subgroup extents reduction |
+| `APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1` | no 64-bit extents atomics |
+| `APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING=1` | `uf_compress` skip decided in the shader |
+| all four together | the minimum feature set |
+| `APRILTAG_VK_MAX_INVOCATIONS=256` / `128` | smaller workgroups (desktop: 1D 128, 2D 8x8) |
+| `APRILTAG_VK_WG=64` + `APRILTAG_VK_SORT_WG=64`, `APRILTAG_VK_WG2D=8x8`, `APRILTAG_VK_SORT_CHUNK=0` | workgroup shapes, sorting network |
+
+The Orange Pi's Mali has no float64, no conditional rendering and no host-pointer import, so its
+default run already covers those paths. With `VK_LAYER_KHRONOS_validation` and synchronisation
+validation on the desktop, the default, `--max-uf 1` (forced retries), pre-recording off, the `rings`
+stress frame and a 4-stream `bench_multiqueue` run give 0 errors and 0 hazards for the default,
+all-four-fallbacks, `MAX_INVOCATIONS=128` and sorting-network settings. Only one device (the
+RX 9060 XT) is installed on the desktop and no software device (lavapipe, SwiftShader) is available,
+so Vulkan 1.1 hardware from other vendors remains untested. A positive control for the layer was
+inconclusive with the current `VK_LAYER_VALIDATE_*` settings; with the older `VK_LAYER_ENABLES` form
+the layer reported that it had read the setting.
+
 ## 9. Measuring
 
 ```
