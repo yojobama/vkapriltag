@@ -1433,6 +1433,51 @@ governors pinned, LumenVision stopped, `APRILTAG_VK_PROBE_MARGIN` 0 against 4): 
 **3.331 -> 2.915 ms (-12.5%)**, `Detect()` unchanged (2.305 against 2.312 ms).
 
 
+## 8m. The combined branch against v1.6.0
+
+`perf/session-combined` merges every branch of the 2026-10 sessions (pre-recorded command buffers,
+tracer and CPU-tail instrumentation, zero-copy import tooling, the Orange Pi measurements and
+`bench_barrier`, the GPU stage changes of 8k, `expected_streams`, the margin gate and the research
+notes) on top of v1.6.0 (`5f578a0`, the tip of `main`). Both sides were built from clean trees with the
+same build type (RelWithDebInfo on the RX 9060 XT, Release on the Orange Pi) and run interleaved,
+1280x800 at decimation 2. "Gate 4" is the combined build with `APRILTAG_VK_PROBE_MARGIN=4`.
+
+**Orange Pi 5** (Mali-G610; governors pinned, LumenVision stopped; 6 rounds of 400 frames):
+
+| | v1.6.0 | combined | combined, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` median | 2.487 ms | 2.118 ms (-14.8%) | 2.120 ms |
+| `pipeline_total` median | 3.497 ms | 3.125 ms (-10.6%) | 2.706 ms (-22.6%) |
+| 1 stream, `ultrafast` | 387 fps | 439 (+13%) | 445 (+15%) |
+| 2 streams, `ultrafast` | 447 | 522 (+17%) | 524 |
+| 4 streams, `ultrafast` | 446 | 525 (+18%) | 524 |
+| 1 stream, `exact` refine | 350 | 432 (+23%) | 439 (+25%) |
+| 4 streams, `exact` refine | 447 | 523 (+17%) | 524 |
+
+**RX 9060 XT** (5 rounds; `bench_multiqueue --import`, 3,000 frames):
+
+| | v1.6.0 | combined | combined, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` median | 0.573 ms | 0.480 ms (-16%) | 0.460 ms |
+| `pipeline_total` median | 0.994 ms | 0.889 ms (-10.6%) | 0.695 ms (-30%) |
+| 1 stream, `ultrafast` | 2,760 fps | 3,310 (+20%) | 3,313 |
+| 4 streams, one queue, `ultrafast` | 4,745 | 5,271 (+11%) | 5,280 |
+| 4 streams, alternating families, `ultrafast` | 8,347 | 9,096 (+9%) | 9,086 |
+| 1 stream, `exact` refine | 2,278 | 2,331 (+2%) | 3,186 (+40%) |
+| 4 streams, `exact` refine | 3,011 | 3,044 (+1%) | 4,974 (+65%) |
+
+With `exact` refinement the CPU tail is the limit, so only the margin gate moves the throughput; with
+`ultrafast` the GPU is the limit and the GPU changes carry it. The gate does nothing for `ultrafast`,
+which already has its own unrefined-decode gate.
+
+**Results are unchanged.** `apriltag_synth_ground_truth` prints the same figures on v1.6.0 and the
+combined build, with and without `--refine-edges` (658/767 and 687/768 decoded, identical mean and
+worst rotation and translation errors against ground truth and against libapriltag), every
+validate run reports MATCH, and no `bench_multiqueue` run had a mismatch. Everything else is
+verified against the previous commits in 8g, 8k and 8l (canonical quad dumps, validation layer).
+The combined build's default behaviour is v1.6.0's plus pre-recorded command buffers (on); the margin
+gate, `expected_streams` and the alternate sort settings are opt-in or neutral.
+
 ## 9. Measuring
 
 ```
