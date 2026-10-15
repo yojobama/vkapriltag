@@ -1475,8 +1475,9 @@ combined build, with and without `--refine-edges` (658/767 and 687/768 decoded, 
 worst rotation and translation errors against ground truth and against libapriltag), every
 validate run reports MATCH, and no `bench_multiqueue` run had a mismatch. Everything else is
 verified against the previous commits in 8g, 8k and 8l (canonical quad dumps, validation layer).
-The combined build's default behaviour is v1.6.0's plus pre-recorded command buffers (on); the margin
-gate, `expected_streams` and the alternate sort settings are opt-in or neutral.
+The combined build's defaults differ from v1.6.0's in pre-recorded command buffers, the 8k GPU stage
+changes (including the rank-merge sort) and the removal of `label_pixels`, all on; the margin gate and
+`expected_streams` are opt-in.
 
 ## 9. Measuring
 
