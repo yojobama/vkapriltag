@@ -1,7 +1,7 @@
 // Simulates several cameras sharing one GPU: one Context (one VkDevice), and per stream a Lane
 // (queue), GpuDetector, QuadDecode, TagDecoder and FramePipeline, fed by its own thread.
 // Usage: bench_multiqueue --pgm <file> [--streams N] [--mode single|per-stream|alternate|auto]
-//   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N] [--import]
+//   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N] [--probe-margin G] [--import]
 //   [--async-upload]
 // single: every stream shares queue 0. per-stream: one queue per stream on the primary family.
 // alternate: queues interleaved across both compute families. auto: ContextOptions::expected_streams
@@ -97,6 +97,7 @@ int main(int argc, char **argv) {
   bool async_upload = false;  // stage-copy the frame on a transfer-only queue
   bool import_frames = false;  // zero-copy host-pointer import of the frame buffers
   uint32_t decimation = 2;
+  float probe_margin = 0.0f;  // TagDecoder margin gate, gray levels (0 = off)
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -119,6 +120,8 @@ int main(int argc, char **argv) {
       family = std::stoi(next());
     } else if (arg == "--import") {
       import_frames = true;
+    } else if (arg == "--probe-margin") {
+      probe_margin = std::stof(next());
     } else if (arg == "--async-upload") {
       async_upload = true;
     } else {
@@ -193,7 +196,8 @@ int main(int argc, char **argv) {
       apriltag_detector_add_family(st.td, tf);
       st.td->refine_edges = true;
       st.tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(
-          st.td, decimation, static_cast<uint32_t>(cpu_threads));
+          st.td, decimation, static_cast<uint32_t>(cpu_threads),
+          apriltag_vulkan::RefineEdgesMethod::kExact, probe_margin);
       st.pipeline = std::make_unique<apriltag_vulkan::FramePipeline>(*st.detector, *st.quad_decode,
                                                                      *st.tag_decoder);
       const size_t align = std::max<size_t>(4096, ctx.caps().min_host_pointer_alignment);

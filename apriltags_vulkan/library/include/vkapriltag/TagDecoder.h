@@ -29,8 +29,11 @@ class TagDecoder {
   // refine_edges (used only if `td->refine_edges` is set).
   // `cpu_threads` is the total parallelism (0 = hardware_concurrency, or APRILTAG_CPU_THREADS).
   // `refine_method` may be overridden by APRILTAG_VK_REFINE; used only if `td->refine_edges` is set.
+  // `probe_margin` is the margin gate in gray levels (see SetProbeMargin; 0 = off); the
+  // APRILTAG_VK_PROBE_MARGIN environment variable overrides it.
   explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0,
-                      RefineEdgesMethod refine_method = RefineEdgesMethod::kExact);
+                      RefineEdgesMethod refine_method = RefineEdgesMethod::kExact,
+                      float probe_margin = 0.0f);
   ~TagDecoder();
 
   TagDecoder(const TagDecoder &) = delete;
@@ -63,7 +66,8 @@ class TagDecoder {
   };
   const Stats &last_stats() const { return last_stats_; }
 
-  // Margin gate (off by default; APRILTAG_VK_PROBE_MARGIN=<gray levels> sets it at construction).
+  // Margin gate (off by default). Set through the constructor's `probe_margin`, this setter, or
+  // APRILTAG_VK_PROBE_MARGIN=<gray levels> (which overrides the constructor value).
   // When edge refinement is on, each candidate quad is first sampled unrefined, and quads whose
   // decision margin (the contrast between the white and black bit cells, in gray levels) is below
   // this value, or whose border polarity is wrong, are rejected without being refined: junk quads

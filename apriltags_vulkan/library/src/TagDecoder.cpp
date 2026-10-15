@@ -52,10 +52,11 @@ void ResetScratch(zarray_t *scratch) { zarray_truncate(scratch, 0); }
 }  // namespace
 
 TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads,
-                       RefineEdgesMethod refine_method)
+                       RefineEdgesMethod refine_method, float probe_margin)
     : td_(td),
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker")),
-      refine_method_(ResolveRefineEdgesMethod(refine_method)) {
+      refine_method_(ResolveRefineEdgesMethod(refine_method)),
+      probe_margin_(probe_margin) {
   // refine_edges() reads td_->quad_decimate for its search radius.
   td_->quad_decimate = static_cast<float>(decimation);
   poly0_ = g2d_polygon_create_zeros(4);
