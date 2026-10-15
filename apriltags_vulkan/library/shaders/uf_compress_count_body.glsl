@@ -1,14 +1,8 @@
 // Shared body for uf_compress_count.comp / uf_compress_count_u8.comp; the wrapper declares
 // Thresholded and THRESHOLDED_AT(i).
 //
-// uf_compress.comp plus uf_final.comp's saturating per-blob pixel count, for the last real
-// compression of the fused first attempt: the pixel's root is already in a register, so the count
-// needs no second pass over parent[] and thresholded[]. The counts are final only if the
-// verification merge that follows joins nothing; when it does, the attempt is discarded and the
-// tail rerun recounts with uf_final.comp.
-//
-// With honour_changed_flag set and changed_flag zero the preceding merge joined nothing, so
-// parent[] is still flat and the walk is skipped; the count still runs.
+// uf_compress.comp plus uf_final.comp's saturating per-blob pixel count, using the root already in
+// a register. With honour_changed_flag set and changed_flag zero the walk is skipped.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
@@ -42,8 +36,7 @@ void main() {
     n = p;
   }
 
-  // Ambiguous (127) pixels are skipped; a pixel stops counting once its blob reached the floor, so
-  // blob_size[r] is only reliable as a test against min_blob_pixels.
+  // Ambiguous (127) pixels are skipped; counting stops once a blob reaches min_blob_pixels.
   if (PackThreshCode(uint(THRESHOLDED_AT(i))) == 1u) return;
   if (blob_size[n] >= pc.min_blob_pixels) return;
   atomicAdd(blob_size[n], 1u);

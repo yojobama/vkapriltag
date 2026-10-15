@@ -61,8 +61,7 @@ void FramePipeline::WorkerLoop() {
 void FramePipeline::HarvestInFlight() {
   std::exception_ptr error;
   {
-    // Time the CPU tail finished ahead of the GPU pass and so waited for it; nonzero means the
-    // GPU, not the tail, limits throughput.
+    // Time the CPU tail waited for the GPU pass.
     VKA_PROF_SCOPE("pipeline.wait_gpu");
     std::unique_lock<std::mutex> lock(mu_);
     cv_.wait(lock, [this] { return finished_; });

@@ -4,9 +4,8 @@
 //   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N] [--probe-margin G] [--import]
 //   [--async-upload]
 // single: every stream shares queue 0. per-stream: one queue per stream on the primary family.
-// alternate: queues interleaved across both compute families. auto: ContextOptions::expected_streams
-// and Context::StreamSlot (what the library recommends; should match alternate). --fps paces each
-// stream like a camera (0 = free-running).
+// alternate: queues interleaved across both compute families; auto: ContextOptions::expected_streams
+// with Context::StreamSlot. --fps paces each stream like a camera (0 = free-running).
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -97,7 +96,7 @@ int main(int argc, char **argv) {
   bool async_upload = false;  // stage-copy the frame on a transfer-only queue
   bool import_frames = false;  // zero-copy host-pointer import of the frame buffers
   uint32_t decimation = 2;
-  float probe_margin = 0.0f;  // TagDecoder margin gate, gray levels (0 = off)
+  float probe_margin = 0.0f;  // TagDecoder margin gate, grey levels (0 = off)
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];

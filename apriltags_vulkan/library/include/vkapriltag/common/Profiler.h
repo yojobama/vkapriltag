@@ -4,19 +4,8 @@
 #include <cstdint>
 #include <string>
 
-// Low-overhead CPU tracing for the whole pipeline, with GPU timestamp spans merged onto the same
-// timeline. Off by default: a disabled scope costs one relaxed atomic load and a branch, and
-// building with VKAPRILTAG_PROFILING=0 (CMake option VKAPRILTAG_ENABLE_PROFILING=OFF) removes even
-// that. Enabled, each scope is two steady_clock reads and one append to a per-thread buffer (no
-// locks, no allocation once the buffer has grown).
-//
-//   prof::Enable(true);                    // or APRILTAG_VK_TRACE=<path>, via EnableFromEnv()
-//   ... run frames, instrumented code calls VKA_PROF_SCOPE("name") ...
-//   std::cout << prof::Summary();          // per-name count / total / mean / p50 / p99 / max
-//   prof::WriteTrace("trace.json");        // open in https://ui.perfetto.dev or chrome://tracing
-//
-// Summary(), WriteTrace() and Reset() read every thread's buffer without locking, so call them
-// only while no instrumented work is running (between frames, after joining).
+// CPU tracing with GPU timestamp spans on the same timeline; off by default.
+// Summary(), WriteTrace() and Reset() must not run while instrumented work is running.
 #ifndef VKAPRILTAG_PROFILING
 #define VKAPRILTAG_PROFILING 1
 #endif
@@ -76,9 +65,8 @@ std::string Summary();
 // be written.
 bool WriteTrace(const std::string &path);
 
-// Records [construction, destruction) under `name` on the calling thread. `name` must be a string
-// literal or otherwise outlive the profiler. set_arg() attaches one integer, for example an item
-// count or an outcome flag.
+// Records [construction, destruction) under `name` on the calling thread; set_arg() attaches one
+// integer.
 class Scope {
  public:
   explicit Scope(const char *name) {

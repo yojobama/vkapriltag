@@ -13,9 +13,8 @@ uint UnpackY(uint xy) { return (xy >> 14u) & 0x3FFFu; }
 
 // --- Threshold codes ---
 //
-// The thresholded buffer holds 0 (black), 127 (ambiguous) or 255 (white) per pixel. Packed into a
-// code, 0 = black, 1 = ambiguous, 2 = white. The mapping is monotonic: (vN > v0) is (cN > c0),
-// v0 + vN == 255 is c0 + cN == 2 when c0 != 1, and equality tests are preserved.
+// The thresholded buffer holds 0 (black), 127 (ambiguous) or 255 (white); the code is 0, 1 or 2.
+// The mapping is monotonic, so comparisons and v0 + vN == 255 tests carry over to the codes.
 
 // 0/127/255 -> 0/1/2, branch-free and monotonic.
 uint PackThreshCode(uint v) { return (v + 1u) >> 7u; }

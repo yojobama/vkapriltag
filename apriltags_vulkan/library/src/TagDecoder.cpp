@@ -204,11 +204,10 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
     }
 
-    // Experiment: how close are the unrefined bits to a code? See ProbeHistogram.
+    // Margin gate and probe statistics: sample the unrefined quad.
     int probe_bin = -1;
     float probe_margin = 0.0f;
-    // The margin gate reads the first family only, so it needs exactly one (a quad could decode in
-    // a second family whose border sits differently).
+    // The gate reads the first family only, so it needs exactly one registered.
     const bool gate = probe_margin_ > 0.0f && zarray_size(td_->tag_families) == 1;
     if ((collect_probe_ || gate) && td_->refine_edges &&
         refine_method_ != RefineEdgesMethod::kUltraFast) {
@@ -218,7 +217,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       uint64_t rcode = 0;
       const float margin = quad_sample_code(td_, &unrefined, &im, &rcode);
       probe_margin = margin;
-      // The nearest-code distance costs a pass over every code, so only the experiment takes it.
+      // The nearest-code distance is only needed for the statistics.
       probe_bin = margin < 0.0f ? 16
                   : collect_probe_ ? std::min(15, apriltag_min_hamming(td_, rcode))
                                    : 0;

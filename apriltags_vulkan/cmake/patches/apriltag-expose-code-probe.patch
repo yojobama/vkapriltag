@@ -22,16 +22,13 @@
      quick_decode_codeword(family, rcode, entry);
      free(values);
      return fmin(white_score / white_score_count, black_score / black_score_count);
-@@ -1494,3 +1502,53 @@
+@@ -1494,3 +1502,50 @@
      }
      return im;
  }
 +
-+// Samples the bits of a quad exactly as quad_decode_index() would (same homography, gray model and
-+// sharpening) for the first family with a matching border polarity, but only reports the raw code
-+// word, not the code lookup's result. Returns the decision margin (-1 when the polarity test
-+// rejects the quad or no homography exists) and stores the code word in *rcode; allocates
-+// quad_original->H/Hinv like quad_decode_index().
++// Samples a quad's bits as quad_decode_index() does and stores the raw code word in *rcode.
++// Returns the decision margin (< 0 if rejected); allocates quad_original->H/Hinv.
 +float quad_sample_code(apriltag_detector_t *td, struct quad *quad_original, image_u8_t *im, uint64_t *rcode)
 +{
 +    if (quad_update_homographies(quad_original) != 0)

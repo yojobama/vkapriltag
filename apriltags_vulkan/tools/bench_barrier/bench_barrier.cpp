@@ -1,10 +1,5 @@
-// Measures what a pipeline barrier costs on this GPU. The inter-span gap metric in the detector
-// cannot see barriers (they are recorded before the span-end timestamp), so this isolates them: a
-// persistent command buffer holds K independent dispatches of S elements, replayed with no barrier,
-// an execution-only barrier, or the library's compute->compute memory barrier between them. The
-// slope of frame time against K gives the cost per dispatch, and the difference between variants
-// is the cost of the barrier. Variants are interleaved round-robin so GPU clock drift hits all of
-// them alike.
+// Measures the cost of a pipeline barrier: K independent dispatches are replayed with no barrier, an
+// execution-only barrier or a memory barrier between them, and frame-time slopes are compared.
 // Usage: bench_barrier [--spv <file>] [--rounds N] [--replays N] [--queue-family N]
 #include <algorithm>
 #include <chrono>

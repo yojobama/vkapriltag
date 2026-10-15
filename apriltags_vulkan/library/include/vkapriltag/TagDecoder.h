@@ -29,8 +29,7 @@ class TagDecoder {
   // refine_edges (used only if `td->refine_edges` is set).
   // `cpu_threads` is the total parallelism (0 = hardware_concurrency, or APRILTAG_CPU_THREADS).
   // `refine_method` may be overridden by APRILTAG_VK_REFINE; used only if `td->refine_edges` is set.
-  // `probe_margin` is the margin gate in gray levels (see SetProbeMargin; 0 = off); the
-  // APRILTAG_VK_PROBE_MARGIN environment variable overrides it.
+  // Margin gate in grey levels (0 = off); APRILTAG_VK_PROBE_MARGIN overrides it.
   explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0,
                       RefineEdgesMethod refine_method = RefineEdgesMethod::kExact,
                       float probe_margin = 0.0f);
@@ -45,16 +44,14 @@ class TagDecoder {
   zarray_t *Decode(const std::vector<DetectedQuad> &quads, const uint8_t *gray_frame,
                    uint32_t width, uint32_t height, bool reversed_border);
 
-  // Where the last Decode() spent its time. Filled only while prof::Enabled() (the per-quad
-  // timing it needs is otherwise skipped); all zero before that. CPU times are summed over
-  // threads, so cpu_ms() / wall_ms is the achieved parallelism.
+  // Timings of the last Decode(), filled only while profiling is enabled; CPU times are summed
+  // over threads.
   struct Stats {
     uint32_t quads = 0;    // candidates received
     uint32_t decoded = 0;  // candidates that produced a detection (before reconcile_detections)
     double wall_ms = 0.0;  // Decode() start to return, including the merge and reconcile
     double probe_ms = 0.0;  // kUltraFast's unrefined decode gate
-    // Refinement is the dominant cost; split by whether the quad went on to decode, since time
-    // spent refining quads that never decode is the part an earlier reject could save.
+    // Refinement time, split by whether the quad went on to decode.
     double refine_ms_decoded = 0.0;
     double refine_ms_rejected = 0.0;
     double decode_ms = 0.0;      // final quad_decode_index
@@ -66,22 +63,13 @@ class TagDecoder {
   };
   const Stats &last_stats() const { return last_stats_; }
 
-  // Margin gate (off by default). Set through the constructor's `probe_margin`, this setter, or
-  // APRILTAG_VK_PROBE_MARGIN=<gray levels> (which overrides the constructor value).
-  // When edge refinement is on, each candidate quad is first sampled unrefined, and quads whose
-  // decision margin (the contrast between the white and black bit cells, in gray levels) is below
-  // this value, or whose border polarity is wrong, are rejected without being refined: junk quads
-  // sit at the noise floor (about 3 for sigma 3 noise) while real tags have margins of tens to
-  // hundreds. Every quad that passes is refined and decoded as before, so detections are identical
-  // to an ungated run unless a real tag's unrefined margin is below the gate. 0 disables.
-  void SetProbeMargin(float gray_levels) { probe_margin_ = gray_levels; }
+  // Margin gate (off by default): quads whose unrefined decision margin is below this, or whose
+  // border polarity is wrong, skip refinement. APRILTAG_VK_PROBE_MARGIN overrides it.
+  void SetProbeMargin(float grey_levels) { probe_margin_ = grey_levels; }
   float probe_margin() const { return probe_margin_; }
 
-  // Experiment: with APRILTAG_VK_PROBE_STATS=1 every candidate quad (when edge refinement is on) is
-  // also sampled unrefined, and the Hamming distance from those bits to the nearest code is
-  // histogrammed, split by whether the full refine + decode accepted the quad. Bins 0..14 are the
-  // distance, 15 means farther, 16 means rejected before the lookup (polarity test or no
-  // homography). Cumulative over Decode() calls.
+  // With APRILTAG_VK_PROBE_STATS=1, histograms each unrefined quad's Hamming distance to the nearest
+  // code by outcome (bins 0-14, 15 = farther, 16 = rejected before the lookup).
   struct ProbeHistogram {
     uint64_t decoded[17] = {};
     uint64_t rejected[17] = {};
@@ -110,7 +98,7 @@ class TagDecoder {
   float probe_margin_ = 0.0f;
   std::vector<ProbeHistogram> slot_probe_;  // per thread, merged into probe_hist_ per Decode()
   ProbeHistogram probe_hist_;
-  // One row per quad for offline analysis, written to APRILTAG_VK_PROBE_CSV at destruction.
+  // One row per quad, written to APRILTAG_VK_PROBE_CSV at destruction.
   struct ProbeRow {
     int distance;
     float margin;

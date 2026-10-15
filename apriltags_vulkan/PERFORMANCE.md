@@ -1049,7 +1049,7 @@ streams the GPU is saturated and there is no gain. Output is unchanged: 5 of 5 c
 libapriltag, and `bench_multiqueue` reports no mismatches in any run.
 
 **Synchronisation.** `apriltag_vulkan_validate --import` and `bench_multiqueue --streams 4 --mode
-per-stream --import` ran under `VK_LAYER_KHRONOS_validation` with synchronization validation enabled:
+per-stream --import` ran under `VK_LAYER_KHRONOS_validation` with synchronisation validation enabled:
 no validation errors and no `SYNC-HAZARD` messages, the same as with pre-recording off. The layer was
 confirmed loaded.
 
@@ -1085,7 +1085,7 @@ previous commit made with the same `CMAKE_BUILD_TYPE`, binaries confirmed differ
   a 0.2 us median lookup (one 387 us first-frame recording).
 - `apriltag_synth_ground_truth` passes with identical numbers on both builds on both machines
   (desktop 658/767, Orange Pi 659/767).
-- `VK_LAYER_KHRONOS_validation` with synchronization validation: 0 errors and 0 hazards for the
+- `VK_LAYER_KHRONOS_validation` with synchronisation validation: 0 errors and 0 hazards for the
   default, retry, stress, unfused and pipelined paths and a 4-stream `bench_multiqueue`, on both
   machines. On the Orange Pi the layer prints no notice of its own, so it was confirmed loaded from the
   loader's debug output and shown to be reporting by enabling best-practices checks, which produced a
@@ -1131,7 +1131,7 @@ desktop (`bench_multiqueue --import`, `ultrafast`): 1 stream 2,774 / 2,775 fps o
 **Stage 2 gate: not needed.** Making the unfused path obsolete (sizing every dispatch on the device so
 it too can be pre-recorded) was gated on Orange Pi data:
 - G1: the Mali takes the fused path already (`unified_memory=yes, host_cached=yes`, one submission per
-  frame, gray upload written directly).
+  frame, grey upload written directly).
 - G2: 0 retried frames out of 100 on every corpus image and stress pattern.
 - G5: the unfused path costs +11.5% on `Detect()` (3.09 vs 2.77 ms) and +8.1% on `pipeline_total` on
   the Mali, so any device stuck on it would pay that.
@@ -1294,7 +1294,7 @@ single compute family, it changes nothing: `StreamSlot` returns 0, because on th
 stream is slower than a shared one (8c). On the Orange Pi `--mode auto` therefore matches
 `--mode single` (2 streams 446 against 446 fps, 4 streams 447 against 447, 1 stream within the run
 spread, no mismatches). `bench_multiqueue --mode auto` exercises it and matches `alternate` on the
-desktop. `VK_LAYER_KHRONOS_validation` with synchronization validation reports 0 errors and 0 hazards
+desktop. `VK_LAYER_KHRONOS_validation` with synchronisation validation reports 0 errors and 0 hazards
 for `auto`, `alternate` and `single` at 4 streams (the layer was confirmed loaded by its own startup
 message).
 ## 8k. GPU stage changes from the 2026-10 research: -13.5% `Detect()` on the Mali
@@ -1369,7 +1369,7 @@ integrated GPUs (OPTIMIZATION_NOTES item 6).
 with pre-recording on and off, the unfused path, forced retries on and off, four stress frames) is
 byte-identical to the original in 15 of 15 cases; also `APRILTAG_VK_UF_CHUNK` 1, 3 and 4 (chunk 1
 exercises the count inside the head compression and a real retry), the 32-bit storage variant and the
-sort run length 32 to 2048. `VK_LAYER_KHRONOS_validation` with synchronization validation: 0 errors
+sort run length 32 to 2048. `VK_LAYER_KHRONOS_validation` with synchronisation validation: 0 errors
 and 0 hazards for the default, forced-retry, pipelined, stress, unfused and 4-stream runs on both
 machines (the Mali layer confirmed loaded by a best-practices control message). `apriltag_synth_
 ground_truth`: 658/767 (RX 9060 XT) and 659/767 (Orange Pi), unchanged.
@@ -1405,7 +1405,7 @@ around distance 8 from the nearest of 587 codes x 4 rotations). The earlier esti
 clutter rejected at distance 4-5" holds for the junk, but not for the tags it would lose.
 
 **The decision margin does.** The same sampling yields upstream's decision margin (the contrast
-between the white and black bit cells, in gray levels). Junk quads sit at the noise floor; real tags
+between the white and black bit cells, in grey levels). Junk quads sit at the noise floor; real tags
 do not:
 
 | contrast | accepted: min / median margin | junk: p99 / max margin | skip margin < 4: tags lost, junk skipped |
@@ -1418,13 +1418,13 @@ do not:
 Polarity failures (negative margin) are 37% of the junk and were never an accepted tag. On the corpus photographs the accepted tags have margin 101 and the junk reaches 24,
 so a gate at 4 skips 87% of the junk there and a gate at 8 skips 91%.
 
-**The gate.** `TagDecoder::SetProbeMargin(m)` / `APRILTAG_VK_PROBE_MARGIN=<gray levels>` (off by
+**The gate.** `TagDecoder::SetProbeMargin(m)` / `APRILTAG_VK_PROBE_MARGIN=<grey levels>` (off by
 default): when edge refinement is on and exactly one family is registered, each quad is sampled
 unrefined and rejected without refinement if its margin is below `m` (or its polarity is wrong).
 Every quad that passes is refined and decoded as before, so **detections are identical to an ungated
 run unless a real tag's unrefined margin is below the gate**. The per-case CSV of the synthetic
 sweep is byte-identical to the ungated run at gate 4 and 8 for contrast 1.0, 0.25, 0.12 and noise
-sigma 3 and 8 (and 8 with contrast 0.25) on the RX 9060 XT, and at gate 4 on the Orange Pi. The risk is a real tag below the gate: a tag needs a swing of under 4 gray levels
+sigma 3 and 8 (and 8 with contrast 0.25) on the RX 9060 XT, and at gate 4 on the Orange Pi. The risk is a real tag below the gate: a tag needs a swing of under 4 grey levels
 (it is 8 at contrast 0.12 in the sweep), and a higher noise level only raises the junk margins, which
 keeps the gate safe and makes it skip less.
 

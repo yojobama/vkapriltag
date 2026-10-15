@@ -481,8 +481,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
       }
     }
   }
-  // One queue per expected stream, spread over the families in use, but only when there is a second
-  // family to spread over: on a single family one shared queue is faster than several.
+  // One queue per expected stream when a second family exists; otherwise one shared queue.
   spread_streams_ = options.expected_streams > 1 && families.size() > 1;
   const uint32_t per_stream_queues =
       spread_streams_ ? (options.expected_streams + static_cast<uint32_t>(families.size()) - 1) /

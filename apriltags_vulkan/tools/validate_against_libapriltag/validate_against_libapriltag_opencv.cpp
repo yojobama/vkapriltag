@@ -64,9 +64,8 @@ int main(int argc, char **argv) {
   bool ingest_ab = false;
   // Writes every iteration's quads in canonical order (diffable between binaries).
   std::string dump_quads_path;
-  // Alternates the image with a synthetic frame of the same size on odd iterations (noise, snake,
-  // checker or rings). A frame that needs more labelling iterations than the detector seeded forces
-  // the non-converged retry, which a single static image never does.
+  // Alternates the image with a synthetic frame (noise, snake, checker or rings) on odd iterations,
+  // forcing the non-converged retry.
   std::string stress_kind;
   // 0 = leave DetectorConfig's default (64). 1 makes the first labelling attempt undershoot on every
   // frame, so the tail is rerun each time: a deterministic way to exercise the retry path.
@@ -367,8 +366,7 @@ int main(int argc, char **argv) {
       std::cout << "  bytes: upload=" << profile.upload_bytes
           << ", readback=" << profile.readback_bytes << std::endl;
       {
-        // Sort workload: selected blobs and their points by point count (the sort runs one
-        // workgroup per blob, and its cost grows faster than linearly with the count).
+        // Histogram of selected blob point counts (blobs/points): the sort workload.
         const uint32_t bounds[] = {16, 32, 64, 128, 256, 512, 1024};
         uint32_t blobs_in[8] = {}, points_in[8] = {};
         for (const apriltag_vulkan::MinMaxExtentsGpu &e : detector.last_selected_extents) {

@@ -9,12 +9,8 @@ layout(local_size_x_id = 0, local_size_x = 256) in;
 // Per-blob slot capacity (one shared word per point), independent of the workgroup size; see
 // local_sort_virtual_cap_ in GpuDetector.cpp.
 layout(constant_id = 3) const uint kLocalCap = 1024;
-// Non-zero (a power of two) selects the rank-merge sort: runs of kChunk points are sorted by
-// ranking (each point counts the points ahead of it in its run), then runs are merged pairwise,
-// each point finding its merged position by binary search in the other run. The packed words are
-// unique, so every rank is exact. It needs about log2(count / kChunk) + 1 barriers where the
-// sorting network below needs one per round (28 to 55). A blob of at most kChunk points is just
-// ranked. 0 keeps the sorting network.
+// Non-zero (a power of two) selects the rank-merge sort: runs of kChunk points are ranked, then
+// merged pairwise by binary search. 0 selects the sorting network.
 layout(constant_id = 4) const uint kChunk = 0;
 
 layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };

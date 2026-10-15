@@ -18,8 +18,7 @@ std::atomic<bool> g_enabled{false};
 
 namespace {
 
-// Per-thread cap; at 32 bytes an event this is 8 MiB per thread, ample for thousands of frames of
-// the instrumented scopes.
+// Per-thread cap on recorded events (8 MiB at 32 bytes each).
 constexpr size_t kMaxEventsPerThread = size_t{1} << 18;
 
 struct Event {
@@ -189,8 +188,7 @@ std::string Summary() {
   Registry &r = Reg();
   std::lock_guard<std::mutex> lock(r.mutex);
 
-  // Spans with the same name on different tracks are reported separately ("name [track]") only
-  // for virtual tracks; host threads are merged, since worker threads run the same scopes.
+  // Spans on virtual tracks are reported per track; host threads are merged.
   std::map<std::string, std::vector<double>> durations_us;
   for (auto &b : r.buffers) {
     const bool virtual_track = r.tracks.count(b->name) != 0;

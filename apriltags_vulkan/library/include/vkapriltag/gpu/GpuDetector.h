@@ -145,8 +145,7 @@ class GpuDetector {
     double cpu_submit_wait_ms = 0.0;  // EndCommandBuffer + QueueSubmit + WaitForFences
     double cpu_counter_read_ms = 0.0; // ReadCounterSlot invalidate + read
 
-    // Fused path only. record_ms is the host time spent recording commands (about 0 on a replay);
-    // replayed is true when the frame submitted only pre-recorded buffers (APRILTAG_VK_PRERECORD).
+    // Fused path only: host time spent recording, and whether the frame only replayed buffers.
     double record_ms = 0.0;
     bool replayed = false;
   };
@@ -382,18 +381,13 @@ class GpuDetector {
   // WriteTimestamp() is a no-op.
   vk::QueryPool timestamp_pool_;
   bool timestamps_enabled_ = false;
-  // Tracing (common/Profiler.h): the "GPU" track id, and steady_clock ns of this frame's first
-  // submission, which anchors the GPU timestamps to the host timeline.
+  // Tracing: the "GPU" track id, and the first submission time that anchors GPU timestamps.
   uint32_t gpu_track_ = 0;
   int64_t frame_first_submit_ns_ = 0;
 
   // --- Fused-path recording and pre-recording (on by default; APRILTAG_VK_PRERECORD=0 disables) ---
-  // On the fused path every dispatch is sized on the device, so a frame is a fixed sequence of
-  // commands. The Record* functions below only record (no host state, no clocks), so their output
-  // can be cached: with pre-recording on, each distinct recording is made once into a persistent
-  // command buffer and later frames just submit it. With it off, the same functions record into a
-  // ring buffer every frame. The unfused path (DetectUnfused) sizes dispatches from host-read
-  // counts and always records.
+  // The Record* functions only record, so their buffers can be cached and replayed; the unfused
+  // path always records.
   enum class RecordingKind : uint8_t {
     kFirstAttempt,   // head + speculative tail; keyed by (input buffer, labelling chunk)
     kContinuation,   // `n` more labelling iterations plus the convergence-flag copy
@@ -424,9 +418,8 @@ class GpuDetector {
   // decimate and threshold, the first labelling chunk, and the convergence-flag copy.
   void RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *imported, uint32_t chunk);
   void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations, bool trailing_compress = true);
-  // The fused tail: blob sizes through line-fit moments and every counter copy, ending in the host
-  // read barrier. `speculative` (first attempt only) stops blob_diff acting on labels that may not
-  // have converged.
+  // The fused tail: blob sizes through line-fit moments; `speculative` stops blob_diff acting on
+  // unconverged labels.
   void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
   void RecordFlatten(VkCommandBuffer cmd);
   void RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations);

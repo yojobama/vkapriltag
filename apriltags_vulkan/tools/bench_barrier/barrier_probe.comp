@@ -1,6 +1,5 @@
 #version 450
-// Probe kernel for bench_barrier: every invocation updates its own element, so chained dispatches
-// have no real dependency and any ordering cost is the barrier's alone.
+// Probe kernel for bench_barrier: each invocation updates its own element.
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 layout(std430, binding = 0) buffer Data { uint data[]; };

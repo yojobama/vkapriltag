@@ -185,8 +185,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // sort_points_local.comp workgroup size: the device's maximum invocation count rounded down to a
   // power of two.
   local_sort_cap_ = PrevPow2(std::max(caps.max_workgroup_invocations, 1u));
-  // Limited to 256 threads; APRILTAG_VK_SORT_WG overrides (rounded down to a power of two, at most
-  // the device limit).
+  // Limited to 256 threads; APRILTAG_VK_SORT_WG overrides it.
   local_sort_cap_ = std::min(local_sort_cap_, 256u);
   if (const char *v = std::getenv("APRILTAG_VK_SORT_WG")) {
     const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
@@ -211,8 +210,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // Persists newly compiled pipelines immediately rather than only at ~Context().
   ctx_.FlushPipelineCache();
 
-  // Opt-in per-shader GPU timing (see DetectProfile::gpu_stage_ms / kGpuStageNames). Tracing
-  // (prof::Enabled() when this is constructed) wants the spans for its GPU track too.
+  // Opt-in per-shader GPU timing; tracing also enables it for the GPU track.
   bool want_timestamps = prof::Enabled();
   if (const char *ts = std::getenv("APRILTAG_VK_TIMESTAMPS")) {
     want_timestamps = want_timestamps || std::strtol(ts, nullptr, 10) != 0;
@@ -311,9 +309,8 @@ void GpuDetector::CreateBuffers() {
     fused_submits_ = (v[0] != '0') && linefit_direct_read_ && extents_direct_read_;
   }
 
-  // On by default where it applies: replay pre-recorded command buffers on the fused path (see
-  // prerecord_). APRILTAG_VK_PRERECORD=0 records every frame instead. Not combined with the
-  // transfer-queue upload, whose semaphore wait is part of the submission.
+  // Replays pre-recorded command buffers on the fused path (APRILTAG_VK_PRERECORD=0 records every
+  // frame); not used with the transfer-queue upload.
   prerecord_ = fused_submits_ && transfer_lane_ == nullptr;
   if (const char *v = std::getenv("APRILTAG_VK_PRERECORD")) {
     prerecord_ = prerecord_ && v[0] != '0';
@@ -483,9 +480,8 @@ void GpuDetector::CreatePipelines() {
     }
   }
 
-  // Rank-merge sort run length (a power of two; see sort_points_local_body.glsl), 0 for the sorting
-  // network. 16 measured best on the Mali-G610 (about -1.5% of Detect()) and neutral on the RX 9060
-  // XT. APRILTAG_VK_SORT_CHUNK overrides.
+  // Rank-merge sort run length (a power of two, 0 for the sorting network);
+  // APRILTAG_VK_SORT_CHUNK overrides it.
   uint32_t sort_chunk = 16u;
   if (const char *v = std::getenv("APRILTAG_VK_SORT_CHUNK")) {
     sort_chunk = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
@@ -649,14 +645,8 @@ void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool tra
   const uint32_t pixels = decimated_width_ * decimated_height_;
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
 
-  // Records `iterations` labelling passes. The flag is cleared before the last merge, so zero
-  // afterwards means converged. The last uf_compress is predicated on it when available.
-  //
-  // Without `trailing_compress` (the fused first attempt) the last merge is a verification merge
-  // and nothing follows it: when it joins nothing, parent[] is still the flat forest the previous
-  // compression left (the compression after uf_init when there is only one iteration), and when it
-  // does, the attempt is discarded and the continuation resumes from the unflattened forest, which
-  // uf_merge accepts. The caller's barrier orders the merge before everything that follows.
+  // Records `iterations` labelling passes, clearing the flag before the last merge.
+  // Without `trailing_compress` the last merge is a verification merge with nothing after it.
   for (uint32_t iter = 0; iter < iterations; ++iter) {
     const bool last = iter + 1 == iterations;
     const bool predicate = last && predicated_compress_ && trailing_compress;
@@ -699,7 +689,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   const VkDeviceSize gray_bytes = VkDeviceSize(config_.width) * config_.height;
 
   // Push constants shared across several stages.
-  // decimate_pl_ takes the decimated dimensions directly; decimation is a specialization constant.
+  // decimate_pl_ takes the decimated dimensions directly; decimation is a specialisation constant.
   struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
   struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
@@ -879,9 +869,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   vk::ComputePipeline::HostReadBarrier(cmd);
 }
 
-// Flattens parent[] unconditionally. The first attempt ends in a verification merge with no
-// compression after it, so when that merge joined something the forest it leaves is valid but not
-// flat, and the rest of the retry path needs it flat.
+// Flattens parent[] unconditionally; the retry path needs a flat forest after a discarded attempt.
 void GpuDetector::RecordFlatten(VkCommandBuffer cmd) {
   const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
   uf_compress_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, &compress_pc);
@@ -897,9 +885,8 @@ void GpuDetector::RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations)
 }
 
 void GpuDetector::RecordTailRerun(VkCommandBuffer cmd) {
-  // parent[] is converged (or max_uf_iterations was hit). Re-zeroes the buffers the discarded tail
-  // dirtied (RecordUfChunk re-zeroes uf_changed_buf_) and reruns the tail. The timestamp pool is
-  // reset, so this frame has no per-span breakdown for the head.
+  // Re-zeroes the buffers the discarded tail dirtied and reruns the tail; the head has no per-span
+  // timestamps on this frame.
   timestamp_pool_.Reset(cmd);
   // Also needed when no continuation ran (max_uf_iterations reached by the first attempt).
   RecordFlatten(cmd);
@@ -1113,10 +1100,8 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
       static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), num_points);
   const auto t_end = Clock::now();
 
-  // Host phases. Recording and the single submission are all there is to attribute on this path:
-  // the legacy per-phase fields keep their meaning of "up to and including labelling" etc. only on
-  // the unfused path, so here the recording time is reported as threshold_label_ms and the
-  // submission as linefit_ms, which keeps gpu_ms (their sum) the host cost of the GPU phase.
+  // Host phases: recording time is reported as threshold_label_ms and the submission as
+  // linefit_ms, so gpu_ms (their sum) is the host cost of the GPU phase.
   if (prof::Enabled()) {
     prof::CompleteHere("gpu.detect", ToNs(frame.t_begin), ToNs(t_end),
                        static_cast<int64_t>(lane_.submit_count - frame.submits_at_start));
@@ -1167,10 +1152,8 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
     }
     last_profile_.has_gpu_stage_breakdown = true;
 
-    // GPU spans onto the trace's timeline. The GPU clock has no fixed relation to the host's, so
-    // the first available span start is pinned to the first submission's host time; later spans
-    // keep their GPU-clock spacing. Expect a constant offset of the submit-to-start latency
-    // (tens of microseconds), not drift.
+    // Pins the first available GPU span start to the first submission's host time; later spans keep
+    // their GPU-clock spacing.
     if (prof::Enabled() && frame_first_submit_ns_ != 0) {
       uint64_t base_ticks = 0;
       bool have_base = false;
@@ -1198,10 +1181,8 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
   }
 }
 
-// The flow for devices whose readbacks are not host-visible and cached (see fused_submits_): the
-// dispatches after boundary extraction are sized from counts read back between submissions, so it
-// cannot be pre-recorded and records every frame. Kept as it was before the fused path was split
-// out; the `fuse` branches inside are dead here and go when this flow does.
+// The flow for devices without host-visible, cached readbacks: dispatches are sized from counts
+// read between submissions, so it records every frame.
 void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   using vk::BarrierKind;
   const auto t_begin = Clock::now();
@@ -1236,7 +1217,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   }
 
   // Push constants shared across several stages.
-  // decimate_pl_ takes the decimated dimensions directly; decimation is a specialization constant.
+  // decimate_pl_ takes the decimated dimensions directly; decimation is a specialisation constant.
   struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
   struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
@@ -1650,10 +1631,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     }
     last_profile_.has_gpu_stage_breakdown = true;
 
-    // GPU spans onto the trace's timeline. The GPU clock has no fixed relation to the host's, so
-    // the first available span start is pinned to the first submission's host time; later spans
-    // keep their GPU-clock spacing. Expect a constant offset of the submit-to-start latency
-    // (tens of microseconds), not drift.
+    // Pins the first available GPU span start to the first submission's host time; later spans keep
+    // their GPU-clock spacing.
     if (prof::Enabled() && frame_first_submit_ns_ != 0) {
       uint64_t base_ticks = 0;
       bool have_base = false;

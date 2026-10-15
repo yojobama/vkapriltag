@@ -1,17 +1,8 @@
 // Shared body for blob_diff.comp / blob_diff_u8.comp; the wrapper declares Thresholded and
 // THRESHOLDED_AT(i).
 //
-// Emits up to 4 QuadBoundaryPoint candidates per interior pixel (E, SE, S, SW
-// connections) and appends the valid ones to the compacted output, reserving a
-// pixel's slots with one counter increment. Append order is nondeterministic
-// and nothing depends on it.
-//
-// A pixel is usable when it is not ambiguous (code 1) and its blob reached
-// min_blob_pixels, the test uf_final.comp's saturating count supports. The
-// threshold codes of the pixel and its neighbours are read first, from the
-// 1-byte thresholded buffer; parent[] and blob_size[] are gathered only for a
-// pixel that has an opposite-coloured neighbour, which is a small fraction of
-// the image.
+// Emits up to 4 boundary points per interior pixel (E, SE, S, SW) with one counter increment.
+// Threshold codes are read first; parent[] and blob_size[] only for pixels next to the other colour.
 //
 // QBPoint.x/.y hold the un-decimated coordinate (base*2 + offset), not the
 // decimated pixel index.

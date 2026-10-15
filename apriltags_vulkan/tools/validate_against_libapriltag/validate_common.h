@@ -285,9 +285,8 @@ inline void AppendCsvRow(const std::string &path, const ImageMetrics &m) {
     << m.dp_attempts << ',' << m.dp_fallbacks << '\n';
 }
 
-// A zero-padded copy of a frame in memory that VK_EXT_external_memory_host can import: the pointer
-// and the allocation are multiples of `alignment`. data() holds the frame; alloc_bytes() is the
-// size to pass to GpuDetector::ImportHostFrame.
+// A zero-padded frame copy whose pointer and allocation are multiples of `alignment`, for importing
+// with GpuDetector::ImportHostFrame; alloc_bytes() is the size to pass.
 class AlignedFrame {
  public:
   AlignedFrame(const uint8_t *src, size_t bytes, size_t alignment) {
@@ -339,9 +338,8 @@ inline double MaxQuadDeviation(const std::vector<apriltag_vulkan::DetectedQuad> 
   return worst;
 }
 
-// Appends frame `index`'s quads to `out` in a canonical order (sorted by corner values), at full
-// round-trip precision. The GPU emits quads in a varying order, so only a sorted dump can be diffed
-// between runs or between binaries.
+// Appends frame `index`'s quads to `out` sorted by corner values at full precision, so dumps can be
+// diffed between runs.
 inline void DumpCanonicalQuads(std::ostream &out, int index,
                                std::vector<apriltag_vulkan::DetectedQuad> quads) {
   std::sort(quads.begin(), quads.end(),
@@ -358,12 +356,8 @@ inline void DumpCanonicalQuads(std::ostream &out, int index,
   }
 }
 
-// Frame ingest A/B in one process: the same pixels detected from `plain` (copied into the staging
-// buffer on every frame) and from `imported` (already passed to GpuDetector::ImportHostFrame, so
-// the copy is skipped), ABBA-ordered so thermal drift hits both. Every iteration's quads are
-// compared with the first copy-path frame's: the count must match, and the worst corner deviation
-// is printed for both paths. Per-span columns need APRILTAG_VK_TIMESTAMPS=1 or
-// --profile. Returns the number of frames whose quads differed.
+// Frame ingest A/B: detects from `plain` (copied each frame) and `imported` (zero-copy) in ABBA
+// order and compares quads with the first copy-path frame; returns the number of differing frames.
 inline int RunIngestAb(apriltag_vulkan::GpuDetector &detector,
                        apriltag_vulkan::QuadDecode &quad_decode,
                        apriltag_vulkan::TagDecoder &tag_decoder, const uint8_t *plain,
@@ -378,8 +372,7 @@ inline int RunIngestAb(apriltag_vulkan::GpuDetector &detector,
   bool have_reference = false;
   int quad_mismatches = 0;
   // Per path: frames whose quad count differed from the reference, and the worst corner deviation
-  // (pixels) of any frame whose count matched. The copy path's own figure is the run-to-run
-  // baseline the import path is judged against.
+  // (pixels) of any frame whose count matched.
   int count_differs[2] = {0, 0};
   double worst_deviation[2] = {0.0, 0.0};
 
