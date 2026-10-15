@@ -1,0 +1,78 @@
+--- a/apriltag.c
++++ b/apriltag.c
+@@ -567,6 +567,13 @@
+ }
+ 
+ // returns the decision margin. Return < 0 if the detection should be rejected.
++// The code word quad_decode() last sampled on this thread, for quad_sample_code().
++#if defined(_MSC_VER)
++static __declspec(thread) uint64_t probe_last_rcode;
++#else
++static _Thread_local uint64_t probe_last_rcode;
++#endif
++
+ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, image_u8_t *im, struct quad *quad, struct quick_decode_entry *entry, image_u8_t *im_samples)
+ {
+     // decode the tag binary contents by sampling the pixel
+@@ -736,6 +743,7 @@
+         }
+     }
+ 
++    probe_last_rcode = rcode;
+     quick_decode_codeword(family, rcode, entry);
+     free(values);
+     return fmin(white_score / white_score_count, black_score / black_score_count);
+@@ -1494,3 +1502,53 @@
+     }
+     return im;
+ }
++
++// Samples the bits of a quad exactly as quad_decode_index() would (same homography, gray model and
++// sharpening) for the first family with a matching border polarity, but only reports the raw code
++// word, not the code lookup's result. Returns the decision margin (-1 when the polarity test
++// rejects the quad or no homography exists) and stores the code word in *rcode; allocates
++// quad_original->H/Hinv like quad_decode_index().
++float quad_sample_code(apriltag_detector_t *td, struct quad *quad_original, image_u8_t *im, uint64_t *rcode)
++{
++    if (quad_update_homographies(quad_original) != 0)
++        return -1;
++
++    for (int famidx = 0; famidx < zarray_size(td->tag_families); famidx++) {
++        apriltag_family_t *family;
++        zarray_get(td->tag_families, famidx, &family);
++
++        if (family->reversed_border != quad_original->reversed_border)
++            continue;
++
++        struct quad *quad = quad_copy(quad_original);
++        struct quick_decode_entry entry;
++        probe_last_rcode = 0;
++        float margin = quad_decode(td, family, im, quad, &entry, NULL);
++        quad_destroy(quad);
++        *rcode = probe_last_rcode;
++        return margin;
++    }
++    return -1;
++}
++
++// The smallest Hamming distance from rcode to any code of the first family over the four rotations.
++int apriltag_min_hamming(apriltag_detector_t *td, uint64_t rcode)
++{
++    apriltag_family_t *family;
++    if (zarray_size(td->tag_families) < 1)
++        return 64;
++    zarray_get(td->tag_families, 0, &family);
++
++    int best = 64;
++    for (int ridx = 0; ridx < 4; ridx++) {
++        for (uint32_t c = 0; c < family->ncodes; c++) {
++            uint64_t x = rcode ^ family->codes[c];
++            int d = 0;
++            while (x) { x &= x - 1; d++; }
++            if (d < best)
++                best = d;
++        }
++        rcode = rotate90(rcode, family->nbits);
++    }
++    return best;
++}

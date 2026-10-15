@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "vkapriltag/RefineEdges.h"
@@ -62,6 +63,27 @@ class TagDecoder {
   };
   const Stats &last_stats() const { return last_stats_; }
 
+  // Margin gate (off by default; APRILTAG_VK_PROBE_MARGIN=<gray levels> sets it at construction).
+  // When edge refinement is on, each candidate quad is first sampled unrefined, and quads whose
+  // decision margin (the contrast between the white and black bit cells, in gray levels) is below
+  // this value, or whose border polarity is wrong, are rejected without being refined: junk quads
+  // sit at the noise floor (about 3 for sigma 3 noise) while real tags have margins of tens to
+  // hundreds. Every quad that passes is refined and decoded as before, so detections are identical
+  // to an ungated run unless a real tag's unrefined margin is below the gate. 0 disables.
+  void SetProbeMargin(float gray_levels) { probe_margin_ = gray_levels; }
+  float probe_margin() const { return probe_margin_; }
+
+  // Experiment: with APRILTAG_VK_PROBE_STATS=1 every candidate quad (when edge refinement is on) is
+  // also sampled unrefined, and the Hamming distance from those bits to the nearest code is
+  // histogrammed, split by whether the full refine + decode accepted the quad. Bins 0..14 are the
+  // distance, 15 means farther, 16 means rejected before the lookup (polarity test or no
+  // homography). Cumulative over Decode() calls.
+  struct ProbeHistogram {
+    uint64_t decoded[17] = {};
+    uint64_t rejected[17] = {};
+  };
+  const ProbeHistogram &probe_histogram() const { return probe_hist_; }
+
  private:
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
@@ -80,6 +102,20 @@ class TagDecoder {
     uint32_t quads, decoded;
   };
   std::vector<SlotStats> slot_stats_;
+  bool collect_probe_ = false;
+  float probe_margin_ = 0.0f;
+  std::vector<ProbeHistogram> slot_probe_;  // per thread, merged into probe_hist_ per Decode()
+  ProbeHistogram probe_hist_;
+  // One row per quad for offline analysis, written to APRILTAG_VK_PROBE_CSV at destruction.
+  struct ProbeRow {
+    int distance;
+    float margin;
+    float perimeter;
+    bool decoded;
+  };
+  std::vector<std::vector<ProbeRow>> slot_rows_;
+  std::vector<ProbeRow> rows_;
+  std::string probe_csv_;
   Stats last_stats_;
 };
 

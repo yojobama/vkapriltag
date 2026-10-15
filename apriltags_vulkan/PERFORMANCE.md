@@ -1340,6 +1340,65 @@ and 0 hazards for the default, forced-retry, pipelined, stress, unfused and 4-st
 machines (the Mali layer confirmed loaded by a best-practices control message). `apriltag_synth_
 ground_truth`: 658/767 (RX 9060 XT) and 659/767 (Orange Pi), unchanged.
 
+## 8l. Probing a quad before refining it: a margin gate (opt-in)
+
+96.8% of the CPU refine time is spent on quads that never decode (8e). The research notes proposed
+sampling the unrefined quad's bits and refining only quads within a Hamming distance of a code. This
+section measures that idea with a probe built into `TagDecoder` and finds a better signal.
+
+**Tooling.** `cmake/patches/apriltag-expose-code-probe.patch` exposes `quad_sample_code()` (upstream's
+bit sampling for a quad, up to the code lookup) and `apriltag_min_hamming()`. With
+`APRILTAG_VK_PROBE_STATS=1` `TagDecoder` histograms, for every candidate quad, the Hamming distance
+from its unrefined bits to the nearest code, split by whether the full refine + decode accepted it;
+`APRILTAG_VK_PROBE_CSV=<file>` appends one row per quad (distance, decision margin, perimeter,
+accepted). `apriltag_synth_ground_truth --contrast <f>` scales the frame's dynamic range about
+mid-grey. Data below: the synthetic sweep (768 cases, blur 0.7, noise sigma 3, `--refine-edges`,
+74k candidate quads of which 705 decode) and the corpus photographs.
+
+**A Hamming cutoff does not work.** Many tags that decode only decode after refinement; their
+unrefined bits are far from any code:
+
+| skip refinement when the nearest code is farther than | accepted tags lost | junk quads skipped |
+| --- | --- | --- |
+| 3 | 20.3% | 99.9% |
+| 5 | 18.9% | 99.1% |
+| 7 | 14.6% | 82.5% |
+| 9 | 9.1% | 43.6% |
+| 10 | 0% | 37.2% |
+
+Zero loss needs a cutoff of 10 of 36 bits, which skips only 37% of the junk (random 36-bit words sit
+around distance 8 from the nearest of 587 codes x 4 rotations). The earlier estimate of "98% of
+clutter rejected at distance 4-5" holds for the junk, but not for the tags it would lose.
+
+**The decision margin does.** The same sampling yields upstream's decision margin (the contrast
+between the white and black bit cells, in gray levels). Junk quads sit at the noise floor; real tags
+do not:
+
+| contrast | accepted: min / median margin | junk: p99 / max margin | skip margin < 4: tags lost, junk skipped |
+| --- | --- | --- | --- |
+| 1.0 | 74.4 / 226 | 3.7 / 127 | 0, 99.7% |
+| 0.5 | 36.9 / 114 | 3.7 / 64 | 0, 99.7% |
+| 0.25 | 16.5 / 57 | 3.7 / 32 | 0, 99.8% |
+| 0.12 | 8.1 / 26 | 3.7 / 18 | 0, 99.7% |
+
+Polarity failures (negative margin) are 37% of the junk and were never an accepted tag. On the corpus photographs the accepted tags have margin 101 and the junk reaches 24,
+so a gate at 4 skips 87% of the junk there and a gate at 8 skips 91%.
+
+**The gate.** `TagDecoder::SetProbeMargin(m)` / `APRILTAG_VK_PROBE_MARGIN=<gray levels>` (off by
+default): when edge refinement is on and exactly one family is registered, each quad is sampled
+unrefined and rejected without refinement if its margin is below `m` (or its polarity is wrong).
+Every quad that passes is refined and decoded as before, so **detections are identical to an ungated
+run unless a real tag's unrefined margin is below the gate**. The per-case CSV of the synthetic
+sweep is byte-identical to the ungated run at gate 4 and 8 for contrast 1.0, 0.25, 0.12 and noise
+sigma 3 and 8 (and 8 with contrast 0.25) on the RX 9060 XT, and at gate 4 on the Orange Pi. The risk is a real tag below the gate: a tag needs a swing of under 4 gray levels
+(it is 8 at contrast 0.12 in the sweep), and a higher noise level only raises the junk margins, which
+keeps the gate safe and makes it skip less.
+
+**Result on the Orange Pi** (`--profile`, 1280x800 corpus image, 8 interleaved runs of 400 frames,
+governors pinned, LumenVision stopped, `APRILTAG_VK_PROBE_MARGIN` 0 against 4): `pipeline_total`
+**3.331 -> 2.915 ms (-12.5%)**, `Detect()` unchanged (2.305 against 2.312 ms).
+
+
 ## 9. Measuring
 
 ```

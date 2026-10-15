@@ -165,6 +165,9 @@ SynthCase MakeSynthCase(const CameraIntrinsics &intr, double tagsize, double dis
   return c;
 }
 
+// Scales the frame's dynamic range about mid-grey (--contrast); 1 leaves the full black/white swing.
+double g_contrast = 1.0;
+
 cv::Mat RenderFrame(const cv::Mat &bitmap, int border_start_px, int border_width_px,
                     const double corners_image[4][2], int width, int height, double blur_sigma,
                     double noise_sigma, uint8_t background) {
@@ -186,6 +189,8 @@ cv::Mat RenderFrame(const cv::Mat &bitmap, int border_start_px, int border_width
   cv::Mat frame(height, width, CV_8UC1, cv::Scalar(background));
   // BORDER_TRANSPARENT leaves the pre-filled flat background outside the tag's plane.
   cv::warpPerspective(bitmap, frame, H, frame.size(), cv::INTER_AREA, cv::BORDER_TRANSPARENT);
+
+  if (g_contrast != 1.0) frame.convertTo(frame, CV_8UC1, g_contrast, 128.0 * (1.0 - g_contrast));
 
   // Blur and read noise, so corner estimates are sub-pixel as on a real camera.
   if (blur_sigma > 0.0) cv::GaussianBlur(frame, frame, cv::Size(0, 0), blur_sigma);
@@ -271,6 +276,7 @@ int main(int argc, char **argv) {
     else if (arg == "--tagsize") tagsize = std::stod(next("--tagsize"));
     else if (arg == "--blur-sigma") blur_sigma = std::stod(next("--blur-sigma"));
     else if (arg == "--noise-sigma") noise_sigma = std::stod(next("--noise-sigma"));
+    else if (arg == "--contrast") g_contrast = std::stod(next("--contrast"));
     else if (arg == "--dump-dir") dump_dir = next("--dump-dir");
     else if (arg == "--csv") csv_path = next("--csv");
     else if (arg == "--refine-edges") refine_edges = true;

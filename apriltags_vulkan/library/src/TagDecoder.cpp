@@ -1,6 +1,10 @@
 #include "vkapriltag/TagDecoder.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #include "vkapriltag/common/Profiler.h"
 
@@ -15,6 +19,11 @@ void quad_decode_index(apriltag_detector_t *td, struct quad *quad_original, imag
 void reconcile_detections(zarray_t *detections, zarray_t *poly0, zarray_t *poly1);
 // Upstream's gradient-based corner refinement, exposed by the same patch.
 void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct quad *quad);
+// Bit sampling without the code lookup, and the nearest-code distance, exposed by
+// cmake/patches/apriltag-expose-code-probe.patch.
+float quad_sample_code(apriltag_detector_t *td, struct quad *quad_original, image_u8_t *im,
+                       uint64_t *rcode);
+int apriltag_min_hamming(apriltag_detector_t *td, uint64_t rcode);
 }
 
 namespace apriltag_vulkan {
@@ -56,9 +65,54 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
     probe_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
+  if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
+    probe_margin_ = static_cast<float>(std::atof(v));
+  }
+  if (const char *v = std::getenv("APRILTAG_VK_PROBE_CSV")) {
+    probe_csv_ = v;
+    collect_probe_ = true;
+  }
+  slot_rows_.assign(pool_->threads(), {});
+  slot_probe_.assign(pool_->threads(), ProbeHistogram{});
 }
 
 TagDecoder::~TagDecoder() {
+  if (!probe_csv_.empty()) {
+    if (FILE *f = std::fopen(probe_csv_.c_str(), "a")) {
+      for (const ProbeRow &r : rows_) {
+        std::fprintf(f, "%d,%.4f,%.2f,%d\n", r.distance, r.margin, r.perimeter, r.decoded ? 1 : 0);
+      }
+      std::fclose(f);
+    }
+  }
+  if (collect_probe_) {
+    uint64_t total = 0;
+    for (int b = 0; b < 17; ++b) total += probe_hist_.decoded[b] + probe_hist_.rejected[b];
+    if (total > 0) {
+      std::fprintf(stderr,
+                   "probe histogram (unrefined bits to nearest code; quads accepted / rejected by the "
+                   "full refine+decode)\n  distance:");
+      for (int b = 0; b < 17; ++b) {
+        if (b == 15) {
+          std::fprintf(stderr, " >=15");
+        } else if (b == 16) {
+          std::fprintf(stderr, " n/a");
+        } else {
+          std::fprintf(stderr, " %d", b);
+        }
+      }
+      std::fprintf(stderr, "\n  accepted:");
+      for (int b = 0; b < 17; ++b) {
+        std::fprintf(stderr, " %llu", static_cast<unsigned long long>(probe_hist_.decoded[b]));
+      }
+      std::fprintf(stderr, "\n  rejected:");
+      for (int b = 0; b < 17; ++b) {
+        std::fprintf(stderr, " %llu", static_cast<unsigned long long>(probe_hist_.rejected[b]));
+      }
+      std::fprintf(stderr, "\n");
+    }
+  }
   // detections_ owns the detection objects; the per_quad_ arrays are freed structurally only.
   ClearDetections(detections_);
   zarray_destroy(detections_);
@@ -149,6 +203,34 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
     }
 
+    // Experiment: how close are the unrefined bits to a code? See ProbeHistogram.
+    int probe_bin = -1;
+    float probe_margin = 0.0f;
+    // The margin gate reads the first family only, so it needs exactly one (a quad could decode in
+    // a second family whose border sits differently).
+    const bool gate = probe_margin_ > 0.0f && zarray_size(td_->tag_families) == 1;
+    if ((collect_probe_ || gate) && td_->refine_edges &&
+        refine_method_ != RefineEdgesMethod::kUltraFast) {
+      struct quad unrefined = quad_original;
+      unrefined.H = nullptr;
+      unrefined.Hinv = nullptr;
+      uint64_t rcode = 0;
+      const float margin = quad_sample_code(td_, &unrefined, &im, &rcode);
+      probe_margin = margin;
+      // The nearest-code distance costs a pass over every code, so only the experiment takes it.
+      probe_bin = margin < 0.0f ? 16
+                  : collect_probe_ ? std::min(15, apriltag_min_hamming(td_, rcode))
+                                   : 0;
+      if (unrefined.H) matd_destroy(unrefined.H);
+      if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
+      if (timing) st.probe_ms += lap();
+      if (gate && margin < probe_margin_) {
+        if (collect_probe_) slot_probe_[slot].rejected[probe_bin]++;
+        finish(false, 0.0);
+        return;
+      }
+    }
+
     // Refine (if enabled) before decode; both are safe to run concurrently across quads.
     double refine_ms = 0.0;
     if (td_->refine_edges) {
@@ -168,8 +250,33 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
 
     if (timing) st.decode_ms += lap();
+    if (collect_probe_ && probe_bin >= 0) {
+      const bool accepted = zarray_size(per_quad_[i]) > 0;
+      (accepted ? slot_probe_[slot].decoded : slot_probe_[slot].rejected)[probe_bin]++;
+      if (!probe_csv_.empty()) {
+        float perimeter = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+          const double dx = q.p[k][0] - q.p[(k + 1) % 4][0];
+          const double dy = q.p[k][1] - q.p[(k + 1) % 4][1];
+          perimeter += static_cast<float>(std::sqrt(dx * dx + dy * dy));
+        }
+        slot_rows_[slot].push_back({probe_bin, probe_margin, perimeter, accepted});
+      }
+    }
     finish(zarray_size(per_quad_[i]) > 0, refine_ms);
   });
+
+  for (ProbeHistogram &sp : slot_probe_) {
+    for (int b = 0; b < 17; ++b) {
+      probe_hist_.decoded[b] += sp.decoded[b];
+      probe_hist_.rejected[b] += sp.rejected[b];
+    }
+    sp = ProbeHistogram{};
+  }
+  for (std::vector<ProbeRow> &r : slot_rows_) {
+    rows_.insert(rows_.end(), r.begin(), r.end());
+    r.clear();
+  }
 
   // Merge in quad order over [0, quads.size()), as in the reset loop above.
   for (size_t i = 0; i < quads.size(); ++i) {
