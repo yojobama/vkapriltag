@@ -1944,3 +1944,17 @@ and takes `quad_decode` down by 2.3% to 3.2% (A76 and desktop) and 0.7% of A55 c
 `sqrtf(x*x + y*y)` is 8.1x faster on an A76 and 6.5x on an A55 but differs from `hypotf` by 1 ulp in 5%
 to 14% of calls, which changed every canonical quad dump, so it is not used. Details in
 `PERFORMANCE.md` 8o.
+
+## 24. CPU tail: three exact changes found with `perf` on the Orange Pi - shipped, on
+
+Profiling `bench_multiqueue` with `perf record`/`perf annotate` (details in `PERFORMANCE.md` 8p)
+showed the quad fit at 77% of CPU samples with `ultrafast` refinement at decimation 1, and 49% back-end
+stalls. (1) The prefix sums were copied into `cs[k]` through the stack with overlapping loads and
+stores of different widths, which defeats store-to-load forwarding on the A76; they are now kept in
+scalars and stored field by field (`quad_decode` -9% to -11%). (2) The combinatorial search refitted
+three of its four segments inside the loops; all ordered peak pairs are now fitted once and
+`ReadMomentsWindow` is inlined (a further -15% to -21%). (3) `exact` refinement now reuses each
+bilinear tap eight steps later, as `RefineEdgesFast` already did (`tag_decode` -12% on the Orange Pi,
+-16% on the RX 9060 XT). Together: CPU time per frame -24% (`ultrafast`, decimation 1) and -13%
+(`exact`, decimation 2); `exact` throughput on the desktop +12% to +17%. Every quad dump, refined
+detection and synthetic CSV is identical; ASan, UBSan and TSan are clean.

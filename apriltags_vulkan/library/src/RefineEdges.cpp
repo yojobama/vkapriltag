@@ -86,33 +86,39 @@ void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
       Sample Mn = 0;
       Sample Mcount = 0;
 
-      for (int step = 0; step < max_steps; ++step) {
-        const Sample n = -range + step_length * step;
-
+      // Bilinear tap at n + grange for virtual step v; false when it falls outside the image.
+      auto tap = [&](int v, Sample *g) {
+        const Sample n = -range + step_length * v;
         const Sample x1 = sx0 + (n + grange) * snx - delta;
         const Sample y1 = sy0 + (n + grange) * sny - delta;
         const Sample x1t = std::trunc(x1);
         const Sample y1t = std::trunc(y1);
-        const Sample a1 = x1 - x1t;
-        const Sample b1 = y1 - y1t;
         const int x1i = static_cast<int>(x1t);
         const int y1i = static_cast<int>(y1t);
-        if (x1i < 0 || x1i + 1 >= im->width || y1i < 0 || y1i + 1 >= im->height) continue;
+        if (x1i < 0 || x1i + 1 >= im->width || y1i < 0 || y1i + 1 >= im->height) return false;
+        *g = BilinearAt<Sample>(im, x1i, y1i, x1 - x1t, y1 - y1t);
+        return true;
+      };
 
-        const Sample x2 = sx0 + (n - grange) * snx - delta;
-        const Sample y2 = sy0 + (n - grange) * sny - delta;
-        const Sample x2t = std::trunc(x2);
-        const Sample y2t = std::trunc(y2);
-        const Sample a2 = x2 - x2t;
-        const Sample b2 = y2 - y2t;
-        const int x2i = static_cast<int>(x2t);
-        const int y2i = static_cast<int>(y2t);
-        if (x2i < 0 || x2i + 1 >= im->width || y2i < 0 || y2i + 1 >= im->height) continue;
+      // The tap at n - grange is the n + grange tap of kLag = 2 * grange * steps_per_unit steps
+      // earlier, kept in a ring.
+      constexpr int kLag = 8;
+      Sample ring_g[kLag];
+      bool ring_in[kLag];
+      for (int v = -kLag; v < 0; ++v) ring_in[v + kLag] = tap(v, &ring_g[v + kLag]);
 
-        const Sample g1 = BilinearAt<Sample>(im, x1i, y1i, a1, b1);
-        const Sample g2 = BilinearAt<Sample>(im, x2i, y2i, a2, b2);
+      for (int step = 0; step < max_steps; ++step) {
+        Sample g1 = 0;
+        const bool in1 = tap(step, &g1);
+        const int slot = step & (kLag - 1);
+        const bool in2 = ring_in[slot];
+        const Sample g2 = ring_g[slot];
+        ring_in[slot] = in1;
+        ring_g[slot] = g1;
+        if (!in1 || !in2) continue;
         if (g1 < g2) continue;  // gradient points the wrong way
 
+        const Sample n = -range + step_length * step;
         const Sample weight = (g2 - g1) * (g2 - g1);
         Mn += weight * n;
         Mcount += weight;

@@ -55,7 +55,7 @@ LineFitMoments Sub(const LineFitMoments &a, const LineFitMoments &b) {
 // Cumulative moments over the circular index range [index0, index1] inclusive, from prefix sums
 // `cs` (cs[k] = sum of points [0, k]) of length total_points. index0 >= index1 takes the
 // wrap-around branch.
-LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, size_t total_points,
+inline LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, size_t total_points,
                                 size_t index0, size_t index1) {
   LineFitMoments result;
   if (index0 < index1) {
@@ -283,20 +283,29 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   peaks.clear();
 
   {
-    LineFitMoments running{};
+    // Running sums stay in registers; each field of cs[k] is stored separately.
+    int32_t mx = 0, my = 0, w_sum = 0;
+    int64_t mxx = 0, mxy = 0, myy = 0;
     for (size_t k = 0; k < total_points; ++k) {
       const RawLineFitPoint &p = points[begin + k];
       // Unpack once: the accessors are bit extractions and cs may alias points as far as the compiler knows.
       const int32_t x2 = p.x2(), y2 = p.y2(), w = p.W();
       const int64_t wx = static_cast<int64_t>(w) * x2;
       const int64_t wy = static_cast<int64_t>(w) * y2;
-      running.Mx += static_cast<int32_t>(wx);
-      running.My += static_cast<int32_t>(wy);
-      running.W += w;
-      running.Mxx += wx * x2;
-      running.Mxy += wx * y2;
-      running.Myy += wy * y2;
-      cs[k] = running;
+      mx += static_cast<int32_t>(wx);
+      my += static_cast<int32_t>(wy);
+      w_sum += w;
+      mxx += wx * x2;
+      mxy += wx * y2;
+      myy += wy * y2;
+      LineFitMoments &c = cs[k];
+      c.Mx = mx;
+      c.My = my;
+      c.W = w_sum;
+      c.Mxx = mxx;
+      c.Myy = myy;
+      c.Mxy = mxy;
+      c.N = 0;
     }
   }
 
@@ -360,62 +369,45 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   for (size_t k = 0; k < K; ++k) point_indices[k] = peaks[k].second;
   std::sort(point_indices.begin(), point_indices.begin() + K);
 
-  // ComputeM0M1Fit: cache line fits for segment (m0, m1) pairs that can ever
-  // appear as the "first segment" of a valid 4-combination (m0 < 7, m1 < 8).
-  constexpr size_t kCacheDim = kNMaxima - 3;  // 7
-  double error_m0_m1[kCacheDim][kCacheDim];
-  double lineparams23_m0_m1[kCacheDim][kCacheDim][2];
-  for (auto &row : error_m0_m1) std::fill(std::begin(row), std::end(row),
-                                          std::numeric_limits<double>::max());
-
-  for (size_t m0 = 0; m0 < kCacheDim; ++m0) {
-    for (size_t m1 = m0 + 1; m1 < kNMaxima - 2; ++m1) {
-      if (m1 >= K) continue;  // stays max
-      double err01, mse01;
-      FitLine(ReadMomentsWindow(cs, total_points, point_indices[m0], point_indices[m1]), nullptr,
-             lineparams23_m0_m1[m0][m1 - 1], &err01, &mse01);
-      if (mse01 > config.max_line_fit_mse) {
-        err01 = std::numeric_limits<double>::max();
-      }
-      error_m0_m1[m0][m1 - 1] = err01;
+  // Line fit of the segment between every ordered pair of peaks; (b, a) with b > a closes the quad.
+  double seg_err[kNMaxima][kNMaxima];
+  double seg_mse[kNMaxima][kNMaxima];
+  double seg_params[kNMaxima][kNMaxima][2];
+  for (size_t a = 0; a < K; ++a) {
+    for (size_t b = 0; b < K; ++b) {
+      if (a == b) continue;
+      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), nullptr,
+              seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
     }
   }
+  const double max_mse = config.max_line_fit_mse;
 
   // Brute force all C(10, 4) = 210 combinations, keeping the minimum total error.
   double best_error = std::numeric_limits<double>::max();
   uint32_t best[4] = {0, 0, 0, 0};
 
-  for (uint32_t m0 = 0; m0 < kCacheDim; ++m0) {
+  for (uint32_t m0 = 0; m0 < kNMaxima - 3; ++m0) {
     for (uint32_t m1 = m0 + 1; m1 < kNMaxima - 2; ++m1) {
-      const double errm0m1 = error_m0_m1[m0][m1 - 1];
-      if (errm0m1 == std::numeric_limits<double>::max()) continue;
-      const double *paramsm0m123 = lineparams23_m0_m1[m0][m1 - 1];
+      if (m1 >= K) break;
+      if (seg_mse[m0][m1] > max_mse) continue;
+      const double errm0m1 = seg_err[m0][m1];
+      const double *paramsm0m123 = seg_params[m0][m1];
 
       for (uint32_t m2 = m1 + 1; m2 < kNMaxima - 1; ++m2) {
         if (m2 >= K) break;
-        double errm1m2, msem1m2;
-        double paramsm1m223[2];
-        FitLine(ReadMomentsWindow(cs, total_points, point_indices[m1], point_indices[m2]), nullptr,
-               paramsm1m223, &errm1m2, &msem1m2);
-        if (msem1m2 > config.max_line_fit_mse) continue;
+        if (seg_mse[m1][m2] > max_mse) continue;
+        const double errm1m2 = seg_err[m1][m2];
+        const double *paramsm1m223 = seg_params[m1][m2];
 
         const double dot = paramsm0m123[0] * paramsm1m223[0] + paramsm0m123[1] * paramsm1m223[1];
         if (std::fabs(dot) > config.cos_critical_rad) continue;
 
         for (uint32_t m3 = m2 + 1; m3 < kNMaxima; ++m3) {
           if (m3 >= K) break;
+          if (seg_mse[m2][m3] > max_mse) continue;
+          if (seg_mse[m3][m0] > max_mse) continue;
 
-          double errm2m3, msem2m3;
-          FitLine(ReadMomentsWindow(cs, total_points, point_indices[m2], point_indices[m3]), nullptr,
-                 nullptr, &errm2m3, &msem2m3);
-          if (msem2m3 > config.max_line_fit_mse) continue;
-
-          double errm3m0, msem3m0;
-          FitLine(ReadMomentsWindow(cs, total_points, point_indices[m3], point_indices[m0]), nullptr,
-                 nullptr, &errm3m0, &msem3m0);
-          if (msem3m0 > config.max_line_fit_mse) continue;
-
-          const double total = errm0m1 + errm1m2 + errm2m3 + errm3m0;
+          const double total = errm0m1 + errm1m2 + seg_err[m2][m3] + seg_err[m3][m0];
           if (total < best_error) {
             best_error = total;
             best[0] = m0;

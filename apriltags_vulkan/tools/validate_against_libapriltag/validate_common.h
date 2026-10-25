@@ -340,6 +340,30 @@ inline double MaxQuadDeviation(const std::vector<apriltag_vulkan::DetectedQuad> 
 
 // Appends frame `index`'s quads to `out` sorted by corner values at full precision, so dumps can be
 // diffed between runs.
+// Writes one line per decoded tag, sorted by id then centre, with every value at full precision.
+inline void DumpDetections(std::ostream &out, int index, const zarray_t *detections) {
+  std::vector<const apriltag_detection_t *> dets;
+  for (int i = 0; i < zarray_size(detections); ++i) {
+    apriltag_detection_t *det;
+    zarray_get(const_cast<zarray_t *>(detections), i, &det);
+    dets.push_back(det);
+  }
+  std::sort(dets.begin(), dets.end(),
+            [](const apriltag_detection_t *a, const apriltag_detection_t *b) {
+    if (a->id != b->id) return a->id < b->id;
+    return std::lexicographical_compare(a->c, a->c + 2, b->c, b->c + 2);
+  });
+  out << "F " << index << ' ' << dets.size() << '\n';
+  char line[512];
+  for (const apriltag_detection_t *d : dets) {
+    std::snprintf(line, sizeof line,
+                  "%d %d %.9g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", d->id,
+                  d->hamming, d->decision_margin, d->c[0], d->c[1], d->p[0][0], d->p[0][1],
+                  d->p[1][0], d->p[1][1], d->p[2][0], d->p[2][1], d->p[3][0], d->p[3][1]);
+    out << line;
+  }
+}
+
 inline void DumpCanonicalQuads(std::ostream &out, int index,
                                std::vector<apriltag_vulkan::DetectedQuad> quads) {
   std::sort(quads.begin(), quads.end(),

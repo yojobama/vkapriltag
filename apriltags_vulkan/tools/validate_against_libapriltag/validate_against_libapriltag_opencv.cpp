@@ -64,6 +64,8 @@ int main(int argc, char **argv) {
   bool ingest_ab = false;
   // Writes every iteration's quads in canonical order (diffable between binaries).
   std::string dump_quads_path;
+  // Appends every iteration's decoded tags (id, margin, centre, corners) at full precision.
+  std::string dump_detections_path;
   // Alternates the image with a synthetic frame (noise, snake, checker or rings) on odd iterations,
   // forcing the non-converged retry.
   std::string stress_kind;
@@ -99,6 +101,8 @@ int main(int argc, char **argv) {
       max_blobs = static_cast<uint32_t>(std::max(1, std::stoi(next("--max-blobs"))));
     } else if (arg == "--dump-quads") {
       dump_quads_path = next("--dump-quads");
+    } else if (arg == "--dump-detections") {
+      dump_detections_path = next("--dump-detections");
     } else if (arg == "--stress") {
       stress_kind = next("--stress");
     } else if (arg == "--max-uf") {
@@ -284,6 +288,8 @@ int main(int argc, char **argv) {
       }
       std::ofstream dump;
       if (!dump_quads_path.empty()) dump.open(dump_quads_path, std::ios::trunc);
+      std::ofstream dump_dets;
+      if (!dump_detections_path.empty()) dump_dets.open(dump_detections_path, std::ios::trunc);
       int retry_frames = 0;
       std::map<uint32_t, int> uf_histogram;
       for (int it = 0; it < iterations; ++it) {
@@ -313,6 +319,7 @@ int main(int argc, char **argv) {
           pipeline_totals.push_back(
               std::chrono::duration<double, std::milli>(t_dec1 - t0).count());
           if (dump.is_open()) apriltag_vulkan::validate::DumpCanonicalQuads(dump, it, quads);
+          if (dump_dets.is_open()) apriltag_vulkan::validate::DumpDetections(dump_dets, it, ours);
       }
       std::cout << "Retry frames (submits > 1): " << retry_frames << " of " << iterations
                 << "; labelling iterations per frame:";

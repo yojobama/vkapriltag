@@ -201,8 +201,9 @@ additionally report steady-state timing (see below); a single iteration is
 dominated by cold-start costs (page faults, pipeline warm-up) and says
 little about per-frame throughput.
 
-`--dump-quads <file>` writes the canonical candidate quads, so two builds or two
-configurations can be compared byte for byte; `--stress <noise|snake|checker|rings>`
+`--dump-quads <file>` writes the canonical candidate quads, and `--dump-detections <file>` the
+decoded tags after refinement at full precision, so two builds or two configurations can be
+compared byte for byte; `--stress <noise|snake|checker|rings>`
 runs deliberately hostile frames and `--max-uf <n>` caps the labelling
 iterations to force the retry path. `--profile` and `--trace <file>` print and
 record the per-stage timing. The same dumps are identical across every
@@ -313,10 +314,10 @@ on the Mali). The totals below are without instrumentation:
 | | Runs on | Orange Pi 5 | Desktop |
 | --- | --- | --- | --- |
 | `GpuDetector::Detect()` | GPU | 2.12 ms | 0.38 to 0.55 ms |
-| `quad_decode` (DP corner seeding) | **CPU** | 0.29 ms | 0.12 ms |
-| `tag_decode` (edge refinement, bit sampling, Hamming) | **CPU** | 0.72 ms | 0.27 ms |
-| **Pipeline total, serial** | GPU + CPU | **3.13 ms** | **0.76 to 0.94 ms** |
-| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.30 ms** | **0.45 to 0.49 ms** |
+| `quad_decode` (DP corner seeding) | **CPU** | 0.20 ms | 0.11 ms |
+| `tag_decode` (edge refinement, bit sampling, Hamming) | **CPU** | 0.63 ms | 0.23 ms |
+| **Pipeline total, serial** | GPU + CPU | **2.99 ms** | **0.80 to 0.91 ms** |
+| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.21 ms** | **0.41 to 0.46 ms** |
 
 `Detect()` also includes the unspanned time (submit, fence wait, host-side readback) that no GPU
 timestamp covers. It is small: an empty `vkQueueSubmit` + `vkWaitForFences` round trip measures
@@ -353,7 +354,7 @@ wrong. On the synthetic sweep the gated and ungated runs are byte-identical at g
 contrast 1.0, 0.25 and 0.12 and noise sigma 3 and 8; junk quads sit at margin 4 or below and real
 tags well above it. It applies only with exactly one tag family, refinement on, and a refine mode
 other than `ultrafast`. The risk is a real tag whose unrefined margin is under the gate, so it
-stays opt-in. On the Orange Pi it takes `pipeline_total` from 3.13 to 2.71 ms. A Hamming-distance
+stays opt-in. On the Orange Pi it takes `pipeline_total` from 2.99 to 2.59 ms. A Hamming-distance
 probe was measured and rejected: it loses 9 to 20% of the tags that only decode after refinement.
 
 ### Pose and pipelining
