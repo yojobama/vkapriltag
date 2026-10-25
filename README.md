@@ -314,7 +314,7 @@ on the Mali). The totals below are without instrumentation:
 | | Runs on | Orange Pi 5 | Desktop |
 | --- | --- | --- | --- |
 | `GpuDetector::Detect()` | GPU | 2.12 ms | 0.38 to 0.55 ms |
-| `quad_decode` (DP corner seeding) | **CPU** | 0.20 ms | 0.11 ms |
+| `quad_decode` (DP corner seeding) | **CPU** | 0.19 ms | 0.11 ms |
 | `tag_decode` (edge refinement, bit sampling, Hamming) | **CPU** | 0.63 ms | 0.23 ms |
 | **Pipeline total, serial** | GPU + CPU | **2.99 ms** | **0.80 to 0.91 ms** |
 | **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.21 ms** | **0.41 to 0.46 ms** |

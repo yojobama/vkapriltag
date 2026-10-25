@@ -102,7 +102,7 @@ are a range. The per-stage GPU table, the throughput tables and the comparison w
 | Stage | Runs on | Orange Pi 5 (Mali-G610) | Desktop (RX 9060 XT) |
 | --- | --- | --- | --- |
 | `GpuDetector` | GPU | 2.12 ms | 0.38 to 0.55 ms |
-| `quad_decode` | CPU | 0.20 ms | 0.11 ms |
+| `quad_decode` | CPU | 0.19 ms | 0.11 ms |
 | `tag_decode` | CPU | 0.63 ms | 0.23 ms |
 | **Pipeline total, serial** | GPU + CPU | **2.99 ms** | **0.80 to 0.91 ms** |
 | **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.21 ms** | **0.41 to 0.46 ms** |
@@ -739,8 +739,8 @@ GPU work and about 0.85 ms of CPU tail per frame (2.99 ms serial). Open items, l
 - **Ingest.** Hardware JPEG decode into a dma-buf is outside the library and needs stride and
   offset on `ImportDmaBufFrame` (section 8d).
 - **Double-buffering the `FramePipeline` readback** so the GPU thread can chain frames: not measured.
-- **The remaining CPU-tail items from profiling** (section 8p): the DP corner search's latency-bound
-  argmax loops, the scan that splits points into blobs, and the frame and line-fit copies.
+- **The remaining CPU-tail items from profiling** (section 8p): the frame upload and the copy of the
+  line-fit points, and the `matd` allocations in upstream's homography.
 
 Measured and closed: the `blob_diff` append atomic and the small-blob sort (section 8n), dispatch
 folding, run-merging before the 64-bit atomics, deferring the post-fill barrier (section 8k), and
@@ -1614,7 +1614,8 @@ any output:
 | the prefix sums are accumulated in scalars and stored field by field; the struct copy through the stack made every 16-byte load overlap the previous 8-byte stores, which defeats store-to-load forwarding (two instructions held 21% of the quad-fit samples) | `FitQuadForBlob` | `quad_decode` -9% (decimation 1), -11% (decimation 2) | |
 | the combinatorial search fits every ordered pair of peaks once (at most 90 fits) instead of refitting three of the four segments inside the loops (up to about 500 fits per fallback blob); `ReadMomentsWindow` is inlined so its 48-byte result stays in registers | `FitQuadForBlob` | `quad_decode` a further -15% (decimation 1), -21% (decimation 2) | |
 | `exact` refinement reuses each bilinear tap: the tap at n - 1 is the n + 1 tap of eight steps earlier, computed from bit-identical operands, so it is kept in an eight-entry ring (as `RefineEdgesFast` already did) | `RefineEdgesT` | `tag_decode` -12% (0.720 -> 0.635 ms) | `tag_decode` -16% |
-| all three | | CPU time per frame -24% (`ultrafast`, decimation 1), -13% (`exact`, decimation 2); `pipeline_total` 3.13 -> 2.99 ms | `exact` throughput +12% (1 stream), +17% (4 streams); `ultrafast` unchanged (GPU-limited) |
+| the DP corner search's four argmax passes run as four independent chains, merged with the lower index winning ties; squared distances are computed in `int64` (exact for these coordinates) and the perpendicular test squares in double as before | `FindDpCornerIndices` | `quad_decode` a further -3.8% (decimation 1), -3.1% (decimation 2), -5.2% on one A76 thread; CPU time -4.8% | `quad_decode` -3.9% (decimation 1) |
+| the first three together | | CPU time per frame -24% (`ultrafast`, decimation 1), -13% (`exact`, decimation 2); `pipeline_total` 3.13 -> 2.99 ms | `exact` throughput +12% (1 stream), +17% (4 streams); `ultrafast` unchanged (GPU-limited) |
 
 Over 2,000 frames with `ultrafast` at decimation 1, task-clock fell from 9,316 to 7,104 ms, cycles
 by 26%, and IPC rose from 0.93 to 1.16. Frame rate does not change there because the GPU pass (5.2
@@ -1633,12 +1634,11 @@ peaks-only.
 
 **Found and not changed** (largest first; shares of all CPU samples after the changes):
 
-- `ultrafast`, decimation 1: the DP corner search (`FindDpCornerIndices`, about 15%) is four passes
-  of a latency-bound argmax over doubles (`d > best` feeds the next iteration). Two independent
-  chains merged with a first-index tie-break, and the squared distances in `int64` (exact for these
-  coordinates), would keep it bit-identical.
-- `ultrafast`, decimation 1: splitting the points into blobs (`QuadDecode::Decode`, 7.4%) scans all
-  48,000 points for blob-index changes; the selected extents already carry each blob's count.
+- Tried and rejected: finding each blob's end by galloping and bisection instead of scanning all
+  48,000 points (`QuadDecode::Decode`, 7.4% of samples). Output is identical and the Pi gains 1 to 3
+  points of `quad_decode`, but on the RX 9060 XT `quad_decode` becomes 18% slower with 12 threads:
+  the sequential scan is what brings the read-back points into the cache, and without it each worker
+  takes those misses itself. Its samples were mostly that first touch, not the comparisons.
 - `memcpy`, 5.3%: the frame upload into the mapped buffer on the GPU-driving thread, before the
   submit (on the critical path when the GPU is the limit; dma-buf import avoids it, section 8d), and
   `FramePipeline`'s copy of the line-fit points (double-buffering the read-back avoids it).

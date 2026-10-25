@@ -1958,3 +1958,14 @@ bilinear tap eight steps later, as `RefineEdgesFast` already did (`tag_decode` -
 -16% on the RX 9060 XT). Together: CPU time per frame -24% (`ultrafast`, decimation 1) and -13%
 (`exact`, decimation 2); `exact` throughput on the desktop +12% to +17%. Every quad dump, refined
 detection and synthetic CSV is identical; ASan, UBSan and TSan are clean.
+
+## 25. DP corner search with independent argmax chains - shipped, on; galloping blob split - rejected
+
+`FindDpCornerIndices` makes four argmax passes over a blob's points, each a chain where `d > best`
+feeds the next iteration. They now run as four independent lanes merged with the lower index winning
+ties (the first maximum, as before), with squared distances in `int64` and the perpendicular test
+squared in double as before. Identical output; `quad_decode` -3.8% (decimation 1) and -3.1%
+(decimation 2) on the Orange Pi, -5.2% on one A76 thread, -3.9% on the RX 9060 XT. Replacing the
+blob-splitting scan with a galloping search was identical too, but made `quad_decode` 18% slower on
+the RX 9060 XT with 12 threads: the scan had been warming the cache with the read-back points for the
+workers. `PERFORMANCE.md` 8p.

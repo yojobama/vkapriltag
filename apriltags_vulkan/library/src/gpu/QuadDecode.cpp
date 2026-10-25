@@ -141,29 +141,35 @@ struct FitQuadResult {
   LineFitMoments moments[4];
 };
 
-// Coordinates for DP corner seeding: RawLineFitPoint's (x2, y2). They only seed the corner
-// indices; corner accuracy comes from the line fits.
-struct Point2 {
-  double x, y;
-};
-
-// Marked inline so MSVC /Ob1 inlines them into FindDpCornerIndices' loops.
-inline Point2 PointAt(std::span<const RawLineFitPoint> points, size_t begin, size_t idx) {
-  const RawLineFitPoint &p = points[begin + idx];
-  return {static_cast<double>(p.x2()), static_cast<double>(p.y2())};
-}
-
-inline double SqDist(Point2 a, Point2 b) {
-  const double dx = a.x - b.x, dy = a.y - b.y;
-  return dx * dx + dy * dy;
-}
-
-// Squared perpendicular distance of p from line ab, scaled by |ab|^2 (avoids a sqrt/division).
-inline double ScaledPerpDistSq(Point2 a, Point2 b, Point2 p) {
-  const double abx = b.x - a.x, aby = b.y - a.y;
-  const double apx = p.x - a.x, apy = p.y - a.y;
-  const double cross = abx * apy - aby * apx;
-  return cross * cross;
+// Index of the largest value(i) over [begin, end), the lowest such index on ties, folded into
+// (best, best_idx) with ties again going to the lower index. Four lanes run independently.
+template <typename T, typename F>
+inline void ArgMax(size_t begin, size_t end, F value, T &best, size_t &best_idx) {
+  T lane_best[4] = {T(-1), T(-1), T(-1), T(-1)};
+  size_t lane_idx[4] = {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
+  size_t i = begin;
+  for (; i + 4 <= end; i += 4) {
+    for (int k = 0; k < 4; ++k) {
+      const T v = value(i + k);
+      if (v > lane_best[k]) {
+        lane_best[k] = v;
+        lane_idx[k] = i + k;
+      }
+    }
+  }
+  for (; i < end; ++i) {
+    const T v = value(i);
+    if (v > lane_best[0]) {
+      lane_best[0] = v;
+      lane_idx[0] = i;
+    }
+  }
+  for (int k = 0; k < 4; ++k) {
+    if (lane_best[k] > best || (lane_best[k] == best && lane_idx[k] < best_idx)) {
+      best = lane_best[k];
+      best_idx = lane_idx[k];
+    }
+  }
 }
 
 // Seeds 4 corner indices: the two mutually-farthest points (2-pass approximation), then the
@@ -173,56 +179,38 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
                          uint32_t out_indices[4]) {
   if (n < 8) return false;
 
-  const Point2 p0 = PointAt(points, begin, 0);
+  const RawLineFitPoint *pts = points.data() + begin;
+  // Squared distance between two points, exact in int64.
+  auto sq_dist = [pts](size_t a, size_t b) {
+    const int64_t dx = pts[a].x2() - pts[b].x2(), dy = pts[a].y2() - pts[b].y2();
+    return dx * dx + dy * dy;
+  };
+
+  int64_t best_d = -1;
   size_t a_idx = 0;
-  double best_d = -1.0;
-  for (size_t i = 1; i < n; ++i) {
-    const double d = SqDist(p0, PointAt(points, begin, i));
-    if (d > best_d) {
-      best_d = d;
-      a_idx = i;
-    }
-  }
-  const Point2 pa = PointAt(points, begin, a_idx);
+  ArgMax(1, n, [&](size_t i) { return sq_dist(0, i); }, best_d, a_idx);
+  best_d = -1;
   size_t b_idx = 0;
-  best_d = -1.0;
-  for (size_t i = 0; i < n; ++i) {
-    const double d = SqDist(pa, PointAt(points, begin, i));
-    if (d > best_d) {
-      best_d = d;
-      b_idx = i;
-    }
-  }
+  ArgMax(0, n, [&](size_t i) { return sq_dist(a_idx, i); }, best_d, b_idx);
   if (a_idx == b_idx) return false;
-  const Point2 pb = PointAt(points, begin, b_idx);
-  const double diameter_sq = SqDist(pa, pb);
+  const double diameter_sq = static_cast<double>(sq_dist(a_idx, b_idx));
   if (diameter_sq < 1e-6) return false;
 
   const size_t lo = std::min(a_idx, b_idx), hi = std::max(a_idx, b_idx);
 
+  // Cross product of (b - a) and (p - a), exact in int64, squared in double.
+  const int64_t ax = pts[a_idx].x2(), ay = pts[a_idx].y2();
+  const int64_t abx = pts[b_idx].x2() - ax, aby = pts[b_idx].y2() - ay;
+  auto perp = [&](size_t i) {
+    const double cross = static_cast<double>(abx * (pts[i].y2() - ay) - aby * (pts[i].x2() - ax));
+    return cross * cross;
+  };
+
   size_t c1_idx = n, c2_idx = n;  // n is not a valid index; doubles as "not found"
   double best_perp1 = -1.0, best_perp2 = -1.0;
-  for (size_t i = lo + 1; i < hi; ++i) {
-    const double d = ScaledPerpDistSq(pa, pb, PointAt(points, begin, i));
-    if (d > best_perp1) {
-      best_perp1 = d;
-      c1_idx = i;
-    }
-  }
-  for (size_t i = 0; i < lo; ++i) {
-    const double d = ScaledPerpDistSq(pa, pb, PointAt(points, begin, i));
-    if (d > best_perp2) {
-      best_perp2 = d;
-      c2_idx = i;
-    }
-  }
-  for (size_t i = hi + 1; i < n; ++i) {
-    const double d = ScaledPerpDistSq(pa, pb, PointAt(points, begin, i));
-    if (d > best_perp2) {
-      best_perp2 = d;
-      c2_idx = i;
-    }
-  }
+  ArgMax(lo + 1, hi, perp, best_perp1, c1_idx);
+  ArgMax(0, lo, perp, best_perp2, c2_idx);
+  ArgMax(hi + 1, n, perp, best_perp2, c2_idx);
   if (c1_idx == n || c2_idx == n) return false;
 
   // Reject degenerate shapes: both corners must deviate from the diameter line (threshold is
