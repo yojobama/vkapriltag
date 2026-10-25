@@ -1934,3 +1934,13 @@ established. Further gains would need less work per blob (for example a smaller 
   0.264 ms on the Mali, 0.5% of the GPU time. Not worth a rewrite.
 - **Small-blob rank sort (A8):** leaving blobs of up to 128 points unsorted bounds the gain at 2.4%;
   ranking them in a single pass is slower than the rank-merge (sort +0.02 to +0.09 ms). Rejected.
+
+## 23. `hypotf` in the quad fit: double form shipped, float form rejected
+
+`FitLine` and `FitLineError` call `hypotf` about 3,900 times per frame; it is 12% of the quad-fit
+samples and 2.2% of all CPU samples on the Orange Pi. `(float)sqrt((double)x*x + (double)y*y)` gave
+identical results to `hypotf` on 4 x 10^6 inputs on glibc 2.41 and MSVC and byte-identical quad dumps,
+and takes `quad_decode` down by 2.3% to 3.2% (A76 and desktop) and 0.7% of A55 cycles. The hint's
+`sqrtf(x*x + y*y)` is 8.1x faster on an A76 and 6.5x on an A55 but differs from `hypotf` by 1 ulp in 5%
+to 14% of calls, which changed every canonical quad dump, so it is not used. Details in
+`PERFORMANCE.md` 8o.

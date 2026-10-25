@@ -23,6 +23,12 @@ constexpr std::array<double, 7> kFilterCoefficients = {
 
 constexpr int kNMaxima = 10;
 
+// Hypotenuse of two floats, evaluated in double and rounded once to float.
+inline float Hypot(float x, float y) {
+  const double dx = x, dy = y;
+  return static_cast<float>(std::sqrt(dx * dx + dy * dy));
+}
+
 // LineFitMoments addition and subtraction.
 LineFitMoments Add(const LineFitMoments &a, const LineFitMoments &b) {
   LineFitMoments r;
@@ -76,7 +82,7 @@ double FitLineError(int N, int64_t Mx, int64_t My, int64_t Mxx, int64_t Myy, int
   int64_t Cxx = Mxx * W - Mx * Mx;
   int64_t Cxy = Mxy * W - Mx * My;
   int64_t Cyy = Myy * W - My * My;
-  const float hypot_cached = std::hypotf(static_cast<float>(Cxx - Cyy), static_cast<float>(2 * Cxy));
+  const float hypot_cached = Hypot(static_cast<float>(Cxx - Cyy), static_cast<float>(2 * Cxy));
   const float eight_w_squared = static_cast<float>(static_cast<int64_t>(W) * static_cast<int64_t>(W) * 8.0);
   const float eig_small = (static_cast<float>(Cxx + Cyy) - hypot_cached) / eight_w_squared;
   return N * eig_small;
@@ -91,7 +97,7 @@ void FitLine(const LineFitMoments &moments, double *lineparam01, double *linepar
   int64_t Cxy = moments.Mxy * W - Mx * My;
   int64_t Cyy = moments.Myy * W - My * My;
 
-  const float hypot_cached = std::hypotf(static_cast<float>(Cxx - Cyy), static_cast<float>(2 * Cxy));
+  const float hypot_cached = Hypot(static_cast<float>(Cxx - Cyy), static_cast<float>(2 * Cxy));
   const float eight_w_squared = static_cast<float>(static_cast<int64_t>(W) * static_cast<int64_t>(W) * 8.0);
   const float eig_small = (static_cast<float>(Cxx + Cyy) - hypot_cached) / eight_w_squared;
 
@@ -115,7 +121,7 @@ void FitLine(const LineFitMoments &moments, double *lineparam01, double *linepar
       nx = nx2;
       ny = ny2;
     }
-    float length = std::hypotf(nx, ny);
+    float length = Hypot(nx, ny);
     lineparam23[0] = nx / length;
     lineparam23[1] = ny / length;
   }

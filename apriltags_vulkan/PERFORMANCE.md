@@ -1546,6 +1546,53 @@ so Vulkan 1.1 hardware from other vendors remains untested. A positive control f
 inconclusive with the current `VK_LAYER_VALIDATE_*` settings; with the older `VK_LAYER_ENABLES` form
 the layer reported that it had read the setting.
 
+## 8o. The hypotenuse in the quad fit
+
+`std::hypotf` is called in `FitLineError` and `FitLine` (`QuadDecode.cpp`), about 3,900 times per frame
+on the 1280x800 corpus image. A profiling hint suggested `sqrtf(x*x + y*y)`, which is 8 times faster on
+an A76. Three forms were compared: `hypotf`, the double form (`(float)sqrt((double)x*x + (double)y*y)`,
+"A") and the float form ("B").
+
+**Profile (Orange Pi, `perf record` on the A76 cores, `APRILTAG_CPU_THREADS=4`, `exact` refinement).**
+Of all CPU samples `hypotf` is 2.2%, because 68% is edge refinement. Of the quad-fit work itself
+(the `QuadDecode::Decode` task, `ReadMomentsWindow` and `hypotf`) it is about 12%, which matches the
+hint's 14%. After the change `hypotf` is 0.15% (the remainder is the double `hypot`).
+
+**Micro-benchmark** (2 x 10^6 moment-style inputs and 2 x 10^6 wide-range inputs, `-O3`, one core):
+
+| | `hypotf` | A (double) | B (float) |
+| --- | --- | --- | --- |
+| A76, ns per call | 7.36 | 3.06 (2.4x) | 0.91 (8.1x) |
+| A55, ns per call | 34.5 | 10.2 (3.4x) | 5.3 (6.5x) |
+| RX 9060 XT host (MSVC), ns per call | 2.6 | 1.95 (1.3x) | 1.08 (2.4x) |
+| results differing from `hypotf` | **0** | **0** | 14.5% / 5.0% (1 ulp) |
+
+**Output.** A reproduces the canonical quad dumps byte for byte (15 of 15 on both machines), the
+synthetic sweep (658/767 and 659/767; 687/768 with `--refine-edges`) and every validate tool. B changes
+all 15 dumps on both machines (a 1 ulp change in the eigenvalue and the normal moves corners), so it is
+not used. A is the shipped form.
+
+**Speed** (ABBA, 8 rounds of 400 frames, 16 runs per variant, medians; Pi governors pinned, LumenVision
+stopped):
+
+| | A76, 4 threads | A76, 1 thread | RX 9060 XT, 12 threads | RX 9060 XT, 1 thread |
+| --- | --- | --- | --- | --- |
+| `quad_decode`, A against `hypotf` | -2.9% (0.2747 -> 0.2667 ms) | -2.3% | -3.2% (0.1176 -> 0.1138 ms) | -0.9% (within spread) |
+| `quad_decode`, B against `hypotf` | -7.5% | -5.3% | -6.9% | -2.7% |
+| `pipeline_total`, A | -0.1% | -0.2% | -1.0% | -0.3% |
+
+`perf stat` over 400 frames on one core: A76 cycles 4,149 -> 4,136 million (-0.3%), instructions 7,068
+-> 7,021 million (-0.7%); A55 cycles 9,471 -> 9,403 million (-0.7%, about 0.09 ms of CPU time per
+frame). The saving is real but small: about 0.01 ms per frame on an A76 and 0.09 ms on an A55, under 1%
+of `pipeline_total` with `exact` refinement. It is larger where the tail runs on the A55 cores or
+refinement is off (`ultrafast`).
+
+**Correctness.** With the double form, GCC 14 AddressSanitizer + UBSan (including `float-cast-overflow`
+and signed overflow) report nothing on the corpus, the four stress frames, `--max-uf 1`, decimation 1
+and both synthetic sweeps; ThreadSanitizer reports nothing with 8 CPU threads and pipelined. LeakSanitizer
+reports 36 MB, all reachable from the Vulkan loader's instance creation, plus 664 bytes allocated by
+upstream's `apriltag_detector_create` in the validate tool; none involves this change.
+
 ## 9. Measuring
 
 ```
@@ -1587,6 +1634,15 @@ Three cautions, all learned the hard way here:
   single-run comparison. Interleave in ABBA order rather than AB (it drifts
   thermally across a session), take many samples, and report min and p25 —
   the mean is dominated by slow outliers.
+
+On the Orange Pi, `perf` works in user mode (`perf record -g`, `perf stat -e cycles:u,instructions:u`
+with `perf_event_paranoid` 2), so build the profiling tree with `-g -fno-omit-frame-pointer` and pin the
+run to the A76 cores with `taskset -c 4-7`. `valgrind --tool=callgrind` and `heaptrack` are installed,
+and GCC 14 carries AddressSanitizer, UndefinedBehaviorSanitizer (add `float-cast-overflow`),
+ThreadSanitizer and LeakSanitizer: configure with `CMAKE_BUILD_TYPE=None` and the flags in
+`CMAKE_CXX_FLAGS`, `CMAKE_C_FLAGS` and both linker flag variables. Run LeakSanitizer with
+`detect_leaks=0` unless the loader's own allocations are being filtered, since the Vulkan loader reports
+tens of megabytes at exit.
 
 For per-dispatch GPU timing, `APRILTAG_VK_TIMESTAMPS=1` adds a timestamp-span
 breakdown plus the gaps between spans, separating intra-submit gaps from
