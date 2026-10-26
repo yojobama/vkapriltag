@@ -2,8 +2,8 @@
 // DecimatedImage and DECIMATED_AT(i).
 //
 // Sorts each selected blob's points by theta_key and writes their RawLineFitPoints in that order.
-// kMode 0: one workgroup per blob, listing blobs above kLocalCap points for modes 1 and 2 and writing
-// blobs above kLargeCap unsorted. Mode 1: one workgroup per run of a listed blob. Mode 2: one merge round.
+// Mode 0: one workgroup per blob; lists blobs above kLocalCap points for modes 1 and 2 and writes
+// blobs above kLargeCap unsorted. Mode 1: a workgroup per run of a listed blob. Mode 2: a merge round.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 // Shared-memory slots per workgroup (one word per point), independent of the workgroup size; see
 // local_sort_split_ in GpuDetector.cpp.
