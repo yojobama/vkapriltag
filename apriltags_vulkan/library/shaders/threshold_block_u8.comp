@@ -9,6 +9,9 @@ layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint8_t decimated[]; };
 layout(std430, binding = 1) readonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
 layout(std430, binding = 2) writeonly buffer Thresholded { uint8_t thresholded[]; };
+// Bindings 0 and 2 viewed as words of 4 pixels, for blocks whose rows are aligned words.
+layout(std430, binding = 0) readonly buffer DecimatedWords { uint decimated_words[]; };
+layout(std430, binding = 2) writeonly buffer ThresholdedWords { uint thresholded_words[]; };
 
 layout(push_constant) uniform PushConstants {
   uint decimated_width;
@@ -41,6 +44,19 @@ void main() {
   uint thresh = mn + (mx - mn) / 2u;
   uint x_end = min(bx * 4u + 4u, pc.decimated_width);
   uint y_end = min(by * 4u + 4u, pc.decimated_height);
+  if ((pc.decimated_width & 3u) == 0u) {
+    for (uint y = by * 4u; y < y_end; ++y) {
+      uint w = (y * pc.decimated_width) / 4u + bx;
+      uint d = decimated_words[w];
+      uint out_word = 0u;
+      for (uint k = 0u; k < 4u; ++k) {
+        uint result = ambiguous ? 127u : ((((d >> (8u * k)) & 0xFFu) > thresh) ? 255u : 0u);
+        out_word |= result << (8u * k);
+      }
+      thresholded_words[w] = out_word;
+    }
+    return;
+  }
   for (uint y = by * 4u; y < y_end; ++y) {
     uint row = y * pc.decimated_width;
     for (uint x = bx * 4u; x < x_end; ++x) {

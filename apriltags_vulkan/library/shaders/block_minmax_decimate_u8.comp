@@ -9,6 +9,8 @@ layout(constant_id = 3) const uint kDecimation = 2u;
 
 layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };
 layout(std430, binding = 1) writeonly buffer DecimatedImage { uint8_t decimated[]; };
+// Binding 1 viewed as words of 4 pixels, for blocks whose rows are aligned words.
+layout(std430, binding = 1) writeonly buffer DecimatedWords { uint decimated_words[]; };
 layout(std430, binding = 2) writeonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -31,6 +33,22 @@ void main() {
 
   uint mn = 255u;
   uint mx = 0u;
+  if ((pc.decimated_width & 3u) == 0u) {
+    for (uint j = 0u; j < 4u; ++j) {
+      // Rows past the image edge clamp to the edge row (ragged last block) and are not written.
+      uint y = min(by * 4u + j, pc.decimated_height - 1u);
+      uint word = 0u;
+      for (uint i = 0u; i < 4u; ++i) {
+        uint v = GrayAt(bx * 4u + i, y);
+        mn = min(mn, v);
+        mx = max(mx, v);
+        word |= v << (8u * i);
+      }
+      if (by * 4u + j == y) decimated_words[(y * pc.decimated_width) / 4u + bx] = word;
+    }
+    minmax_unfiltered[by * pc.block_width + bx] = mn | (mx << 8u);
+    return;
+  }
   for (uint j = 0u; j < 4u; ++j) {
     // Coordinates past the image edge clamp to the edge pixel (ragged last block).
     uint y = min(by * 4u + j, pc.decimated_height - 1u);

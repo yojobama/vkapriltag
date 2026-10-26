@@ -11,6 +11,8 @@
 layout(local_size_x_id = 0, local_size_x = 128) in;
 
 layout(std430, binding = 0) writeonly buffer Parent { uint parent[]; };
+// Binding 0 viewed as 4-pixel groups, for rows whose start is a multiple of 4.
+layout(std430, binding = 0) writeonly buffer Parent4 { uvec4 parent4[]; };
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -28,14 +30,23 @@ void main() {
   uint x_end = min(x0 + 4u, pc.width);
 
   // Run starts are held as x + 1, with 0 for none so far.
+  // With a width that is a multiple of 4, a thread's 4 pixels are one aligned word and one uvec4.
+  bool whole = (pc.width & 3u) == 0u;
   uint start[4] = uint[4](0u, 0u, 0u, 0u);
   uint last = 0u;
   if (in_row) {
     uint prev = (x0 > 0u) ? uint(THRESHOLDED_AT(row + x0 - 1u)) : 0u;
+#ifdef THRESHOLDED_WORD
+    uint word = whole ? THRESHOLDED_WORD((row + x0) >> 2u) : 0u;
+#endif
     for (uint k = 0u; k < 4u; ++k) {
       uint x = x0 + k;
       if (x >= x_end) break;
+#ifdef THRESHOLDED_WORD
+      uint v = whole ? ((word >> (8u * k)) & 0xFFu) : uint(THRESHOLDED_AT(row + x));
+#else
       uint v = uint(THRESHOLDED_AT(row + x));
+#endif
       bool join_left = (v != 127u) && (x > 0u) && (prev == v);
       if (!join_left) last = x + 1u;
       start[k] = last;
@@ -54,6 +65,15 @@ void main() {
 
   // Pixel 0 of a row always starts a run, so seg_left is used only for segments after the first.
   uint seg_left = row + gl_WorkGroupID.x * gl_WorkGroupSize.x * 4u - 1u;
+  if (whole) {
+    uvec4 p;
+    for (uint k = 0u; k < 4u; ++k) {
+      uint s = max(start[k], before);
+      p[k] = (s != 0u) ? row + s - 1u : seg_left;
+    }
+    parent4[(row + x0) >> 2u] = p;
+    return;
+  }
   for (uint k = 0u; k < 4u; ++k) {
     uint x = x0 + k;
     if (x >= x_end) break;

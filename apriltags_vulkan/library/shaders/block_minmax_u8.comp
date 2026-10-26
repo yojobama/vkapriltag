@@ -7,6 +7,8 @@
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint8_t decimated[]; };
+// Binding 0 viewed as words of 4 pixels, for blocks whose rows are aligned words.
+layout(std430, binding = 0) readonly buffer DecimatedWords { uint decimated_words[]; };
 layout(std430, binding = 1) writeonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
 
 layout(push_constant) uniform PushConstants {
@@ -32,6 +34,19 @@ void main() {
 
   uint mn = 255u;
   uint mx = 0u;
+  if ((pc.decimated_width & 3u) == 0u) {
+    for (uint j = 0u; j < 4u; ++j) {
+      uint y = min(by * 4u + j, pc.decimated_height - 1u);
+      uint w = decimated_words[(y * pc.decimated_width) / 4u + bx];
+      for (uint i = 0u; i < 4u; ++i) {
+        uint v = (w >> (8u * i)) & 0xFFu;
+        mn = min(mn, v);
+        mx = max(mx, v);
+      }
+    }
+    minmax_unfiltered[by * bw + bx] = mn | (mx << 8u);
+    return;
+  }
   for (uint j = 0; j < 4u; ++j) {
     for (uint i = 0; i < 4u; ++i) {
       uint v = sampleAt(bx * 4u + i, by * 4u + j);

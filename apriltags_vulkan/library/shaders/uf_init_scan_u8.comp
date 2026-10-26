@@ -6,5 +6,8 @@
 
 layout(std430, binding = 1) readonly buffer Thresholded { uint8_t thresholded[]; };
 #define THRESHOLDED_AT(i) (thresholded[(i)])
+// Binding 1 viewed as words of 4 codes.
+layout(std430, binding = 1) readonly buffer ThresholdedWords { uint thresholded_words[]; };
+#define THRESHOLDED_WORD(w) (thresholded_words[(w)])
 
 #include "uf_init_scan_body.glsl"
