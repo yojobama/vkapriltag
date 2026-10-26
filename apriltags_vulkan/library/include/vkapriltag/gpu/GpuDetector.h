@@ -329,6 +329,9 @@ class GpuDetector {
   // True when each labelling chunk's last uf_compress is predicated on uf_changed_buf_ with
   // VK_EXT_conditional_rendering; otherwise uf_compress.comp's honour_changed_flag guard applies.
   bool predicated_compress_ = false;
+  // True when a second uf_merge checks that the labelling converged (APRILTAG_VK_UF_VERIFY=1); one
+  // merge pass joins every component, so by default the frame trusts it.
+  bool uf_verify_ = false;
   // True when reduce_extents_hash_atomic64.comp is the reduction shader; select_blobs.comp then
   // unbiases gx_sum/gy_sum.
   bool extents_atomic64_ = false;
@@ -358,6 +361,9 @@ class GpuDetector {
   vk::ComputePipeline block_filter_pl_;
   vk::ComputePipeline threshold_pl_;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
+  // Run starts from a workgroup max-scan, so no compression precedes the merge (single-merge only).
+  vk::ComputePipeline uf_init_scan_pl_;
+  bool uf_init_scan_ = false;
   // Pixels of a row each uf_init thread initialises.
   uint32_t uf_init_run_ = 4;
   // Pixels of a row each threshold thread covers.

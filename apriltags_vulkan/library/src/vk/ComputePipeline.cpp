@@ -1,9 +1,100 @@
 #include "vkapriltag/vk/ComputePipeline.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 namespace apriltag_vulkan::vk {
+
+namespace {
+
+struct ProbeState {
+  VkQueryPool pool = VK_NULL_HANDLE;
+  uint32_t idx = 0;
+  std::vector<std::string> names;
+  uint32_t frames = 0;
+  std::vector<std::pair<std::string, std::vector<double>>> rows;
+};
+ProbeState &Probe() {
+  static ProbeState s;
+  return s;
+}
+constexpr uint32_t kProbeSlots = 256;
+
+}  // namespace
+
+bool DispatchProbe::Enabled() {
+  static const bool on = std::getenv("APRILTAG_VK_DISPATCH_TIMES") != nullptr;
+  return on;
+}
+
+void DispatchProbe::Begin(VkCommandBuffer cmd, VkDevice device) {
+  if (!Enabled()) return;
+  ProbeState &p = Probe();
+  if (p.pool == VK_NULL_HANDLE) {
+    VkQueryPoolCreateInfo qi{};
+    qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = kProbeSlots;
+    vkCreateQueryPool(device, &qi, nullptr, &p.pool);
+  }
+  vkCmdResetQueryPool(cmd, p.pool, 0, kProbeSlots);
+  p.idx = 0;
+  p.names.clear();
+  Mark(cmd, "<start>");
+}
+
+void DispatchProbe::Mark(VkCommandBuffer cmd, const char *name) {
+  if (!Enabled()) return;
+  ProbeState &p = Probe();
+  if (p.pool == VK_NULL_HANDLE || p.idx >= kProbeSlots) return;
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, p.pool, p.idx++);
+  p.names.push_back(name);
+}
+
+void DispatchProbe::Collect(VkDevice device, double ns_per_tick) {
+  if (!Enabled()) return;
+  ProbeState &p = Probe();
+  if (p.pool == VK_NULL_HANDLE || p.idx < 2) return;
+  std::vector<uint64_t> t(p.idx);
+  if (vkGetQueryPoolResults(device, p.pool, 0, p.idx, t.size() * 8, t.data(), 8,
+                            VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+    return;
+  }
+  if (p.rows.size() != p.idx - 1) {
+    p.rows.clear();
+    for (uint32_t i = 1; i < p.idx; ++i) p.rows.push_back({p.names[i], {}});
+  }
+  for (uint32_t i = 1; i < p.idx; ++i) {
+    p.rows[i - 1].second.push_back(double(t[i] - t[i - 1]) * ns_per_tick / 1000.0);
+  }
+  ++p.frames;
+}
+
+void DispatchProbe::Report(VkDevice device) {
+  if (!Enabled()) return;
+  ProbeState &p = Probe();
+  if (p.pool != VK_NULL_HANDLE) vkDestroyQueryPool(device, p.pool, nullptr);
+  p.pool = VK_NULL_HANDLE;
+  std::fprintf(stderr, "dispatch times over %u frames (median us, previous timestamp to this one):\n",
+               p.frames);
+  double total = 0;
+  for (auto &r : p.rows) {
+    std::vector<double> v = r.second;
+    if (v.empty()) continue;
+    std::sort(v.begin(), v.end());
+    const double m = v[v.size() / 2];
+    total += m;
+    // Labels are shader paths when the SPIR-V is loaded from files.
+    std::string n = r.first;
+    const size_t slash = n.find_last_of("/\\");
+    if (slash != std::string::npos) n = n.substr(slash + 1);
+    std::fprintf(stderr, "  %-40s %9.1f\n", n.c_str(), m);
+  }
+  std::fprintf(stderr, "  %-40s %9.1f\n", "sum of medians", total);
+}
 
 ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_source,
                                  const std::vector<VkBuffer> &buffers,
@@ -12,7 +103,8 @@ ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_
     : device_(ctx.device()),
       shader_(ctx.device(), shader_source),
       push_constant_bytes_(push_constant_bytes),
-      workgroup_size_(workgroup_size) {
+      workgroup_size_(workgroup_size),
+      label_(shader_source.label) {
   for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = ctx.caps().max_workgroup_count[i];
 
   // Fail at build time rather than with an obscure driver error later.
@@ -152,7 +244,8 @@ ComputePipeline::ComputePipeline(ComputePipeline &&other) noexcept
       descriptor_pool_(other.descriptor_pool_),
       descriptor_set_(other.descriptor_set_),
       push_constant_bytes_(other.push_constant_bytes_),
-      workgroup_size_(other.workgroup_size_) {
+      workgroup_size_(other.workgroup_size_),
+      label_(std::move(other.label_)) {
   for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = other.max_workgroup_count_[i];
   other.set_layout_ = VK_NULL_HANDLE;
   other.pipeline_layout_ = VK_NULL_HANDLE;
@@ -173,6 +266,7 @@ ComputePipeline &ComputePipeline::operator=(ComputePipeline &&other) noexcept {
     descriptor_set_ = other.descriptor_set_;
     push_constant_bytes_ = other.push_constant_bytes_;
     workgroup_size_ = other.workgroup_size_;
+    label_ = std::move(other.label_);
     for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = other.max_workgroup_count_[i];
     other.set_layout_ = VK_NULL_HANDLE;
     other.pipeline_layout_ = VK_NULL_HANDLE;
@@ -202,6 +296,7 @@ void ComputePipeline::DispatchRaw(VkCommandBuffer cmd, uint32_t gx, uint32_t gy,
   }
   vkCmdDispatch(cmd, gx, gy, gz);
   Barrier(cmd, barrier);
+  DispatchProbe::Mark(cmd, label_.c_str());
 }
 
 void ComputePipeline::DispatchIndirect(VkCommandBuffer cmd, VkBuffer indirect_buffer,
@@ -218,6 +313,7 @@ void ComputePipeline::DispatchIndirect(VkCommandBuffer cmd, VkBuffer indirect_bu
   }
   vkCmdDispatchIndirect(cmd, indirect_buffer, offset);
   Barrier(cmd, barrier);
+  DispatchProbe::Mark(cmd, label_.c_str());
 }
 
 void ComputePipeline::Dispatch1D(VkCommandBuffer cmd, uint32_t elements,

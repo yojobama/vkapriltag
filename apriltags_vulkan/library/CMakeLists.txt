@@ -49,6 +49,8 @@ set(SHADER_SOURCES
   shaders/threshold_u8.comp
   shaders/uf_init.comp
   shaders/uf_init_u8.comp
+  shaders/uf_init_scan.comp
+  shaders/uf_init_scan_u8.comp
   shaders/uf_merge.comp
   shaders/uf_merge_u8.comp
   shaders/uf_compress.comp

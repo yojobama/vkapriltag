@@ -112,6 +112,8 @@ struct DeviceCaps {
   bool has_subgroup_arithmetic = false;
   // Runtime-variable lane index (subgroupShuffle), needed by the reduce-by-key subgroup shaders.
   bool has_subgroup_shuffle = false;
+  // Lanes per subgroup (VkPhysicalDeviceSubgroupProperties::subgroupSize).
+  uint32_t subgroup_size = 0;
 
   // --- Memory topology ---
   // True when device-local memory is also host-visible, so staging copies can be skipped.

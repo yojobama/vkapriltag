@@ -707,6 +707,7 @@ void Context::QueryCaps(const ContextOptions &options) {
     caps_.has_subgroup_ballot = ballot_in_compute;
     caps_.has_subgroup_arithmetic = arithmetic_in_compute;
     caps_.has_subgroup_shuffle = shuffle_in_compute;
+    caps_.subgroup_size = subgroup_props.subgroupSize;
     if (options.force_no_subgroup) {
       caps_.has_subgroup_ballot = false;
       caps_.has_subgroup_arithmetic = false;

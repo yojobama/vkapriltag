@@ -76,6 +76,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig 
     : GpuDetector(ctx, lane, nullptr, config) {}
 
 GpuDetector::~GpuDetector() {
+  vk::DispatchProbe::Report(ctx_.device());
   // Detect() returns only after its submission completes, so nothing recorded is in flight.
   for (const RecordedFrame &r : recorded_frames_) lane_.FreePersistentCommands(r.cmd);
   if (upload_semaphore_ != VK_NULL_HANDLE) {
@@ -317,6 +318,8 @@ void GpuDetector::CreateBuffers() {
     fused_submits_ = (v[0] != '0') && linefit_direct_read_ && extents_direct_read_;
   }
 
+  if (const char *v = std::getenv("APRILTAG_VK_UF_VERIFY")) uf_verify_ = v[0] != '0';
+
   // Replays pre-recorded command buffers on the fused path (APRILTAG_VK_PRERECORD=0 records every
   // frame); not used with the transfer-queue upload.
   prerecord_ = fused_submits_ && transfer_lane_ == nullptr;
@@ -434,6 +437,18 @@ void GpuDetector::CreatePipelines() {
   uf_init_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
       8, wg2d_, {uf_init_run_});
+  // Needs subgroup arithmetic and at most 64 subgroups per workgroup; APRILTAG_VK_UF_INIT_SCAN=0
+  // keeps uf_init and a compression.
+  uf_init_scan_ = !uf_verify_ && ctx_.caps().has_subgroup_arithmetic &&
+                  ctx_.caps().subgroup_size > 0 && wg1d_.x / ctx_.caps().subgroup_size <= 64u;
+  if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_SCAN")) {
+    uf_init_scan_ = uf_init_scan_ && v[0] != '0';
+  }
+  if (uf_init_scan_) {
+    uf_init_scan_pl_ = vk::ComputePipeline(
+        ctx_, ShaderPath(pick("uf_init_scan", "uf_init_scan_u8")),
+        {parent_buf_.get(), thresholded_buf_.get()}, 8, vk::WorkgroupSize{wg1d_.x, 1, 1});
+  }
   // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
   // APRILTAG_VK_FIND_MODE overrides.
   uint32_t find_mode = 1u;
@@ -743,6 +758,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
 
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
+  vk::DispatchProbe::Begin(cmd, ctx_.device());
   if (!gray_direct_write_ && imported == nullptr && transfer_lane_ == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
@@ -759,6 +775,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   if (local_sort_split_ < local_sort_virtual_cap_) large_sort_buf_.FillZeroRange(cmd, 0, 32);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanClear));
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
+  vk::DispatchProbe::Mark(cmd, "<clears>");
 
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
@@ -778,8 +795,26 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
-  uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
-                        decimated_height_, &dwdh_pc);
+  if (uf_init_scan_) {
+    uf_init_scan_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &dwdh_pc);
+  } else {
+    uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+                          decimated_height_, &dwdh_pc);
+  }
+  if (!uf_verify_) {
+    // One merge joins every component; the compression after it also counts blob sizes. It skips
+    // its walk when the merge joined nothing only if parent[] was flat before the merge.
+    if (!uf_init_scan_) {
+      const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
+      uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
+    }
+    uf_merge_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
+    const UfCountPc count_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u,
+                             config_.min_cluster_pixels};
+    uf_compress_count_pl_.Dispatch1D(cmd, pixels, &count_pc);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
+    return;
+  }
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
   if (chunk == 1) {
@@ -818,7 +853,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends
   // valid boundary points directly to the compacted buffer.
   struct { uint32_t w, h, capacity, honour_changed_flag, min_blob; } blobdiff_pc{
-      decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u,
+      decimated_width_, decimated_height_, qbp_capacity_, speculative && uf_verify_ ? 1u : 0u,
       config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
@@ -1111,7 +1146,7 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   // Seeds the first labelling chunk with last frame's converged iteration count.
   uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
   chunk = std::min(chunk, config_.max_uf_iterations);
-  DetectFused(frame, chunk);
+  DetectFused(frame, uf_verify_ ? chunk : 1u);
 }
 
 void GpuDetector::DetectFused(const FrameStart &frame, uint32_t chunk) {
@@ -1134,7 +1169,7 @@ void GpuDetector::DetectFused(const FrameStart &frame, uint32_t chunk) {
   // submission. Only if the convergence flag says otherwise is there more to do.
   uint32_t uf_iterations = chunk;
   SubmitTimed(timed([&] { return FirstAttempt(frame.imported, chunk); }));
-  bool converged = ReadCounterSlot(kSlotUfChanged) == 0;
+  bool converged = !uf_verify_ || ReadCounterSlot(kSlotUfChanged) == 0;
 
   if (!converged) {
     // The chunk undershot: discards the tail's results and resumes convergence from the current
@@ -1221,6 +1256,7 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
   // uf_iterations and uf_converged are set by DetectFused, once any retry is resolved.
   last_profile_.submits = static_cast<uint32_t>(lane_.submit_count - frame.submits_at_start);
 
+  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns);
   if (timestamps_enabled_) {
     const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
     const double ns_per_tick = ctx_.caps().timestamp_period_ns;
@@ -1331,6 +1367,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   VkCommandBuffer cmd = BeginTimedCommands();
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
+  vk::DispatchProbe::Begin(cmd, ctx_.device());
   if (!gray_direct_write_ && imported == nullptr && transfer_lane_ == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
@@ -1366,13 +1403,17 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
-  uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
-                        decimated_height_, &dwdh_pc);
+  if (uf_init_scan_) {
+    uf_init_scan_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &dwdh_pc);
+  } else {
+    uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+                          decimated_height_, &dwdh_pc);
+  }
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
   struct UfCompressPc { uint32_t dw, dh, honour_changed_flag; };
   const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
-  uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
+  if (!uf_init_scan_) uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
 
   // Records `iterations` labelling passes. The flag is cleared before the last merge, so zero
   // afterwards means converged. The last uf_compress is predicated on it when available.
@@ -1409,7 +1450,16 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // Seeds the first chunk with last frame's converged iteration count.
   uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
   chunk = std::min(chunk, config_.max_uf_iterations);
-  record_uf_chunk(cmd, chunk);
+  if (uf_verify_) {
+    record_uf_chunk(cmd, chunk);
+  } else {
+    // One merge joins every component; the compression skips its walk when it joined nothing and
+    // parent[] was flat before the merge.
+    chunk = 1;
+    uf_merge_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
+    const UfCompressPc compress_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u};
+    uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_pc);
+  }
   // The labelling span ends here; any extra convergence chunks are not attributed to it.
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
   // Orders the compute writes before the transfer read below; the default Compute barrier does not
@@ -1697,6 +1747,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // uf_iterations and uf_converged are set at the end of Detect(), once the fused retry is resolved.
   last_profile_.submits = static_cast<uint32_t>(lane_.submit_count - submits_at_start);
 
+  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns);
   if (timestamps_enabled_) {
     const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
     const double ns_per_tick = ctx_.caps().timestamp_period_ns;
@@ -1750,7 +1801,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // Quad fitting itself happens in QuadDecode (CPU tail); Detect() only runs
   // the GPU pipeline and exposes its outputs via last_selected_extents /
   // last_line_fit_points.
-  return ReadCounterSlot(kSlotUfChanged) == 0;
+  return !uf_verify_ || ReadCounterSlot(kSlotUfChanged) == 0;
   };  // finish_frame
 
   if (fuse) {
@@ -1795,7 +1846,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     // submits the tail separately.
     vk::ComputePipeline::HostReadBarrier(cmd);
     SubmitTimedAndWait(cmd);
-    converged = ReadCounterSlot(kSlotUfChanged) == 0;
+    converged = !uf_verify_ || ReadCounterSlot(kSlotUfChanged) == 0;
     while (!converged && uf_iterations < config_.max_uf_iterations) {
       const uint32_t next =
           std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
