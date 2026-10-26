@@ -1,8 +1,10 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -13,27 +15,34 @@
 
 namespace apriltag_vulkan {
 
-// Overlaps frame N's GPU pass with frame N-1's CPU tail. Detect() stays serialised (one frame in
-// flight) and copies its results to host memory, so the CPU tail reads only host data. Improves
-// throughput; each frame's detections are returned one Push() late.
+// Overlaps GPU passes with the CPU tail, one Push() late with one detector. A second detector takes
+// alternate frames, so the next GPU pass does not wait for the host; results are two Push() late.
 class FramePipeline {
  public:
-  // None of the three are owned; all must outlive the FramePipeline and not be used directly.
+  // Nothing is owned; everything must outlive the FramePipeline and not be used directly.
   FramePipeline(GpuDetector &detector, QuadDecode &quad_decode, TagDecoder &tag_decoder);
+  // `second_detector` must have the same DetectorConfig as `detector` and its own vk::Lane (lanes
+  // are not thread-safe; both may use the same queue). It doubles the device memory.
+  FramePipeline(GpuDetector &detector, GpuDetector &second_detector, QuadDecode &quad_decode,
+                TagDecoder &tag_decoder);
   ~FramePipeline();
 
   FramePipeline(const FramePipeline &) = delete;
   FramePipeline &operator=(const FramePipeline &) = delete;
 
-  // Starts the GPU pass for `gray_frame` and decodes the previous frame meanwhile. Returns the
-  // previous frame's detections (nullptr on the first call), owned by the TagDecoder and valid
-  // until the next Push()/Flush(). `gray_frame` must stay valid until the next Push()/Flush()
-  // returns, and the previous call's frame must still be valid. Rethrows any exception from the
-  // GPU pass.
+  // Frames in flight before a Push() returns detections: 1, or 2 with a second detector.
+  size_t depth() const { return slots_.size(); }
+
+  // Starts the GPU pass for `gray_frame` and decodes the frame pushed depth() calls earlier
+  // meanwhile. Returns that frame's detections (nullptr until depth() frames have been pushed),
+  // owned by the TagDecoder and valid until the next Push()/Flush(). `gray_frame` must stay valid
+  // until depth() further Push()/Flush() calls have returned. Rethrows any exception from the GPU
+  // pass.
   zarray_t *Push(const uint8_t *gray_frame, uint32_t width, uint32_t height,
                  bool reversed_border);
 
-  // Finishes the frame in flight and returns its detections (nullptr if none).
+  // Finishes the oldest frame in flight and returns its detections; nullptr when none is left.
+  // Call it until it returns nullptr to drain every frame.
   zarray_t *Flush();
 
   // Profile of the most recently completed frame (the one last returned).
@@ -46,33 +55,40 @@ class FramePipeline {
   const std::vector<MinMaxExtentsGpu> &last_selected_extents() const { return done_extents_; }
 
  private:
-  void WorkerLoop();
-  // Blocks until the in-flight GPU pass finishes and swaps its results into done_*.
-  void HarvestInFlight();
+  // One detector, the thread that drives it, and the frame it is working on.
+  struct Slot {
+    GpuDetector *detector = nullptr;
+    std::thread worker;
+    // Guarded by mu_: the worker owns the job between `running` and `finished` going true.
+    bool running = false;
+    bool finished = false;
+    std::exception_ptr error;
+
+    bool in_flight = false;
+    const uint8_t *frame = nullptr;
+    uint32_t width = 0, height = 0;
+    bool reversed_border = false;
+  };
+
+  void Start();
+  void WorkerLoop(Slot &slot);
+  // Blocks until the slot's GPU pass finishes and swaps its results into done_*.
+  void HarvestInFlight(Slot &slot);
   zarray_t *DecodeHarvested();
 
-  GpuDetector &detector_;
   QuadDecode &quad_decode_;
   TagDecoder &tag_decoder_;
 
-  std::thread worker_;
   std::mutex mu_;
   std::condition_variable cv_;
   bool stop_ = false;
-  // Guarded by mu_: the worker owns the job between `running_` and `finished_` going true.
-  bool running_ = false;
-  bool finished_ = false;
-  const uint8_t *job_frame_ = nullptr;
-  std::exception_ptr job_error_;
 
-  bool in_flight_ = false;
+  std::vector<std::unique_ptr<Slot>> slots_;
+  // The slot the next Push() uses; when every slot is in flight it holds the oldest frame.
+  size_t next_ = 0;
+
   bool have_done_ = false;
-
-  // The frame on the GPU, and the frame whose results are staged in done_extents_/done_points_.
-  const uint8_t *flight_frame_ = nullptr;
-  uint32_t flight_width_ = 0, flight_height_ = 0;
-  bool flight_reversed_border_ = false;
-
+  // The frame whose results are staged in done_extents_/done_points_.
   const uint8_t *done_frame_ = nullptr;
   uint32_t done_width_ = 0, done_height_ = 0;
   bool done_reversed_border_ = false;

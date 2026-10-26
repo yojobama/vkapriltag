@@ -270,6 +270,8 @@ class GpuDetector {
 
   // --- Buffers (device-local, long-lived, sized once at construction) ---
   vk::Buffer gray_buf_, decimated_buf_;
+  // True when the threshold and sort stages read gray_buf_ as the decimated image.
+  bool alias_decimated_ = false;
   vk::Buffer minmax_unfiltered_buf_, minmax_filtered_buf_;
   vk::Buffer thresholded_buf_;
   // Reused as the per-pixel label (1 + root, or 0 if too small) once labelling converges.
@@ -304,6 +306,9 @@ class GpuDetector {
   // Blobs sort_points_local.comp had to pass through unsorted - see
   // DetectProfile::oversized_sort_blobs.
   vk::Buffer oversized_sort_counter_buf_;
+  // Blobs of more than local_sort_split_ points and their indirect dispatch args (see
+  // sort_points_local_body.glsl), and the packed keys between merge rounds.
+  vk::Buffer large_sort_buf_, sort_scratch_buf_;
   uint32_t hash_table_size_ = 0;
 
   // Indirect dispatch args built on-device from raw_blob_counter_buf_.
@@ -336,6 +341,9 @@ class GpuDetector {
   // local_sort_cap_ is the workgroup thread count; the virtual cap may exceed it (threads stride).
   uint32_t local_sort_cap_ = 0;
   uint32_t local_sort_virtual_cap_ = 0;
+  // Blobs above this many points are sorted in runs of this length by several workgroups and
+  // merged by whole-dispatch rounds; equal to local_sort_virtual_cap_ when that is not needed.
+  uint32_t local_sort_split_ = 0;
 
   // --- Pipelines ---
   vk::ComputePipeline decimate_pl_;
@@ -350,6 +358,10 @@ class GpuDetector {
   vk::ComputePipeline block_filter_pl_;
   vk::ComputePipeline threshold_pl_;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
+  // Pixels of a row each uf_init thread initialises.
+  uint32_t uf_init_run_ = 4;
+  // Pixels of a row each threshold thread covers.
+  uint32_t threshold_run_ = 4;
   // Also performs the atomic compaction of boundary points.
   // uf_compress plus uf_final's count, for the last real compression of the first attempt.
   vk::ComputePipeline uf_compress_count_pl_;
@@ -369,6 +381,7 @@ class GpuDetector {
   std::vector<vk::ComputePipeline> blob_scan_block_pls_;
   std::vector<vk::ComputePipeline> blob_scan_add_offsets_pls_;
   vk::ComputePipeline sort_points_local_pl_;
+  vk::ComputePipeline sort_large_runs_pl_, sort_large_merge_pl_;
 
   DetectProfile last_profile_;
   uint64_t device_bytes_ = 0;
@@ -422,6 +435,8 @@ class GpuDetector {
   // unconverged labels.
   void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
   void RecordFlatten(VkCommandBuffer cmd);
+  // Records the per-blob sort and, when split, the run sort and merge rounds for large blobs.
+  void RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs, bool count_from_buffer);
   void RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations);
   void RecordTailRerun(VkCommandBuffer cmd);
 

@@ -87,6 +87,10 @@ class ComputePipeline {
   // (the DRAW_INDIRECT stage is not covered by BarrierKind::Compute).
   static void IndirectDispatchBarrier(VkCommandBuffer cmd);
 
+  // Orders this command buffer's transfer writes after every earlier transfer on the same queue;
+  // valid on a transfer-only queue.
+  static void TransferWriteBarrier(VkCommandBuffer cmd);
+
  private:
   void Destroy();
 

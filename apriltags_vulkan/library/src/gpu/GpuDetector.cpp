@@ -203,6 +203,14 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
       std::min(std::max(scaled_cap, kCapAtDecimation2), 4096u);
   local_sort_virtual_cap_ = std::min(
       local_sort_virtual_cap_, PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u)));
+  // Larger blobs are sorted in runs of this length and merged; only with a cap above 2048.
+  // APRILTAG_VK_SORT_SPLIT overrides it (a power of two; the cap or above disables the split).
+  local_sort_split_ = local_sort_virtual_cap_ > 2048u ? 1024u : local_sort_virtual_cap_;
+  if (const char *v = std::getenv("APRILTAG_VK_SORT_SPLIT")) {
+    const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    if (wanted >= 1u) local_sort_split_ = PrevPow2(wanted);
+  }
+  local_sort_split_ = std::min(local_sort_split_, local_sort_virtual_cap_);
 
   CreateBuffers();
   CreatePipelines();
@@ -326,6 +334,16 @@ void GpuDetector::CreateBuffers() {
   raw_blob_counter_buf_ = ssbo(4);
   hash_drop_counter_buf_ = ssbo(4);
   oversized_sort_counter_buf_ = ssbo(4);
+  {
+    // Eight words of dispatch args and count, then one blob index per selected blob.
+    vk::Buffer b(ctx_, VkDeviceSize(8 + std::max(config_.max_blobs, 1u)) * 4,
+                 kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, vk::MemoryKind::DeviceLocal);
+    device_bytes_ += b.size();
+    large_sort_buf_ = std::move(b);
+  }
+  if (local_sort_split_ < local_sort_virtual_cap_) {
+    sort_scratch_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * 4);
+  }
 
   // VkDispatchIndirectCommands built on the device by build_indirect_args_pl_.
   {
@@ -377,6 +395,11 @@ void GpuDetector::CreatePipelines() {
   auto pick = [u8](const char *base_name, const char *u8_name) {
     return u8 ? u8_name : base_name;
   };
+  // At decimation 1 with one byte per pixel the decimated image is gray_buf_ itself, so the
+  // decimate pass is skipped; APRILTAG_VK_DEC1_ALIAS=0 keeps the copy.
+  const char *alias_env = std::getenv("APRILTAG_VK_DEC1_ALIAS");
+  alias_decimated_ = u8 && config_.decimation == 1 && !(alias_env != nullptr && alias_env[0] == '0');
+  const VkBuffer decimated_view = alias_decimated_ ? gray_buf_.get() : decimated_buf_.get();
 
   // Subgroup aggregation is used only for reduce_extents_hash, and not on integrated GPUs. Needs
   // ballot, arithmetic and shuffle.
@@ -391,17 +414,26 @@ void GpuDetector::CreatePipelines() {
                                      {config_.decimation});
   block_minmax_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("block_minmax", "block_minmax_u8")),
-      {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_);
+      {decimated_view, minmax_unfiltered_buf_.get()}, 16, wg2d_);
   block_filter_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
       8, wg2d_);
+  // threshold covers this many pixels of a row per thread; APRILTAG_VK_THRESH_RUN overrides.
+  if (const char *v = std::getenv("APRILTAG_VK_THRESH_RUN")) {
+    threshold_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  }
   threshold_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("threshold", "threshold_u8")),
-      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_);
+      {decimated_view, minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_,
+      {threshold_run_});
 
+  // uf_init covers this many pixels of a row per thread; APRILTAG_VK_UF_INIT_RUN overrides.
+  if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_RUN")) {
+    uf_init_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  }
   uf_init_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
-      8, wg2d_);
+      8, wg2d_, {uf_init_run_});
   // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
   // APRILTAG_VK_FIND_MODE overrides.
   uint32_t find_mode = 1u;
@@ -487,13 +519,27 @@ void GpuDetector::CreatePipelines() {
     sort_chunk = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
     if (sort_chunk != 0u && (sort_chunk & (sort_chunk - 1u)) != 0u) sort_chunk = 0u;
   }
-  sort_points_local_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
-      {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
-       decimated_buf_.get(), line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
-       // binding 6: the device-side selected-blob count.
-       selected_counter_buf_.get()},
-      20, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_, sort_chunk});
+  // Mode 0 sorts whole blobs, mode 1 the runs of large blobs, mode 2 merges them (see
+  // sort_points_local_body.glsl).
+  const bool sort_split = local_sort_split_ < local_sort_virtual_cap_;
+  auto make_sort = [&](uint32_t mode) {
+    return vk::ComputePipeline(
+        ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
+        {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
+         decimated_view, line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
+         // binding 6: the device-side selected-blob count.
+         selected_counter_buf_.get(), large_sort_buf_.get(),
+         sort_split ? sort_scratch_buf_.get() : large_sort_buf_.get(),
+         // binding 9: the line-fit buffer again, as words for the merge rounds.
+         line_fit_points_buf_.get()},
+        32, vk::WorkgroupSize{local_sort_cap_, 1, 1},
+        {local_sort_split_, sort_chunk, mode, local_sort_virtual_cap_});
+  };
+  sort_points_local_pl_ = make_sort(0u);
+  if (sort_split) {
+    sort_large_runs_pl_ = make_sort(1u);
+    sort_large_merge_pl_ = make_sort(2u);
+  }
 
   hash_group_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("hash_group"),
@@ -603,7 +649,8 @@ void GpuDetector::AddImportedFrame(const uint8_t *key, vk::Buffer buffer, bool y
   frame.decimate = vk::ComputePipeline(
       ctx_,
       ShaderPath(yuyv ? (u8 ? "decimate_yuyv_u8" : "decimate_yuyv") : (u8 ? "decimate_u8" : "decimate")),
-      {buffer.get(), decimated_buf_.get()}, 8, wg2d_, {config_.decimation});
+      {buffer.get(), alias_decimated_ ? gray_buf_.get() : decimated_buf_.get()}, 8, wg2d_,
+      {config_.decimation});
   frame.buffer = std::move(buffer);
   imported_frames_.push_back(std::move(frame));
 }
@@ -709,24 +756,30 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   raw_blob_counter_buf_.FillZero(cmd);
   hash_drop_counter_buf_.FillZero(cmd);
   oversized_sort_counter_buf_.FillZero(cmd);
+  if (local_sort_split_ < local_sort_virtual_cap_) large_sort_buf_.FillZeroRange(cmd, 0, 32);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanClear));
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  (imported != nullptr ? imported->decimate : decimate_pl_)
-      .Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  if (imported != nullptr) {
+    imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  } else if (!alias_decimated_) {
+    decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  }
   block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 
   struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
       decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &thresh_pc);
+  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
+                          decimated_height_, &thresh_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
-  uf_init_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
+  uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+                        decimated_height_, &dwdh_pc);
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
   if (chunk == 1) {
@@ -850,14 +903,8 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   build_sort_args_pl_.DispatchRaw(cmd, 1, 1, 1, &sort_args_pc, BarrierKind::Compute);
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
-  // One workgroup per blob sorts its points by angle in shared memory and writes the
-  // RawLineFitPoints (see sort_points_local.comp).
-  struct { uint32_t num_selected_blobs, count_from_buffer, max_blobs; int dw, dh; } sort_pc{
-      0u, 1u, config_.max_blobs, static_cast<int>(decimated_width_),
-      static_cast<int>(decimated_height_)};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
-  sort_points_local_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 24, &sort_pc,
-                                         BarrierKind::ComputeAndTransfer);
+  RecordSort(cmd, 0u, true);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
 
   // Both readbacks are read in place on the fused path, so there is nothing to copy; the span
@@ -867,6 +914,49 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   // Counted by sort_points_local, so this is the first submit that can carry it back.
   RecordCounterCopy(cmd, oversized_sort_counter_buf_, kSlotOversizedSortBlobs);
   vk::ComputePipeline::HostReadBarrier(cmd);
+}
+
+namespace {
+
+struct SortPc {
+  uint32_t num_selected_blobs, count_from_buffer, max_blobs;
+  int32_t dw, dh;
+  uint32_t run_len, scratch_flag, final_round;
+};
+
+}  // namespace
+
+// Sorts each blob's points by angle (sort_points_local_body.glsl); blobs above local_sort_split_
+// points are sorted in runs by several workgroups, then merged in rounds of one thread per point.
+void GpuDetector::RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs,
+                             bool count_from_buffer) {
+  using vk::BarrierKind;
+  SortPc pc{num_selected_blobs, count_from_buffer ? 1u : 0u, config_.max_blobs,
+            static_cast<int32_t>(decimated_width_), static_cast<int32_t>(decimated_height_),
+            0u, 0u, 0u};
+  const bool split = local_sort_split_ < local_sort_virtual_cap_;
+  const BarrierKind after = split ? BarrierKind::Compute : BarrierKind::ComputeAndTransfer;
+  if (count_from_buffer) {
+    sort_points_local_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 24, &pc, after);
+  } else {
+    sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &pc, after);
+  }
+  if (!split) return;
+  vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+
+  uint32_t rounds = 0;
+  for (uint32_t run = local_sort_split_; run < local_sort_virtual_cap_; run <<= 1u) ++rounds;
+  // The rounds alternate between SortScratch and the line-fit buffer; the last reads SortScratch.
+  pc.scratch_flag = (rounds % 2u == 1u) ? 1u : 0u;
+  sort_large_runs_pl_.DispatchIndirect(cmd, large_sort_buf_.get(), 0, &pc, BarrierKind::Compute);
+  for (uint32_t k = 0; k < rounds; ++k) {
+    pc.run_len = local_sort_split_ << k;
+    pc.scratch_flag = ((rounds - 1u - k) % 2u == 0u) ? 1u : 0u;
+    pc.final_round = (k + 1u == rounds) ? 1u : 0u;
+    sort_large_merge_pl_.DispatchIndirect(
+        cmd, large_sort_buf_.get(), 12, &pc,
+        pc.final_round != 0u ? BarrierKind::ComputeAndTransfer : BarrierKind::Compute);
+  }
 }
 
 // Flattens parent[] unconditionally; the retry path needs a flat forest after a discarded attempt.
@@ -1011,6 +1101,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (transfer_lane_ != nullptr && !gray_direct_write_ && frame.imported == nullptr) {
     // The staged frame is copied on the transfer queue; the first compute submission waits for it.
     VkCommandBuffer tcmd = transfer_lane_->BeginCommands();
+    // The previous frame's copy into gray_buf_ was the last write on this queue.
+    vk::ComputePipeline::TransferWriteBarrier(tcmd);
     gray_buf_.RecordCopyFrom(tcmd, upload_staging_, frame.gray_bytes);
     transfer_lane_->SubmitSignal(tcmd, upload_semaphore_);
     pending_wait_ = upload_semaphore_;
@@ -1211,6 +1303,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   if (transfer_lane_ != nullptr && !gray_direct_write_ && imported == nullptr) {
     // The staged frame is copied on the transfer queue; the first compute submission waits for it.
     VkCommandBuffer tcmd = transfer_lane_->BeginCommands();
+    // The previous frame's copy into gray_buf_ was the last write on this queue.
+    vk::ComputePipeline::TransferWriteBarrier(tcmd);
     gray_buf_.RecordCopyFrom(tcmd, upload_staging_, gray_bytes);
     transfer_lane_->SubmitSignal(tcmd, upload_semaphore_);
     pending_wait_ = upload_semaphore_;
@@ -1250,24 +1344,30 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   raw_blob_counter_buf_.FillZero(cmd);
   hash_drop_counter_buf_.FillZero(cmd);
   oversized_sort_counter_buf_.FillZero(cmd);
+  if (local_sort_split_ < local_sort_virtual_cap_) large_sort_buf_.FillZeroRange(cmd, 0, 32);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanClear));
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  (imported != nullptr ? imported->decimate : decimate_pl_)
-      .Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  if (imported != nullptr) {
+    imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  } else if (!alias_decimated_) {
+    decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  }
   block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 
   struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
       decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &thresh_pc);
+  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
+                          decimated_height_, &thresh_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
-  uf_init_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
+  uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+                        decimated_height_, &dwdh_pc);
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
   struct UfCompressPc { uint32_t dw, dh, honour_changed_flag; };
@@ -1488,19 +1588,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   }
   if (fuse || num_points > 0) {
-    // One workgroup per blob sorts its points by angle in shared memory and writes the
-    // RawLineFitPoints (see sort_points_local.comp).
-    struct { uint32_t num_selected_blobs, count_from_buffer, max_blobs; int dw, dh; } sort_pc{
-        num_selected_blobs, fuse ? 1u : 0u, config_.max_blobs,
-        static_cast<int>(decimated_width_), static_cast<int>(decimated_height_)};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
-    if (fuse) {
-      sort_points_local_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 24, &sort_pc,
-                                             BarrierKind::ComputeAndTransfer);
-    } else {
-      sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &sort_pc,
-                                        BarrierKind::ComputeAndTransfer);
-    }
+    RecordSort(cmd, num_selected_blobs, fuse);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanReadbackCopy));
