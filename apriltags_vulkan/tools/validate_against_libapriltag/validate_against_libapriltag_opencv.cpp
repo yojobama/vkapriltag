@@ -178,7 +178,16 @@ int main(int argc, char **argv) {
       if (!setup_tag_family(&tf, family_name.c_str())) {
           return 1;
       }
+      // Torn down at the end of the iteration, after the detectors that use it.
+      struct FamilyOwner {
+        apriltag_family_t *tf;
+        const std::string &name;
+        ~FamilyOwner() { teardown_tag_family(&tf, name.c_str()); }
+      } family_owner{tf, family_name};
       apriltag_detector_t* td_ours = apriltag_detector_create();
+      // Destroyed after the TagDecoder declared below.
+      std::unique_ptr<apriltag_detector_t, decltype(&apriltag_detector_destroy)> td_ours_owner(
+          td_ours, &apriltag_detector_destroy);
       apriltag_detector_add_family(td_ours, tf);
       // td_ref runs with upstream's default config (refine_edges = true), so match it here.
       td_ours->refine_edges = true;
@@ -452,6 +461,8 @@ int main(int argc, char **argv) {
       std::vector<int> our_ids = SortedIds(our_dets);
 
       apriltag_detector_t* td_ref = apriltag_detector_create();
+      std::unique_ptr<apriltag_detector_t, decltype(&apriltag_detector_destroy)> td_ref_owner(
+          td_ref, &apriltag_detector_destroy);
       apriltag_detector_add_family(td_ref, tf);
       td_ref->quad_decimate = static_cast<float>(decimation);
       td_ref->nthreads = 1;
@@ -472,6 +483,7 @@ int main(int argc, char **argv) {
       print_detections(ref);
       std::vector<apriltag_vulkan::validate::DetectionInfo> ref_dets = ExtractDetections(ref);
       std::vector<int> ref_ids = SortedIds(ref_dets);
+      apriltag_detections_destroy(ref);
 
       PrintIds("Our tag IDs", our_ids);
       PrintIds("Reference tag IDs", ref_ids);

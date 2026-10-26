@@ -1101,6 +1101,8 @@ void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (transfer_lane_ != nullptr && !gray_direct_write_ && frame.imported == nullptr) {
     // The staged frame is copied on the transfer queue; the first compute submission waits for it.
     VkCommandBuffer tcmd = transfer_lane_->BeginCommands();
+    // The previous frame's copy into gray_buf_ was the last write on this queue.
+    vk::ComputePipeline::TransferWriteBarrier(tcmd);
     gray_buf_.RecordCopyFrom(tcmd, upload_staging_, frame.gray_bytes);
     transfer_lane_->SubmitSignal(tcmd, upload_semaphore_);
     pending_wait_ = upload_semaphore_;
@@ -1301,6 +1303,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   if (transfer_lane_ != nullptr && !gray_direct_write_ && imported == nullptr) {
     // The staged frame is copied on the transfer queue; the first compute submission waits for it.
     VkCommandBuffer tcmd = transfer_lane_->BeginCommands();
+    // The previous frame's copy into gray_buf_ was the last write on this queue.
+    vk::ComputePipeline::TransferWriteBarrier(tcmd);
     gray_buf_.RecordCopyFrom(tcmd, upload_staging_, gray_bytes);
     transfer_lane_->SubmitSignal(tcmd, upload_semaphore_);
     pending_wait_ = upload_semaphore_;

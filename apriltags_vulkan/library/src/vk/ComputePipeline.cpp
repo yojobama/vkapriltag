@@ -271,6 +271,15 @@ void ComputePipeline::HostReadBarrier(VkCommandBuffer cmd) {
                        &barrier, 0, nullptr, 0, nullptr);
 }
 
+void ComputePipeline::TransferWriteBarrier(VkCommandBuffer cmd) {
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                       &barrier, 0, nullptr, 0, nullptr);
+}
+
 void ComputePipeline::IndirectDispatchBarrier(VkCommandBuffer cmd) {
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
