@@ -451,10 +451,23 @@ void GpuDetector::CreatePipelines() {
   if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_SCAN")) {
     uf_init_scan_ = uf_init_scan_ && v[0] != '0';
   }
+  // Blob sizes counted per run piece (uf_count_runs) on integrated GPUs with uf_init_scan;
+  // APRILTAG_VK_COUNT_RUNS overrides the device test.
+  count_runs_ = uf_init_scan_ && ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+  if (const char *v = std::getenv("APRILTAG_VK_COUNT_RUNS")) {
+    count_runs_ = uf_init_scan_ && v[0] != '0';
+  }
   if (uf_init_scan_) {
     uf_init_scan_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath(pick("uf_init_scan", "uf_init_scan_u8")),
-        {parent_buf_.get(), thresholded_buf_.get()}, 8, vk::WorkgroupSize{wg1d_.x, 1, 1});
+        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get()}, 12,
+        vk::WorkgroupSize{wg1d_.x, 1, 1}, {count_runs_ ? 1u : 0u});
+  }
+  if (count_runs_) {
+    uf_count_runs_pl_ = vk::ComputePipeline(
+        ctx_, ShaderPath(pick("uf_count_runs", "uf_count_runs_u8")),
+        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get()}, 16,
+        vk::WorkgroupSize{wg1d_.x, 1, 1});
   }
   // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
   // APRILTAG_VK_FIND_MODE overrides.
@@ -506,7 +519,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
        qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()},
-      20, wg2d_);
+      20, wg2d_, {count_runs_ ? 1u : 0u});
 
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
@@ -679,6 +692,19 @@ struct GpuDetector::FrameStart {
   VkDeviceSize gray_bytes = 0;
 };
 
+void GpuDetector::RecordInitScan(VkCommandBuffer cmd) {
+  struct { uint32_t dw, dh, min_blob; } pc{decimated_width_, decimated_height_,
+                                          config_.min_cluster_pixels};
+  uf_init_scan_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
+}
+
+void GpuDetector::RecordCountRuns(VkCommandBuffer cmd) {
+  // The segment is uf_init_scan's: 4 pixels per thread of its workgroup.
+  struct { uint32_t dw, dh, min_blob, segment; } pc{decimated_width_, decimated_height_,
+                                                    config_.min_cluster_pixels, 4u * wg1d_.x};
+  uf_count_runs_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
+}
+
 void GpuDetector::RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier) {
   struct { uint32_t dw, dh, band_mask, band_phase; } pc{decimated_width_, decimated_height_, 0u, 0u};
   const uint32_t columns = merge_x4_ ? decimated_width_ / 4u : decimated_width_;
@@ -783,7 +809,9 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
-  blob_size_buf_.FillZero(cmd);
+  // uf_init_scan writes every run piece's entry for uf_count_runs, so the fill is needed only without
+  // it.
+  if (!count_runs_) blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
   blob_cursor_buf_.FillZero(cmd);
   raw_blob_counter_buf_.FillZero(cmd);
@@ -800,22 +828,27 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
   if (uf_init_scan_) {
-    uf_init_scan_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &dwdh_pc);
+    RecordInitScan(cmd);
   } else {
     uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
                           decimated_height_, &dwdh_pc);
   }
   if (!uf_verify_) {
-    // One merge joins every component; the compression after it also counts blob sizes. It skips
-    // its walk when the merge joined nothing only if parent[] was flat before the merge.
+    // One merge joins every component. With count_runs_ the run pieces are counted and pointed at
+    // their roots; otherwise a compression after the merge also counts blob sizes, skipping its
+    // walk when the merge joined nothing only if parent[] was flat before the merge.
     if (!uf_init_scan_) {
       const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
       uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
     }
     RecordMerge(cmd);
-    const UfCountPc count_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u,
-                             config_.min_cluster_pixels};
-    uf_compress_count_pl_.Dispatch1D(cmd, pixels, &count_pc);
+    if (count_runs_) {
+      RecordCountRuns(cmd);
+    } else {
+      const UfCountPc count_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u,
+                               config_.min_cluster_pixels};
+      uf_compress_count_pl_.Dispatch1D(cmd, pixels, &count_pc);
+    }
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
     return;
   }
@@ -1367,7 +1400,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
-  blob_size_buf_.FillZero(cmd);
+  if (!count_runs_) blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
   blob_cursor_buf_.FillZero(cmd);
   raw_blob_counter_buf_.FillZero(cmd);
@@ -1383,7 +1416,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
   if (uf_init_scan_) {
-    uf_init_scan_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &dwdh_pc);
+    RecordInitScan(cmd);
   } else {
     uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
                           decimated_height_, &dwdh_pc);
@@ -1409,8 +1442,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
         vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
       }
       // The barrier makes the merge's flag write visible to the compression's guard or predicate read.
-      RecordMerge(c, predicate ? BarrierKind::ComputeAndPredicate
-                                        : BarrierKind::Compute);
+      RecordMerge(c, predicate ? BarrierKind::ComputeAndPredicate : BarrierKind::Compute);
       if (predicate) {
         // Runs only when the flag is nonzero, so the guard is skipped.
         const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
@@ -1435,8 +1467,12 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     // parent[] was flat before the merge.
     chunk = 1;
     RecordMerge(cmd);
-    const UfCompressPc compress_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u};
-    uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_pc);
+    if (count_runs_) {
+      RecordCountRuns(cmd);
+    } else {
+      const UfCompressPc compress_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u};
+      uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_pc);
+    }
   }
   // The labelling span ends here; any extra convergence chunks are not attributed to it.
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
@@ -1462,7 +1498,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   struct { uint32_t dw, dh, min_blob; } uf_final_pc{decimated_width_, decimated_height_,
                                                     config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
-  uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
+  // uf_count_runs has already counted with count_runs_.
+  if (!count_runs_) uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
   // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends

@@ -1,0 +1,12 @@
+#version 450
+// As uf_count_runs.comp, with Thresholded stored as uint8_t per pixel and also read as words.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(std430, binding = 1) readonly buffer Thresholded { uint8_t thresholded[]; };
+layout(std430, binding = 1) readonly buffer ThresholdedWords { uint thresholded_words[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
+#define THRESHOLDED_WORD(w) (thresholded_words[(w)])
+
+#include "uf_count_runs_body.glsl"

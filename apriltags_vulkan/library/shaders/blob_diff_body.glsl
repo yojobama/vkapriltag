@@ -8,6 +8,9 @@
 // decimated pixel index.
 // Dispatched 2D: (ox, oy) is the interior coordinate.
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+// Non-zero when parent[] points every pixel at a run start that points at its root
+// (uf_count_runs.comp) rather than at the root itself.
+layout(constant_id = 3) const uint kTwoHop = 0u;
 
 layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 1) writeonly buffer Compacted { uint compacted[]; };
@@ -33,6 +36,7 @@ uint CodeAt(uint i) { return PackThreshCode(uint(THRESHOLDED_AT(i))); }
 // Whether pixel i belongs to a blob large enough to matter; `root` is its blob's root label.
 bool Usable(uint i, out uint root) {
   root = parent[i];
+  if (kTwoHop != 0u) root = parent[root];
   return blob_size[root] >= pc.min_blob_pixels;
 }
 
