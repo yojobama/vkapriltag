@@ -2005,6 +2005,47 @@ layer reports nothing on either machine.
 - The 4-points-per-thread reduction in place of the subgroup one on the desktop: 25 -> 20 us at
   decimation 1 but 11.5 -> 16 us at decimation 2.
 
+## 8v. Rounds 4 and 5 against v1.7.0
+
+The branch head (sections 8t and 8u) against v1.7.0 (`2626760`), measured as in section 8s: six
+interleaved rounds of 1,000 frames of `apriltag_vulkan_validate` (medians of the round medians) and
+three rounds of `bench_multiqueue` (800 frames per round on the Orange Pi, 3,000 on the desktop), the
+same build type on both sides (`Release` on the Orange Pi, `RelWithDebInfo` on the RX 9060 XT),
+governors on `performance` and LumenVision stopped. v1.7.0 has no second detector, so its depth-2
+column is compared with its one-stream rate. Output is byte-identical: the 15 canonical dumps, 95
+configurations per machine (five images and two of awkward width, decimations 1, 2 and 4, plain and
+four stress frames) and 36 record paths (unfused, not pre-recorded, `--max-uf 1`, pipelined at depths
+1 and 2, `--import`) against v1.7.0's serial path; no `bench_multiqueue` mismatches.
+
+Orange Pi 5:
+
+| | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 5.248 -> 3.227 ms (-39%) | 2.108 -> 1.602 ms (-24%) | 2.117 -> 1.593 ms (-25%) |
+| `quad_decode` | 0.699 -> 0.480 ms (-31%) | 0.286 -> 0.180 ms (-37%) | 0.284 -> 0.176 ms (-38%) |
+| `tag_decode` | 0.132 -> 0.141 ms | 0.720 -> 0.629 ms (-13%) | 0.169 -> 0.153 ms |
+| `pipeline_total` | 6.088 -> 3.852 ms (-37%) | 3.120 -> 2.423 ms (-22%) | 2.579 -> 1.931 ms (-25%) |
+| 1 stream | 187 -> 299 fps (+59%) | 434 -> 604 fps (+39%) | 435 -> 599 fps (+38%) |
+| 1 stream, depth 2 | 329 fps (+75%) | 715 fps (+65%) | 715 fps (+64%) |
+| 4 streams, one queue | 197 -> 325 fps (+65%) | 505 -> 688 fps (+36%) | 508 -> 699 fps (+38%) |
+| latency, 1 stream (depth 1 / depth 2) | 10.65 -> 6.69 / 9.11 ms | 4.61 -> 3.31 / 4.19 ms | 4.59 -> 3.33 / 4.19 ms |
+
+RX 9060 XT:
+
+| | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 0.682 -> 0.488 ms (-28%) | 0.503 -> 0.369 ms (-27%) | 0.501 -> 0.370 ms (-26%) |
+| `quad_decode` | 0.254 -> 0.217 ms | 0.119 -> 0.111 ms | 0.118 -> 0.109 ms |
+| `tag_decode` | 0.079 -> 0.082 ms | 0.273 -> 0.220 ms (-19%) | 0.096 -> 0.092 ms |
+| `pipeline_total` | 1.016 -> 0.789 ms (-22%) | 0.893 -> 0.713 ms (-20%) | 0.715 -> 0.577 ms (-19%) |
+| 1 stream | 1,973 -> 2,363 fps (+20%) | 2,052 -> 2,351 fps (+15%) | 2,428 -> 2,538 fps (+5%) |
+| 1 stream, depth 2 | 2,836 fps (+44%) | 2,390 fps (+16%) | 4,005 fps (+65%) |
+| 4 streams, one queue | 2,885 -> 3,948 fps (+37%) | 2,849 -> 3,367 fps (+18%) | 4,648 -> 8,138 fps (+75%) |
+| 4 streams, both compute families | 3,673 -> 5,018 fps (+37%) | 2,823 -> 3,393 fps (+20%) | 7,108 -> 8,261 fps (+16%) |
+
+The loss section 8s recorded (4 streams over both compute families at decimation 1 with the sort
+split) is gone: +37% with the split and +43% without it (`APRILTAG_VK_SORT_SPLIT=8192`, 5,242 fps).
+
 ## 9. Measuring
 
 ```
