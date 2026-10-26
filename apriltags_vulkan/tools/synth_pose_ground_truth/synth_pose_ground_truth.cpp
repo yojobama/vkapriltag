@@ -454,6 +454,7 @@ int main(int argc, char **argv) {
                 if (pose.t) matd_destroy(pose.t);
                 break;
               }
+              apriltag_detections_destroy(ref);
 
               if (csv != nullptr) {
                 const bool lib_ok = lib.decoded && lib.pose_valid;
