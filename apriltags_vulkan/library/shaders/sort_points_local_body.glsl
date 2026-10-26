@@ -15,6 +15,9 @@ layout(constant_id = 5) const uint kMode = 0;
 // Largest blob that is sorted (a power of two, a multiple of kLocalCap, at most
 // 1 << kLocalIndexBits); see local_sort_virtual_cap_ in GpuDetector.cpp.
 layout(constant_id = 6) const uint kLargeCap = 1024;
+// Blobs of at most this many points are sorted by ranking every key against all of them, read 4 at a
+// time; 0 disables.
+layout(constant_id = 7) const uint kRankAll = 0;
 
 layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
@@ -86,6 +89,8 @@ const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
 shared uint s_packed[kLocalCap];
 // Ping-pong partner of s_packed for the rank-merge sort.
 shared uint s_merge[kChunk != 0u ? kLocalCap : 1u];
+// The keys of a blob of at most kRankAll points, 4 to an entry, padded with 0xFFFFFFFF.
+shared uvec4 s_rank[kRankAll != 0u ? kRankAll / 4u : 1u];
 
 uint SortedAt(bool from_merge, uint i) { return from_merge ? s_merge[i] : s_packed[i]; }
 
@@ -110,6 +115,22 @@ void Emit(uint base, uint pos, uint packed) {
 void SortRange(uint base, uint first, uint count) {
   uint tid = gl_LocalInvocationID.x;
   uint threads = gl_WorkGroupSize.x;
+
+  if (kRankAll != 0u && count <= kRankAll) {
+    uint padded = (count + 3u) & ~3u;
+    for (uint idx = tid; idx < padded; idx += threads) {
+      s_rank[idx >> 2u][idx & 3u] = (idx < count) ? PackedKey(base, first + idx) : 0xFFFFFFFFu;
+    }
+    memoryBarrierShared();
+    barrier();
+    for (uint idx = tid; idx < count; idx += threads) {
+      uint v = s_rank[idx >> 2u][idx & 3u];
+      uvec4 ranks = uvec4(0u);
+      for (uint j = 0u; j < padded / 4u; ++j) ranks += uvec4(lessThan(s_rank[j], uvec4(v)));
+      Emit(base, first + ranks.x + ranks.y + ranks.z + ranks.w, v);
+    }
+    return;
+  }
 
   if (kChunk != 0u) {
     for (uint idx = tid; idx < count; idx += threads) {

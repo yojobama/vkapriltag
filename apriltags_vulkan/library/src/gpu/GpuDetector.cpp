@@ -529,6 +529,11 @@ void GpuDetector::CreatePipelines() {
     sort_chunk = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
     if (sort_chunk != 0u && (sort_chunk & (sort_chunk - 1u)) != 0u) sort_chunk = 0u;
   }
+  // Blobs up to this size are ranked in one pass (0 disables); APRILTAG_VK_SORT_RANK_ALL overrides.
+  uint32_t sort_rank_all = 256u;
+  if (const char *v = std::getenv("APRILTAG_VK_SORT_RANK_ALL")) {
+    sort_rank_all = static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) & ~3u;
+  }
   // Mode 0 sorts whole blobs, mode 1 the runs of large blobs, mode 2 merges them (see
   // sort_points_local_body.glsl).
   const bool sort_split = local_sort_split_ < local_sort_virtual_cap_;
@@ -545,7 +550,8 @@ void GpuDetector::CreatePipelines() {
          // binding 9: the line-fit buffer again, as words for the merge rounds.
          line_fit_points_buf_.get()},
         32, vk::WorkgroupSize{local_sort_cap_, 1, 1},
-        {local_sort_split_, sort_chunk, mode, local_sort_virtual_cap_});
+        {local_sort_split_, sort_chunk, mode, local_sort_virtual_cap_,
+         mode == 0u ? sort_rank_all : 0u});
   };
   sort_points_local_pl_ = make_sort(0u);
   if (sort_split) {
