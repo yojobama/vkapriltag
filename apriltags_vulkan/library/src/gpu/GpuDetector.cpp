@@ -238,13 +238,16 @@ void GpuDetector::CreateBuffers() {
     return b;
   };
 
-  // Host-visible device memory written directly on unified-memory parts; otherwise device-local,
-  // filled through a persistently mapped staging buffer.
+  // Host-visible device memory written directly where the device has it (unified memory, or a
+  // discrete GPU's mappable window); otherwise device-local, filled through a persistently mapped
+  // staging buffer. APRILTAG_VK_GRAY_MAPPED=0 keeps the staging buffer on discrete GPUs.
+  const char *gray_mapped_env = std::getenv("APRILTAG_VK_GRAY_MAPPED");
+  const bool gray_mapped = ctx_.caps().unified_memory ||
+                           !(gray_mapped_env != nullptr && gray_mapped_env[0] == '0');
   gray_buf_ = vk::Buffer(
       ctx_, VkDeviceSize(gray_words_) * 4,
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-      ctx_.caps().unified_memory ? vk::MemoryKind::DeviceLocalMapped
-                                 : vk::MemoryKind::DeviceLocal,
+      gray_mapped ? vk::MemoryKind::DeviceLocalMapped : vk::MemoryKind::DeviceLocal,
       transfer_lane_ != nullptr ? ctx_.queue_families() : std::vector<uint32_t>{});
   device_bytes_ += gray_buf_.size();
   gray_direct_write_ = gray_buf_.host_visible();
@@ -1808,7 +1811,7 @@ std::string GpuDetector::DescribeSizing() const {
   }
   os << ", blob capacity " << config_.max_blobs;
   os << ", device memory " << (device_bytes_ / (1024 * 1024)) << " MiB";
-  os << ", gray upload " << (gray_direct_write_ ? "direct (unified memory)" : "staged");
+  os << ", gray upload " << (gray_direct_write_ ? "direct (mapped device memory)" : "staged");
   // Whether the line-fit readback avoided its copies depends on a host-cached memory type.
   os << ", linefit readback " << (linefit_direct_read_ ? "direct (host-cached)" : "staged");
   os << ", uf_compress skip "
