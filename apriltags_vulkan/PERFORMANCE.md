@@ -1766,10 +1766,12 @@ already keep the GPU busy. `bench_multiqueue --depth 2` and `apriltag_vulkan_val
   clusters first needs a counting pass, and `blob_diff` with its point stores removed (a bound build)
   still takes 573 of its 749 us. Not built.
 
-**Found and not changed:** `bench_multiqueue --async-upload` reports a write-after-write hazard on
-the grey buffer under synchronisation validation (the transfer-queue upload, also in the previous
-commit); the validate tool does not destroy its reference `apriltag_detector_t` objects
-(LeakSanitizer).
+**Two earlier problems fixed alongside.** The transfer-queue upload (`--async-upload`) wrote each
+frame into the grey buffer with nothing on that queue ordering it after the previous frame's copy;
+synchronisation validation reported a write-after-write hazard (10 per 100 frames, also in 1.7.0). A
+transfer-to-transfer barrier now opens each upload command buffer, and the report is gone. The
+validate tool now releases its detectors, the reference detections and the tag family per image, so
+LeakSanitizer is clean on it.
 
 ## 9. Measuring
 
