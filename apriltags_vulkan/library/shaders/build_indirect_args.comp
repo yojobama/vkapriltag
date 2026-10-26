@@ -6,9 +6,11 @@ layout(local_size_x_id = 0, local_size_x = 1) in;
 // Writes one VkDispatchIndirectCommand to slot `pc.slot` from the counter at
 // binding 0:
 //
-//   0  raw blob count       -> init_extents, merge_extents, select_blobs
+//   0  raw blob count       -> select_blobs
 //   1  boundary point count -> hash_group, reduce_extents_hash, scatter
-//   2  selected blob count  -> sort_points_local (one workgroup per blob)
+//
+// Slot 2 (sort_points_local, one workgroup per selected blob) is written by
+// scan_blob_counts.comp.
 //
 // divide_by_workgroup_size == 0 gives one workgroup per item; clamp_to bounds
 // the count.

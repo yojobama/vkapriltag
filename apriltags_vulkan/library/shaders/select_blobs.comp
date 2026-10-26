@@ -1,7 +1,8 @@
 #version 450
 // Filters raw blob extents down to tag-quad candidates by size, bounding box and border polarity
 // (mirrors SelectBlobs). Survivors are compacted into selected[], capped at max_blobs; remap[]
-// maps each raw blob index to its selected index, or 0xFFFFFFFF if rejected.
+// maps each raw blob index to its selected index, or 0xFFFFFFFF if rejected. Folds
+// reduce_extents_hash.comp's private accumulator copies into each blob's extents first.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
@@ -11,6 +12,8 @@ layout(std430, binding = 0) readonly buffer Extents { MinMaxExtentsGpu extents[]
 layout(std430, binding = 1) writeonly buffer Selected { MinMaxExtentsGpu selected[]; };
 layout(std430, binding = 2) buffer Counter { uint counter; };
 layout(std430, binding = 3) writeonly buffer Remap { uint remap[]; };
+// The number of raw blob ids hash_group.comp assigned; only those have initialised extents.
+layout(std430, binding = 4) readonly buffer RawBlobCounter { uint raw_blob_count; };
 
 layout(push_constant) uniform PushConstants {
   uint max_raw_blobs;
@@ -42,11 +45,24 @@ bool hasReversedBorder(MinMaxExtentsGpu e) {
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
-  if (i >= pc.max_raw_blobs) return;
+  if (i >= min(raw_blob_count, pc.max_raw_blobs)) return;
 
   remap[i] = 0xFFFFFFFFu;
 
   MinMaxExtentsGpu e = extents[i];
+  if (i < kPrivateExtentsBlobs) {
+    for (uint c = 1u; c < kExtentsCopies; ++c) {
+      MinMaxExtentsGpu o = extents[ExtentsSlot(i, c, pc.max_raw_blobs)];
+      e.min_x = min(e.min_x, o.min_x);
+      e.min_y = min(e.min_y, o.min_y);
+      e.max_x = max(e.max_x, o.max_x);
+      e.max_y = max(e.max_y, o.max_y);
+      e.count += o.count;
+      e.gx_sum += o.gx_sum;
+      e.gy_sum += o.gy_sum;
+      e.pxgx_plus_pygy_sum += o.pxgx_plus_pygy_sum;
+    }
+  }
   // Removes the per-point +1 bias.
   if (pc.gx_gy_biased != 0u) {
     e.gx_sum -= int(e.count);

@@ -357,8 +357,6 @@ void GpuDetector::CreateBuffers() {
     indirect_args_buf_ = std::move(b);
   }
 
-  blob_scan_chain_ = BuildScanChain(std::max(config_.max_blobs, 1u));
-
   // Readback staging starts at a fixed size and grows on demand.
   const VkDeviceSize initial_readback =
       VkDeviceSize(config_.max_blobs) * sizeof(MinMaxExtentsGpu) + 16 +
@@ -373,22 +371,6 @@ void GpuDetector::EnsureReadbackCapacity(VkDeviceSize bytes) {
   readback_staging_ = vk::Buffer(ctx_, new_capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                  vk::MemoryKind::HostVisibleCached);
   readback_capacity_ = readback_staging_.size();
-}
-
-GpuDetector::ScanChain GpuDetector::BuildScanChain(uint32_t capacity) {
-  ScanChain chain;
-  uint32_t size = capacity;
-  // Fan-out per level is the scan block size, matching scan_block.comp's local_size_x.
-  while (size > scan_wg_) {
-    uint32_t next = (size + scan_wg_ - 1) / scan_wg_;
-    chain.level_capacities.push_back(next);
-    vk::Buffer b(ctx_, VkDeviceSize(std::max(next, 1u)) * 4, kSsboUsage,
-                 vk::MemoryKind::DeviceLocal);
-    device_bytes_ += b.size();
-    chain.level_buffers.push_back(std::move(b));
-    size = next;
-  }
-  return chain;
 }
 
 void GpuDetector::CreatePipelines() {
@@ -487,45 +469,19 @@ void GpuDetector::CreatePipelines() {
        qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()},
       20, wg2d_);
 
-  init_extents_pl_ =
-      vk::ComputePipeline(ctx_, ShaderPath("init_extents"), {extents_buf_.get()}, 4, wg1d_);
-  merge_extents_pl_ =
-      vk::ComputePipeline(ctx_, ShaderPath("merge_extents"), {extents_buf_.get()}, 4, wg1d_);
-
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
       {extents_buf_.get(), selected_extents_buf_.get(), selected_counter_buf_.get(),
-       remap_buf_.get()},
+       remap_buf_.get(), raw_blob_counter_buf_.get()},
       44, wg1d_);
 
-  // Per-blob point base offsets: extract_blob_counts.comp copies each selected blob's count, then a
-  // chain scan makes the inclusive prefix sum.
-  extract_blob_counts_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("extract_blob_counts"),
-      {selected_extents_buf_.get(), selected_counter_buf_.get(), blob_point_offsets_buf_.get()}, 4,
-      wg1d_);
-  {
-    const vk::WorkgroupSize scan_wg{scan_wg_, 1, 1};
-    VkBuffer prev_values = blob_point_offsets_buf_.get();
-    VkBuffer prev_output = blob_point_offsets_buf_.get();
-    for (size_t i = 0; i < blob_scan_chain_.level_buffers.size(); ++i) {
-      VkBuffer block_sums = blob_scan_chain_.level_buffers[i].get();
-      blob_scan_block_pls_.push_back(vk::ComputePipeline(
-          ctx_, ShaderPath("scan_block"), {prev_values, prev_output, block_sums}, 4, scan_wg));
-      prev_values = block_sums;
-      prev_output = block_sums;
-    }
-    blob_scan_block_pls_.push_back(vk::ComputePipeline(
-        ctx_, ShaderPath("scan_block"), {prev_values, prev_output, prev_output}, 4, scan_wg));
-
-    std::vector<VkBuffer> level_values = {blob_point_offsets_buf_.get()};
-    for (auto &buf : blob_scan_chain_.level_buffers) level_values.push_back(buf.get());
-    for (size_t i = 0; i + 1 < level_values.size(); ++i) {
-      blob_scan_add_offsets_pls_.push_back(vk::ComputePipeline(
-          ctx_, ShaderPath("scan_add_offsets"), {level_values[i], level_values[i + 1]}, 4,
-          scan_wg));
-    }
-  }
+  // Per-blob point base offsets: the inclusive prefix sum of the selected blobs' point counts, in
+  // one workgroup; it also writes the sort's indirect arguments (slot 2).
+  scan_blob_counts_pl_ = vk::ComputePipeline(
+      ctx_, ShaderPath("scan_blob_counts"),
+      {selected_extents_buf_.get(), selected_counter_buf_.get(), blob_point_offsets_buf_.get(),
+       indirect_args_buf_.get()},
+      8, vk::WorkgroupSize{scan_wg_, 1, 1});
 
   // Rank-merge sort run length (a power of two, 0 for the sorting network);
   // APRILTAG_VK_SORT_CHUNK overrides it.
@@ -560,8 +516,8 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("hash_group"),
       {qbp_keys_buf_.get(), hash_owner_buf_.get(),
        point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
-       hash_drop_counter_buf_.get(), qbp_counter_buf_.get()},
-      16, wg1d_);
+       hash_drop_counter_buf_.get(), qbp_counter_buf_.get(), extents_buf_.get()},
+      20, wg1d_);
   // One pipeline per source counter: the counter is binding 0, and
   // ComputePipeline binds its buffers at construction.
   build_indirect_args_pl_ = vk::ComputePipeline(
@@ -571,9 +527,6 @@ void GpuDetector::CreatePipelines() {
   build_qbp_args_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("build_indirect_args"),
       {qbp_counter_buf_.get(), indirect_args_buf_.get()}, 16, vk::WorkgroupSize{1, 1, 1});
-  build_sort_args_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("build_indirect_args"),
-      {selected_counter_buf_.get(), indirect_args_buf_.get()}, 16, vk::WorkgroupSize{1, 1, 1});
   // Reduction variant priority: subgroup, then 64-bit atomic, then plain 32-bit. The atomic64
   // variant views extents_buf_ again at binding 4 as uint64_t words.
   const bool extents_atomic64 = !subgroup && ctx_.caps().has_int64_atomics;
@@ -594,36 +547,6 @@ void GpuDetector::CreatePipelines() {
        selected_extents_buf_.get(), blob_point_offsets_buf_.get(), blob_cursor_buf_.get(),
        index_points_buf_.get(), qbp_counter_buf_.get()},
       16, wg1d_);
-}
-
-void GpuDetector::RunInclusiveScan(
-    VkCommandBuffer cmd, uint32_t count, const ScanChain &chain,
-    const std::vector<vk::ComputePipeline> &scan_block_pipelines,
-    const std::vector<vk::ComputePipeline> &scan_add_offsets_pipelines) {
-  if (count == 0) return;
-  (void)chain;
-
-  // Element count at each level; stop once a level fits in a single block.
-  std::vector<uint32_t> ns;
-  ns.push_back(count);
-  while (ns.back() > scan_wg_) {
-    ns.push_back((ns.back() + scan_wg_ - 1) / scan_wg_);
-  }
-  // The chain was built for the worst-case capacity, so a smaller count can
-  // only need fewer levels than there are pipelines.
-  const size_t levels = std::min(ns.size(), scan_block_pipelines.size());
-
-  // Down pass: scan each level.
-  for (size_t i = 0; i < levels; ++i) {
-    struct { uint32_t count; } pc{ns[i]};
-    scan_block_pipelines[i].Dispatch1D(cmd, ns[i], &pc);
-  }
-  // Up pass: fold each level's block offsets back into the level below.
-  for (size_t i = levels - 1; i-- > 0;) {
-    if (i >= scan_add_offsets_pipelines.size()) continue;
-    struct { uint32_t count; } pc{ns[i]};
-    scan_add_offsets_pipelines[i].Dispatch1D(cmd, ns[i], &pc);
-  }
 }
 
 void GpuDetector::RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &counter,
@@ -869,29 +792,23 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
-  struct { uint32_t count, table_mask, max_probes, count_from_buffer; } hash_pc{
-      0u, hash_table_size_ - 1u, 128u, 1u};
+  struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
+      0u, hash_table_size_ - 1u, 128u, 1u, config_.max_raw_blobs};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
   hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
-  // Builds the dispatch arguments on the device from raw_blob_counter_buf_; both consumers
-  // bounds-check against max_raw_blobs.
+  // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
+  // bounds-checks against max_raw_blobs. reduce_extents_hash does not read them.
   struct { uint32_t wg, slot, divide, clamp; } build_indirect_pc{wg1d_.x, 0u, 1u,
                                                                 config_.max_raw_blobs};
   build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
-  vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
-  struct { uint32_t capacity; } extentscap_pc{config_.max_raw_blobs};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
-  init_extents_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &extentscap_pc);
-
   struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{0u, config_.max_raw_blobs,
                                                                          1u};
   reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &reduce_pc);
-
-  // Folds the per-workgroup copies into the canonical entries, indirect over the raw blob count.
-  merge_extents_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &extentscap_pc);
+  vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
   struct {
@@ -908,11 +825,9 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   select_blobs_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &select_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
-  struct { uint32_t capacity; } extract_pc{config_.max_blobs};
+  struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 2u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
-  extract_blob_counts_pl_.Dispatch1D(cmd, config_.max_blobs, &extract_pc);
-  RunInclusiveScan(cmd, config_.max_blobs, blob_scan_chain_, blob_scan_block_pls_,
-                   blob_scan_add_offsets_pls_);
+  scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
   struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
@@ -933,9 +848,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
       VkDeviceSize(kSlotPointCount) * 4);
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
 
-  // Slot 2: one workgroup per selected blob, clamped to max_blobs.
-  struct { uint32_t wg, slot, divide, clamp; } sort_args_pc{wg1d_.x, 2u, 0u, config_.max_blobs};
-  build_sort_args_pl_.DispatchRaw(cmd, 1, 1, 1, &sort_args_pc, BarrierKind::Compute);
+  // Slot 2 (one workgroup per selected blob) was written by scan_blob_counts.
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
@@ -1522,8 +1435,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   }
   if (fuse || qbp_count > 0) {
     // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
-    struct { uint32_t count, table_mask, max_probes, count_from_buffer; } hash_pc{
-        qbp_count, hash_table_size_ - 1u, 128u, fuse ? 1u : 0u};
+    struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
+        qbp_count, hash_table_size_ - 1u, 128u, fuse ? 1u : 0u, config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
     if (fuse) {
       hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
@@ -1532,17 +1445,13 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     }
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
-    // Builds the dispatch arguments on the device from raw_blob_counter_buf_; both consumers
-    // bounds-check against max_raw_blobs.
+    // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
+    // bounds-checks against max_raw_blobs.
     struct { uint32_t wg, slot, divide, clamp; } build_indirect_pc{wg1d_.x, 0u, 1u,
                                                                   config_.max_raw_blobs};
     build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
-    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
-    struct { uint32_t capacity; } extentscap_pc{config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
-    init_extents_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &extentscap_pc);
-
     struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{
         qbp_count, config_.max_raw_blobs, fuse ? 1u : 0u};
     if (fuse) {
@@ -1550,9 +1459,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     } else {
       reduce_extents_hash_pl_.Dispatch1D(cmd, qbp_count, &reduce_pc);
     }
-
-    // Folds the per-workgroup copies into the canonical entries, indirect over the raw blob count.
-    merge_extents_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &extentscap_pc);
+    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
     struct {
@@ -1569,11 +1476,9 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     select_blobs_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &select_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
-    struct { uint32_t capacity; } extract_pc{config_.max_blobs};
+    struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 2u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
-    extract_blob_counts_pl_.Dispatch1D(cmd, config_.max_blobs, &extract_pc);
-    RunInclusiveScan(cmd, config_.max_blobs, blob_scan_chain_, blob_scan_block_pls_,
-                     blob_scan_add_offsets_pls_);
+    scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
     struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
@@ -1631,12 +1536,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   if (!fuse) EnsureReadbackCapacity(linefit_offset + linefit_bytes);
 
   if (!fuse) cmd = BeginTimedCommands();
-  // Slot 2: one workgroup per selected blob, clamped to max_blobs.
-  if (fuse) {
-    struct { uint32_t wg, slot, divide, clamp; } sort_args_pc{wg1d_.x, 2u, 0u, config_.max_blobs};
-    build_sort_args_pl_.DispatchRaw(cmd, 1, 1, 1, &sort_args_pc, BarrierKind::Compute);
-    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
-  }
+  // Slot 2 (one workgroup per selected blob) was written by scan_blob_counts.
+  if (fuse) vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   if (fuse || num_points > 0) {
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
     RecordSort(cmd, num_selected_blobs, fuse);

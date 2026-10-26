@@ -47,8 +47,8 @@ QBPoint UnpackQBPoint(uint packed) {
 // (frc971::apriltag::MinMaxExtents without starting_offset, rep0, rep1).
 //
 // The accumulator is replicated kExtentsCopies ways, each workgroup writing its
-// own copy; merge_extents.comp folds the copies into copy 0, the canonical
-// array read by downstream shaders. Only blob indices below
+// own copy; select_blobs.comp folds the copies into copy 0 as it reads them.
+// hash_group.comp initialises every copy. Only blob indices below
 // kPrivateExtentsBlobs are replicated; higher ones use the shared slot.
 //
 //   copy 0, any bi      -> bi

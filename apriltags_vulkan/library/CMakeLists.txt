@@ -60,12 +60,8 @@ set(SHADER_SOURCES
   shaders/uf_final_u8.comp
   shaders/blob_diff.comp
   shaders/blob_diff_u8.comp
-  shaders/scan_block.comp
-  shaders/scan_add_offsets.comp
-  shaders/init_extents.comp
-  shaders/merge_extents.comp
   shaders/select_blobs.comp
-  shaders/extract_blob_counts.comp
+  shaders/scan_blob_counts.comp
   shaders/sort_points_local.comp
   shaders/sort_points_local_u8.comp
   shaders/hash_group.comp

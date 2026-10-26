@@ -29,7 +29,7 @@ void main() {
   if (bi == 0u || bi > pc.max_raw_blobs) return;
   bi -= 1u;
 
-  // Accumulates into this workgroup's own copy; merge_extents.comp folds the copies together.
+  // Accumulates into this workgroup's own copy; select_blobs.comp folds the copies together.
   uint s = ExtentsSlot(bi, gl_WorkGroupID.x & (kExtentsCopies - 1u), pc.max_raw_blobs);
 
   QBPoint p = UnpackQBPoint(compacted[i]);

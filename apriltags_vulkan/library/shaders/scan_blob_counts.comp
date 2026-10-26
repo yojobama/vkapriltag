@@ -1,0 +1,54 @@
+#version 450
+// Inclusive prefix sum of the selected blobs' point counts over `capacity` entries (zero past the
+// selected count), in one workgroup: each thread sums a contiguous chunk, the chunk totals are
+// scanned in shared memory, then each thread writes its chunk. Also writes the sort's indirect
+// arguments: one workgroup per selected blob.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
+layout(std430, binding = 1) readonly buffer SelectedCounter { uint num_selected; };
+layout(std430, binding = 2) writeonly buffer Offsets { uint offsets[]; };
+layout(std430, binding = 3) writeonly buffer IndirectArgs { uint indirect_args[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint capacity;
+  uint sort_args_slot;
+} pc;
+
+// Sized for the largest workgroup (1024 threads); only the first gl_WorkGroupSize.x are used.
+shared uint chunk_sums[1024];
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint n = min(num_selected, pc.capacity);
+  uint per = (pc.capacity + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x;
+  uint begin = min(tid * per, pc.capacity);
+  uint end = min(begin + per, pc.capacity);
+
+  uint local_sum = 0u;
+  for (uint i = begin; i < min(end, n); ++i) local_sum += selected[i].count;
+  chunk_sums[tid] = local_sum;
+  barrier();
+
+  for (uint offset = 1u; offset < gl_WorkGroupSize.x; offset <<= 1u) {
+    uint addend = (tid >= offset) ? chunk_sums[tid - offset] : 0u;
+    barrier();
+    chunk_sums[tid] += addend;
+    barrier();
+  }
+
+  uint run = chunk_sums[tid] - local_sum;
+  for (uint i = begin; i < end; ++i) {
+    if (i < n) run += selected[i].count;
+    offsets[i] = run;
+  }
+
+  if (tid == 0u) {
+    indirect_args[pc.sort_args_slot * 3u + 0u] = n;
+    indirect_args[pc.sort_args_slot * 3u + 1u] = 1u;
+    indirect_args[pc.sort_args_slot * 3u + 2u] = 1u;
+  }
+}

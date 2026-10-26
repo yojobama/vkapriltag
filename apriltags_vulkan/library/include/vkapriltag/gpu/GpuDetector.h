@@ -158,9 +158,9 @@ class GpuDetector {
       "uf_final",       // uf_final.comp - per-blob pixel-count histogram
       "boundary",       // blob_diff (blob-size test, append + compaction)
       "hash_group",     // hash_group.comp (also assigns dense raw blob ids)
-      "extents",        // init_extents.comp + reduce_extents_hash.comp
+      "extents",        // reduce_extents_hash.comp
       "select",         // select_blobs.comp
-      "blob_scan",      // extract_blob_counts.comp + its scan chain
+      "blob_scan",      // scan_blob_counts.comp
       "scatter",        // scatter_index_points.comp
       "sort",           // sort_points_local.comp (fused with line-fit moments)
       "readback_copy",  // device->staging copies of the extents and line-fit payloads
@@ -216,20 +216,6 @@ class GpuDetector {
   void CreateBuffers();
   void CreatePipelines();
 
-  // A chain of scratch buffers implementing a multi-level block scan over
-  // an array of up to `capacity` uint32 values, fanning out by scan_wg_ per
-  // level.
-  struct ScanChain {
-    std::vector<vk::Buffer> level_buffers;   // block-sum scratch, one per extra level
-    std::vector<uint32_t> level_capacities;  // capacity of each extra level
-  };
-  ScanChain BuildScanChain(uint32_t capacity);
-
-  // Runs an inclusive scan of `count` values in place, touching only the
-  // levels that `count` actually requires.
-  void RunInclusiveScan(VkCommandBuffer cmd, uint32_t count, const ScanChain &chain,
-                        const std::vector<vk::ComputePipeline> &scan_block_pipelines,
-                        const std::vector<vk::ComputePipeline> &scan_add_offsets_pipelines);
 
   // Copies a device counter into the shared counter staging buffer and reads
   // it back after the submission retires.
@@ -339,7 +325,6 @@ class GpuDetector {
   std::vector<RawLineFitPoint> linefit_scratch_;
 
   // Scan chain for the per-blob point-offset assignment (sized to config_.max_blobs).
-  ScanChain blob_scan_chain_;
   // Largest per-blob point count sort_points_local.comp sorts in shared memory (power of two).
   // local_sort_cap_ is the workgroup thread count; the virtual cap may exceed it (threads stride).
   uint32_t local_sort_cap_ = 0;
@@ -372,9 +357,7 @@ class GpuDetector {
   // uf_compress plus uf_final's count, for the last real compression of the first attempt.
   vk::ComputePipeline uf_compress_count_pl_;
   vk::ComputePipeline blob_diff_pl_;
-  vk::ComputePipeline init_extents_pl_;
-  vk::ComputePipeline merge_extents_pl_;
-  vk::ComputePipeline build_qbp_args_pl_, build_sort_args_pl_;
+  vk::ComputePipeline build_qbp_args_pl_;
   vk::ComputePipeline select_blobs_pl_;
   // Builds indirect_args_buf_ from raw_blob_counter_buf_.
   vk::ComputePipeline build_indirect_args_pl_;
@@ -383,9 +366,7 @@ class GpuDetector {
 
 
   // Per-blob point base-offset assignment and the segmented local sort.
-  vk::ComputePipeline extract_blob_counts_pl_;
-  std::vector<vk::ComputePipeline> blob_scan_block_pls_;
-  std::vector<vk::ComputePipeline> blob_scan_add_offsets_pls_;
+  vk::ComputePipeline scan_blob_counts_pl_;
   vk::ComputePipeline sort_points_local_pl_;
   vk::ComputePipeline sort_large_runs_pl_, sort_large_merge_pl_;
 
