@@ -1699,8 +1699,8 @@ faster, because its time is set by the largest blobs. The GPU (1 GHz) and DDR (2
 already at their maximum with the `performance` governors, and all four shader cores are enabled
 (`core_mask` 0x50005). Labelling remains the largest stage (39% of the GPU spans at decimation 2) and
 is bound by DRAM traffic on a 4-byte-per-pixel `parent[]` array that does not fit in the L2.
-`bench_multiqueue --import` fails on the Mali, which has no host-pointer import; its error path also
-destroys the device before some child objects (an existing tool bug; dma-buf import is the Mali path).
+The Mali has no host-pointer import (`VK_EXT_external_memory_host`), so `bench_multiqueue --import`
+warns and runs without it there; dma-buf import is the Mali path.
 
 ## 9. Measuring
 

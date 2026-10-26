@@ -43,6 +43,14 @@ void *AlignedAlloc(size_t alignment, size_t bytes) {
 #endif
 }
 
+void AlignedFree(void *p) {
+#ifdef _WIN32
+  _aligned_free(p);
+#else
+  std::free(p);
+#endif
+}
+
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::duration<double, std::milli>;
 
@@ -58,6 +66,15 @@ struct Stream {
   size_t frame_alloc = 0;
   std::vector<double> latency_ms;
   int late = 0;
+
+  // Releases users before what they use: pipeline and decoders, detector (and its imports), frames.
+  ~Stream() {
+    pipeline.reset();
+    tag_decoder.reset();
+    if (td != nullptr) apriltag_detector_destroy(td);
+    detector.reset();
+    for (uint8_t *frame : frames) AlignedFree(frame);
+  }
 };
 
 std::mutex g_expected_mutex;
@@ -131,7 +148,8 @@ int main(int argc, char **argv) {
   if (pgm_path.empty() || (mode != "single" && mode != "per-stream" && mode != "alternate" && mode != "auto")) {
     std::cerr << "Usage: bench_multiqueue --pgm <file> [--streams N] "
                  "[--mode single|per-stream|alternate|auto] [--iterations N] [--decimation N] "
-                 "[--cpu-threads N] [--fps N] [--family N]\n";
+                 "[--cpu-threads N] [--fps N] [--family N] [--probe-margin G] [--import] "
+                 "[--async-upload]\n";
     return 1;
   }
   if (cpu_threads == 0) {
@@ -155,8 +173,7 @@ int main(int argc, char **argv) {
   config.reversed_border = tf->reversed_border;
   config.normal_border = !tf->reversed_border;
 
-  std::vector<Stream> pool(static_cast<size_t>(streams));
-  size_t queue_count = 0;
+  int status = 0;
   try {
     apriltag_vulkan::vk::ContextOptions opts;
     opts.queue_family = family;
@@ -165,7 +182,13 @@ int main(int argc, char **argv) {
     opts.use_secondary_compute_family = (mode == "alternate");
     if (mode == "auto") opts.expected_streams = static_cast<uint32_t>(streams);
     apriltag_vulkan::vk::Context ctx(opts);
-    queue_count = ctx.queue_count();
+    const size_t queue_count = ctx.queue_count();
+    if (import_frames && !ctx.caps().has_external_memory_host) {
+      std::cerr << "warning: VK_EXT_external_memory_host unavailable; --import ignored\n";
+      import_frames = false;
+    }
+    // Declared after the Context so the streams are destroyed first, also when an exception unwinds.
+    std::vector<Stream> pool(static_cast<size_t>(streams));
 
     // Queue slot per stream.
     std::vector<size_t> slots;
@@ -271,11 +294,11 @@ int main(int argc, char **argv) {
               << " latency_med_ms=" << all[all.size() / 2]
               << " latency_p99_ms=" << all[static_cast<size_t>(all.size() * 0.99)]
               << " late=" << late << " mismatches=" << g_mismatches.load() << std::endl;
-
-    pool.clear();  // streams first, then the Context
+    status = g_mismatches.load() == 0 ? 0 : 2;
   } catch (const std::exception &e) {
     std::cerr << "Failed: " << e.what() << std::endl;
-    return 1;
+    status = 1;
   }
-  return g_mismatches.load() == 0 ? 0 : 2;
+  teardown_tag_family(&tf, "tag36h11");
+  return status;
 }
