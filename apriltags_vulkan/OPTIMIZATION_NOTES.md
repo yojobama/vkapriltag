@@ -1969,3 +1969,15 @@ squared in double as before. Identical output; `quad_decode` -3.8% (decimation 1
 blob-splitting scan with a galloping search was identical too, but made `quad_decode` 18% slower on
 the RX 9060 XT with 12 threads: the scan had been warming the cache with the read-back points for the
 workers. `PERFORMANCE.md` 8p.
+
+## 26. GPU stages found with the Mali counters - three shipped, on
+
+Arm's libGPUCounters on the Orange Pi showed the G610 starved for memory (load/store-bound, every
+load partial-width, 49 MB of DRAM traffic per frame at decimation 1) and a 200 us counter timeline put
+most of it in labelling and the threshold passes (`PERFORMANCE.md` 8q). `uf_init` now initialises 4
+pixels per thread and points them at their run start within the chunk, so the compression that
+follows walks chains a quarter as long (labelling -11% to -13.5%); at decimation 1 the threshold and
+sort stages read the grey buffer in place of a copied decimated image; and `threshold` covers 4 pixels
+per thread. Identical output; `Detect()` 5.21 -> 4.78 ms at decimation 1 and 2.12 -> 2.04 ms at
+decimation 2 on the Orange Pi. Workgroup sizes, the sort's workgroup, longer `uf_init` runs and the
+Mali clock and power settings measured no better.

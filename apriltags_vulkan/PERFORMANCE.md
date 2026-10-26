@@ -72,6 +72,9 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2). |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
 | `APRILTAG_VK_PRERECORD=0` | Pre-recorded command buffers are on by default for the fused single-submission frame; `0` records every frame instead. See sections 8f and 8g. |
+| `APRILTAG_VK_UF_INIT_RUN=<n>` | Pixels of a row each `uf_init` thread initialises (default 4). See section 8q. |
+| `APRILTAG_VK_THRESH_RUN=<n>` | Pixels of a row each `threshold` thread covers (default 4). |
+| `APRILTAG_VK_DEC1_ALIAS=0` | At decimation 1, copy the grey image into the decimated buffer instead of reading it in place. |
 | `APRILTAG_VK_SORT_CHUNK=<n>` | Rank-merge sort run length (a power of two, default 16); `0` selects the Batcher sorting network. See section 8k. |
 | `APRILTAG_VK_SORT_WG=<n>` | Workgroup size of the point sort (default 256, the maximum). |
 | `APRILTAG_VK_PROBE_MARGIN=<grey levels>` | Margin gate before edge refinement (default off); overrides `TagDecoder`'s `probe_margin`. See section 8l. |
@@ -101,11 +104,11 @@ are a range. The per-stage GPU table, the throughput tables and the comparison w
 
 | Stage | Runs on | Orange Pi 5 (Mali-G610) | Desktop (RX 9060 XT) |
 | --- | --- | --- | --- |
-| `GpuDetector` | GPU | 2.12 ms | 0.38 to 0.55 ms |
+| `GpuDetector` | GPU | 2.04 ms | 0.38 to 0.55 ms |
 | `quad_decode` | CPU | 0.19 ms | 0.11 ms |
-| `tag_decode` | CPU | 0.63 ms | 0.23 ms |
-| **Pipeline total, serial** | GPU + CPU | **2.99 ms** | **0.80 to 0.91 ms** |
-| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.21 ms** | **0.41 to 0.46 ms** |
+| `tag_decode` | CPU | 0.63 ms | 0.22 ms |
+| **Pipeline total, serial** | GPU + CPU | **2.87 ms** | **0.77 to 0.91 ms** |
+| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.2 ms** | **0.40 to 0.46 ms** |
 
 The GPU phase dominates on the deployment target (71% of a serial frame) and
 is essentially all real shader execution. Two things it is *not*:
@@ -466,7 +469,7 @@ finding with a controlled wall-clock A/B.
 idles through the whole CPU tail and vice versa. `FramePipeline` runs the GPU
 pass for frame N on its own thread while the caller decodes frame N-1, making
 a frame cost `max(GPU, CPU)` rather than the sum — the last two rows of the
-table in section 3 (2.99 -> 2.21 ms on the Orange Pi, about 0.85 -> 0.44 ms on
+table in section 3 (2.87 -> 2.2 ms on the Orange Pi, about 0.85 -> 0.43 ms on
 the desktop).
 
 Three things callers must know:
@@ -728,8 +731,8 @@ rather than `atomicAdd`, at some cost.
 
 `OPTIMIZATION_NOTES.md` holds the full list with numbers, including everything
 already tried and rejected — read it before proposing work, since most of the
-obvious ideas are in the rejected column. Where it stands on the Orange Pi: 2.12 ms of
-GPU work and about 0.85 ms of CPU tail per frame (2.99 ms serial). Open items, largest first:
+obvious ideas are in the rejected column. Where it stands on the Orange Pi: 2.04 ms of
+GPU work and about 0.85 ms of CPU tail per frame (2.87 ms serial). Open items, largest first:
 
 - **CPU edge refinement.** `tag_decode` is 0.63 ms, and 97% of the refinement time goes to
   quads that never decode. The margin gate (section 8l) removes most of it with no change to the
@@ -1651,6 +1654,54 @@ peaks-only.
 - Off-CPU time is the worker pool and `FramePipeline` waiting on condition variables and the GPU
   fence; no lock contention showed up.
 
+## 8q. Profiling the Mali GPU with Arm's tools
+
+**Tools.** The Mali Offline Compiler (`malioc`, Arm Performance Studio 2026.5; the Linux build, run
+under WSL) for static analysis of every shader's SPIR-V for the Mali-G610; Arm's libGPUCounters for
+the G610's hardware counters on the Orange Pi (`tools/mali_counters`: `hwcnt_run` prints all 270
+counters over a command's run, `hwcnt_timeline` samples selected counters every 200 us); the Mali
+driver's sysfs controls under `/sys/devices/platform/fb000000.gpu` and the Rockchip devfreq nodes.
+Streamline was not needed: the timeline sampler gives the same per-stage view headless.
+
+**Static analysis.** Every shader is load/store-bound, with almost no arithmetic, no register
+spilling and full occupancy, except `merge_extents` (64 registers, 50% occupancy, a small
+dispatch). Longest load/store paths: `scan_block` 30 cycles, `blob_diff_u8` 29, `sort_points_local_u8`
+22, `merge_extents` 18, `block_minmax_u8` 17, `init_extents` 16.
+
+**Hardware counters** (`ultrafast`, decimation 1, 1280x720, 2,000 frames). The GPU reads 27.4 MB and
+writes 21.9 MB of DRAM per frame, about 53 times the frame's size; the shader cores report no
+instruction to issue for most of their active cycles (waiting on memory), the FMA pipe is idle (0.2%)
+and every load is a partial-width access. The level-3 TLB misses about 800 times per frame
+(negligible, so the large-page pool is not worth enabling). Sampling every 200 us at 20 fps and
+aligning the frames places the traffic: about 9 MB of writes in the first 0.8 ms (clears, threshold,
+labelling initialisation), about 17 MB of reads and 8 MB of writes in labelling, the atomics in the
+boundary, hash and extents stages, and high starvation with little traffic in the sort.
+
+**Changes** (each identical in output: the 15 canonical quad dumps on both machines, about 100
+further configurations including the 32-bit path, stress frames, forced retries, `--import`,
+`--pipelined` and dma-buf import, the synthetic CSV; validation layer with synchronisation validation
+clean on both machines):
+
+| change | Orange Pi | RX 9060 XT |
+| --- | --- | --- |
+| `uf_init` initialises 4 pixels of a row per thread and points each at the start of its run within the chunk, so the following compression walks chains 4 times shorter (runs of 8, 16, 32 and 64 were slower: too few threads, serial loops) | labelling -13.5% (decimation 1), -11% (decimation 2); `Detect()` -5.4% and -4.3%; `ultrafast` throughput +5.7% (decimation 1), +3.0% (decimation 2) | labelling about -11% |
+| at decimation 1 with 8-bit storage the threshold and sort stages read the grey buffer as the decimated image and the copy pass is skipped (imported frames are decimated into the grey buffer instead) | `Detect()` -2.6% (decimation 1) | |
+| `threshold` covers 4 pixels per thread, reading each 4x4 block's min/max once | threshold span 0.35 -> 0.28 ms (decimation 1); with the alias `Detect()` -4.0% (decimation 1), -1.5% (decimation 2), throughput +3.7% | |
+
+Together on the Orange Pi: `Detect()` 5.21 -> 4.78 ms at decimation 1 (-8%) and 2.12 -> 2.04 ms at
+decimation 2; load/store issue cycles -15%, starvation -10%, DRAM reads -3% and writes -6% per frame.
+`APRILTAG_VK_UF_INIT_RUN`, `APRILTAG_VK_THRESH_RUN` and `APRILTAG_VK_DEC1_ALIAS=0` restore the old
+behaviour for comparison.
+
+**Measured and not changed.** Workgroup size (1D 64 to 512, 2D 8x8 to 32x8): within 1% everywhere.
+The sort's workgroup: 128 and 64 threads are 50% and 120% slower at decimation 1 and 512 or 1,024 no
+faster, because its time is set by the largest blobs. The GPU (1 GHz) and DDR (2112 MHz) clocks were
+already at their maximum with the `performance` governors, and all four shader cores are enabled
+(`core_mask` 0x50005). Labelling remains the largest stage (39% of the GPU spans at decimation 2) and
+is bound by DRAM traffic on a 4-byte-per-pixel `parent[]` array that does not fit in the L2.
+`bench_multiqueue --import` fails on the Mali, which has no host-pointer import; its error path also
+destroys the device before some child objects (an existing tool bug; dma-buf import is the Mali path).
+
 ## 9. Measuring
 
 ```
@@ -1701,6 +1752,13 @@ ThreadSanitizer and LeakSanitizer: configure with `CMAKE_BUILD_TYPE=None` and th
 `CMAKE_CXX_FLAGS`, `CMAKE_C_FLAGS` and both linker flag variables. Run LeakSanitizer with
 `detect_leaks=0` unless the loader's own allocations are being filtered, since the Vulkan loader reports
 tens of megabytes at exit.
+
+On Mali, `hwcnt_run <command>` (`tools/mali_counters`, built with
+`-DVKAPRILTAG_BUILD_MALI_COUNTERS=ON`) prints every hardware counter over a run, and `hwcnt_timeline
+200 out.csv <command>` samples the main ones every 200 us; run the detector paced (`bench_multiqueue
+--fps 20`) and align the frames to attribute counters to stages (section 8q). For static shader
+analysis, `malioc -c Mali-G610 --vulkan --compute <shader>.spv` from Arm Performance Studio (Linux
+x86-64 or Windows host).
 
 For per-dispatch GPU timing, `APRILTAG_VK_TIMESTAMPS=1` adds a timestamp-span
 breakdown plus the gaps between spans, separating intra-submit gaps from

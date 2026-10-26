@@ -296,28 +296,28 @@ difference at 30 and 60 fps. `apriltags_vulkan/PERFORMANCE.md` section 8i has th
 | Stage | Runs on | Orange Pi 5 | Desktop |
 | --- | --- | --- | --- |
 | clear (per-frame buffer zeroing) | GPU | 0.048 ms | ~0 ms |
-| threshold + decimate | GPU | 0.145 ms | 0.018 ms |
-| labelling (includes the blob-size count) | GPU | 0.761 ms | 0.183 ms |
+| threshold + decimate | GPU | 0.138 ms | 0.012 ms |
+| labelling (includes the blob-size count) | GPU | 0.685 ms | 0.124 ms |
 | label finalise (only when a frame retries) | GPU | 0.004 ms | ~0 ms |
-| boundary extraction | GPU | 0.276 ms | 0.023 ms |
-| hash grouping | GPU | 0.055 ms | 0.017 ms |
-| extents | GPU | 0.174 ms | 0.029 ms |
-| select + blob scan | GPU | 0.066 ms | 0.017 ms |
-| scatter | GPU | 0.070 ms | 0.014 ms |
-| sort + line-fit moments | GPU | 0.302 ms | 0.066 ms |
+| boundary extraction | GPU | 0.275 ms | 0.015 ms |
+| hash grouping | GPU | 0.055 ms | 0.011 ms |
+| extents | GPU | 0.170 ms | 0.019 ms |
+| select + blob scan | GPU | 0.064 ms | 0.012 ms |
+| scatter | GPU | 0.068 ms | 0.008 ms |
+| sort + line-fit moments | GPU | 0.233 ms | 0.045 ms |
 | readback copy | GPU | 0.003 ms | ~0 ms |
-| **sum of GPU stages** | **GPU** | **1.90 ms** | **0.37 ms** |
+| **sum of GPU stages** | **GPU** | **1.74 ms** | **0.25 ms** |
 
 The stage rows are one instrumented frame (`APRILTAG_VK_TIMESTAMPS=1`, which itself costs about 9%
 on the Mali). The totals below are without instrumentation:
 
 | | Runs on | Orange Pi 5 | Desktop |
 | --- | --- | --- | --- |
-| `GpuDetector::Detect()` | GPU | 2.12 ms | 0.38 to 0.55 ms |
+| `GpuDetector::Detect()` | GPU | 2.04 ms | 0.38 to 0.55 ms |
 | `quad_decode` (DP corner seeding) | **CPU** | 0.19 ms | 0.11 ms |
-| `tag_decode` (edge refinement, bit sampling, Hamming) | **CPU** | 0.63 ms | 0.23 ms |
-| **Pipeline total, serial** | GPU + CPU | **2.99 ms** | **0.80 to 0.91 ms** |
-| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.21 ms** | **0.41 to 0.46 ms** |
+| `tag_decode` (edge refinement, bit sampling, Hamming) | **CPU** | 0.63 ms | 0.22 ms |
+| **Pipeline total, serial** | GPU + CPU | **2.87 ms** | **0.77 to 0.91 ms** |
+| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.2 ms** | **0.40 to 0.46 ms** |
 
 `Detect()` also includes the unspanned time (submit, fence wait, host-side readback) that no GPU
 timestamp covers. It is small: an empty `vkQueueSubmit` + `vkWaitForFences` round trip measures
@@ -332,13 +332,13 @@ is recorded once and submitted once. Decimation is the largest single lever on t
 
 | | Orange Pi 5 | RX 9060 XT |
 | --- | --- | --- |
-| 1 stream, `ultrafast` | 439 fps | 3,310 fps |
-| 4 streams, `ultrafast`, one queue | 525 fps | 5,271 fps |
-| 4 streams, `ultrafast`, queues spread over both compute families | | 9,096 fps |
-| 1 stream, `exact` | 432 fps | 2,331 fps |
-| 4 streams, `exact` | 523 fps | 3,044 fps |
-| 1 stream, `exact`, gate 4 | 439 fps | 3,186 fps |
-| 4 streams, `exact`, gate 4 | 524 fps | 4,974 fps |
+| 1 stream, `ultrafast` | 452 fps | 3,424 fps |
+| 4 streams, `ultrafast`, one queue | 533 fps | 5,370 fps |
+| 4 streams, `ultrafast`, queues spread over both compute families | | 9,192 fps |
+| 1 stream, `exact` | 458 fps | 2,791 fps |
+| 4 streams, `exact` | 532 fps | 3,735 fps |
+| 1 stream, `exact`, gate 4 | 479 fps | 3,352 fps |
+| 4 streams, `exact`, gate 4 | 530 fps | 5,330 fps |
 
 Spreading streams over queue families (`ContextOptions::expected_streams`, `Context::StreamSlot`)
 helps only where the device has two compute families (the desktop: +82% at four streams over one
@@ -354,7 +354,7 @@ wrong. On the synthetic sweep the gated and ungated runs are byte-identical at g
 contrast 1.0, 0.25 and 0.12 and noise sigma 3 and 8; junk quads sit at margin 4 or below and real
 tags well above it. It applies only with exactly one tag family, refinement on, and a refine mode
 other than `ultrafast`. The risk is a real tag whose unrefined margin is under the gate, so it
-stays opt-in. On the Orange Pi it takes `pipeline_total` from 2.99 to 2.59 ms. A Hamming-distance
+stays opt-in. On the Orange Pi it takes `pipeline_total` from 2.89 to 2.49 ms. A Hamming-distance
 probe was measured and rejected: it loses 9 to 20% of the tags that only decode after refinement.
 
 ### Pose and pipelining
@@ -389,7 +389,9 @@ precision.
 ### Tracing and further reading
 
 `apriltag_vulkan_validate --profile` prints the per-stage GPU spans, the CPU-tail split and
-blob-size histograms; `--trace out.json` writes a Chrome trace of the CPU and GPU spans.
+blob-size histograms; `--trace out.json` writes a Chrome trace of the CPU and GPU spans. On Mali,
+`hwcnt_run` and `hwcnt_timeline` (`-DVKAPRILTAG_BUILD_MALI_COUNTERS=ON`, Linux) read the GPU's
+hardware counters through Arm's libGPUCounters.
 `apriltags_vulkan/PERFORMANCE.md` covers configuration, per-device guidance and how to measure
 fairly; `apriltags_vulkan/OPTIMIZATION_NOTES.md` is the record of what each optimisation did and of
 everything measured and rejected, including two Mali-specific results (shared-memory tiling and
@@ -409,7 +411,8 @@ apriltags_vulkan/
   tools/       validation tools (ID/corner, end-to-end pose, synthetic
                ground truth, pose solver), the corpus generator, and the
                benchmarks (bench_multiqueue for several streams, bench_barrier
-               for the cost of a barrier)
+               for the cost of a barrier), and the Mali counter tools
+               (hwcnt_run, hwcnt_timeline)
   cmake/       the upstream apriltag patch, shader-embedding machinery
   OPTIMIZATION_NOTES.md   detailed performance history and rejected approaches
   PERFORMANCE.md          how to configure, run and measure it per device

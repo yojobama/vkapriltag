@@ -1,5 +1,5 @@
 // Tests zero-copy input through dma-buf import (Linux).
-//   dmabuf_import_test --pgm <file> [--iterations N]           (dma-heap buffer filled from a PGM)
+//   dmabuf_import_test --pgm <file> [--iterations N] [--decimation N]  (dma-heap buffer from a PGM)
 //   dmabuf_import_test --camera /dev/video0 [--width W --height H] [--frames N]
 // Each path runs Detect() on a normal copied frame and on the imported buffer, and requires the
 // resulting line-fit points to be identical; timings are host wall time per Detect() including the
@@ -86,11 +86,14 @@ bool SameQuads(const Quads &x, const Quads &y) {
   return true;
 }
 
+// Decimation for every detector this tool creates (--decimation).
+uint32_t g_decimation = 2;
+
 apriltag_vulkan::DetectorConfig MakeConfig(uint32_t w, uint32_t h, const apriltag_family_t *tf) {
   apriltag_vulkan::DetectorConfig config;
   config.width = w;
   config.height = h;
-  config.decimation = 2;
+  config.decimation = g_decimation;
   config.tag_width = static_cast<uint32_t>(tf->width_at_border);
   config.reversed_border = tf->reversed_border;
   config.normal_border = !tf->reversed_border;
@@ -329,6 +332,7 @@ int main(int argc, char **argv) {
     if (arg == "--pgm") pgm = next();
     else if (arg == "--camera") camera = next();
     else if (arg == "--iterations") iterations = std::stoi(next());
+    else if (arg == "--decimation") g_decimation = static_cast<uint32_t>(std::stoi(next()));
     else if (arg == "--yuyv") yuyv_heap = true;
     else if (arg == "--frames") frames = std::stoi(next());
     else if (arg == "--sync") sync_mode = std::stoi(next());

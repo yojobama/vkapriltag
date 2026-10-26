@@ -88,3 +88,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(apriltag_pose_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 install(TARGETS apriltag_pose_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Mali hardware-counter tools (Linux, Arm Mali): hwcnt_run prints every counter over a command's
+# run, hwcnt_timeline samples selected counters periodically. Built against Arm's libGPUCounters.
+option(VKAPRILTAG_BUILD_MALI_COUNTERS "Build the Mali hardware-counter tools (fetches libGPUCounters)" OFF)
+if (VKAPRILTAG_BUILD_MALI_COUNTERS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  include(FetchContent)
+  set(HWCPIPE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(HWCPIPE_WERROR OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    libgpucounters
+    GIT_REPOSITORY https://github.com/ARM-software/libGPUCounters.git
+    GIT_TAG 378c7b59e2dae87cbbffb0ac9cf96ed13c939823
+  )
+  FetchContent_MakeAvailable(libgpucounters)
+  add_executable(hwcnt_run mali_counters/hwcnt_run.cpp)
+  target_link_libraries(hwcnt_run PRIVATE hwcpipe)
+  add_executable(hwcnt_timeline mali_counters/hwcnt_timeline.cpp)
+  target_link_libraries(hwcnt_timeline PRIVATE hwcpipe)
+endif()
