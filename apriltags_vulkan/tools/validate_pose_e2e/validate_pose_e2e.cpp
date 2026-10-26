@@ -472,6 +472,7 @@ int main(int argc, char **argv) {
     }
     std::cout << std::endl;
 
+    apriltag_detections_destroy(ref);
     apriltag_detector_destroy(td_ours);
     apriltag_detector_destroy(td_ref);
     teardown_tag_family(&tf, family_name.c_str());
