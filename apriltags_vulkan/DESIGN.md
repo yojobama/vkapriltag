@@ -328,6 +328,7 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Two frame buffers are required because the GPU reads gray_frame asynchronously; reusing the camera buffer back-to-back corrupts the in-flight frame.
 - Selected extents are still exposed although QuadDecode no longer takes them: GpuDetector still populates them, and the detector's copy already belongs to the in-flight frame by the time a caller could read it.
 - Extents ping-pong via swap to keep capacity (Detect() would otherwise reallocate every frame); points must be copied.
+- Optional second GpuDetector (depth 2): frames alternate between two detectors, each driven by its own thread, so one detector's host work (upload, submit, fence wake-up, readback copy) overlaps the other's GPU pass and the GPU stays busy (Mali 83-93% -> 99%). Each detector needs its own vk::Lane, because a Lane's command pool and fences are not thread-safe; both may use the same queue. Results arrive two Push() calls late, frames must stay valid for two further calls, and Flush() is called until it returns nullptr.
 
 ### PoseEstimator
 - Pinhole only: neither this library nor the CUDA original implements undistortion; wide-angle callers should undistort corners first, which matters far more than any solver numerical detail.

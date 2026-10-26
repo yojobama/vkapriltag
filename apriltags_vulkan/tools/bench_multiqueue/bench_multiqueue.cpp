@@ -2,10 +2,11 @@
 // (queue), GpuDetector, QuadDecode, TagDecoder and FramePipeline, fed by its own thread.
 // Usage: bench_multiqueue --pgm <file> [--streams N] [--mode single|per-stream|alternate|auto]
 //   [--iterations N] [--decimation N] [--cpu-threads N] [--fps N] [--family N] [--probe-margin G] [--import]
-//   [--async-upload]
+//   [--async-upload] [--depth 1|2]
 // single: every stream shares queue 0. per-stream: one queue per stream on the primary family.
 // alternate: queues interleaved across both compute families; auto: ContextOptions::expected_streams
-// with Context::StreamSlot. --fps paces each stream like a camera (0 = free-running).
+// with Context::StreamSlot. --fps paces each stream like a camera (0 = free-running). --depth 2
+// gives each stream's FramePipeline a second detector on the same queue (two frames in flight).
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -57,12 +58,15 @@ using Ms = std::chrono::duration<double, std::milli>;
 struct Stream {
   std::unique_ptr<apriltag_vulkan::vk::Lane> lane;
   std::unique_ptr<apriltag_vulkan::vk::Lane> transfer_lane;
-  std::unique_ptr<apriltag_vulkan::GpuDetector> detector;
+  // The second detector's own lanes on the same queues (a Lane is not thread-safe).
+  std::unique_ptr<apriltag_vulkan::vk::Lane> lane2, transfer_lane2;
+  std::unique_ptr<apriltag_vulkan::GpuDetector> detector, detector2;
   std::unique_ptr<apriltag_vulkan::QuadDecode> quad_decode;
   apriltag_detector_t *td = nullptr;
   std::unique_ptr<apriltag_vulkan::TagDecoder> tag_decoder;
   std::unique_ptr<apriltag_vulkan::FramePipeline> pipeline;
-  uint8_t *frames[2] = {nullptr, nullptr};  // aligned so they can be imported
+  // Aligned so they can be imported; depth + 1 of them are used in turn.
+  uint8_t *frames[3] = {nullptr, nullptr, nullptr};
   size_t frame_alloc = 0;
   std::vector<double> latency_ms;
   int late = 0;
@@ -72,6 +76,7 @@ struct Stream {
     pipeline.reset();
     tag_decoder.reset();
     if (td != nullptr) apriltag_detector_destroy(td);
+    detector2.reset();
     detector.reset();
     for (uint8_t *frame : frames) AlignedFree(frame);
   }
@@ -114,6 +119,7 @@ int main(int argc, char **argv) {
   bool import_frames = false;  // zero-copy host-pointer import of the frame buffers
   uint32_t decimation = 2;
   float probe_margin = 0.0f;  // TagDecoder margin gate, grey levels (0 = off)
+  int depth = 1;  // frames in flight per stream's FramePipeline
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -140,6 +146,8 @@ int main(int argc, char **argv) {
       probe_margin = std::stof(next());
     } else if (arg == "--async-upload") {
       async_upload = true;
+    } else if (arg == "--depth") {
+      depth = std::min(2, std::max(1, std::stoi(next())));
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -149,7 +157,7 @@ int main(int argc, char **argv) {
     std::cerr << "Usage: bench_multiqueue --pgm <file> [--streams N] "
                  "[--mode single|per-stream|alternate|auto] [--iterations N] [--decimation N] "
                  "[--cpu-threads N] [--fps N] [--family N] [--probe-margin G] [--import] "
-                 "[--async-upload]\n";
+                 "[--async-upload] [--depth 1|2]\n";
     return 1;
   }
   if (cpu_threads == 0) {
@@ -220,26 +228,36 @@ int main(int argc, char **argv) {
       st.tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(
           st.td, decimation, static_cast<uint32_t>(cpu_threads),
           apriltag_vulkan::RefineEdgesMethod::kExact, probe_margin);
-      st.pipeline = std::make_unique<apriltag_vulkan::FramePipeline>(*st.detector, *st.quad_decode,
-                                                                     *st.tag_decoder);
+      if (depth == 2) {
+        st.lane2 = ctx.CreateLane(slot);
+        if (st.transfer_lane) st.transfer_lane2 = ctx.CreateTransferLane(static_cast<size_t>(s));
+        st.detector2 = std::make_unique<apriltag_vulkan::GpuDetector>(
+            ctx, *st.lane2, st.transfer_lane2.get(), config);
+        st.pipeline = std::make_unique<apriltag_vulkan::FramePipeline>(
+            *st.detector, *st.detector2, *st.quad_decode, *st.tag_decoder);
+      } else {
+        st.pipeline = std::make_unique<apriltag_vulkan::FramePipeline>(
+            *st.detector, *st.quad_decode, *st.tag_decoder);
+      }
       const size_t align = std::max<size_t>(4096, ctx.caps().min_host_pointer_alignment);
       st.frame_alloc = (gray.size() + align - 1) / align * align;
-      for (int b = 0; b < 2; ++b) {
+      for (int b = 0; b <= depth; ++b) {
         st.frames[b] = static_cast<uint8_t *>(AlignedAlloc(align, st.frame_alloc));
         std::memset(st.frames[b], 0, st.frame_alloc);
         std::memcpy(st.frames[b], gray.data(), gray.size());
         if (import_frames) st.detector->ImportHostFrame(st.frames[b], st.frame_alloc);
+        if (import_frames && st.detector2) st.detector2->ImportHostFrame(st.frames[b], st.frame_alloc);
       }
       st.latency_ms.reserve(static_cast<size_t>(iterations));
     }
 
     for (Stream &st : pool) {  // warm-up, serial
       for (int i = 0; i < 20; ++i) {
-        zarray_t *r = st.pipeline->Push(st.frames[i & 1], width, height,
+        zarray_t *r = st.pipeline->Push(st.frames[i % (depth + 1)], width, height,
                                         config.reversed_border);
         if (r != nullptr) CheckResult(r);
       }
-      if (zarray_t *r = st.pipeline->Flush()) CheckResult(r);
+      while (zarray_t *r = st.pipeline->Flush()) CheckResult(r);
     }
 
     std::atomic<int> ready{0};
@@ -259,15 +277,18 @@ int main(int argc, char **argv) {
             if (Ms(Clock::now() - due).count() > 0.5 * period_ms) ++sp->late;
           }
           pushed[static_cast<size_t>(k)] = Clock::now();
-          zarray_t *r = sp->pipeline->Push(sp->frames[k & 1], width, height,
+          zarray_t *r = sp->pipeline->Push(sp->frames[k % (depth + 1)], width, height,
                                            config.reversed_border);
-          if (r != nullptr && k > 0) {
-            sp->latency_ms.push_back(Ms(Clock::now() - pushed[static_cast<size_t>(k - 1)]).count());
+          if (r != nullptr && k >= depth) {
+            sp->latency_ms.push_back(
+                Ms(Clock::now() - pushed[static_cast<size_t>(k - depth)]).count());
             CheckResult(r);
           }
         }
-        if (zarray_t *r = sp->pipeline->Flush()) {
-          sp->latency_ms.push_back(Ms(Clock::now() - pushed.back()).count());
+        // The frames still in flight finish in push order.
+        size_t drained = static_cast<size_t>(std::max(0, iterations - depth));
+        while (zarray_t *r = sp->pipeline->Flush()) {
+          sp->latency_ms.push_back(Ms(Clock::now() - pushed[drained++]).count());
           CheckResult(r);
         }
       });
@@ -289,6 +310,7 @@ int main(int argc, char **argv) {
     std::cout << "mode=" << mode << " streams=" << streams << " queues=" << queue_count
               << " cpu_threads=" << cpu_threads << " target_fps=" << fps
               << " import=" << import_frames << " async_upload=" << async_upload
+              << " depth=" << depth
               << " total_fps=" << total_fps
               << " per_stream_fps=" << total_fps / streams
               << " latency_med_ms=" << all[all.size() / 2]

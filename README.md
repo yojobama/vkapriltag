@@ -66,7 +66,10 @@ three detection stages and overlaps frame N's GPU pass with frame N-1's CPU
 tail, making a frame cost `max(GPU, CPU)` instead of the sum. It is a
 throughput optimization, not a latency one — detections arrive one `Push()`
 later, and it needs two frame buffers — so the stages stay independently
-usable for callers that must act on the newest frame immediately. See
+usable for callers that must act on the newest frame immediately. Given a
+second `GpuDetector` (with its own `vk::Lane`) it keeps two frames on the GPU,
+so the GPU never waits for the host: more throughput again, for a second set
+of device buffers and one more frame of latency. See
 [Performance](#performance).
 
 This is a port of [frc971's CUDA `GpuDetector`](https://github.com/Team766/apriltags_cuda)
@@ -339,6 +342,14 @@ is recorded once and submitted once. Decimation is the largest single lever on t
 | 4 streams, `exact` | 532 fps | 3,735 fps |
 | 1 stream, `exact`, gate 4 | 479 fps | 3,352 fps |
 | 4 streams, `exact`, gate 4 | 530 fps | 5,330 fps |
+
+One stream with `FramePipeline` given a second detector (two frames in flight), against one detector:
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| decimation 1, `ultrafast`, gate 4 | 215 -> 233 fps | 2,183 -> 2,843 fps |
+| decimation 2, `exact` | 479 -> 555 fps | 2,413 -> 2,630 fps |
+| decimation 2, `ultrafast`, gate 4 | 435 -> 555 fps | 2,604 -> 4,480 fps |
 
 Spreading streams over queue families (`ContextOptions::expected_streams`, `Context::StreamSlot`)
 helps only where the device has two compute families (the desktop: +82% at four streams over one

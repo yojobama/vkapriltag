@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -76,6 +77,8 @@ int main(int argc, char **argv) {
   uint32_t max_blobs = 0;
   // Use the frame-pipelined path (FramePipeline) instead of the serial chain; timings are throughput-only.
   bool pipelined = false;
+  // With --pipelined: frames in flight (2 adds a second GpuDetector).
+  int pipeline_depth = 1;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -111,6 +114,8 @@ int main(int argc, char **argv) {
       ingest_ab = true;
     } else if (arg == "--pipelined") {
       pipelined = true;
+    } else if (arg == "--pipeline-depth") {
+      pipeline_depth = std::min(2, std::max(1, std::stoi(next("--pipeline-depth"))));
     } else {
       std::cerr << "Unknown argument: " << arg << std::endl;
       return 1;
@@ -188,6 +193,13 @@ int main(int argc, char **argv) {
       config.normal_border = !tf->reversed_border;
 
       apriltag_vulkan::GpuDetector detector(ctx, config);
+      // The second detector needs its own lane; it shares the queue.
+      std::unique_ptr<apriltag_vulkan::vk::Lane> second_lane;
+      std::unique_ptr<apriltag_vulkan::GpuDetector> second_detector;
+      if (pipelined && pipeline_depth == 2) {
+        second_lane = ctx.CreateLane(0);
+        second_detector = std::make_unique<apriltag_vulkan::GpuDetector>(ctx, *second_lane, config);
+      }
       apriltag_vulkan::QuadDecode quad_decode(config);
       apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
 
@@ -228,7 +240,27 @@ int main(int argc, char **argv) {
 
       if (pipelined) {
         // The same buffer is pushed every iteration; a live camera must alternate two buffers (see FramePipeline::Push).
-        apriltag_vulkan::FramePipeline pipe(detector, quad_decode, tag_decoder);
+        std::unique_ptr<apriltag_vulkan::FramePipeline> pipe_owner =
+            second_detector
+                ? std::make_unique<apriltag_vulkan::FramePipeline>(detector, *second_detector,
+                                                                   quad_decode, tag_decoder)
+                : std::make_unique<apriltag_vulkan::FramePipeline>(detector, quad_decode,
+                                                                   tag_decoder);
+        apriltag_vulkan::FramePipeline &pipe = *pipe_owner;
+        // Dumps are numbered by returned frame, so they compare with the serial path's.
+        std::ofstream dump, dump_dets;
+        if (!dump_quads_path.empty()) dump.open(dump_quads_path, std::ios::trunc);
+        if (!dump_detections_path.empty()) dump_dets.open(dump_detections_path, std::ios::trunc);
+        int returned = 0;
+        auto record = [&](zarray_t *dets) {
+          if (dump.is_open()) {
+            apriltag_vulkan::validate::DumpCanonicalQuads(dump, returned, pipe.last_quads());
+          }
+          if (dump_dets.is_open()) {
+            apriltag_vulkan::validate::DumpDetections(dump_dets, returned, dets);
+          }
+          ++returned;
+        };
         for (int it = 0; it < iterations; ++it) {
           const auto t0 = std::chrono::steady_clock::now();
           zarray_t *done = pipe.Push(image.data, width, height, config.reversed_border);
@@ -239,12 +271,14 @@ int main(int argc, char **argv) {
             ours = done;
             profile = pipe.last_profile();
             gpu_totals.push_back(profile.total_ms);
+            record(done);
           }
         }
-        if (zarray_t *tail = pipe.Flush()) {
+        while (zarray_t *tail = pipe.Flush()) {
           ours = tail;
           profile = pipe.last_profile();
           gpu_totals.push_back(profile.total_ms);
+          record(tail);
         }
         quads = pipe.last_quads();
       } else {

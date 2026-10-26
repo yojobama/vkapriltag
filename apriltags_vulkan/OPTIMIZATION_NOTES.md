@@ -1981,3 +1981,18 @@ sort stages read the grey buffer in place of a copied decimated image; and `thre
 per thread. Identical output; `Detect()` 5.21 -> 4.78 ms at decimation 1 and 2.12 -> 2.04 ms at
 decimation 2 on the Orange Pi. Workgroup sizes, the sort's workgroup, longer `uf_init` runs and the
 Mali clock and power settings measured no better.
+
+## 27. The sort's largest blob split across workgroups, and two frames in flight - shipped
+
+Round 3 of profiling (`PERFORMANCE.md` 8r) found the sort limited by its single largest blob: one
+workgroup sorted it while the rest of the GPU waited. Blobs of more than 1,024 points are now sorted
+in runs of 1,024 by separate workgroups and merged by whole-GPU rounds; identical output, on by
+default at decimation 1. `Detect()` -5.8% on the Orange Pi and -10% on the RX 9060 XT at decimation 1;
+at decimation 2 it cost 2% on the Mali and stays off; with streams spread over both compute families of
+the desktop it costs 5% to 10% (`APRILTAG_VK_SORT_SPLIT=8192` turns it off). `FramePipeline` can take a
+second `GpuDetector`, keeping the Mali 99% busy instead of 83% to 93%: single-stream throughput +8% to
++28% on the Orange Pi and +9% to +72% on the desktop, at the cost of a second set of device buffers and
+one more frame of latency. Measured and not shipped: the quad refit inside the parallel loop (exact
+on MSVC, but GCC's default multiply-add fusion changes the last bit of some corners on AArch64), fitting
+the largest blobs first (mixed), zeroing `blob_size` in `uf_init` (no gain), and skipping the boundary
+points of rejected clusters (bounded: the counting pass would cost more than it saves).

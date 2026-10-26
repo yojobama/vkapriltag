@@ -77,6 +77,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_DEC1_ALIAS=0` | At decimation 1, copy the grey image into the decimated buffer instead of reading it in place. |
 | `APRILTAG_VK_SORT_CHUNK=<n>` | Rank-merge sort run length (a power of two, default 16); `0` selects the Batcher sorting network. See section 8k. |
 | `APRILTAG_VK_SORT_WG=<n>` | Workgroup size of the point sort (default 256, the maximum). |
+| `APRILTAG_VK_SORT_SPLIT=<n>` | Blobs of more than `n` points are sorted in runs of `n` by several workgroups and merged (a power of two; default 1,024 at decimation 1, off otherwise; `8192` turns it off). See section 8r. |
 | `APRILTAG_VK_PROBE_MARGIN=<grey levels>` | Margin gate before edge refinement (default off); overrides `TagDecoder`'s `probe_margin`. See section 8l. |
 | `APRILTAG_VK_PROBE_STATS=1`, `APRILTAG_VK_PROBE_CSV=<file>` | Per-quad probe histograms and one CSV row per quad (analysis aid). |
 | `APRILTAG_VK_TRACE=<file>` | Write a Chrome-trace JSON of the CPU and GPU spans. See section 9. |
@@ -741,7 +742,8 @@ GPU work and about 0.85 ms of CPU tail per frame (2.87 ms serial). Open items, l
   (items 1 to 3 below).
 - **Ingest.** Hardware JPEG decode into a dma-buf is outside the library and needs stride and
   offset on `ImportDmaBufFrame` (section 8d).
-- **Double-buffering the `FramePipeline` readback** so the GPU thread can chain frames: not measured.
+- **The quad refit in the parallel loop** (section 8r): -25% `quad_decode` on the desktop, held back
+  only by GCC's default multiply-add fusion; it needs a decision on `-ffp-contract=off`.
 - **The remaining CPU-tail items from profiling** (section 8p): the frame upload and the copy of the
   line-fit points, and the `matd` allocations in upstream's homography.
 
@@ -1701,6 +1703,73 @@ already at their maximum with the `performance` governors, and all four shader c
 is bound by DRAM traffic on a 4-byte-per-pixel `parent[]` array that does not fit in the L2.
 The Mali has no host-pointer import (`VK_EXT_external_memory_host`), so `bench_multiqueue --import`
 warns and runs without it there; dma-buf import is the Mali path.
+
+## 8r. Profiling round 3: the sort's largest blob, and two frames in flight
+
+**Profile.** Every profiler from sections 8p and 8q again, on both machines, in two configurations:
+`ultrafast` with margin gate 4 at decimation 1 on a 1280x720 frame (the common use) and `exact` at
+decimation 2. Every configuration is limited by the GPU (Orange Pi: 5.0 ms of GPU work in a 5.6 ms
+serial frame at decimation 1). The Mali's own utilisation counter read 82% to 93% with one pipelined
+stream, so the GPU idled between frames. The sort was 19% of the GPU spans at decimation 1 with
+little memory traffic and high starvation in the counters. The DRAM controller was 34% loaded (46.8 MB
+per frame). On the CPU, the 6.5% of blobs that fall back from the DP corner search took about 60% of
+the quad fit's time, and `heaptrack` counted 1,000 to 1,400 allocations per frame (upstream's `matd`).
+callgrind still stops inside the Mali driver, `perf annotate` crashes on this `perf` build, and AMD's
+Radeon GPU Analyzer was not run.
+
+**The sort is set by its largest blob.** One workgroup sorts each blob, so the one blob of more than
+2,048 points at decimation 1 runs on a single core while the rest of the GPU waits. Bound first, by
+leaving blobs above a cap unsorted (wrong output): cap 2,048 took the sort span from 863 to 550 us and
+`Detect()` down 7.8% on the Orange Pi; cap 1,024 down 10%; on the RX 9060 XT the sort fell from 132 to
+54 us. Halving the shared memory (the sorting network in place of the rank-merge) changed nothing, so
+the limit is the serial tail, not occupancy.
+
+**Changes** (each identical in output: the 15 canonical quad dumps on both machines, 60 configurations
+against the previous commit on each machine at decimations 1, 2 and 4 with four stress frames, every
+split length from 64 to 2,048 at decimations 1, 2 and 4, the split on the fused, unfused,
+non-pre-recorded and retry paths; dma-buf import at decimations 1 and 2, grey and YUYV; validation layer
+with synchronisation validation clean on both machines; ThreadSanitizer, AddressSanitizer and UBSan
+clean on the new paths):
+
+| change | Orange Pi | RX 9060 XT |
+| --- | --- | --- |
+| blobs of more than 1,024 points are listed by the per-blob sort, sorted in runs of 1,024 by one workgroup each, and merged by whole-GPU rounds of one thread per point (`sort_points_local_body.glsl` modes 1 and 2); on by default at decimation 1 only | sort span 824 -> 579 us; `Detect()` 4.77 -> 4.49 ms (-5.8%); `pipeline_total` 5.38 -> 5.08 ms; 1 stream 202 -> 215 fps; 4 streams on one queue 217 -> 232 fps | sort span 131 -> 100 us; `Detect()` 0.66 -> 0.59 ms (-10%); `pipeline_total` -7%; 1 stream +6%; 2 and 4 streams on one queue +6% and +7%; **2 and 4 streams spread over both compute families -5% and -10%** |
+| `FramePipeline` takes an optional second `GpuDetector` (with its own `vk::Lane`) and alternates frames between them, so the next GPU pass starts without waiting for the host; detections arrive two `Push()` calls late; opt-in | Mali utilisation 93% -> 99% (decimation 1) and 83% -> 99% (decimation 2); 1 stream: decimation 1 215 -> 233 fps, decimation 2 `exact` 479 -> 555, `ultrafast` gate 4 435 -> 555 | 1 stream: decimation 1 2,183 -> 2,843 fps, decimation 2 `exact` 2,413 -> 2,630, `ultrafast` gate 4 2,604 -> 4,480 |
+
+Split length: 512 was 0.7% better than 1,024 on the Orange Pi at decimation 1 and 5% worse on the
+desktop; 2,048 gained little and 256 lost (more merge rounds). At decimation 2 (a 2,048-point cap and
+one round) the split cost 2% on the Orange Pi, so it stays off there. With streams spread over both
+compute families of a discrete GPU the other streams already hide the long sort and the split's extra
+dispatches are pure cost: set `APRILTAG_VK_SORT_SPLIT=8192` there.
+
+Depth 2 is a throughput change: it doubles the device memory and, at full rate, the push-to-result
+latency (`bench_multiqueue`, free-running) goes from 9.2 to 12.9 ms on the Orange Pi at decimation 1
+and from 0.91 to 1.05 ms on the desktop. With several streams it changes nothing measurable; they
+already keep the GPU busy. `bench_multiqueue --depth 2` and `apriltag_vulkan_validate --pipelined
+--pipeline-depth 2` select it; the pipelined path of the validate tool now writes `--dump-quads` and
+`--dump-detections`, which match the serial path's byte for byte at depths 1 and 2.
+
+**Measured and not shipped:**
+
+- **The quad refit inside the parallel loop** (it runs serially after the per-blob fits): `quad_decode`
+  -25% on the desktop at decimation 1 with identical output there, but on the Orange Pi it changed the
+  last bit of the corner coordinates in 40 of 60 configurations. GCC on AArch64 fuses `a * b + c`
+  into multiply-adds by default (`-ffp-contract=fast`), and moving the code changes which ones; an
+  out-of-line function did not restore them. It could ship with `-ffp-contract=off` for the library,
+  which would change every GCC build's dumps once.
+- **Fitting the largest blobs first:** `quad_decode` +6% on the Orange Pi at decimation 1, -5% at
+  decimation 2; desktop 0% and -12%. Output identical; not worth the mixed result.
+- **Zeroing `blob_size` in `uf_init`** in place of the per-frame fill: identical output, no gain
+  (`Detect()` 4.55 ms against 4.51 ms with the fill).
+- **Skipping the boundary points of clusters that selection rejects** (71% of the 166,000 points at
+  decimation 1): the most it could save is the downstream stages' share, about 0.44 ms; knowing the
+  clusters first needs a counting pass, and `blob_diff` with its point stores removed (a bound build)
+  still takes 573 of its 749 us. Not built.
+
+**Found and not changed:** `bench_multiqueue --async-upload` reports a write-after-write hazard on
+the grey buffer under synchronisation validation (the transfer-queue upload, also in the previous
+commit); the validate tool does not destroy its reference `apriltag_detector_t` objects
+(LeakSanitizer).
 
 ## 9. Measuring
 
