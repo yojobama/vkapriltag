@@ -1,39 +1,13 @@
 #version 450
-// threshold.comp with uint8_t DecimatedImage and Thresholded (both change
-// together; the encoding stays 0/127/255).
+// As threshold.comp, with DecimatedImage and Thresholded stored as uint8_t per pixel (the encoding
+// stays 0/127/255).
+#extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
-
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint8_t decimated[]; };
-layout(std430, binding = 1) readonly buffer FilteredMinMax { uint minmax_filtered[]; };
 layout(std430, binding = 2) writeonly buffer Thresholded { uint8_t thresholded[]; };
+#define DECIMATED_AT(i) (decimated[(i)])
+#define STORE_THRESHOLDED(i, v) (thresholded[(i)] = uint8_t(v))
 
-layout(push_constant) uniform PushConstants {
-  uint decimated_width;
-  uint decimated_height;
-  uint min_white_black_diff;
-  uint block_width;
-} pc;
-
-void main() {
-  uint x = gl_GlobalInvocationID.x;
-  uint y = gl_GlobalInvocationID.y;
-  if (x >= pc.decimated_width || y >= pc.decimated_height) return;
-  uint i = y * pc.decimated_width + x;
-
-  // block_width is the host's ceil-rounded block grid (decimated_width need not be a multiple of 4).
-  uint packed = minmax_filtered[(x / 4u) + (y / 4u) * pc.block_width];
-  uint mn = packed & 0xffu;
-  uint mx = (packed >> 8u) & 0xffu;
-
-  uint result;
-  if (mx - mn < pc.min_white_black_diff) {
-    result = 127u;
-  } else {
-    uint thresh = mn + (mx - mn) / 2u;
-    result = (uint(decimated[i]) > thresh) ? 255u : 0u;
-  }
-  thresholded[i] = uint8_t(result);
-}
+#include "threshold_body.glsl"

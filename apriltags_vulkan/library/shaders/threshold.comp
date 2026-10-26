@@ -1,36 +1,11 @@
 #version 450
-// Final adaptive threshold: writes 127 (ambiguous), 0 (black) or 255 (white)
-// per decimated pixel (InternalThreshold). Dispatched 2D.
-layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+// DecimatedImage and Thresholded as uint per pixel; threshold_u8.comp is the uint8_t variant.
+// The shader is in threshold_body.glsl.
+#extension GL_GOOGLE_include_directive : require
 
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint decimated[]; };
-layout(std430, binding = 1) readonly buffer FilteredMinMax { uint minmax_filtered[]; };
 layout(std430, binding = 2) writeonly buffer Thresholded { uint thresholded[]; };
+#define DECIMATED_AT(i) (decimated[(i)])
+#define STORE_THRESHOLDED(i, v) (thresholded[(i)] = (v))
 
-layout(push_constant) uniform PushConstants {
-  uint decimated_width;
-  uint decimated_height;
-  uint min_white_black_diff;
-  uint block_width;
-} pc;
-
-void main() {
-  uint x = gl_GlobalInvocationID.x;
-  uint y = gl_GlobalInvocationID.y;
-  if (x >= pc.decimated_width || y >= pc.decimated_height) return;
-  uint i = y * pc.decimated_width + x;
-
-  // block_width is the host's ceil-rounded block grid (decimated_width need not be a multiple of 4).
-  uint packed = minmax_filtered[(x / 4u) + (y / 4u) * pc.block_width];
-  uint mn = packed & 0xffu;
-  uint mx = (packed >> 8u) & 0xffu;
-
-  uint result;
-  if (mx - mn < pc.min_white_black_diff) {
-    result = 127u;
-  } else {
-    uint thresh = mn + (mx - mn) / 2u;
-    result = (decimated[i] > thresh) ? 255u : 0u;
-  }
-  thresholded[i] = result;
-}
+#include "threshold_body.glsl"

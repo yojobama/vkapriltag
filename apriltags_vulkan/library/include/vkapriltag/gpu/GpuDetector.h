@@ -270,6 +270,8 @@ class GpuDetector {
 
   // --- Buffers (device-local, long-lived, sized once at construction) ---
   vk::Buffer gray_buf_, decimated_buf_;
+  // True when the threshold and sort stages read gray_buf_ as the decimated image.
+  bool alias_decimated_ = false;
   vk::Buffer minmax_unfiltered_buf_, minmax_filtered_buf_;
   vk::Buffer thresholded_buf_;
   // Reused as the per-pixel label (1 + root, or 0 if too small) once labelling converges.
@@ -352,6 +354,8 @@ class GpuDetector {
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
   // Pixels of a row each uf_init thread initialises.
   uint32_t uf_init_run_ = 4;
+  // Pixels of a row each threshold thread covers.
+  uint32_t threshold_run_ = 4;
   // Also performs the atomic compaction of boundary points.
   // uf_compress plus uf_final's count, for the last real compression of the first attempt.
   vk::ComputePipeline uf_compress_count_pl_;

@@ -377,6 +377,11 @@ void GpuDetector::CreatePipelines() {
   auto pick = [u8](const char *base_name, const char *u8_name) {
     return u8 ? u8_name : base_name;
   };
+  // At decimation 1 with one byte per pixel the decimated image is gray_buf_ itself, so the
+  // decimate pass is skipped; APRILTAG_VK_DEC1_ALIAS=0 keeps the copy.
+  const char *alias_env = std::getenv("APRILTAG_VK_DEC1_ALIAS");
+  alias_decimated_ = u8 && config_.decimation == 1 && !(alias_env != nullptr && alias_env[0] == '0');
+  const VkBuffer decimated_view = alias_decimated_ ? gray_buf_.get() : decimated_buf_.get();
 
   // Subgroup aggregation is used only for reduce_extents_hash, and not on integrated GPUs. Needs
   // ballot, arithmetic and shuffle.
@@ -391,13 +396,18 @@ void GpuDetector::CreatePipelines() {
                                      {config_.decimation});
   block_minmax_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("block_minmax", "block_minmax_u8")),
-      {decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_);
+      {decimated_view, minmax_unfiltered_buf_.get()}, 16, wg2d_);
   block_filter_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
       8, wg2d_);
+  // threshold covers this many pixels of a row per thread; APRILTAG_VK_THRESH_RUN overrides.
+  if (const char *v = std::getenv("APRILTAG_VK_THRESH_RUN")) {
+    threshold_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  }
   threshold_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("threshold", "threshold_u8")),
-      {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_);
+      {decimated_view, minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_,
+      {threshold_run_});
 
   // uf_init covers this many pixels of a row per thread; APRILTAG_VK_UF_INIT_RUN overrides.
   if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_RUN")) {
@@ -494,7 +504,7 @@ void GpuDetector::CreatePipelines() {
   sort_points_local_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
       {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
-       decimated_buf_.get(), line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
+       decimated_view, line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
        // binding 6: the device-side selected-blob count.
        selected_counter_buf_.get()},
       20, vk::WorkgroupSize{local_sort_cap_, 1, 1}, {local_sort_virtual_cap_, sort_chunk});
@@ -607,7 +617,8 @@ void GpuDetector::AddImportedFrame(const uint8_t *key, vk::Buffer buffer, bool y
   frame.decimate = vk::ComputePipeline(
       ctx_,
       ShaderPath(yuyv ? (u8 ? "decimate_yuyv_u8" : "decimate_yuyv") : (u8 ? "decimate_u8" : "decimate")),
-      {buffer.get(), decimated_buf_.get()}, 8, wg2d_, {config_.decimation});
+      {buffer.get(), alias_decimated_ ? gray_buf_.get() : decimated_buf_.get()}, 8, wg2d_,
+      {config_.decimation});
   frame.buffer = std::move(buffer);
   imported_frames_.push_back(std::move(frame));
 }
@@ -719,14 +730,18 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  (imported != nullptr ? imported->decimate : decimate_pl_)
-      .Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  if (imported != nullptr) {
+    imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  } else if (!alias_decimated_) {
+    decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  }
   block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 
   struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
       decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &thresh_pc);
+  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
+                          decimated_height_, &thresh_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
@@ -1261,14 +1276,18 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
                                                 block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  (imported != nullptr ? imported->decimate : decimate_pl_)
-      .Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  if (imported != nullptr) {
+    imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  } else if (!alias_decimated_) {
+    decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+  }
   block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
 
   struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
       decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &thresh_pc);
+  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
+                          decimated_height_, &thresh_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
