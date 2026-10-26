@@ -345,6 +345,10 @@ int main(int argc, char **argv) {
   }
   apriltag_family_t *tf = nullptr;
   if (!setup_tag_family(&tf, "tag36h11")) return 1;
+  struct FamilyOwner {
+    apriltag_family_t *tf;
+    ~FamilyOwner() { teardown_tag_family(&tf, "tag36h11"); }
+  } family_owner{tf};
   try {
     if (!camera.empty()) return RunCamera(camera, width, height, frames, tf, sync_mode);
     if (!pgm.empty()) return RunHeap(pgm, iterations, tf, yuyv_heap);
