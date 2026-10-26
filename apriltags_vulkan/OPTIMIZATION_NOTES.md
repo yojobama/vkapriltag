@@ -14,7 +14,7 @@ Where the current code stands (1.8.0, Orange Pi 5, 1280x800, decimation 2,
 and 3.13 ms at 1.7.0 and 2.49 and 3.50 ms at 1.6.0, with identical detections
 (items 23 to 27, `PERFORMANCE.md` sections 8m and 8s). Round 4 (item 28, section 8t) takes `Detect()`
 to 1.83 ms there and from 4.71 to 3.73 ms at decimation 1, and round 5 (item 29, section 8u) to 1.78
-and 3.44 ms, again with identical detections.
+and 3.44 ms, again with identical detections. Round 6 (item 30, section 8w) changes only the desktop.
 
 ## Summary
 
@@ -2072,3 +2072,17 @@ throughput with two frames in flight 233 -> 330 fps and 554 -> 714 fps; RX 9060 
 -23%, 4 streams +27% to +69% where the GPU is the limit. The CPU tail was profiled again: its 0.5 ms is
 1.8 ms of fit work over the four A76 cores (the A55 cores add nothing), not one slow blob, and thread
 counts or core pinning did not shorten it.
+
+## 30. Profiling round 6: sort workgroups of 1,024 on discrete GPUs - shipped
+
+Dispatch times, the Mali counters, `malioc`, RenderDoc, the Chrome trace and the sanitisers again
+(`PERFORMANCE.md` 8w). One change: the point sort runs in workgroups of up to 1,024 threads on discrete
+GPUs (256 stays on integrated GPUs); RX 9060 XT sort at decimation 2 47 to 68 -> about 25 us,
+`Detect()` about -3.6% at decimation 1, identical output.
+
+- **Rejected:** `blob_diff` in two passes through a candidate list (Mali 759 -> 833 us), a
+  piece-length shortcut in its size test (759 -> 838 us), nested merge bands (no gain), the final line
+  fits in parallel (-7% at decimation 1, +7% at decimation 2) and desktop sort splits of 128 to 512.
+- **Found:** GPU timestamps cost about 0.2 ms per Mali frame; every remaining Mali shader is at full
+  occupancy except `select_blobs` (44 us); the CPU tail has about 220 us of serial work (span grouping
+  before the workers, `update_fit` after them) and A55 workers take about 120 us to wake.

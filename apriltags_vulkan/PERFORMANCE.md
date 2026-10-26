@@ -86,7 +86,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_THRESH_RUN=<n>` | Pixels of a row each `threshold` thread covers (default 4). |
 | `APRILTAG_VK_DEC1_ALIAS=0` | At decimation 1, copy the grey image into the decimated buffer instead of reading it in place. |
 | `APRILTAG_VK_SORT_CHUNK=<n>` | Rank-merge sort run length (a power of two, default 16); `0` selects the Batcher sorting network. See section 8k. |
-| `APRILTAG_VK_SORT_WG=<n>` | Workgroup size of the point sort (default 256, the maximum). |
+| `APRILTAG_VK_SORT_WG=<n>` | Workgroup size of the point sort (default: the device maximum, at most 256 on integrated GPUs and 1,024 on others). See section 8w. |
 | `APRILTAG_VK_SORT_SPLIT=<n>` | Blobs of more than `n` points are sorted in runs of `n` by several workgroups and merged (a power of two; default 1,024 at decimation 1, off otherwise; `8192` turns it off). See section 8r. |
 | `APRILTAG_VK_PROBE_MARGIN=<grey levels>` | Margin gate before edge refinement (default off); overrides `TagDecoder`'s `probe_margin`. See section 8l. |
 | `APRILTAG_VK_PROBE_STATS=1`, `APRILTAG_VK_PROBE_CSV=<file>` | Per-quad probe histograms and one CSV row per quad (analysis aid). |
@@ -2045,6 +2045,57 @@ RX 9060 XT:
 
 The loss section 8s recorded (4 streams over both compute families at decimation 1 with the sort
 split) is gone: +37% with the split and +43% without it (`APRILTAG_VK_SORT_SPLIT=8192`, 5,242 fps).
+
+## 8w. Profiling round 6: what is left, and one change
+
+**Instrumentation.** Per-dispatch GPU times (`APRILTAG_VK_DISPATCH_TIMES`), the Mali hardware counters
+and `malioc` on the Orange Pi; RenderDoc with AMD's counters on the RX 9060 XT; the Chrome trace of the
+CPU tail; the validation layer with shader-access synchronisation analysis; ASan, UBSan and LSan on
+both machines (MSVC on the desktop, GCC 14 on the Orange Pi) and TSan on the Orange Pi.
+
+**Where the Mali time goes** (decimation 1, medians in us): `blob_diff` 760, `uf_merge` 435, the sort
+383 + 142 + 23 + 38, `uf_count_runs` 307, `uf_init_scan` 296, the extents reduction 227, `hash_group`
+142, `scatter` 142, the threshold 119 + 50, `select_blobs` 44, the scan 28. `malioc` puts every
+shader at full occupancy except `select_blobs` (64 registers, half occupancy, 44 us). Other findings:
+
+- GPU timestamps cost about 0.2 ms per frame on the Mali: `Detect()` without them is 3.23 ms at
+  decimation 1 and 1.59 ms at decimation 2. The spans and dispatch times read high by that much there.
+- Small buffer fills are free (ten extra fills measured no difference), `vkQueueSubmit` takes 19 us,
+  and spinning on the fence instead of waiting gained nothing.
+- The CPU tail (`quad_decode`, about 500 us at decimation 1) is about 59 us of serial span grouping
+  before the workers start, 280 us in parallel and a 160 us serial tail, of which `update_fit` is about
+  100 us. Waking a worker takes about 120 us on an A55 core and 60 us on an A76.
+
+**On the RX 9060 XT** (RenderDoc): with frames written into mappable device memory (section 8u),
+`block_minmax` reads them over PCIe in 16 us at 63% memory stall, against 3 us from a device-local
+copy; the 38 us copy saved still outweighs it. The second merge phase takes 23 us at decimation 2;
+`hash_group` and `scatter` stay about 60% memory-stalled. The card runs in two clock states about 1.45x
+apart, so single desktop runs are noisy.
+
+**Change** (identical output: canonical dumps, 95 configurations, 42 record paths and 84 fallback
+combinations on the desktop; integrated GPUs are unaffected):
+
+| change | where | effect |
+| --- | --- | --- |
+| point sort in workgroups of up to 1,024 threads on discrete GPUs (256 kept on integrated GPUs, where larger was slower) | RX 9060 XT | sort at decimation 2 (one large blob, no split) 47 to 68 -> about 25 us, at decimation 1 about 102 -> 88 us; `Detect()` about -3.6% at decimation 1 |
+
+**Measured and not shipped:**
+
+- `blob_diff` in two passes, the candidate pixels listed with one counter increment per subgroup and
+  then processed densely: Mali 759 -> 833 us (368 + 446 us); slower on the desktop as well.
+- A shortcut in `blob_diff`'s size test through the piece lengths: 759 -> 838 us on the Mali.
+- Merge bands nested over several levels on the desktop: no net gain over bands of 8.
+- The final line fits in parallel on the worker pool (MSVC): `quad_decode` -7% at decimation 1 but
+  +7% at decimation 2.
+- Sort splits of 128 to 512 points on the desktop: slower.
+
+**Sanitisers and validation.** Clean: MSVC ASan on the desktop (86 runs), GCC ASan, UBSan (with
+`float-cast-overflow`) and LSan on the Orange Pi (92 runs) and TSan there (23 runs, 8 CPU threads and
+pipelined runs), covering the stress frames, `--max-uf 1`, every record path and the environment
+switches for the fallbacks.
+
+The remaining Mali stages are each load/store-bound at full occupancy, and the changes tried on them
+this round were slower; what remains on the CPU side is the serial part of the quad fit.
 
 ## 9. Measuring
 
