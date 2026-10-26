@@ -324,6 +324,8 @@ class GpuDetector {
   // True when reduce_extents_hash_atomic64.comp is the reduction shader; select_blobs.comp then
   // unbiases gx_sum/gy_sum.
   bool extents_atomic64_ = false;
+  // True when the extents reduction takes 4 points per thread (reduce_extents_hash*_x4.comp).
+  bool reduce_x4_ = false;
   // Backs last_line_fit_points only on the staging path.
   std::vector<RawLineFitPoint> linefit_scratch_;
 

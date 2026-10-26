@@ -353,7 +353,7 @@ void GpuDetector::CreateBuffers() {
 
   // VkDispatchIndirectCommands built on the device by build_indirect_args_pl_.
   {
-    // Raw blobs, boundary points, selected blobs.
+    // Slot 1: the boundary points, one per thread; slot 2: 4 per thread.
     vk::Buffer b(ctx_, 3 * 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                 vk::MemoryKind::DeviceLocal);
     device_bytes_ += b.size();
@@ -563,15 +563,20 @@ void GpuDetector::CreatePipelines() {
   // ComputePipeline binds its buffers at construction.
   build_indirect_args_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("build_indirect_args"),
-      {raw_blob_counter_buf_.get(), blob_args_buf_.get()}, 16,
+      {raw_blob_counter_buf_.get(), blob_args_buf_.get()}, 20,
       vk::WorkgroupSize{1, 1, 1});
   build_qbp_args_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("build_indirect_args"),
-      {qbp_counter_buf_.get(), indirect_args_buf_.get()}, 16, vk::WorkgroupSize{1, 1, 1});
+      {qbp_counter_buf_.get(), indirect_args_buf_.get()}, 20, vk::WorkgroupSize{1, 1, 1});
   // Reduction variant priority: subgroup, then 64-bit atomic, then plain 32-bit. The atomic64
   // variant views extents_buf_ again at binding 4 as uint64_t words.
   const bool extents_atomic64 = !subgroup && ctx_.caps().has_int64_atomics;
   extents_atomic64_ = extents_atomic64;
+  // The atomic variants take 4 points per thread; APRILTAG_VK_REDUCE_X4=0 keeps one.
+  reduce_x4_ = !subgroup;
+  if (const char *v = std::getenv("APRILTAG_VK_REDUCE_X4")) {
+    reduce_x4_ = reduce_x4_ && v[0] != '0';
+  }
   // Binding 4 is bound for all three variants so binding 5 (boundary-point count) keeps its index.
   std::vector<VkBuffer> reduce_extents_buffers{qbp_compacted_buf_.get(), point_slot_buf_.get(),
                                                slot_dense_buf_.get(),   extents_buf_.get(),
@@ -579,8 +584,10 @@ void GpuDetector::CreatePipelines() {
   reduce_extents_hash_pl_ = vk::ComputePipeline(
       ctx_,
       ShaderPath(subgroup ? "reduce_extents_hash_subgroup"
-                          : (extents_atomic64 ? "reduce_extents_hash_atomic64"
-                                              : "reduce_extents_hash")),
+                 : reduce_x4_ ? (extents_atomic64 ? "reduce_extents_hash_atomic64_x4"
+                                                  : "reduce_extents_hash_x4")
+                              : (extents_atomic64 ? "reduce_extents_hash_atomic64"
+                                                  : "reduce_extents_hash")),
       reduce_extents_buffers, 12, wg1d_);
   scatter_index_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("scatter_index_points"),
@@ -855,7 +862,8 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
 
   // Slot 1 of the indirect args: ceil(boundary points / wg1d), for hash_group, reduce_extents_hash
   // and scatter_index_points. The counts stay on the device.
-  struct { uint32_t wg, slot, divide, clamp; } qbp_args_pc{wg1d_.x, 1u, 1u, qbp_capacity_};
+  struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{wg1d_.x, 1u, 1u,
+                                                                       qbp_capacity_, 2u};
   build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
@@ -868,14 +876,15 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
 
   // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
   // bounds-checks against max_raw_blobs. reduce_extents_hash does not read them.
-  struct { uint32_t wg, slot, divide, clamp; } build_indirect_pc{wg1d_.x, 0u, 1u,
-                                                                config_.max_raw_blobs};
+  struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
+      wg1d_.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
   build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
   struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{0u, config_.max_raw_blobs,
                                                                          1u};
-  reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &reduce_pc);
+  reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), reduce_x4_ ? 24 : 12,
+                                           &reduce_pc);
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
@@ -1479,7 +1488,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // Slot 1 of the indirect args: ceil(boundary points / wg1d), for
   // hash_group, reduce_extents_hash and scatter_index_points.
   if (fuse) {
-    struct { uint32_t wg, slot, divide, clamp; } qbp_args_pc{wg1d_.x, 1u, 1u, qbp_capacity_};
+    struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{wg1d_.x, 1u, 1u,
+                                                                       qbp_capacity_, 2u};
     build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   }
@@ -1497,17 +1507,19 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
 
     // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
     // bounds-checks against max_raw_blobs.
-    struct { uint32_t wg, slot, divide, clamp; } build_indirect_pc{wg1d_.x, 0u, 1u,
-                                                                  config_.max_raw_blobs};
+    struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
+        wg1d_.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
     build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
 
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
     struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{
         qbp_count, config_.max_raw_blobs, fuse ? 1u : 0u};
     if (fuse) {
-      reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &reduce_pc);
+      reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(),
+                                               reduce_x4_ ? 24 : 12, &reduce_pc);
     } else {
-      reduce_extents_hash_pl_.Dispatch1D(cmd, qbp_count, &reduce_pc);
+      reduce_extents_hash_pl_.Dispatch1D(cmd, reduce_x4_ ? (qbp_count + 3u) / 4u : qbp_count,
+                                         &reduce_pc);
     }
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));

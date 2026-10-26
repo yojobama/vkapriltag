@@ -1,0 +1,5 @@
+#version 450
+// reduce_extents_hash.comp with 4 points per thread; see reduce_extents_hash_x4_body.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "reduce_extents_hash_x4_body.glsl"

@@ -8,13 +8,13 @@ layout(local_size_x_id = 0, local_size_x = 1) in;
 //
 //   raw blob count       -> select_blobs (slot 0 of GpuDetector's blob_args_buf_)
 //   boundary point count -> hash_group, reduce_extents_hash, scatter (slot 1 of
-//                           indirect_args_buf_)
+//                           indirect_args_buf_), and the 4-points-per-thread reduction (slot 2)
 //
 // The sort's arguments (one workgroup per selected blob) are written by
 // scan_blob_counts.comp.
 //
 // divide_by_workgroup_size == 0 gives one workgroup per item; clamp_to bounds
-// the count.
+// the count. quarter_slot, unless 0xFFFFFFFF, also gets a command for 4 items per invocation.
 layout(std430, binding = 0) readonly buffer Count { uint count; };
 layout(std430, binding = 1) writeonly buffer IndirectArgs { uint args[]; };
 
@@ -23,6 +23,7 @@ layout(push_constant) uniform PushConstants {
   uint slot;
   uint divide_by_workgroup_size;
   uint clamp_to;
+  uint quarter_slot;
 } pc;
 
 void main() {
@@ -33,4 +34,10 @@ void main() {
   args[pc.slot * 3u + 0u] = groups;
   args[pc.slot * 3u + 1u] = 1u;
   args[pc.slot * 3u + 2u] = 1u;
+  if (pc.quarter_slot != 0xFFFFFFFFu) {
+    uint per_group = 4u * pc.workgroup_size;
+    args[pc.quarter_slot * 3u + 0u] = (n + per_group - 1u) / per_group;
+    args[pc.quarter_slot * 3u + 1u] = 1u;
+    args[pc.quarter_slot * 3u + 2u] = 1u;
+  }
 }

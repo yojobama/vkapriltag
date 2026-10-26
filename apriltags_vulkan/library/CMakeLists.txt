@@ -73,6 +73,8 @@ set(SHADER_SOURCES
   shaders/build_indirect_args.comp
   shaders/reduce_extents_hash.comp
   shaders/reduce_extents_hash_atomic64.comp
+  shaders/reduce_extents_hash_atomic64_x4.comp
+  shaders/reduce_extents_hash_x4.comp
   shaders/reduce_extents_hash_subgroup.comp
   shaders/scatter_index_points.comp
 )
