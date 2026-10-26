@@ -87,26 +87,43 @@ void main() {
   uint rep0;
   if (!Usable(idx, rep0)) return;
 
+  // Every candidate neighbour has code 2 - c0, and E-SE, SE-S and S-SW are 4-adjacent, so a
+  // candidate next to another candidate in that chain shares its root and its blob-size test.
   uint rE = 0u, rSE = 0u, rS = 0u, rSW = 0u;
-  bool wantE = candE && Usable(idxE, rE);
-  bool wantSE = candSE && Usable(idxSE, rSE);
   bool wantS = candS && Usable(idxS, rS);
-  bool wantSW = false;
-  if (candSW && Usable(idxSW, rSW)) {
-    // Skip the SW connection when W and S are labelled, unambiguous and differ:
-    // W's own SE connection already covers that edge.
-    bool sw_is_duplicate = false;
-    if (x != 1u) {
-      uint cW = CodeAt(idxW);
-      if (cW != 1u && cS != 1u && cS != cW) {
-        uint rW;
-        if (Usable(idxW, rW)) {
-          // wantS is Usable(S) whenever S is a candidate; otherwise read it here.
-          sw_is_duplicate = candS ? wantS : Usable(idxS, rS);
-        }
-      }
+  bool wantSE = false;
+  if (candSE) {
+    if (candS) {
+      rSE = rS;
+      wantSE = wantS;
+    } else {
+      wantSE = Usable(idxSE, rSE);
     }
-    wantSW = !sw_is_duplicate;
+  }
+  bool wantE = false;
+  if (candE) {
+    if (candSE) {
+      rE = rSE;
+      wantE = wantSE;
+    } else {
+      wantE = Usable(idxE, rE);
+    }
+  }
+  bool wantSW = false;
+  if (candSW) {
+    if (candS) {
+      rSW = rS;
+      wantSW = wantS;
+    } else {
+      wantSW = Usable(idxSW, rSW);
+    }
+  }
+  // Skip the SW connection when W and S are labelled, unambiguous and differ: W's own SE
+  // connection already covers that edge. W and S each share a usable blob, with SW or with this
+  // pixel, so their blob-size tests always pass.
+  if (wantSW && x != 1u) {
+    uint cW = CodeAt(idxW);
+    if (cW != 1u && cS != 1u && cS != cW) wantSW = false;
   }
 
   // Gradient signs from code comparison (codes are monotonic in threshold
