@@ -350,6 +350,8 @@ class GpuDetector {
   vk::ComputePipeline block_filter_pl_;
   vk::ComputePipeline threshold_pl_;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
+  // Pixels of a row each uf_init thread initialises.
+  uint32_t uf_init_run_ = 4;
   // Also performs the atomic compaction of boundary points.
   // uf_compress plus uf_final's count, for the last real compression of the first attempt.
   vk::ComputePipeline uf_compress_count_pl_;

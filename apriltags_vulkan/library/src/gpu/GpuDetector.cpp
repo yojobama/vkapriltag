@@ -399,9 +399,13 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(pick("threshold", "threshold_u8")),
       {decimated_buf_.get(), minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_);
 
+  // uf_init covers this many pixels of a row per thread; APRILTAG_VK_UF_INIT_RUN overrides.
+  if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_RUN")) {
+    uf_init_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  }
   uf_init_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
-      8, wg2d_);
+      8, wg2d_, {uf_init_run_});
   // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
   // APRILTAG_VK_FIND_MODE overrides.
   uint32_t find_mode = 1u;
@@ -726,7 +730,8 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
-  uf_init_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
+  uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+                        decimated_height_, &dwdh_pc);
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
   if (chunk == 1) {
@@ -1267,7 +1272,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
-  uf_init_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dwdh_pc);
+  uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+                        decimated_height_, &dwdh_pc);
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
   struct UfCompressPc { uint32_t dw, dh, honour_changed_flag; };

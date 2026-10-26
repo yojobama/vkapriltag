@@ -1,25 +1,9 @@
 #version 450
-// Initialises the union-find parent array: a pixel joins its left neighbour
-// when both hold the same non-ambiguous value, so each horizontal run is one
-// component rooted at its leftmost (minimum) index. Ambiguous pixels (127) stay
-// their own root. Dispatched 2D so x comes from gl_GlobalInvocationID.x.
-layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+// Thresholded as uint per pixel; uf_init_u8.comp is the uint8_t variant.
+// The shader is in uf_init_body.glsl.
+#extension GL_GOOGLE_include_directive : require
 
-layout(std430, binding = 0) writeonly buffer Parent { uint parent[]; };
 layout(std430, binding = 1) readonly buffer Thresholded { uint thresholded[]; };
+#define THRESHOLDED_AT(i) (thresholded[(i)])
 
-layout(push_constant) uniform PushConstants {
-  uint width;
-  uint height;
-} pc;
-
-void main() {
-  uint x = gl_GlobalInvocationID.x;
-  uint y = gl_GlobalInvocationID.y;
-  if (x >= pc.width || y >= pc.height) return;
-  uint i = y * pc.width + x;
-
-  uint v = thresholded[i];
-  bool join_left = (v != 127u) && (x > 0u) && (thresholded[i - 1u] == v);
-  parent[i] = join_left ? (i - 1u) : i;
-}
+#include "uf_init_body.glsl"
