@@ -89,6 +89,10 @@ Design decisions and rationale removed from source comments. Measurements live i
 - 64-bit add exactness: adding `(uint64(uint(v)) << 32) | 1` increments the high half by v mod 2^32, identical to the 32-bit atomicAdd, and the low half by one. The low half never carries into the high half because count is bounded by boundary-point capacity (< 2^32). Nothing to unpack afterwards: the struct fields are those halves.
 - gx/gy are structurally zero for two of four connection types (E is (+/-1, 0), S is (0, +/-1); only SE/SW carry both), so about half the points would issue an atomic RMW adding zero. Skipping is bit-identical and, unlike a saturating guard, tests a value already in a register.
 
+### reduce_extents_hash_x4_body.glsl
+- 4 consecutive boundary points per thread, combined while they map to the same extents slot, then one set of guarded min/max atomics and the adds per run. blob_diff appends a pixel's points together, usually for one blob pair, so this cuts the atomics. Used by the atomic variants (integrated GPUs, devices without subgroups); its dispatch arguments are build_indirect_args' quarter slot.
+- Sums are exact: the 64-bit adds carry the same per-point totals (count, the +1 biases) as one point at a time, and min/max fold exactly.
+
 ### reduce_extents_hash_subgroup.comp
 - Needs ARITHMETIC beyond what uf_final_subgroup.comp needs because it reduces per-point values, not just counts; SHUFFLE for the same runtime-lane-index reason as uf_final_subgroup.comp (see its subgroupBroadcast vs subgroupShuffle comment).
 - Motivation: the scalar version issues 8 atomics per boundary point keyed by raw blob index (~1.27M at 1080p); this reduces all 8 across every lane sharing a key before touching memory.
@@ -110,6 +114,9 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Geometric prefilters (aspect_max/fill_min/fill_max): defaults are no-ops; see DetectorConfig::aspect_max/fill_min/fill_max for the derivation and corpus measurements.
 - Polarity test: no GLSL `double`, since float64 (shaderFloat64) is optional and unsupported on Mali and most mobile GPUs, where using it fails pipeline creation outright. The CUDA original's dot() returns float anyway. Only the sign matters and sum2 is an exact integer, accumulated in int32 like the reduce atomics; a positive scale keeps the sign, so 2*dot clears the 0.5. fp32 rounding of sum2 (ulp ~64 at realistic magnitudes) is far below the correction terms, so it can only disagree with a float64 version for blobs essentially exactly on the polarity boundary.
 - Bounding-box test history: the earlier `bbox area < tag_width` compared a pixel area against tag_width (in bit squares, 8 for tag36h11), a unit mismatch that rejected almost nothing. Zero width/height is a hard rejection as it would divide by zero below.
+
+### sort_points_local_body.glsl, kRankAll
+- Blobs of at most kRankAll (256) points are sorted by ranking: each key's rank is the number of smaller keys, counted against all of the blob's keys read four at a time from a uvec4 copy in shared memory. Packed keys are unique, so the order is the rank-merge sort's. Only in mode 0; one key per load had lost (OPTIMIZATION_NOTES.md item 22), and 64, 512 or 1024 were slower than 256 on the Mali.
 
 ### sort_points_large*.comp
 - The same shader as sort_points_local*.comp for modes 1 and 2 (the split sort's runs and merge rounds), with the large-blob list declared read-only. Only mode 0 writes it, and with the validation layer's shader-access analysis a writable binding in the runs or merge dispatch reads as a write before the next round's indirect argument read.
@@ -168,7 +175,14 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Needs subgroup arithmetic and at most 64 subgroups per workgroup (sg_last); otherwise uf_init.comp and a compression run.
 - With a width that is a multiple of 4 the codes are read as one word and the parents stored as one uvec4.
 
+### uf_count_runs_body.glsl
+- Integrated GPUs only (count_runs_): uf_compress_count walked all 921k pixels at decimation 1 to their roots so blob_diff could read a root in one load; this pass touches the codes of every pixel but walks and writes only from the first pixel of each run piece (a run, cut where uf_init_scan's segments end) and from each segment's last pixel.
+- Two hops are enough afterwards: uf_init_scan points every pixel at its piece's first pixel or at the previous segment's last pixel; the merge only hooks roots (piece starts) to roots, and its path splitting only repoints a walked node at its grandparent, which is again a piece start or a segment's last pixel. All of those point at their root after this pass, so parent[parent[i]] is the root.
+- Counting: uf_init_scan writes each piece's length, capped at min_blob_pixels, at its first pixel (kPieceLengths), so a root's entry starts at its own piece's share and needs no fill; every other piece adds its capped length unless the root's count has reached the floor. blob_size[root] >= min_blob_pixels exactly when the blob has that many pixels, by the argument in uf_final.comp: capping a piece at the floor cannot move the total across it.
+- On the RX 9060 XT it is 15-20 us slower than uf_compress_count (blob_diff's extra hop and the scan's stores cost more than the saved walks), so discrete GPUs keep the compression.
+
 ### uf_merge_body.glsl
+- Banded merging (merge_band_, discrete GPUs): one pass joins every vertical overlap at once, so the run roots of a tall component hook row onto row and later finds walk one hop per row; RenderDoc's AMD counters showed the pass latency-bound (93% L2 hits, no memory stalls). Phase 0 joins the rows inside bands of 8, phase 1 only the rows across band boundaries; together they cover every edge once, and union-find state carries over between dispatches. On the Mali-G610 the in-band pass alone costs nearly as much as one pass.
 - One pass: doUnion retries its atomicMin until it hooks a root (old == the root it found), so when a union returns its two pixels share a root, and later unions only join components. After one pass every vertical run overlap has been joined, so the verification merge, which never found a change in 105 configurations of v1.8.0, is off (APRILTAG_VK_UF_VERIFY=1). Stale plain loads in find() only make a walk end early at a node that is no longer a root; the atomicMin then returns its current parent and the loop continues.
 - uf_merge_x4_u8.comp: 4 pixels per thread with the codes read as one word per row, on integrated GPUs (578 -> 432 us on the Mali-G610 at decimation 1, 92 -> 124 us on the RX 9060 XT).
 - Only the down edge is considered; with uf_init's horizontal runs the two cover every edge exactly once.
@@ -296,6 +310,9 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Indirect dispatch needs IndirectDispatchBarrier (compute -> DRAW_INDIRECT stage); a plain Compute barrier does not cover it. See build_indirect_args.comp.
 - DispatchProbe (APRILTAG_VK_DISPATCH_TIMES) timestamps the end of every dispatch from inside Dispatch*, so no call site changes; its state is global because it serves one detector per process, and the pipeline keeps its shader label for the report.
 - The host-read barrier is needed since a fence alone does not make device writes host-visible in the Vulkan memory model.
+
+### Grey upload on discrete GPUs
+- gray_buf_ asks for DEVICE_LOCAL | HOST_VISIBLE memory on every device, not only unified memory: discrete GPUs expose a 256 MiB window of it even without resizable BAR, and writing the frame there removes the staging copy RenderDoc timed at 38 us on the RX 9060 XT. Host writes cross PCIe as write-combined stores (about 7 us more per frame than the staging memcpy), which costs a little only when the CPU is the limit. Falls back to the staging path when no such memory is available.
 
 ### Buffer / MemoryKind
 - MemoryKind (rather than raw VkMemoryPropertyFlags) keeps unified-memory fallbacks in one place.

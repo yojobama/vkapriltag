@@ -75,6 +75,11 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_FUSED_THRESHOLD=0` | Keep decimation, block min/max, block filter and threshold as separate passes. See section 8t. |
 | `APRILTAG_VK_MERGE_X4=0\|1` | `uf_merge` with 4 pixels per thread (default: on integrated GPUs only). See section 8t. |
 | `APRILTAG_VK_DISPATCH_TIMES=1` | Print the median GPU time of every dispatch when the detector is destroyed (one detector per process). See section 9. |
+| `APRILTAG_VK_GRAY_MAPPED=0` | On discrete GPUs, upload frames through a staging buffer and a GPU copy instead of writing them into mappable device memory. See section 8u. |
+| `APRILTAG_VK_MERGE_BAND=<n>` | Merge rows in bands of `n` (a power of two) before the band boundaries; `0` merges in one pass (default: 8 on discrete GPUs, 0 on integrated). See section 8u. |
+| `APRILTAG_VK_REDUCE_X4=0` | One boundary point per thread in the atomic extents reductions instead of 4. See section 8u. |
+| `APRILTAG_VK_SORT_RANK_ALL=<n>` | Blobs of at most `n` points are sorted by ranking every key in one pass (default 256; `0` disables). See section 8u. |
+| `APRILTAG_VK_COUNT_RUNS=0\|1` | Count blob sizes per run piece and find roots in two hops (default: integrated GPUs). See section 8u. |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
 | `APRILTAG_VK_PRERECORD=0` | Pre-recorded command buffers are on by default for the fused single-submission frame; `0` records every frame instead. See sections 8f and 8g. |
 | `APRILTAG_VK_UF_INIT_RUN=<n>` | Pixels of a row each `uf_init` thread initialises (default 4). See section 8q. |
@@ -1919,6 +1924,87 @@ and `dmabuf_import_test`).
   input order instead); the unions are 350 of `uf_merge`'s 578 us; counting is about 120 of
   `uf_compress_count`'s 409 us.
 
+## 8u. Profiling round 5: RenderDoc on the desktop, and five more changes
+
+**Instrumentation.** Everything from section 8t again, plus RenderDoc 1.45 on the RX 9060 XT (a
+capture of one frame through the in-application API, then a replay script that times every command
+and reads AMD's GPUPerfAPI counters per dispatch; see section 9), `perf`, `heaptrack` and the Chrome
+trace for the CPU tail on the Orange Pi, and the Mali hardware counters against v1.8.0.
+
+**What RenderDoc showed on the desktop.**
+
+- Every frame began with a 38 us GPU copy of the 0.9 MB grey frame from the staging buffer, a
+  transfer the in-app spans had attributed to "clear". The card has a 256 MiB device-local window the
+  host can map (no resizable BAR needed), so the frame is now written there directly.
+- `uf_merge` was the largest stage (83 us at decimation 1, 49 to 101 us at decimation 2 depending on
+  the run) with a 93% L2 hit rate and no memory stalls: latency-bound on union-find chains, not
+  bandwidth. A tall component's run roots hook one row onto the next, so later finds walk one hop per
+  row. Merging inside bands of 8 rows first, then across the band boundaries, keeps chains short.
+- `hash_group` and `scatter` spend 57% to 66% of their cycles in memory stalls (random gathers); the
+  4-points-per-thread versions tried below did not help them.
+
+**Mali counters** (per frame, v1.8.0 against round 4): load/store issue cycles -31%, partial reads
+-33%, instruction issue starvation -19% to -22%, L2 read lookups -14%. Every shader is still
+load/store-bound.
+
+**CPU tail.** `perf`: the quad fit is 54% of CPU samples with `ultrafast` at decimation 1 and `exact`
+refinement 72% at decimation 2, as in round 3. The trace shows `quad.decode_all` at about 500 us for
+1.8 ms of fit work: the slowest blob (up to 540 us for a 2,904-point blob that falls back to the
+combinatorial search) is not the limit, and 4 threads on the A76 cores are as fast as 8 on all cores,
+so the A55 cores add nothing. Thread counts of 4 to 8 and core pinning measured no better. The Orange
+Pi stays GPU-bound for throughput.
+
+**Changes** (each identical in output: canonical dumps, 95 configurations against v1.8.0, 42 record
+paths and 80 fallback combinations per machine, synthetic CSVs, validation layer with shader-access
+synchronisation analysis):
+
+| change | where | effect |
+| --- | --- | --- |
+| frames written into mappable device memory on discrete GPUs (`APRILTAG_VK_GRAY_MAPPED=0` keeps the staging copy) | RX 9060 XT | 4 streams +13% to +32%, 1 stream +2% to +4%; 4 streams with `exact` at decimation 2 (CPU-bound) -2% |
+| `uf_merge` in two phases, inside 8-row bands then across them, on discrete GPUs | RX 9060 XT | `uf_merge` 95 -> 59 us (decimation 1), 86 -> 32 us (decimation 2); `Detect()` -11% and about -29%; 4 streams +10% |
+| extents reduction with 4 boundary points per thread, combining a run of points in the same blob before its atomics (atomic variants) | Orange Pi | reduction 341 -> 223 us; `Detect()` 3.73 -> 3.63 ms, 1.83 -> 1.78 ms (RX 9060 XT without subgroups: 98 -> 20 us) |
+| blobs of up to 256 points sorted by ranking every key, four keys per shared load | Orange Pi | sort 425 -> 386 us; `Detect()` 3.63 -> 3.58 ms at decimation 1, unchanged at decimation 2 |
+| blob sizes counted per run piece and roots found in two hops, in place of `uf_compress_count`, on integrated GPUs | Orange Pi | `uf_compress_count` 420 us replaced by `uf_count_runs` 303 us, the `blob_size` fill gone, `uf_init_scan` +63 us, `blob_diff` +50 us; `Detect()` 3.59 -> 3.44 ms, 1.79 -> 1.78 ms |
+
+Against v1.8.0 and round 4 (section 8t), interleaved:
+
+| Orange Pi | v1.8.0 | round 4 | round 5 |
+| --- | --- | --- | --- |
+| `Detect()`, dec. 1 / dec. 2 `exact` | 4.72 / 2.19 ms | 3.73 / 1.84 ms | 3.44 / 1.78 ms |
+| `pipeline_total`, dec. 1 / dec. 2 | 5.33 / 3.05 ms | 4.38 / 2.68 ms | 4.09 / 2.62 ms |
+| dec. 1, 1 stream / depth 2 / 4 streams | 216 / 233 / 230 fps | 271 / 302 / 298 fps | 299 / 330 / 324 fps |
+| dec. 2 `exact`, depth 2 / 4 streams | 554 / 533 fps | 689 / 665 fps | 714 / 700 fps |
+| dec. 2 `ultrafast`, depth 2 / 4 streams | 554 / 538 fps | 689 / 672 fps | 716 / 695 fps |
+| latency, dec. 1, 1 stream (depth 1 / depth 2) | 9.24 / 12.9 ms | 7.38 / 9.93 ms | 6.66 / 9.09 ms |
+
+| RX 9060 XT, against v1.8.0 | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 0.598 -> 0.482 ms (-19%) | 0.462 -> 0.358 ms (-23%) | 0.460 -> 0.362 ms (-21%) |
+| `pipeline_total` | 0.897 -> 0.777 ms | 0.790 -> 0.689 ms | 0.663 -> 0.564 ms |
+| 1 stream | 2,046 -> 2,403 fps (+17%) | 2,257 -> 2,371 fps (+5%) | 2,485 -> 2,600 fps (+5%) |
+| 4 streams, one queue | 3,118 -> 3,966 fps (+27%) | 3,486 -> 3,431 fps (-2%) | 4,965 -> 8,375 fps (+69%) |
+| 4 streams, both compute families | 3,526 -> 5,095 fps (+44%) | 3,445 -> 3,416 fps (-1%) | 7,251 -> 8,238 fps (+14%) |
+
+With `exact` refinement at decimation 2 the desktop is limited by the CPU tail, so the GPU savings do
+not show in its throughput. AddressSanitizer with UBSan and LeakSanitizer, and ThreadSanitizer, report
+nothing on the Orange Pi (80 runs each, including the new paths forced on and off), and the validation
+layer reports nothing on either machine.
+
+**Measured and not shipped:**
+
+- 4 points per thread in `hash_group` (143 -> 170 us) and `scatter` (141 -> 228 us) on the Mali: only
+  the atomic-bound reduction gains.
+- Banded merging on the Mali: the in-band pass alone costs 370 us against 433 for one pass; the merge
+  there is limited by per-pixel work, not chain length.
+- `uf_init_scan` over whole rows (one workgroup per row looping over chunks), which would remove the
+  segment-boundary pointers: 233 -> 374 us on the Mali.
+- Run counting on the RX 9060 XT: 15 to 20 us slower per frame.
+- The sort split at decimation 2 on the desktop (lengths 256 to 1,024): no gain over the run-to-run
+  spread, which is ±40% for that dispatch there.
+- Rank-all thresholds of 64, 512 and 1,024 (all worse than 256).
+- The 4-points-per-thread reduction in place of the subgroup one on the desktop: 25 -> 20 us at
+  decimation 1 but 11.5 -> 16 us at decimation 2.
+
 ## 9. Measuring
 
 ```
@@ -1982,6 +2068,21 @@ breakdown plus the gaps between spans, separating intra-submit gaps from
 submit boundaries, and `APRILTAG_VK_DISPATCH_TIMES=1` (with `APRILTAG_VK_PRERECORD=0`) times every
 dispatch on its own. Each timestamp waits for the work before it, which adds about 4 us per dispatch
 on the Mali and overstates transfer fills; confirm a saving with an interleaved `Detect()` comparison.
+
+On the RX 9060 XT, RenderDoc adds what the in-app timestamps cannot: every command timed on its own
+(fills and copies as well as dispatches) and AMD's GPUPerfAPI counters per dispatch (cache hit rates,
+memory and write-unit stalls, wavefronts, bytes fetched and written). A compute-only frame has no
+present to mark it, so the validate tool captures one through RenderDoc's in-application API when
+built with `renderdoc_app.h` found by CMake:
+
+```
+ENABLE_VULKAN_RENDERDOC_CAPTURE=1 APRILTAG_VK_PRERECORD=0 apriltag_vulkan_validate --data img.pgm \
+    --iterations 25 --renderdoc-capture 20 --renderdoc-file out/frame
+RDOC_CAP=out/frame_capture.rdc RDOC_OUT=frame.tsv qrenderdoc --python tools/renderdoc/rdoc_counters.py
+```
+
+Each command is timed in isolation on replay, so transfers that overlap in a real frame read high.
+RenderDoc has no counters for the Mali-G610; there, use the Mali tools above.
 
 For the validation layer's synchronisation checks to see compute shaders' buffer accesses, set
 `khronos_validation.validate_sync = true` and `khronos_validation.syncval_shader_accesses_heuristic

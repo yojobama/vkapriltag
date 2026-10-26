@@ -13,7 +13,8 @@ Where the current code stands (1.8.0, Orange Pi 5, 1280x800, decimation 2,
 `exact` refinement): `Detect()` 2.00 ms, serial pipeline 2.83 ms, against 2.11
 and 3.13 ms at 1.7.0 and 2.49 and 3.50 ms at 1.6.0, with identical detections
 (items 23 to 27, `PERFORMANCE.md` sections 8m and 8s). Round 4 (item 28, section 8t) takes `Detect()`
-to 1.83 ms there and from 4.71 to 3.73 ms at decimation 1, again with identical detections.
+to 1.83 ms there and from 4.71 to 3.73 ms at decimation 1, and round 5 (item 29, section 8u) to 1.78
+and 3.44 ms, again with identical detections.
 
 ## Summary
 
@@ -2042,3 +2043,32 @@ registers and half occupancy, or full occupancy with per-pixel atomics, slower e
 instead of 8; sort chunks of 8, 32 and 64, the network, and workgroups of 64 or 128 with split lengths of
 256 to 1,024. Bounds: the sorting itself is 320 of the sort's 424 us at decimation 1, the unions 350 of
 `uf_merge`'s 578 us, and candidate pixels about 70% of `blob_diff`.
+
+## 29. Profiling round 5: RenderDoc on the desktop, five more changes - shipped
+
+RenderDoc (`apriltag_vulkan_validate --renderdoc-capture`, `tools/renderdoc/rdoc_counters.py`) timed
+every command of a desktop frame and read AMD's counters per dispatch (`PERFORMANCE.md` 8u). It found a
+38 us GPU copy of the grey frame at the start of every frame and showed `uf_merge` latency-bound (93%
+L2 hits, no memory stalls). Five changes, each with identical output:
+
+- **Frames written into mappable device memory on discrete GPUs** (the 256 MiB BAR window, no
+  resizable BAR needed): RX 9060 XT 4 streams +13% to +32%, 1 stream +2% to +4%.
+- **`uf_merge` in two phases on discrete GPUs**, inside 8-row bands and then across them, so a tall
+  component's root chain grows by at most a band per hop: `uf_merge` 95 -> 59 us and 86 -> 32 us,
+  `Detect()` -11% and about -29%. On the Mali the in-band pass alone costs nearly as much as one pass.
+- **The atomic extents reduction with 4 points per thread**, combining a run of points in the same
+  blob before its atomics: Mali 341 -> 223 us, `Detect()` -2.7% and -3.0%. The same in `hash_group`
+  and `scatter` was slower (143 -> 170 us, 141 -> 228 us).
+- **Blobs of up to 256 points ranked in one pass, four keys per shared load**: Mali sort 425 -> 386 us,
+  `Detect()` -1.5% at decimation 1. A one-key-per-load ranking had lost before (item 22).
+- **Blob sizes counted per run piece on integrated GPUs**: `uf_init_scan` writes each piece's capped
+  length, a 4-pixel-per-thread pass points only piece starts and segment ends at their roots and adds
+  to the roots' saturating counts, and `blob_diff` finds roots in two hops; `uf_compress_count` and the
+  `blob_size` fill go. Mali `Detect()` -4.1% at decimation 1, neutral at decimation 2; 15 to 20 us
+  slower on the RX 9060 XT. Scanning whole rows to avoid the segment pointers was slower (233 -> 374 us).
+
+Against v1.8.0: Orange Pi `Detect()` 4.72 -> 3.44 ms (-27%) and 2.19 -> 1.78 ms (-19%), single-stream
+throughput with two frames in flight 233 -> 330 fps and 554 -> 714 fps; RX 9060 XT `Detect()` -19% to
+-23%, 4 streams +27% to +69% where the GPU is the limit. The CPU tail was profiled again: its 0.5 ms is
+1.8 ms of fit work over the four A76 cores (the A55 cores add nothing), not one slow blob, and thread
+counts or core pinning did not shorten it.
