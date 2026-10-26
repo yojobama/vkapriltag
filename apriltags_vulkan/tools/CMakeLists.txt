@@ -8,6 +8,14 @@ if (OpenCV_FOUND)
   )
 
   target_link_libraries(apriltag_vulkan_validate PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  # --renderdoc-capture needs RenderDoc's in-application API header; without it the option warns.
+  find_path(RENDERDOC_APP_INCLUDE_DIR renderdoc_app.h
+            PATHS "$ENV{ProgramFiles}/RenderDoc" /usr/include /usr/local/include /opt/renderdoc/include)
+  if (RENDERDOC_APP_INCLUDE_DIR)
+    target_include_directories(apriltag_vulkan_validate PRIVATE ${RENDERDOC_APP_INCLUDE_DIR})
+    target_compile_definitions(apriltag_vulkan_validate PRIVATE VKAPRILTAG_HAVE_RENDERDOC)
+    target_link_libraries(apriltag_vulkan_validate PRIVATE ${CMAKE_DL_LIBS})
+  endif()
 
   # Corpus generator: rescales a source image to a spread of resolutions. Needs OpenCV only.
   add_executable(make_corpus make_corpus/make_corpus.cpp)

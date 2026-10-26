@@ -19,6 +19,7 @@
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
 #include "validate_common.h"
+#include "renderdoc_capture.h"
 #include <chrono>
 
 #include <opencv2/opencv.hpp>
@@ -70,6 +71,8 @@ int main(int argc, char **argv) {
   // Alternates the image with a synthetic frame (noise, snake, checker or rings) on odd iterations,
   // forcing the non-converged retry.
   std::string stress_kind;
+  int renderdoc_frame = -1;
+  std::string renderdoc_path;
   // 0 = leave DetectorConfig's default (64). 1 makes the first labelling attempt undershoot on every
   // frame, so the tail is rerun each time: a deterministic way to exercise the retry path.
   uint32_t max_uf = 0;
@@ -106,6 +109,10 @@ int main(int argc, char **argv) {
       dump_quads_path = next("--dump-quads");
     } else if (arg == "--dump-detections") {
       dump_detections_path = next("--dump-detections");
+    } else if (arg == "--renderdoc-capture") {
+      renderdoc_frame = std::stoi(next("--renderdoc-capture"));
+    } else if (arg == "--renderdoc-file") {
+      renderdoc_path = next("--renderdoc-file");
     } else if (arg == "--stress") {
       stress_kind = next("--stress");
     } else if (arg == "--max-uf") {
@@ -125,7 +132,8 @@ int main(int argc, char **argv) {
   if (load_path.empty()) {
     std::cerr << "Usage: apriltag_vulkan_validate --data <FileName> [--family tag36h11] "
                  "[--iterations N] [--csv path.csv] [--decimation N] "
-                 "[--profile] [--trace out.json]"
+                 "[--profile] [--trace out.json] "
+                 "[--renderdoc-capture FRAME] [--renderdoc-file path_template]"
              << std::endl;
     return 1;
   }
@@ -335,13 +343,16 @@ int main(int argc, char **argv) {
       if (!dump_detections_path.empty()) dump_dets.open(dump_detections_path, std::ios::trunc);
       int retry_frames = 0;
       std::map<uint32_t, int> uf_histogram;
+      apriltag_vulkan::validate::RenderDocCapture renderdoc(renderdoc_frame, renderdoc_path);
       for (int it = 0; it < iterations; ++it) {
           // The last iteration is always the clean image, so the reference comparison below still applies.
           const uint8_t *frame = (!stress_kind.empty() && (it & 1) && it != iterations - 1)
                                      ? stress_frame.data
                                      : image.data;
           const auto t0 = std::chrono::steady_clock::now();
+          renderdoc.BeforeFrame(it);
           detector.Detect(frame);
+          renderdoc.AfterFrame(it);
           profile = detector.last_profile();
           gpu_totals.push_back(profile.total_ms);
           if (profile.submits > 1) ++retry_frames;
