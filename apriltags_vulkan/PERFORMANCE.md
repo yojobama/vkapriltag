@@ -69,7 +69,12 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_WG=<n>` | Override the 1D workgroup size (power of two, clamped to limits). |
 | `APRILTAG_VK_MAX_INVOCATIONS=<n>` | Pretend the device caps workgroups at `n`. Testing aid: reproduces a constrained part's launch geometry on desktop hardware. |
 | `APRILTAG_VK_MAX_POINTS=<n>` | Cap boundary points per frame. The main device-memory lever - see below. |
-| `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2). |
+| `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2); only with `APRILTAG_VK_UF_VERIFY=1`. |
+| `APRILTAG_VK_UF_VERIFY=1` | Run a second `uf_merge` that checks the labelling converged, with the retry path, as in 1.8.0 (one merge joins every component, so it is off by default). See section 8t. |
+| `APRILTAG_VK_UF_INIT_SCAN=0` | Initialise `parent[]` with `uf_init` and a compression instead of `uf_init_scan`'s workgroup max-scan. See section 8t. |
+| `APRILTAG_VK_FUSED_THRESHOLD=0` | Keep decimation, block min/max, block filter and threshold as separate passes. See section 8t. |
+| `APRILTAG_VK_MERGE_X4=0\|1` | `uf_merge` with 4 pixels per thread (default: on integrated GPUs only). See section 8t. |
+| `APRILTAG_VK_DISPATCH_TIMES=1` | Print the median GPU time of every dispatch when the detector is destroyed (one detector per process). See section 9. |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
 | `APRILTAG_VK_PRERECORD=0` | Pre-recorded command buffers are on by default for the fused single-submission frame; `0` records every frame instead. See sections 8f and 8g. |
 | `APRILTAG_VK_UF_INIT_RUN=<n>` | Pixels of a row each `uf_init` thread initialises (default 4). See section 8q. |
@@ -1827,6 +1832,93 @@ end-to-end tool and the synthetic sweep did not release libapriltag's detections
 `dmabuf_import_test` did not release its tag family. LeakSanitizer runs with `leak:_dl_init`
 suppressed, which covers the Mali driver's allocations when it is loaded.
 
+## 8t. Profiling round 4: every dispatch timed, one merge pass, fewer and wider passes
+
+**Method.** `APRILTAG_VK_DISPATCH_TIMES=1` (new) writes a GPU timestamp after every dispatch and prints
+each one's median when the detector is destroyed; bound builds then removed part of a stage's work to
+see what the rest costs. Two configurations as in 8s: `ultrafast` with margin gate 4 at decimation 1
+on a 1280x720 frame, and `exact` at decimation 2 on the 1280x800 corpus image. Timings are interleaved
+`apriltag_vulkan_validate` runs against v1.8.0 (six rounds of 500 frames, medians), governors on
+`performance`, LumenVision stopped.
+
+**Per dispatch on the Orange Pi, decimation 1** (median us; each timestamp adds about 4 us):
+
+| stage | v1.8.0 | round 4 |
+| --- | --- | --- |
+| clears | 161 | 161 |
+| threshold (decimate, block min/max, filter, threshold) | 85 + 59 + 157 | 52 + 111 |
+| labelling | `uf_init` 225, `uf_compress` 291, `uf_merge` 576, `uf_compress_count` 407, verification `uf_merge` 383 | `uf_init_scan` 233, `uf_merge` (4 pixels per thread) 432, `uf_compress_count` 420 |
+| `blob_diff` | 757 | 710 |
+| grouping and extents | argument builds 17 + 21, `hash_group` 123, `init_extents` 26, reduction 344, `merge_extents` 26 | argument builds 17 + 21, `hash_group` 144 (initialises the extents), reduction 339 |
+| selection and offsets | `select_blobs` 17, count copy and scan chain 76, sort arguments 17 | `select_blobs` 43 (folds the copies), one-workgroup scan 28 |
+| scatter, sort | 140, 632 | 141, 631 |
+| sum | 4,539 | 3,481 |
+
+At decimation 2 the sum fell from 1,988 to 1,560 us.
+
+**Changes** (each identical in output: the 15 canonical quad dumps on both machines, 95 configurations
+against v1.8.0 per machine including two images whose decimated width is not a multiple of 4, 42 record
+paths and 44 fallback combinations, the synthetic CSVs at contrast 1.0 and 0.25 with and without
+`--refine-edges`):
+
+| change | Orange Pi `Detect()`, dec. 1 / dec. 2 |
+| --- | --- |
+| one `uf_merge` pass: each union retries its `atomicMin` until it hooks a root, so one pass joins every component; the verification merge never found a change in 105 configurations of v1.8.0 (`APRILTAG_VK_UF_VERIFY=1` keeps it) | 4.71 -> 4.32 / 2.20 -> 2.03 ms |
+| `uf_init_scan`: run starts within a workgroup's row segment from a subgroup max-scan, so no compression precedes the merge | -> 4.12 / 1.99 |
+| six fewer dispatches: extents initialised by `hash_group`, copies folded by `select_blobs`, one-workgroup scan that also writes the sort's arguments (a tiny dispatch with its barrier costs about 10 us here: 8 and 16 extra cost 78 and 160 us) | -> 4.09 / 1.93 |
+| decimation folded into `block_minmax`, `block_filter` into a per-block `threshold` | -> 4.05 / 1.90 |
+| `blob_diff`: 4-adjacent candidate neighbours share one root and one blob-size test | -> 4.01 / 1.89 |
+| word-wide loads and stores in the 4-pixel threshold and labelling passes | -> 3.86 / 1.84 |
+| `uf_merge` with 4 pixels per thread and word loads, on integrated GPUs | -> 3.73 / 1.83 |
+
+Against v1.8.0 (`Detect()` and `pipeline_total` from the interleaved validate runs; throughput and latency from `bench_multiqueue`, three rounds of 800 frames on the Orange Pi and 3,000 on the desktop, interleaved, depth 1 unless stated):
+
+| Orange Pi | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 4.71 -> 3.73 ms (-21%) | 2.19 -> 1.83 ms (-17%) | |
+| `pipeline_total` | 5.32 -> 4.38 ms (-18%) | 3.04 -> 2.67 ms (-12%) | |
+| 1 stream | 216 -> 271 fps (+26%) | 494 -> 538 fps (noisy) | 480 -> 536 fps (noisy) |
+| 1 stream, depth 2 | 233 -> 302 fps (+29%) | 554 -> 691 fps (+25%) | 554 -> 691 fps (+25%) |
+| 4 streams, one queue | 230 -> 299 fps (+30%) | 533 -> 672 fps (+26%) | 532 -> 674 fps (+27%) |
+| latency, 1 stream (depth 1 / depth 2) | 9.25 -> 7.37 / 12.9 -> 9.93 ms | 4.04 -> 3.72 / 5.40 -> 4.33 ms | |
+
+| RX 9060 XT | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 0.597 -> 0.534 ms (-11%) | 0.462 -> 0.432 ms (-6.5%) | 0.462 -> 0.432 ms (-6.5%) |
+| `pipeline_total` | 0.894 -> 0.836 ms | 0.789 -> 0.762 ms | 0.664 -> 0.636 ms |
+| 1 stream | 2,103 -> 2,239 fps (+6%) | 2,333 -> 2,240 fps (-4%, noisy) | 2,483 -> 2,525 fps (+2%) |
+| 4 streams, one queue | 3,136 -> 3,426 fps (+9%) | 3,525 -> 3,521 fps | 4,927 -> 5,411 fps (+10%) |
+| 4 streams, both compute families | 3,582 -> 4,102 fps (+15%) | 3,524 -> 3,463 fps (-2%) | 7,306 -> 7,325 fps |
+
+**Validation layer.** Its synchronisation checks ignore compute shaders' buffer accesses unless
+`syncval_shader_accesses_heuristic` is set (section 9): with it unset, a barrier removed on purpose
+between `hash_group` and the reduction went unreported, so the "clean" results of earlier sections
+covered transfers and indirect reads only. With it set, three reports remained, all for disjoint byte
+ranges of an indirect-argument buffer (one, between the split sort's rounds, also in v1.8.0). The blob
+counts' dispatch arguments now have their own buffer and the sort's runs and merge passes are compiled
+with the large-blob list read-only; both machines report nothing across 84 configurations each (three
+images, decimations 1 and 2, seven paths and fallbacks, plain and `snake` frames), with no extra
+barriers. AddressSanitizer with UBSan and LeakSanitizer, and ThreadSanitizer, report nothing on the
+Orange Pi (62 runs each, including `--pipelined --pipeline-depth 2`, `--max-uf 1`, `bench_multiqueue`
+and `dmabuf_import_test`).
+
+**Measured and not shipped** (Orange Pi, decimation 1, per dispatch):
+
+- `blob_diff` with 4 pixels per thread and word loads: 755 -> 1,072 us (61 registers, half
+  occupancy), and 1,168 us with one atomic per pixel at 32 registers. Its time is in the candidate
+  pixels (removing everything after the candidate test leaves 219 of 755 us), not in the code loads.
+- `uf_compress_count` counting each horizontal run once with its length capped at
+  `min_cluster_pixels`: 409 -> 615 us (434 us even without the length loop); with 4 pixels per
+  thread reusing a run's root: 422 -> 820 us (and 47 -> 57 us on the RX 9060 XT).
+- `uf_merge` with 4 pixels per thread on the RX 9060 XT: 92 -> 124 us, so it stays on integrated GPUs.
+- Zeroing `blob_size` at run starts in `uf_init` in place of the fill: the fill's 133 us left the
+  dispatch timings but `Detect()` moved only 0.01 ms; the timestamp after each fill overstates it.
+- 4 or 16 extents copies instead of 8; sort chunks of 8, 32 and 64 and the sorting network; sort
+  workgroups of 64 and 128 with split lengths of 256 to 1,024. None better.
+- Bounds for what is left: the sorting itself is 320 of the sort's 424 us (emitting the points in
+  input order instead); the unions are 350 of `uf_merge`'s 578 us; counting is about 120 of
+  `uf_compress_count`'s 409 us.
+
 ## 9. Measuring
 
 ```
@@ -1887,7 +1979,15 @@ x86-64 or Windows host).
 
 For per-dispatch GPU timing, `APRILTAG_VK_TIMESTAMPS=1` adds a timestamp-span
 breakdown plus the gaps between spans, separating intra-submit gaps from
-submit boundaries. For an independent view on AMD, RADV can emit RGP traces
+submit boundaries, and `APRILTAG_VK_DISPATCH_TIMES=1` (with `APRILTAG_VK_PRERECORD=0`) times every
+dispatch on its own. Each timestamp waits for the work before it, which adds about 4 us per dispatch
+on the Mali and overstates transfer fills; confirm a saving with an interleaved `Detect()` comparison.
+
+For the validation layer's synchronisation checks to see compute shaders' buffer accesses, set
+`khronos_validation.validate_sync = true` and `khronos_validation.syncval_shader_accesses_heuristic
+= true` in a `vk_layer_settings.txt` named by `VK_LAYER_SETTINGS_PATH` (with
+`APRILTAG_VK_VALIDATION=1`). Without the second setting only transfers and indirect reads are checked:
+a deliberately removed barrier between two dispatches goes unreported. For an independent view on AMD, RADV can emit RGP traces
 with `MESA_VK_TRACE=rgp MESA_VK_TRACE_PER_SUBMIT=1` (the per-submit flag is
 what makes it work for a headless compute app with no `vkQueuePresentKHR`).
 RenderDoc needs an artificial frame boundary for the same reason, and Mali

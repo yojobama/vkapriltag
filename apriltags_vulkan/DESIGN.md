@@ -20,15 +20,18 @@ Design decisions and rationale removed from source comments. Measurements live i
 - The `c0 == 1u` half of the early-out is already implied by `l0 == 0u` when min_cluster_pixels >= 2 (uf_init/uf_merge never join ambiguous pixels, so they are size-1 components); kept explicit so behaviour is unchanged at min_cluster_pixels == 1.
 - The SW dedup test is pure equality on codes, preserved by any injective mapping of 0/127/255.
 - The three gradient signs are computed unconditionally; monotonic codes make them bit-identical to the value-based ones even when unused.
+- Shared roots: every candidate neighbour has code 2 - c0, and E-SE, SE-S and S-SW are 4-adjacent, so two candidates next to each other in that chain are in one component and share the root and the blob-size test. The SW duplicate test needs no lookup either: W (code c0 or 2 - c0) shares a blob with the pixel or with SW, and S (not ambiguous) with the pixel or SW, and both of those passed. Only W's code is read.
+- With 4 pixels per thread (measured in round 4) it is slower on the Mali-G610, 755 -> 1,072 us: its time is in the dependent root and size lookups of candidate pixels, which a fatter thread serialises.
 
 ### block_minmax.comp / block_minmax_u8.comp
 - Result packed as (min | max<<8) in one uint so 8-bit storage support is not needed in the base variant; in the _u8 variant it stays packed because it is already 4x smaller than the per-pixel image (one entry per 4x4 block).
 - Decimated width/height need not be a multiple of 4 (only the original image dimensions are guaranteed even). Edge-clamping (rather than bounds-check-and-skip) repeats the edge pixel, a harmless way to extend a min/max window past the border.
 
 ### build_indirect_args.comp
-- Purpose: dispatch init_extents/select_blobs over the actual raw blob count rather than max_raw_blobs (65536 default vs a few hundred to a few thousand real blobs); the count only exists on the device, so building args here avoids a host round trip. Single invocation, negligible cost.
-- groupCountX rounds up; consumers already bounds-check against max_raw_blobs (a push constant), so the shader only needs "large enough", not exact.
-- Slots 1 and 2 let dispatches previously sized by host readback be issued in the same submission that produced the count, removing three mid-frame SubmitAndWait round trips (~0.47 ms GPU idle per frame on Mali-G610).
+- Purpose: dispatch select_blobs over the actual raw blob count rather than max_raw_blobs (65536 default vs a few hundred to a few thousand real blobs); the count only exists on the device, so building args here avoids a host round trip. Single invocation, negligible cost.
+- groupCountX rounds up; select_blobs bounds-checks against the raw blob count itself (only assigned ids have initialised extents), so the shader only needs "large enough", not exact.
+- The boundary-point count's arguments (indirect_args_buf_) let hash_group, the reduction and scatter be issued in the same submission that produced the count, removing mid-frame SubmitAndWait round trips (~0.47 ms GPU idle per frame on Mali-G610).
+- The raw blob count's arguments live in blob_args_buf_, apart from indirect_args_buf_: the reduction reads indirect_args_buf_ right after this dispatch with only a compute barrier between, and the validation layer's shader-access analysis cannot tell that a dispatch writing one slot leaves another alone.
 
 ### common.glsl
 - PackXY: 14 bits per axis bounds supported image size at 16383; GpuDetector's constructor asserts config width/height stay under it.
@@ -37,7 +40,7 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Monotonic code mapping keeps blob_diff's rewritten tests identity-preserving: boundary test v0+vN==255 becomes c0+cN==2 (c0 in {0,2} forces cN = 2-c0, so the (1,1) collision is unreachable); gradient sign is preserved; SW dedup is equality.
 - QBPoint: the original struct also carried rep0/rep1 and a validity flag; neither had a reader once the (rep0, rep1) key moved to its own arrays and later shaders only ran over valid points.
 - MinMaxExtentsGpu omits starting_offset (no sorted array left to offset into; see reduce_extents_hash.comp) and rep0/rep1 (no CPU consumer).
-- Privatised extents: reduce_extents_hash issues up to eight atomics per point into that point's blob accumulator; ~65k points over a few hundred blobs is ~170-way contention. Replacing them with plain stores (an incorrect build, to bound the payoff) cut the `extents` span 0.434 -> 0.062 ms and GPU total 3.43 -> 2.64 ms on Mali-G610. Replicating all max_raw_blobs entries would cost 8 x 3 MB, so only the first kPrivateExtentsBlobs (4096; real frames see 388 raw blobs at decimation 2, 1257 at decimation 1) are replicated; overflow falls back to the contended canonical slot (correct, just slower). Copy 0 being the canonical array leaves select_blobs, extract_blob_counts and the host unchanged.
+- Privatised extents: reduce_extents_hash issues up to eight atomics per point into that point's blob accumulator; ~65k points over a few hundred blobs is ~170-way contention. Replacing them with plain stores (an incorrect build, to bound the payoff) cut the `extents` span 0.434 -> 0.062 ms and GPU total 3.43 -> 2.64 ms on Mali-G610. Replicating all max_raw_blobs entries would cost 8 x 3 MB, so only the first kPrivateExtentsBlobs (4096; real frames see 388 raw blobs at decimation 2, 1257 at decimation 1) are replicated; overflow falls back to the contended canonical slot (correct, just slower). Copy 0 is the canonical array; hash_group.comp writes the identity to every copy as it assigns a blob's id and select_blobs.comp folds the copies as it reads them, so no dispatch of its own does either.
 - Field order: count and pxgx_plus_pygy_sum are incremented by every point, so they are packed into one 64-bit atomicAdd when VK_KHR_shader_atomic_int64 is available; reduce_extents_hash_atomic64.comp explains why this is exact.
 - IPoint omits gx/gy (written by scatter_index_points.comp, never read; compute_line_fit_points.comp recomputes the gradient weight from the decimated image).
 - RawLineFitPoint: largest per-frame readback (one entry per selected point); Mx/My/Mxx/Mxy/Myy are exact functions of (x2, y2, W), so only those plus blob_index are carried and the host rebuilds moments in int64. Two-word packing is exact because each field's bound is enforced elsewhere (W: |gx|,|gy| <= 255 gives sqrt(2*255^2) = 360.6, truncating to 360; the host static_asserts the 22-bit blob_index ceiling against max_raw_blobs). fp16 would not be exact: its 11-bit mantissa rounds integers above 2048 and x2 reaches 3839 at 1080p/decimation 1.
@@ -48,8 +51,10 @@ Design decisions and rationale removed from source comments. Measurements live i
 - kDecimation is a specialisation constant (fixed per detector) so the multiply/divide by it is compile-time on devices with no integer divide (see GpuDetector.cpp).
 - _u8: selected at runtime (GpuDetector::ShaderPath) on devices reporting storageBuffer8BitAccess; quarters decimated_buf_ and the traffic of decimate's write, block_minmax's read and sort_points_local's gradient sample. GrayImage stays uint32 because it is the host upload buffer, unrelated to the feature. No optional device feature may be assumed, so the 32-bit path is the default.
 
-### extract_blob_counts.comp
-- Runs in the same submission as select_blobs.comp, before the host reads num_selected_blobs, hence the count is read from the GPU counter buffer instead of a push constant.
+### scan_blob_counts.comp
+- One workgroup scans max_blobs entries: each thread sums a contiguous chunk, the chunk totals are scanned in shared memory (Hillis-Steele), and each thread writes its chunk. It replaced a copy pass and a two-level scan chain, three dispatches that each cost about 10 us of launch and barrier on the Mali-G610 for a few thousand entries.
+- Reads the selected count from the GPU counter buffer (same submission as select_blobs.comp), and writes the sort's indirect arguments (one workgroup per selected blob, clamped to max_blobs) to blob_args_buf_, which build_sort_args used to do.
+- blob_point_offsets[max_blobs - 1] is still the inclusive total the host reads back.
 
 ### hash_group.comp
 - Replaces a global (rep0, rep1) sort that existed only to make equal pairs adjacent. Nothing downstream needs point ORDER, only GROUPING (each selected blob's points are re-sorted by angle in sort_points_local.comp), so a single hash pass replaces 2 * ceil(bits/4) stable radix passes that each read and rewrote three words per element.
@@ -60,10 +65,11 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Hash mix: keys are dense small ids, so a plain xor/shift would cluster badly under linear probing.
 - Dropping a point on probe exhaustion matches the defensive capacity clamps elsewhere; it is counted (drop_counter) rather than silent so an undersized table shows up in profiling.
 
-### init_extents.comp / merge_extents.comp
-- One invocation per blob writes the kExtentsCopies-1 extra entries, so the work scales with the frame's real blob count (indirect dispatch; a few hundred blobs, not ~94k replicated slots).
+### Extents initialisation and folding (hash_group.comp, select_blobs.comp)
+- hash_group's slot winner writes the identity to the new blob's canonical entry and its kExtentsCopies-1 copies, so the work scales with the frame's real blob count, and the reduction (the next dispatch, after a barrier) sees them initialised.
 - Identity, not zero: min/max fold correctly only against +/-INT_MAX and sums against 0. A never-written copy contributes nothing, which also lets the subgroup reduction variant stay unprivatised and still merge correctly.
-- merge_extents runs a few hundred invocations folding 7 entries each, versus the ~65k points x 8 atomics of contention it removes. Because min/max/sum fold associatively and exactly, the result is bit-identical to the unprivatised reduction regardless of how points were distributed across copies.
+- select_blobs folds the 7 copies as it reads a blob's extents, versus the ~65k points x 8 atomics of contention the copies remove. Min/max/sum fold associatively and exactly, so the result is bit-identical to the unprivatised reduction regardless of how points were distributed across copies.
+- select_blobs stops at the raw blob count, not at the dispatch's rounded-up size: ids above the count were never initialised this frame and hold an earlier frame's extents (the `snake` stress frame, one raw blob, found this).
 
 ### label_pixels_body.glsl
 - Folds blob identity, "blob big enough" and the threshold into one spatially local per-pixel word written back into parent[]. In-place is safe (each invocation reads/writes only its own entry, no extra buffer to allocate/zero/bind) and cannot leak across frames because next frame's uf_init overwrites every entry.
@@ -92,14 +98,8 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Shares the descriptor layout and push-constant block with the scalar variants (see reduce_extents_hash_body.glsl).
 - No `!= 0` guard on gx_sum/gy_sum (unlike the scalar shader): there gx or gy is structurally zero for ~half of points, so the guard skips real atomics; here values are already reduced across a subgroup so zero sums are rare and the test is pure cost. Measured on an MX230 (extents span, min over 12 runs of 6 iterations): 0.2816 ms unguarded vs 0.2919 guarded (+3.7%). Same split as uf_final.comp / uf_final_subgroup.comp.
 
-### scan_block.comp / scan_add_offsets.comp
-- Block size is a specialisation constant because the former hardcoded 1024 exceeds maxComputeWorkGroupInvocations on Mali-G610 (512) and Vulkan only guarantees 128; the host picks the largest power of two the device allows.
-- shared temp[1024] (4 KiB) is well inside the 16 KiB of shared memory Vulkan guarantees.
-- Single-workgroup case is the top ("collapse") level of a multi-level scan, where the caller binds block_sums to the same buffer as output_values; with gl_WorkGroupID.x == 0 the block_sums write would clobber output_values[0], which already holds the correct scanned value.
-- scan_add_offsets: workgroup 0 needs no offset; block_offsets is the inclusive scan of block totals (scan_block.comp run on block_sums one level up), so block_offsets[g-1] is exactly the exclusive prefix for block g.
-
 ### scatter_index_points.comp
-- Replaces rewrite_index_points.comp without the sorted array. The cursor-based placement needs no separate output counter: every point reaching the atomicAdd on blob_cursor[sel] is one of exactly e.count points of that blob (counted the same way by reduce_extents_hash), so the total equals blob_point_offsets_buf_'s last inclusive-scanned entry from extract_blob_counts.comp's scan chain.
+- Replaces rewrite_index_points.comp without the sorted array. The cursor-based placement needs no separate output counter: every point reaching the atomicAdd on blob_cursor[sel] is one of exactly e.count points of that blob (counted the same way by reduce_extents_hash), so the total equals blob_point_offsets_buf_'s last inclusive-scanned entry from scan_blob_counts.comp.
 - Intra-blob order is atomic-arrival dependent, like the blob_diff append order, and is overwritten by sort_points_local.comp.
 - Pseudo-angle: only the sort order around the perimeter is consumed, never the angle value. The "diamond" construction is monotonic in true angle (strictly increasing counterclockwise through the same quadrant crossings as atan2) for one divide and no transcendental: 0->1 across the first quadrant, 1->3 across dx<0 (-dy/d is already monotonic decreasing there), 3->4 across dx>=0, dy<0. Its zero point is the +x axis rather than atan2+PI's; the sort is circular so the seam position does not change the ordering FitQuadForBlob reads on the CPU.
 - Key scaling: 20 bits so sort_points_local.comp can pack key and 12-bit local index into one 32-bit shared word. With the 4096-point ceiling that index implies, a full blob still gets ~244 key units per point, so ties stay vanishingly rare at any decimation.
@@ -110,6 +110,9 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Geometric prefilters (aspect_max/fill_min/fill_max): defaults are no-ops; see DetectorConfig::aspect_max/fill_min/fill_max for the derivation and corpus measurements.
 - Polarity test: no GLSL `double`, since float64 (shaderFloat64) is optional and unsupported on Mali and most mobile GPUs, where using it fails pipeline creation outright. The CUDA original's dot() returns float anyway. Only the sign matters and sum2 is an exact integer, accumulated in int32 like the reduce atomics; a positive scale keeps the sign, so 2*dot clears the 0.5. fp32 rounding of sum2 (ulp ~64 at realistic magnitudes) is far below the correction terms, so it can only disagree with a float64 version for blobs essentially exactly on the polarity boundary.
 - Bounding-box test history: the earlier `bbox area < tag_width` compared a pixel area against tag_width (in bit squares, 8 for tag36h11), a unit mismatch that rejected almost nothing. Zero width/height is a hard rejection as it would divide by zero below.
+
+### sort_points_large*.comp
+- The same shader as sort_points_local*.comp for modes 1 and 2 (the split sort's runs and merge rounds), with the large-blob list declared read-only. Only mode 0 writes it, and with the validation layer's shader-access analysis a writable binding in the runs or merge dispatch reads as a write before the next round's indirect argument read.
 
 ### sort_points_local*.comp
 - Wrappers only: the _u8 sibling is chosen by GpuDetector on devices with storageBuffer8BitAccess, the 32-bit one otherwise.
@@ -128,6 +131,10 @@ Design decisions and rationale removed from source comments. Measurements live i
 ### subgroup_ballot128.glsl
 - subgroupBallot returns a uvec4 (up to 128 lanes) and the RX 9060 XT reports subgroupSize=64, so set bits can span .x and .y. Callers that read only .x silently dropped lanes >= 32, a bug invisible on Mali-G610 (subgroup size 16).
 - Does not declare GL_KHR_shader_subgroup_ballot itself to avoid a needless requirement in files with no other subgroup calls. FindLSB128 returns 128 for zero, but callers check AnyBits128 first.
+
+### block_minmax_decimate_u8.comp / threshold_block_u8.comp
+- With 8-bit storage the threshold stage is two passes: block_minmax_decimate decimates each 4x4 block from the packed upload, writing the block's pixels and its min/max (imported frames and decimation 1 keep decimate/block_minmax), and threshold_block folds a block's 3x3 neighbourhood of min/max and thresholds its 16 pixels. Each removed pass also removes its barrier and a round trip through memory.
+- When the decimated width is a multiple of 4 each block row is one aligned word, read and written as such.
 
 ### threshold.comp / threshold_u8.comp
 - Dispatched 2D for the same reason as decimate.comp (no runtime `%`/`/` by decimated_width).
@@ -156,7 +163,14 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Dispatched 2D so the row-start test (x > 0) needs no runtime `%` by width (see decimate.comp notes); i is still the linear index into parent[]/thresholded[].
 - _u8: Parent stays uint32 because it holds a pixel index that routinely exceeds 255.
 
+### uf_init_scan_body.glsl
+- Points each pixel at its run start within the workgroup's row segment (4 pixels per thread, 4 x workgroup width pixels per segment): each thread finds the last run start among its pixels, and a subgroup max-scan plus a max over the earlier subgroups' totals in shared memory gives every pixel the latest start at or before it. A run that began before the segment points at the pixel left of the segment, so a chain is at most one hop per segment and no compression is needed before the merge; uf_compress_count then walks the chains (its walk is not skipped when the merge joined nothing, since parent[] was not flat).
+- Needs subgroup arithmetic and at most 64 subgroups per workgroup (sg_last); otherwise uf_init.comp and a compression run.
+- With a width that is a multiple of 4 the codes are read as one word and the parents stored as one uvec4.
+
 ### uf_merge_body.glsl
+- One pass: doUnion retries its atomicMin until it hooks a root (old == the root it found), so when a union returns its two pixels share a root, and later unions only join components. After one pass every vertical run overlap has been joined, so the verification merge, which never found a change in 105 configurations of v1.8.0, is off (APRILTAG_VK_UF_VERIFY=1). Stale plain loads in find() only make a walk end early at a node that is no longer a root; the atomicMin then returns its current parent and the loop continues.
+- uf_merge_x4_u8.comp: 4 pixels per thread with the codes read as one word per row, on integrated GPUs (578 -> 432 us on the Mali-G610 at decimation 1, 92 -> 124 us on the RX 9060 XT).
 - Only the down edge is considered; with uf_init's horizontal runs the two cover every edge exactly once.
 - Run-level merging: down edges between two rows are not independent. Wherever a run in row y sits above a run of the same value in row y+1, every column of the overlap requests the same union of the same two components (uf_init already joined each run), so only the leftmost column needs to perform it. Each redundant union costs two find() walks, the dependent global loads that OPTIMIZATION_NOTES.md's first pass identified as this stage's real cost. The start test costs two extra loads adjacent to ones already made, against a find pair and an atomicMin saved per interior overlap column.
 - This is the transferable half of HA4 (Hennequin & Lacassagne), run-based 4-connected GPU CCL, without its warp intrinsics, which three measurements in this tree say are the wrong tool on both device classes here. See "A scan of the literature" in OPTIMIZATION_NOTES.md.
@@ -187,7 +201,7 @@ Design decisions and rationale removed from source comments. Measurements live i
 - quad_fit_method default kDp: identical decoded ID sets and corner RMS differences in the third decimal (< 0.1 px, no systematic direction) at every decimation on both dev targets; an algorithmic win (skips the C(10,4) search), so it helps weaker CPUs more. ~8% of blobs fall back to kPeaks at decimation 2. A high fallback rate means DP costs without saving the search.
 - max_raw_blobs/max_boundary_points are defensive caps, smaller than the CUDA implementation's dense worst case (tens of MB / ~400 MB at 1080p); max_boundary_points = 0 is the dense worst case and reproduces CUDA behaviour exactly.
 - max_blobs = 0: scales with decimated pixel count, anchored at 2048 for 1080p at decimation 2 (the former flat value), so frames at or below that size are unchanged. Slack is cheap (one dispatch plus scan over capacity; the per-frame readback uses the actual count; +2.2 us for 24x capacity, 0.06% of a 3.6 ms frame; a 12 MP frame at decimation 2 qualifies 1878 blobs against 12042 resolved). Clamped to max_raw_blobs because selected blobs are a subset of raw blobs. Overflow is not graceful: select_blobs.comp drops in atomicAdd order, so detections become irreproducible (4032x3024 at decimation 1 returned 3 or 4 tags).
-- uf_iterations_per_chunk = 2: uf_compress does full path compression each iteration, so one merge pass already resolves these shapes and the second only observes no change. At 1080p boundary points, blob count, point count and candidate quads are bit-identical for 2 through 64. Scenes needing more cost one extra chunk on the first frame; the adaptive seed (last_uf_iterations_) remembers the count.
+- uf_iterations_per_chunk = 2 (only with APRILTAG_VK_UF_VERIFY=1, see uf_merge_body.glsl): uf_compress does full path compression each iteration, so one merge pass already resolves these shapes and the second only observes no change. At 1080p boundary points, blob count, point count and candidate quads are bit-identical for 2 through 64. Scenes needing more cost one extra chunk on the first frame; the adaptive seed (last_uf_iterations_) remembers the count.
 - Constructor checks: boundary coordinates are the doubled decimated index (2*width/decimation), so a bare `width <= 16383` test is off by 2x at decimation 1; label_pixels' 30-bit label is implied by that (8191x8191 < 2^26); RawLineFitPoint's 22-bit blob_index and 10-bit W (W <= 361) mean max_raw_blobs <= 2^22, checked because failure would be silent mis-grouping.
 - block_width_/block_height_ round up because width/height are only guaranteed divisible by decimation; block_minmax/threshold handle the ragged block (edge-clamped sampling / block_width push constant).
 - local_sort_cap_ = min(pow2 floor of max workgroup invocations, 256): the bitonic network is sized to the blob (~256 slots typical), so 1024 threads idle three quarters of lanes. Mali-G610 1080p: 1024 threads 4.03 ms, 512 3.08, 256 3.08, 128 3.83, 64 5.71.
@@ -280,6 +294,7 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Extra specialization constants (from id 3) serve device-derived constants such as a shared-memory array length decoupled from the workgroup thread count.
 - Zero-element dispatches record nothing because count-driven dispatch sizes make empty frames normal.
 - Indirect dispatch needs IndirectDispatchBarrier (compute -> DRAW_INDIRECT stage); a plain Compute barrier does not cover it. See build_indirect_args.comp.
+- DispatchProbe (APRILTAG_VK_DISPATCH_TIMES) timestamps the end of every dispatch from inside Dispatch*, so no call site changes; its state is global because it serves one detector per process, and the pipeline keeps its shader label for the report.
 - The host-read barrier is needed since a fence alone does not make device writes host-visible in the Vulkan memory model.
 
 ### Buffer / MemoryKind

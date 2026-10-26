@@ -12,7 +12,8 @@ corpus image on the Orange Pi and an RX 9060 XT, and say so where they start.
 Where the current code stands (1.8.0, Orange Pi 5, 1280x800, decimation 2,
 `exact` refinement): `Detect()` 2.00 ms, serial pipeline 2.83 ms, against 2.11
 and 3.13 ms at 1.7.0 and 2.49 and 3.50 ms at 1.6.0, with identical detections
-(items 23 to 27, `PERFORMANCE.md` sections 8m and 8s).
+(items 23 to 27, `PERFORMANCE.md` sections 8m and 8s). Round 4 (item 28, section 8t) takes `Detect()`
+to 1.83 ms there and from 4.71 to 3.73 ms at decimation 1, again with identical detections.
 
 ## Summary
 
@@ -1997,3 +1998,47 @@ one more frame of latency. Measured and not shipped: the quad refit inside the p
 on MSVC, but GCC's default multiply-add fusion changes the last bit of some corners on AArch64), fitting
 the largest blobs first (mixed), zeroing `blob_size` in `uf_init` (no gain), and skipping the boundary
 points of rejected clusters (bounded: the counting pass would cost more than it saves).
+
+## 28. Profiling round 4: one merge pass, fewer and wider passes - shipped
+
+Round 4 (`PERFORMANCE.md` 8t) timed every dispatch on its own (`APRILTAG_VK_DISPATCH_TIMES`, new) and
+bounded each large stage by removing part of its work. Seven changes, each with identical quad dumps,
+detections and synthetic CSVs on both machines:
+
+- **One `uf_merge` pass.** Each union retries its `atomicMin` until it hooks a root, so one pass joins
+  every component; the second, verification merge (383 us of 4.7 ms on the Mali at decimation 1) never
+  found a change in 105 configurations of 1.8.0 and is gone, with its flag clear and readback
+  (`APRILTAG_VK_UF_VERIFY=1` restores them). `Detect()` -8.2% (decimation 1), -7.4% (decimation 2).
+- **`uf_init_scan`**: each pixel points at its run start within a workgroup's row segment, found with a
+  subgroup max-scan, so no compression precedes the merge. A further -4.7% and -2.2%.
+- **Six fewer dispatches**: `hash_group` initialises each blob's extents as it assigns the id,
+  `select_blobs` folds the private copies (bounded by the raw blob count: only those ids are
+  initialised; the snake stress frame found that), and one workgroup scans the blob counts and writes
+  the sort's arguments. A tiny dispatch with its barrier costs about 10 us on the Mali.
+- **Two threshold passes instead of four**: decimation folded into `block_minmax`, `block_filter` into
+  a per-block `threshold`.
+- **`blob_diff`**: candidate neighbours that are 4-adjacent share one root and one blob-size test, and
+  the SW duplicate test needs no lookup (its W and S tests always pass). `blob_diff` -6%.
+- **Word-wide loads and stores** in the 4-pixel threshold and labelling passes (`block_minmax` 85 -> 51
+  us, `threshold` 170 -> 112 us, `uf_init_scan` 286 -> 234 us).
+- **`uf_merge` with 4 pixels per thread** and word loads on integrated GPUs (578 -> 432 us); item 9's
+  version used byte loads and lost 6%. Slower on the RX 9060 XT (92 -> 124 us), so not used there.
+
+Together on the Orange Pi: `Detect()` 4.71 -> 3.73 ms (-21%) at decimation 1 and 2.19 -> 1.83 ms (-17%)
+at decimation 2; single-stream throughput with two frames in flight 233 -> 302 fps and 554 -> 691 fps.
+On the RX 9060 XT `Detect()` -11% and -6.5%.
+
+The validation layer's synchronisation checks ignore compute shaders' buffer accesses unless
+`syncval_shader_accesses_heuristic` is set, so earlier "clean" runs checked only transfers and indirect
+reads. With it set, three reports with disjoint byte ranges remained (one also in 1.8.0); the blob
+counts' dispatch arguments moved to their own buffer and the sort's runs and merge passes were compiled
+with the large-blob list read-only, and both machines are clean, with no extra barriers.
+
+Measured and not shipped: `blob_diff` with 4 pixels per thread (1,072 to 1,168 us against 755; 61
+registers and half occupancy, or full occupancy with per-pixel atomics, slower either way);
+`uf_compress_count` counting once per run with the run length capped at `min_cluster_pixels` (409 ->
+615 us; 434 us even without the length loop) and with 4 pixels per thread reusing a run's root (422 ->
+820 us); zeroing `blob_size` only at run starts in place of the fill (-0.01 ms); 4 or 16 extents copies
+instead of 8; sort chunks of 8, 32 and 64, the network, and workgroups of 64 or 128 with split lengths of
+256 to 1,024. Bounds: the sorting itself is 320 of the sort's 424 us at decimation 1, the unions 350 of
+`uf_merge`'s 578 us, and candidate pixels about 70% of `blob_diff`.
