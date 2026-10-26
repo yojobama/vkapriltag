@@ -355,6 +355,42 @@ Spreading streams over queue families (`ContextOptions::expected_streams`, `Cont
 helps only where the device has two compute families (the desktop: +82% at four streams over one
 queue); on the Mali one queue shared by all streams is faster, and the helper then changes nothing.
 
+### What changed in 1.8.0 (against 1.7.0)
+
+Same output: the quad dumps are byte-identical to 1.7.0's in 60 configurations on each machine
+(decimations 1, 2 and 4, with and without stress frames) and the 15 canonical dumps match. Both
+versions built the same way and run alternately (`apriltags_vulkan/PERFORMANCE.md` section 8s):
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| `Detect()`, decimation 1 (1280x720, `ultrafast`, gate 4) | 5.19 -> 4.51 ms (-13%) | 0.67 -> 0.59 ms (-13%) |
+| `pipeline_total`, decimation 1 | 6.00 -> 5.09 ms (-15%) | 1.00 -> 0.88 ms (-12%) |
+| `pipeline_total`, decimation 2, `exact` | 3.13 -> 2.83 ms (-9%) | 0.85 -> 0.79 ms (-8%) |
+| 1 stream, decimation 1 | 187 -> 216 fps (+15%) | 2,041 -> 2,151 fps (+5%) |
+| 1 stream, decimation 1, depth 2 | 233 fps (+25%) | 2,893 fps (+42%) |
+| 1 stream, decimation 2, `exact`, depth 2 | 430 -> 556 fps (+29%) | 2,179 -> 2,601 fps (+19%) |
+| 4 streams, one queue, decimation 2, `exact` | 523 -> 554 fps (+6%) | 2,942 -> 3,544 fps (+20%) |
+
+- **CPU tail** (`quad_decode` -32% to -34% on the Orange Pi): `hypotf` replaced by a double-precision
+  form with identical results, the prefix sums kept in registers, each segment fitted once in the
+  combinatorial search, and the DP corner search's argmax passes run as independent chains. `exact`
+  refinement reuses each bilinear tap (`tag_decode` -12% on the Orange Pi, -16% on the desktop).
+- **GPU stages:** `uf_init` and `threshold` cover 4 pixels per thread; at decimation 1 the threshold
+  and sort read the grey buffer directly instead of a copy.
+- **The sort's largest blob:** blobs of more than 1,024 points are sorted in runs by several
+  workgroups and merged by whole-GPU rounds, on by default at decimation 1. With streams spread over
+  both compute families of a discrete GPU it costs 4% to 10%; set `APRILTAG_VK_SORT_SPLIT=8192` there.
+- **`FramePipeline` depth 2 (opt-in):** given a second `GpuDetector` with its own `vk::Lane`, it keeps
+  two frames on the GPU. It costs a second set of device buffers and one more frame of latency
+  (12.9 ms against 9.3 ms at full rate on the Orange Pi at decimation 1).
+- **Fixes:** uploads through a transfer lane now wait for the previous frame's copy into the grey
+  buffer (a write-after-write hazard under synchronisation validation); the validate, pose
+  end-to-end, synthetic sweep and dma-buf test tools no longer leak; `bench_multiqueue --import`
+  warns and continues on devices without host-pointer import. AddressSanitizer, UBSan,
+  LeakSanitizer and ThreadSanitizer are clean on the Orange Pi and AddressSanitizer on the desktop.
+- **Tooling:** `hwcnt_run` and `hwcnt_timeline` (Mali hardware counters), `bench_multiqueue --depth`,
+  `apriltag_vulkan_validate --pipeline-depth`, and quad and detection dumps from the pipelined path.
+
 ### The margin gate
 
 With `refine_edges` on, 97% of the CPU refinement time goes to quads that never decode.

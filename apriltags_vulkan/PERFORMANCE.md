@@ -1773,6 +1773,60 @@ transfer-to-transfer barrier now opens each upload command buffer, and the repor
 validate tool now releases its detectors, the reference detections and the tag family per image, so
 LeakSanitizer is clean on it.
 
+## 8s. Against v1.7.0
+
+Version 1.8.0 (sections 8o to 8r) against v1.7.0 (`2626760`). Both sides built the same way (`Release`
+on the Orange Pi, `RelWithDebInfo` on the RX 9060 XT), run alternately: six rounds of 1,000 frames of
+`apriltag_vulkan_validate` (medians of the round medians) and three rounds of `bench_multiqueue` (800
+frames per round on the Orange Pi, 3,000 on the desktop), with the Orange Pi's governors on
+`performance` and LumenVision stopped. Three configurations: decimation 1 on a 1280x720 frame with
+`ultrafast` refinement and margin gate 4, and decimation 2 on the 1280x800 corpus image with `exact`
+and with `ultrafast` at gate 4. "Depth 2" is `FramePipeline` with a second detector (opt-in).
+
+Orange Pi 5:
+
+| | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 5.185 -> 4.505 ms (-13%) | 2.110 -> 1.996 ms (-5.4%) | 2.113 -> 2.013 ms (-4.7%) |
+| `quad_decode` | 0.675 -> 0.459 ms (-32%) | 0.289 -> 0.190 ms (-34%) | 0.286 -> 0.190 ms (-34%) |
+| `tag_decode` | 0.127 -> 0.124 ms | 0.722 -> 0.637 ms (-12%) | 0.169 -> 0.173 ms |
+| `pipeline_total` | 6.001 -> 5.089 ms (-15%) | 3.125 -> 2.830 ms (-9.4%) | 2.582 -> 2.385 ms (-7.6%) |
+| 1 stream | 187 -> 216 fps (+15%) | 418 to 457 -> 442 to 464 fps (noisy) | 437 -> 475 fps (+8.7%) |
+| 1 stream, depth 2 | 233 fps (+25%) | 556 fps (+29%) | 555 fps (+27%) |
+| 4 streams, one queue | 199 -> 232 fps (+16%) | 523 -> 554 fps (+6%) | 524 -> 555 fps (+6%) |
+| latency, 1 stream (depth 1 / depth 2) | 10.7 -> 9.26 / 12.9 ms | 4.6 -> 4.4 / 5.4 ms | 4.6 -> 4.2 / 5.4 ms |
+
+RX 9060 XT:
+
+| | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 0.673 -> 0.587 ms (-13%) | 0.471 -> 0.455 ms (-3.4%) | 0.467 -> 0.445 ms (-4.7%) |
+| `pipeline_total` | 1.000 -> 0.882 ms (-12%) | 0.852 -> 0.787 ms (-7.6%) | 0.685 -> 0.652 ms (-4.8%) |
+| 1 stream | 2,041 -> 2,151 fps (+5%) | 2,179 -> 2,339 fps (+7%) | 2,553 -> 2,544 fps (0%) |
+| 1 stream, depth 2 | 2,893 fps (+42%) | 2,601 fps (+19%) | 4,466 fps (+75%) |
+| 4 streams, one queue | 2,920 -> 3,130 fps (+7%) | 2,942 -> 3,544 fps (+20%) | 4,734 -> 4,941 fps (+4%) |
+| 4 streams, both compute families | 3,713 -> **3,573 fps (-4%)** | 2,895 -> 3,455 fps (+19%) | 7,065 -> 7,276 fps (+3%) |
+
+The one loss is the sort split (8r) with streams spread over both compute families at decimation 1;
+with `APRILTAG_VK_SORT_SPLIT=8192` the same run gives 3,946 fps (+6% over 1.7.0). With several streams
+on the Orange Pi depth 2 changes nothing; the streams already keep the GPU busy.
+
+Output: the quad dumps of the two versions are byte-identical in 60 configurations on each machine
+(five images, decimations 1, 2 and 4, no stress and the `noise`, `rings` and `snake` stress frames),
+the 15 canonical dumps match, and `bench_multiqueue` reported no mismatches in any run above.
+
+Sanitisers on the release tree: AddressSanitizer with UBSan (including `float-cast-overflow`) and
+LeakSanitizer, and ThreadSanitizer, on the Orange Pi (GCC 14); AddressSanitizer on the RX 9060 XT
+(MSVC). The runs covered the corpus at decimations 1, 2 and 4, four stress frames, the retry path,
+`FramePipeline` at depths 1 and 2, the unfused, non-pre-recorded and split-sort paths, every
+optional-feature fallback, the four refine modes with the margin gate, `bench_multiqueue` (1 and 4
+streams, both queue families, depth 2, transfer-queue upload, host-pointer import), `bench_barrier`,
+`dmabuf_import_test` (grey and YUYV), the pose tools, `make_corpus` and the synthetic sweep (658/767
+on the desktop and 659/767 on the Orange Pi, 687/768 with `--refine-edges`, as before). The library had no reports. Three test tools leaked and are fixed: the pose
+end-to-end tool and the synthetic sweep did not release libapriltag's detections, and
+`dmabuf_import_test` did not release its tag family. LeakSanitizer runs with `leak:_dl_init`
+suppressed, which covers the Mali driver's allocations when it is loaded.
+
 ## 9. Measuring
 
 ```

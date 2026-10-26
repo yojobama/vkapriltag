@@ -9,9 +9,10 @@ was checked against the unmodified libapriltag CPU detector (97 candidate quads,
 decoded tag set [554]). The later passes use `grayimage.pgm` or the 1280x800
 corpus image on the Orange Pi and an RX 9060 XT, and say so where they start.
 
-Where the current code stands (1.7.0, Orange Pi 5, 1280x800, decimation 2):
-`Detect()` 2.12 ms, serial pipeline 3.13 ms, against 2.49 and 3.50 ms at 1.6.0
-with identical detections (the fifth pass and `PERFORMANCE.md` section 8m).
+Where the current code stands (1.8.0, Orange Pi 5, 1280x800, decimation 2,
+`exact` refinement): `Detect()` 2.00 ms, serial pipeline 2.83 ms, against 2.11
+and 3.13 ms at 1.7.0 and 2.49 and 3.50 ms at 1.6.0, with identical detections
+(items 23 to 27, `PERFORMANCE.md` sections 8m and 8s).
 
 ## Summary
 
@@ -414,7 +415,7 @@ echo performance > /sys/class/devfreq/dmc/governor
 ## Remaining opportunities, largest first
 
 This list is the state after the first pass (1920x1080, 16.1 ms). The current
-list, at 1.7.0, is in `PERFORMANCE.md` section 8.
+list, at 1.8.0, is in `PERFORMANCE.md` section 8.
 
 Where the 16.1 ms went then: CPU `quad_decode` 3.7, sort+group 3.01, linefit
 3.05, threshold+label 2.59, boundary 1.73, readback 1.09, tag_decode 0.66,
