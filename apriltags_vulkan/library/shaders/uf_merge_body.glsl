@@ -98,6 +98,29 @@ void main() {
   }
 
   bool merged = false;
+#ifdef THRESHOLDED_WORD
+  // Each thread covers 4 pixels of the row, read as one word per row; the width is a multiple of 4.
+  uint x0 = x * 4u;
+  if (x0 < pc.width && y + 1u < pc.height) {
+    uint i0 = y * pc.width + x0;
+    uint top = THRESHOLDED_WORD(i0 >> 2u);
+    uint bottom = THRESHOLDED_WORD((i0 + pc.width) >> 2u);
+    for (uint k = 0u; k < 4u; ++k) {
+      uint v = (top >> (8u * k)) & 0xFFu;
+      if (v == 127u || ((bottom >> (8u * k)) & 0xFFu) != v) continue;
+      uint i = i0 + k;
+      bool overlap_start;
+      if (k > 0u) {
+        overlap_start = ((top >> (8u * k - 8u)) & 0xFFu) != v ||
+                        ((bottom >> (8u * k - 8u)) & 0xFFu) != v;
+      } else {
+        overlap_start = (x0 == 0u) || (THRESHOLDED_AT(i - 1u) != v) ||
+                        (THRESHOLDED_AT(i - 1u + pc.width) != v);
+      }
+      if (overlap_start && doUnion(i, i + pc.width)) merged = true;
+    }
+  }
+#else
   if (x < pc.width && y + 1u < pc.height) {
     uint i = y * pc.width + x;
     uint v = THRESHOLDED_AT(i);
@@ -108,6 +131,7 @@ void main() {
       if (overlap_start && doUnion(i, i + pc.width)) merged = true;
     }
   }
+#endif
 
   if (kMergeFlagMode == 0u) {
     if (merged) atomicOr(wg_changed, 1u);

@@ -55,6 +55,7 @@ set(SHADER_SOURCES
   shaders/uf_init_scan_u8.comp
   shaders/uf_merge.comp
   shaders/uf_merge_u8.comp
+  shaders/uf_merge_x4_u8.comp
   shaders/uf_compress.comp
   shaders/uf_compress_count.comp
   shaders/uf_compress_count_u8.comp

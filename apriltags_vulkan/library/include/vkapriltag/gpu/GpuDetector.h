@@ -353,6 +353,8 @@ class GpuDetector {
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
   // Run starts from a workgroup max-scan, so no compression precedes the merge (single-merge only).
   vk::ComputePipeline uf_init_scan_pl_;
+  // True when uf_merge_pl_ is uf_merge_x4_u8.comp (4 pixels per thread).
+  bool merge_x4_ = false;
   bool uf_init_scan_ = false;
   // Pixels of a row each uf_init thread initialises.
   uint32_t uf_init_run_ = 4;
