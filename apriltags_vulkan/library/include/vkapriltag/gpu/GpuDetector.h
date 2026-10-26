@@ -345,6 +345,11 @@ class GpuDetector {
   vk::ComputePipeline block_minmax_pl_;
   vk::ComputePipeline block_filter_pl_;
   vk::ComputePipeline threshold_pl_;
+  // With 8-bit storage: decimate and block_minmax in one pass (uploaded frames, decimation above 1),
+  // and block_filter and threshold in one pass.
+  vk::ComputePipeline block_minmax_decimate_pl_, threshold_block_pl_;
+  bool minmax_decimate_ = false;
+  bool threshold_block_ = false;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
   // Run starts from a workgroup max-scan, so no compression precedes the merge (single-merge only).
   vk::ComputePipeline uf_init_scan_pl_;
@@ -417,6 +422,8 @@ class GpuDetector {
   // Pure recording. The head is shared by every flow: timestamp reset, upload copy, counter clears,
   // decimate and threshold, the first labelling chunk, and the convergence-flag copy.
   void RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *imported, uint32_t chunk);
+  // Decimation, block min/max, block filter and threshold.
+  void RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *imported);
   void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations, bool trailing_compress = true);
   // The fused tail: blob sizes through line-fit moments; `speculative` stops blob_diff acting on
   // unconverged labels.

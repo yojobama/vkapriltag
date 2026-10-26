@@ -1,0 +1,46 @@
+#version 450
+// decimate_u8.comp and block_minmax_u8.comp in one pass: each thread decimates one 4x4 block of
+// the decimated image from the packed grey frame, writes its pixels and their min/max.
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+layout(constant_id = 3) const uint kDecimation = 2u;
+
+layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };
+layout(std430, binding = 1) writeonly buffer DecimatedImage { uint8_t decimated[]; };
+layout(std430, binding = 2) writeonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint decimated_width;
+  uint decimated_height;
+  uint block_width;
+  uint block_height;
+} pc;
+
+// The grey pixel decimate_u8.comp takes for decimated pixel (x, y).
+uint GrayAt(uint x, uint y) {
+  uint linear = (y * kDecimation) * (pc.decimated_width * kDecimation) + x * kDecimation;
+  return (gray_packed[linear >> 2u] >> ((linear & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+  uint bx = gl_GlobalInvocationID.x;
+  uint by = gl_GlobalInvocationID.y;
+  if (bx >= pc.block_width || by >= pc.block_height) return;
+
+  uint mn = 255u;
+  uint mx = 0u;
+  for (uint j = 0u; j < 4u; ++j) {
+    // Coordinates past the image edge clamp to the edge pixel (ragged last block).
+    uint y = min(by * 4u + j, pc.decimated_height - 1u);
+    for (uint i = 0u; i < 4u; ++i) {
+      uint x = min(bx * 4u + i, pc.decimated_width - 1u);
+      uint v = GrayAt(x, y);
+      mn = min(mn, v);
+      mx = max(mx, v);
+      if (by * 4u + j == y && bx * 4u + i == x) decimated[y * pc.decimated_width + x] = uint8_t(v);
+    }
+  }
+  minmax_unfiltered[by * pc.block_width + bx] = mn | (mx << 8u);
+}

@@ -411,6 +411,22 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(pick("threshold", "threshold_u8")),
       {decimated_view, minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_,
       {threshold_run_});
+  // One thread per 4x4 block; APRILTAG_VK_FUSED_THRESHOLD=0 keeps the separate passes.
+  const char *fused_env = std::getenv("APRILTAG_VK_FUSED_THRESHOLD");
+  const bool fused_threshold = u8 && !(fused_env != nullptr && fused_env[0] == '0');
+  minmax_decimate_ = fused_threshold && !alias_decimated_;
+  threshold_block_ = fused_threshold;
+  if (minmax_decimate_) {
+    block_minmax_decimate_pl_ = vk::ComputePipeline(
+        ctx_, ShaderPath("block_minmax_decimate_u8"),
+        {gray_buf_.get(), decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_,
+        {config_.decimation});
+  }
+  if (threshold_block_) {
+    threshold_block_pl_ = vk::ComputePipeline(
+        ctx_, ShaderPath("threshold_block_u8"),
+        {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get()}, 20, wg2d_);
+  }
 
   // uf_init covers this many pixels of a row per thread; APRILTAG_VK_UF_INIT_RUN overrides.
   if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_RUN")) {
@@ -667,17 +683,45 @@ void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool tra
   }
 }
 
+void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *imported) {
+  // decimate takes the decimated dimensions directly; decimation is a specialisation constant.
+  struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
+  struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
+                                                block_height_};
+  if (imported != nullptr) {
+    imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+    block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
+  } else if (minmax_decimate_) {
+    block_minmax_decimate_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
+  } else {
+    if (!alias_decimated_) {
+      decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+    }
+    block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
+  }
+
+  if (threshold_block_) {
+    struct { uint32_t dw, dh, min_diff, bw, bh; } thresh_pc{
+        decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_,
+        block_height_};
+    threshold_block_pl_.Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
+    return;
+  }
+  struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
+  block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
+  struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
+      decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
+  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
+                          decimated_height_, &thresh_pc);
+}
+
 void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *imported,
                                   uint32_t chunk) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
   const VkDeviceSize gray_bytes = VkDeviceSize(config_.width) * config_.height;
 
-  // Push constants shared across several stages.
-  // decimate_pl_ takes the decimated dimensions directly; decimation is a specialisation constant.
-  struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
-  struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
 
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
@@ -700,21 +744,8 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
   vk::DispatchProbe::Mark(cmd, "<clears>");
 
-  struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
-                                                block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  if (imported != nullptr) {
-    imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
-  } else if (!alias_decimated_) {
-    decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
-  }
-  block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
-  block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
-
-  struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
-      decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
-                          decimated_height_, &thresh_pc);
+  RecordThreshold(cmd, imported);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));
@@ -1259,11 +1290,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     pending_wait_ = upload_semaphore_;
   }
 
-  // Push constants shared across several stages.
-  // decimate_pl_ takes the decimated dimensions directly; decimation is a specialisation constant.
-  struct { uint32_t dw, dh; } dims_pc{decimated_width_, decimated_height_};
   struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
-  struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
 
   // ------------------------------------------------------------------
   // Submit 1: decimate, adaptive threshold, and the first chunk of
@@ -1298,21 +1325,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanClear));
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
 
-  struct { uint32_t dw, dh, bw, bh; } minmax_pc{decimated_width_, decimated_height_, block_width_,
-                                                block_height_};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanThreshold));
-  if (imported != nullptr) {
-    imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
-  } else if (!alias_decimated_) {
-    decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
-  }
-  block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
-  block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
-
-  struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
-      decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
-                          decimated_height_, &thresh_pc);
+  RecordThreshold(cmd, imported);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanThreshold));
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanLabelling));

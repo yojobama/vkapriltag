@@ -44,9 +44,11 @@ set(SHADER_SOURCES
   shaders/decimate_yuyv_u8.comp
   shaders/block_minmax.comp
   shaders/block_minmax_u8.comp
+  shaders/block_minmax_decimate_u8.comp
   shaders/block_filter.comp
   shaders/threshold.comp
   shaders/threshold_u8.comp
+  shaders/threshold_block_u8.comp
   shaders/uf_init.comp
   shaders/uf_init_u8.comp
   shaders/uf_init_scan.comp
