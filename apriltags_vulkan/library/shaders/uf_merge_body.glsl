@@ -18,6 +18,10 @@ layout(std430, binding = 2) buffer Changed { uint changed_flag; };
 layout(push_constant) uniform PushConstants {
   uint width;
   uint height;
+  // Non-zero: rows are merged in bands of band_mask + 1 (a power of two); phase 0 joins the rows
+  // inside each band, phase 1 only the rows across band boundaries.
+  uint band_mask;
+  uint band_phase;
 } pc;
 
 shared uint wg_changed;
@@ -88,6 +92,14 @@ layout(constant_id = 4) const uint kMergeFlagMode = 0u;
 void main() {
   uint x = gl_GlobalInvocationID.x;
   uint y = gl_GlobalInvocationID.y;
+  if (pc.band_mask != 0u) {
+    // A row outside this phase is moved past the last row, so the bounds test below skips it.
+    if (pc.band_phase == 0u) {
+      if (((y + 1u) & pc.band_mask) == 0u) y = pc.height;
+    } else {
+      y = y * (pc.band_mask + 1u) + pc.band_mask;
+    }
+  }
 
   if (kMergeFlagMode == 0u) {
     // Every invocation must reach both barriers, so the tests below select work rather than

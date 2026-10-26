@@ -477,8 +477,15 @@ void GpuDetector::CreatePipelines() {
   }
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(merge_x4_ ? "uf_merge_x4_u8" : pick("uf_merge", "uf_merge_u8")),
-      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 8,
+      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 16,
       vk::WorkgroupSize{wg1d_.x, 1, 1}, {find_mode, merge_flag_mode});
+  // Rows merged in bands of this many (a power of two) before the band boundaries, on discrete GPUs;
+  // 0 is one pass. APRILTAG_VK_MERGE_BAND overrides.
+  merge_band_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 0u : 8u;
+  if (const char *v = std::getenv("APRILTAG_VK_MERGE_BAND")) {
+    const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    merge_band_ = wanted >= 2u ? PrevPow2(wanted) : 0u;
+  }
   // Binding 1 / the third push constant are the convergence flag and the
   // opt-in to honouring it; see uf_compress.comp.
   uf_compress_pl_ = vk::ComputePipeline(
@@ -659,6 +666,19 @@ struct GpuDetector::FrameStart {
   VkDeviceSize gray_bytes = 0;
 };
 
+void GpuDetector::RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier) {
+  struct { uint32_t dw, dh, band_mask, band_phase; } pc{decimated_width_, decimated_height_, 0u, 0u};
+  const uint32_t columns = merge_x4_ ? decimated_width_ / 4u : decimated_width_;
+  if (merge_band_ == 0u) {
+    uf_merge_pl_.Dispatch2D(cmd, columns, decimated_height_, &pc, barrier);
+    return;
+  }
+  pc.band_mask = merge_band_ - 1u;
+  uf_merge_pl_.Dispatch2D(cmd, columns, decimated_height_, &pc);
+  pc.band_phase = 1u;
+  uf_merge_pl_.Dispatch2D(cmd, columns, decimated_height_ / merge_band_, &pc, barrier);
+}
+
 void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool trailing_compress) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
@@ -677,12 +697,11 @@ void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool tra
       vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
     }
     if (last && !trailing_compress) {
-      uf_merge_pl_.Dispatch2D(c, merge_x4_ ? decimated_width_ / 4u : decimated_width_, decimated_height_, &dwdh_pc, BarrierKind::None);
+      RecordMerge(c, BarrierKind::None);
       continue;
     }
     // The barrier makes the merge's flag write visible to the compression's guard or predicate read.
-    uf_merge_pl_.Dispatch2D(c, merge_x4_ ? decimated_width_ / 4u : decimated_width_, decimated_height_, &dwdh_pc,
-                            predicate ? BarrierKind::ComputeAndPredicate : BarrierKind::Compute);
+    RecordMerge(c, predicate ? BarrierKind::ComputeAndPredicate : BarrierKind::Compute);
     if (!trailing_compress && iter + 2 == iterations) {
       // The last real compression, just before the verification merge: it also counts blob sizes.
       const UfCountPc count_pc{decimated_width_, decimated_height_, 1u, config_.min_cluster_pixels};
@@ -780,7 +799,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
       const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
       uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
     }
-    uf_merge_pl_.Dispatch2D(cmd, merge_x4_ ? decimated_width_ / 4u : decimated_width_, decimated_height_, &dwdh_pc);
+    RecordMerge(cmd);
     const UfCountPc count_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u,
                              config_.min_cluster_pixels};
     uf_compress_count_pl_.Dispatch1D(cmd, pixels, &count_pc);
@@ -1375,8 +1394,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
         vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
       }
       // The barrier makes the merge's flag write visible to the compression's guard or predicate read.
-      uf_merge_pl_.Dispatch2D(c, merge_x4_ ? decimated_width_ / 4u : decimated_width_, decimated_height_, &dwdh_pc,
-                              predicate ? BarrierKind::ComputeAndPredicate
+      RecordMerge(c, predicate ? BarrierKind::ComputeAndPredicate
                                         : BarrierKind::Compute);
       if (predicate) {
         // Runs only when the flag is nonzero, so the guard is skipped.
@@ -1401,7 +1419,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     // One merge joins every component; the compression skips its walk when it joined nothing and
     // parent[] was flat before the merge.
     chunk = 1;
-    uf_merge_pl_.Dispatch2D(cmd, merge_x4_ ? decimated_width_ / 4u : decimated_width_, decimated_height_, &dwdh_pc);
+    RecordMerge(cmd);
     const UfCompressPc compress_pc{decimated_width_, decimated_height_, uf_init_scan_ ? 0u : 1u};
     uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_pc);
   }
