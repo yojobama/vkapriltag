@@ -297,8 +297,11 @@ class GpuDetector {
   vk::Buffer large_sort_buf_, sort_scratch_buf_;
   uint32_t hash_table_size_ = 0;
 
-  // Indirect dispatch args built on-device from raw_blob_counter_buf_.
+  // Indirect dispatch args built on the device: the boundary-point count's (slot 1) here, the raw and
+  // selected blob counts' (slots 0 and 1) in blob_args_buf_, so no dispatch writes a buffer that a
+  // later indirect dispatch reads before the barrier that orders them.
   vk::Buffer indirect_args_buf_;
+  vk::Buffer blob_args_buf_;
 
   // --- Host-visible staging, allocated once and permanently mapped ---
   // upload_staging_ is unused when gray_buf_ is host-visible and written directly.

@@ -1,0 +1,11 @@
+#version 450
+// sort_points_local*.comp for modes 1 and 2 (32-bit-per-pixel DecimatedImage), with the large-blob list
+// read-only.
+#define SORT_LARGE_ONLY
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout(std430, binding = 3) readonly buffer DecimatedImage { uint decimated[]; };
+#define DECIMATED_AT(i) (decimated[(i)])
+
+#include "sort_points_local_body.glsl"

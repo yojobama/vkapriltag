@@ -356,6 +356,12 @@ void GpuDetector::CreateBuffers() {
     device_bytes_ += b.size();
     indirect_args_buf_ = std::move(b);
   }
+  {
+    vk::Buffer b(ctx_, 2 * 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                 vk::MemoryKind::DeviceLocal);
+    device_bytes_ += b.size();
+    blob_args_buf_ = std::move(b);
+  }
 
   // Readback staging starts at a fixed size and grows on demand.
   const VkDeviceSize initial_readback =
@@ -499,11 +505,11 @@ void GpuDetector::CreatePipelines() {
       44, wg1d_);
 
   // Per-blob point base offsets: the inclusive prefix sum of the selected blobs' point counts, in
-  // one workgroup; it also writes the sort's indirect arguments (slot 2).
+  // one workgroup; it also writes the sort's indirect arguments (blob_args_buf_ slot 1).
   scan_blob_counts_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("scan_blob_counts"),
       {selected_extents_buf_.get(), selected_counter_buf_.get(), blob_point_offsets_buf_.get(),
-       indirect_args_buf_.get()},
+       blob_args_buf_.get()},
       8, vk::WorkgroupSize{scan_wg_, 1, 1});
 
   // Rank-merge sort run length (a power of two, 0 for the sorting network);
@@ -518,7 +524,9 @@ void GpuDetector::CreatePipelines() {
   const bool sort_split = local_sort_split_ < local_sort_virtual_cap_;
   auto make_sort = [&](uint32_t mode) {
     return vk::ComputePipeline(
-        ctx_, ShaderPath(pick("sort_points_local", "sort_points_local_u8")),
+        ctx_,
+        ShaderPath(mode == 0u ? pick("sort_points_local", "sort_points_local_u8")
+                              : pick("sort_points_large", "sort_points_large_u8")),
         {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
          decimated_view, line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
          // binding 6: the device-side selected-blob count.
@@ -545,7 +553,7 @@ void GpuDetector::CreatePipelines() {
   // ComputePipeline binds its buffers at construction.
   build_indirect_args_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("build_indirect_args"),
-      {raw_blob_counter_buf_.get(), indirect_args_buf_.get()}, 16,
+      {raw_blob_counter_buf_.get(), blob_args_buf_.get()}, 16,
       vk::WorkgroupSize{1, 1, 1});
   build_qbp_args_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("build_indirect_args"),
@@ -860,10 +868,10 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
               config_.aspect_max,         config_.fill_min,
               config_.fill_max};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
-  select_blobs_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &select_pc);
+  select_blobs_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
-  struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 2u};
+  struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
   scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
@@ -886,7 +894,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
       VkDeviceSize(kSlotPointCount) * 4);
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
 
-  // Slot 2 (one workgroup per selected blob) was written by scan_blob_counts.
+  // The sort's arguments (one workgroup per selected blob) were written by scan_blob_counts.
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
@@ -923,7 +931,7 @@ void GpuDetector::RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs,
   const bool split = local_sort_split_ < local_sort_virtual_cap_;
   const BarrierKind after = split ? BarrierKind::Compute : BarrierKind::ComputeAndTransfer;
   if (count_from_buffer) {
-    sort_points_local_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 24, &pc, after);
+    sort_points_local_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 12, &pc, after);
   } else {
     sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &pc, after);
   }
@@ -1494,10 +1502,10 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
                 config_.aspect_max,         config_.fill_min,
                 config_.fill_max};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
-    select_blobs_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 0, &select_pc);
+    select_blobs_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
-    struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 2u};
+    struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
     scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
@@ -1557,7 +1565,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   if (!fuse) EnsureReadbackCapacity(linefit_offset + linefit_bytes);
 
   if (!fuse) cmd = BeginTimedCommands();
-  // Slot 2 (one workgroup per selected blob) was written by scan_blob_counts.
+  // The sort's arguments (one workgroup per selected blob) were written by scan_blob_counts.
   if (fuse) vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   if (fuse || num_points > 0) {
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));

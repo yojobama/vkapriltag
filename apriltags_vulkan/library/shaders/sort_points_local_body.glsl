@@ -26,8 +26,13 @@ layout(std430, binding = 5) buffer OversizedBlobs { uint oversized_blobs; };
 // constant.
 layout(std430, binding = 6) readonly buffer CountBuf { uint count_buf; };
 // Blobs of more than kLocalCap points: [0..2] mode 1's dispatch, [3..5] mode 2's, [6] the count,
-// then the blob indices. Zeroed each frame.
+// then the blob indices. Zeroed each frame. Read-only in the modes 1 and 2 build
+// (sort_points_large*.comp), which the validation layer's shader-access analysis relies on.
+#ifdef SORT_LARGE_ONLY
+layout(std430, binding = 7) readonly buffer LargeBlobs {
+#else
 layout(std430, binding = 7) buffer LargeBlobs {
+#endif
   uint large_args[8];
   uint large_blobs[];
 };
@@ -261,6 +266,7 @@ void main() {
     }
     if (count > kLocalCap) {
       // Listed for modes 1 and 2; the y and z group counts are 1 whenever x is non-zero.
+#ifndef SORT_LARGE_ONLY
       if (tid == 0u) {
         large_blobs[atomicAdd(large_args[6], 1u)] = blob;
         atomicAdd(large_args[0], kLargeCap / kLocalCap);
@@ -270,6 +276,7 @@ void main() {
         large_args[4] = 1u;
         large_args[5] = 1u;
       }
+#endif
       return;
     }
     SortRange(base, 0u, count);

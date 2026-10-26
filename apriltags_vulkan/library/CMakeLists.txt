@@ -67,6 +67,8 @@ set(SHADER_SOURCES
   shaders/scan_blob_counts.comp
   shaders/sort_points_local.comp
   shaders/sort_points_local_u8.comp
+  shaders/sort_points_large.comp
+  shaders/sort_points_large_u8.comp
   shaders/hash_group.comp
   shaders/build_indirect_args.comp
   shaders/reduce_extents_hash.comp
