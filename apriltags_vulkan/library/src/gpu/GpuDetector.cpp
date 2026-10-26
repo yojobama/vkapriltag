@@ -186,8 +186,9 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // sort_points_local.comp workgroup size: the device's maximum invocation count rounded down to a
   // power of two.
   local_sort_cap_ = PrevPow2(std::max(caps.max_workgroup_invocations, 1u));
-  // Limited to 256 threads; APRILTAG_VK_SORT_WG overrides it.
-  local_sort_cap_ = std::min(local_sort_cap_, 256u);
+  // Limited to 256 threads on integrated GPUs and 1,024 on others; APRILTAG_VK_SORT_WG overrides it.
+  local_sort_cap_ = std::min(
+      local_sort_cap_, caps.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 256u : 1024u);
   if (const char *v = std::getenv("APRILTAG_VK_SORT_WG")) {
     const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
     if (wanted >= 1u) {
