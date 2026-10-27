@@ -752,8 +752,9 @@ GPU work and about 0.85 ms of CPU tail per frame (2.87 ms serial). Open items, l
   (items 1 to 3 below).
 - **Ingest.** Hardware JPEG decode into a dma-buf is outside the library and needs stride and
   offset on `ImportDmaBufFrame` (section 8d).
-- **The quad refit in the parallel loop** (section 8r): -25% `quad_decode` on the desktop, held back
-  only by GCC's default multiply-add fusion; it needs a decision on `-ffp-contract=off`.
+- **Quads that never decode** (section 8y): the DP corner seeding turns many non-tag blobs into
+  convex quads that libapriltag's peak search would reject (131 against 54 on a busy 1200x800
+  frame), and each costs a refinement. Fewer of them means a different quad set.
 - **The remaining CPU-tail items from profiling** (section 8p): the frame upload and the copy of the
   line-fit points, and the `matd` allocations in upstream's homography.
 
@@ -2000,7 +2001,7 @@ layer reports nothing on either machine.
   segment-boundary pointers: 233 -> 374 us on the Mali.
 - Run counting on the RX 9060 XT: 15 to 20 us slower per frame.
 - The sort split at decimation 2 on the desktop (lengths 256 to 1,024): no gain over the run-to-run
-  spread, which is ±40% for that dispatch there.
+  spread, which is Â±40% for that dispatch there.
 - Rank-all thresholds of 64, 512 and 1,024 (all worse than 256).
 - The 4-points-per-thread reduction in place of the subgroup one on the desktop: 25 -> 20 us at
   decimation 1 but 11.5 -> 16 us at decimation 2.
@@ -2142,6 +2143,71 @@ RX 9060 XT (decimation 1 on `hd720.pgm`, decimation 2 on `grayimage.pgm`):
 
 With `exact` refinement at decimation 2 the desktop is limited by the CPU tail, and its throughput is
 unchanged within the run-to-run spread.
+
+## 8y. Against vulkan-apriltag, and the quad refit in the parallel loop
+
+**The comparison.** vulkan-apriltag (github.com/carbotaniuman/vulkan-apriltag, GPL-3.0, one commit)
+is another Vulkan port of the AprilTag front end: full resolution only, tag36h11 only, quads fitted
+on the GPU and decoded with libapriltag's own `quad_decode`. Both were driven by the same harness
+(same images, the same serial timing loop of upload, GPU, readback and CPU decode, no GPU timestamps,
+`Release` builds, interleaved rounds), with libapriltag on the CPU as the reference. Its code was only
+built and run, not used: the changes below come from the measurements.
+
+- Accuracy: on the synthetic sweep (384 frames each at contrast 1, contrast 0.25 and noise sigma 8
+  with blur 1.2) vulkan-apriltag decodes exactly what libapriltag does at `quad_decimate` 1, and so
+  does vkapriltag at decimation 1 (two more tags at contrast 0.25), with corner errors within 0.001
+  px of each other. On ten real images vulkan-apriltag matches libapriltag's 24 tags within 0.005
+  px; vkapriltag matches them within 0.04 px and also decodes a 12 px tag libapriltag misses.
+- Speed at the same resolution: on the Orange Pi vkapriltag is 1.4x to 2.2x faster (4.1 to 7.5 ms
+  against 5.7 to 16.5 ms per frame; its GPU part grows to 15.9 ms on a frame with eight tags). On the
+  RX 9060 XT the two tie on one-tag frames (0.85 ms) and vulkan-apriltag is 8% to 21% faster on
+  frames with five to eight tags: its CPU part is 0.15 to 0.23 ms against our 0.34 to 0.75 ms.
+
+**Why our CPU part was longer.** vkapriltag hands about twice as many quads to `TagDecoder` as
+libapriltag produces (131 against 54 on `field2.png` at decimation 1, 52 against 25 on `hd720.pgm`).
+Counting where each blob is rejected, in our quad fit and in a counting copy of libapriltag's:
+
+| field2.png, decimation 1 | libapriltag | vkapriltag |
+| --- | --- | --- |
+| blobs fitted (after the size and border-polarity tests) | 709 | 837 |
+| rejected by area | 284 | 430 |
+| rejected by the angle and convexity test | 299 | 253 |
+| quads | 54 | 131 |
+
+The DP corner seeding (item 25) takes the farthest points and the points of largest deviation as
+corners, so a ball or other round blob becomes a tidy convex quad that passes the angle test, where
+libapriltag's error peaks usually do not. Removing those quads changes the quad set, so it was not
+done. Fitting only the blobs that end up as quads (simulated by remembering them from the first of
+repeated frames) saves 40 to 110 us of `quad_decode` on the desktop: a GPU pre-filter would be worth
+little. The time was elsewhere: about 120 us of serial refit after the parallel fits at decimation 1.
+
+**Change: the refit runs inside the parallel loop.** Each blob's lines, corners, area and angle
+tests now run in the task that fitted it; survivors are still collected in blob order. Measured in
+section 8r at -25% on the desktop, it was held back because GCC on AArch64 fuses `a * b + c` into
+multiply-adds by default and moving the code changed which ones, and so the last bit of some corners.
+`QuadDecode.cpp` is now compiled with `-ffp-contract=off` on GCC and Clang, so its arithmetic no
+longer depends on the code's layout.
+
+Output: identical on the RX 9060 XT (15 canonical dumps, 95 configurations, 42 record paths and 84
+fallbacks against v1.9.0; synthetic CSVs). On the Orange Pi 234 of 331 dump files change, all by at
+most 1.1e-13 px, with the same quads, ids and Hamming distances everywhere; record paths and fallbacks
+match the new build's own default output, the synthetic CSVs are unchanged, and ASan, UBSan, LSan
+and TSan are clean (88 and 23 runs; MSVC ASan on the desktop, 84 runs).
+
+Interleaved against v1.9.0, six rounds (1,000 frames on the desktop, 600 on the Orange Pi), `exact`
+refinement:
+
+| | RX 9060 XT `quad_decode` | RX 9060 XT `pipeline_total` | Orange Pi `quad_decode` | Orange Pi `pipeline_total` |
+| --- | --- | --- | --- | --- |
+| field2.png (1200x800), dec. 1 | 0.445 -> 0.334 ms (-25%) | 1.444 -> 1.312 ms (-9%) | 0.913 -> 0.742 ms (-19%) | 6.878 -> 6.704 ms (-2.5%) |
+| field2.png, dec. 2 | 0.137 -> 0.118 ms (-14%) | 0.677 -> 0.651 ms (-4%) | 0.186 -> 0.152 ms (-18%) | 2.429 -> 2.391 ms (-1.6%) |
+| hd720.pgm, dec. 1 | 0.214 -> 0.163 ms (-24%) | 0.869 -> 0.819 ms (-6%) | 0.482 -> 0.403 ms (-16%) | 4.097 -> 4.025 ms (-1.8%) |
+| hd720.pgm, dec. 2 | 0.169 -> 0.153 ms (-10%) | 0.761 -> 0.721 ms (-5%) | 0.223 -> 0.200 ms (-10%) | 2.285 -> 2.250 ms (-1.5%) |
+| grayimage.pgm / corpus 1280x800, dec. 1 | 0.231 -> 0.176 ms (-24%) | 0.910 -> 0.851 ms (-6%) | 0.501 -> 0.416 ms (-17%) | 4.380 -> 4.288 ms (-2.1%) |
+| grayimage.pgm / corpus 1280x800, dec. 2 | 0.110 -> 0.094 ms (-14%) | 0.725 -> 0.644 ms (-11%) | 0.176 -> 0.153 ms (-13%) | 2.398 -> 2.383 ms (-0.6%) |
+
+The Orange Pi figures include whatever turning off multiply-add fusion in `QuadDecode.cpp` costs;
+it was not measured on its own.
 
 ## 9. Measuring
 

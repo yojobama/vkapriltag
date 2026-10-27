@@ -2086,3 +2086,22 @@ GPUs (256 stays on integrated GPUs); RX 9060 XT sort at decimation 2 47 to 68 ->
 - **Found:** GPU timestamps cost about 0.2 ms per Mali frame; every remaining Mali shader is at full
   occupancy except `select_blobs` (44 us); the CPU tail has about 220 us of serial work (span grouping
   before the workers, `update_fit` after them) and A55 workers take about 120 us to wake.
+
+## 31. Against vulkan-apriltag; the quad refit in the parallel loop - shipped
+
+vulkan-apriltag (carbotaniuman, GPL-3.0) was built and measured against vkapriltag, not read for code
+(`PERFORMANCE.md` 8y). Same accuracy as libapriltag at full resolution for both; vkapriltag 1.4x to
+2.2x faster on the Orange Pi, level or 8% to 21% slower on the RX 9060 XT on multi-tag frames, where
+its CPU part was 0.34 to 0.75 ms against 0.15 to 0.23 ms.
+
+- **Found:** vkapriltag passes about twice libapriltag's quads to `TagDecoder` (131 against 54 on a
+  busy frame), because the DP corner seeding makes round blobs into convex quads that pass the angle
+  test. Removing them changes the quad set; not done.
+- **Bounded and not built:** a GPU pass dropping blobs that are certain to be rejected. Fitting only
+  the surviving blobs saves at most 40 to 110 us of `quad_decode` on the desktop.
+- **Shipped:** the per-blob refit moved into the parallel loop (held back in section 8r), with
+  `QuadDecode.cpp` built with `-ffp-contract=off` on GCC and Clang. `quad_decode` -24% to -25% at
+  decimation 1 and -10% to -14% at decimation 2 on the desktop, -16% to -19% and -10% to -18% on the
+  Orange Pi; `pipeline_total` -4% to -11% and -0.6% to -2.5%. Identical on MSVC; on GCC/AArch64 the
+  last bit of some corners changes once (at most 1.1e-13 px, same quads and detections).
+
