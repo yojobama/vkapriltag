@@ -56,6 +56,10 @@ struct DetectorConfig {
   // Env override: APRILTAG_VK_QUADFIT=peaks|dp
   enum class QuadFitMethod { kPeaks, kDp };
   QuadFitMethod quad_fit_method = QuadFitMethod::kDp;
+  // kDp only: also require the kPeaks search to accept the blob, as libapriltag's fit would. Drops
+  // about two thirds of the quads that never decode, and rarely the smallest real tags.
+  // Env override: APRILTAG_VK_DP_PEAKS_CHECK=0|1
+  bool dp_peaks_check = false;
 
   // Caps on the raw (pre-selection) blob count.
   uint32_t max_raw_blobs = 65536;

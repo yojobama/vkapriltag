@@ -510,6 +510,7 @@ QuadDecode::QuadDecode(const DetectorConfig &config)
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker")),
       scratch_(pool_->threads()) {
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
+  if (const char *v = std::getenv("APRILTAG_VK_DP_PEAKS_CHECK")) config_.dp_peaks_check = v[0] == '1';
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
@@ -549,6 +550,14 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     r.dp_attempted = fq.dp_attempted;
     r.dp_used = fq.dp_used;
     r.has_quad = fq.valid && UpdateFitQuad(config_, fq, &r.quad);
+    if (r.has_quad && fq.dp_used && config_.dp_peaks_check) {
+      DetectorConfig peaks_config = config_;
+      peaks_config.quad_fit_method = DetectorConfig::QuadFitMethod::kPeaks;
+      const FitQuadResult fp = FitQuadForBlob(peaks_config, line_fit_points, spans[s].begin,
+                                              spans[s].end, scratch_[slot]);
+      DetectedQuad unused;
+      r.has_quad = fp.valid && UpdateFitQuad(config_, fp, &unused);
+    }
   });
 
   last_dp_stats_ = DpStats{};
