@@ -430,6 +430,79 @@ DetectorConfig::QuadFitMethod ResolveQuadFitMethod(DetectorConfig::QuadFitMethod
   return configured;
 }
 
+// UpdateFitQuads for one blob: refits the lines from the moments, intersects adjacent lines to
+// get corners and applies the geometric checks. Returns false if the quad is rejected.
+bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, DetectedQuad *out) {
+  const double min_tag_width =
+      std::max(3.0, config.tag_width / static_cast<double>(config.decimation));
+  double lines[4][4];
+  for (int i = 0; i < 4; ++i) {
+    double err, mse;
+    FitLine(quad.moments[i], lines[i], lines[i] + 2, &err, &mse);
+  }
+
+  double corners[4][2];
+  bool bad_determinant = false;
+  for (int i = 0; i < 4; ++i) {
+    const int j = (i + 1) & 3;
+    double A00 = lines[i][3], A01 = -lines[j][3];
+    double A10 = -lines[i][2], A11 = lines[j][2];
+    double B0 = -lines[i][0] + lines[j][0];
+    double B1 = -lines[i][1] + lines[j][1];
+
+    double det = A00 * A11 - A10 * A01;
+    if (std::fabs(det) < 0.001) {
+      bad_determinant = true;
+      break;
+    }
+    double W00 = A11 / det, W01 = -A01 / det;
+    double L0 = W00 * B0 + W01 * B1;
+
+    corners[i][0] = lines[i][0] + L0 * A00;
+    corners[i][1] = lines[i][1] + L0 * A10;
+  }
+  if (bad_determinant) return false;
+
+  // Area check: sum of the two triangles (0,1,2) and (2,3,0).
+  {
+    auto triangle_area = [&](int a, int b, int c) {
+      double la = std::hypot(corners[b][0] - corners[a][0], corners[b][1] - corners[a][1]);
+      double lb = std::hypot(corners[c][0] - corners[b][0], corners[c][1] - corners[b][1]);
+      double lc = std::hypot(corners[a][0] - corners[c][0], corners[a][1] - corners[c][1]);
+      double p = (la + lb + lc) / 2;
+      double v = p * (p - la) * (p - lb) * (p - lc);
+      return v > 0 ? std::sqrt(v) : 0.0;
+    };
+    double area = triangle_area(0, 1, 2) + triangle_area(2, 3, 0);
+    if (area < 0.95 * min_tag_width * min_tag_width) return false;
+  }
+
+  // Reject quads that are not convex and consistently wound.
+  bool reject = false;
+  for (int i = 0; i < 4 && !reject; ++i) {
+    int i0 = i, i1 = (i + 1) & 3, i2 = (i + 2) & 3;
+    double dx1 = corners[i1][0] - corners[i0][0];
+    double dy1 = corners[i1][1] - corners[i0][1];
+    double dx2 = corners[i2][0] - corners[i1][0];
+    double dy2 = corners[i2][1] - corners[i1][1];
+    double cos_dtheta = (dx1 * dx2 + dy1 * dy2) /
+                       std::sqrt((dx1 * dx1 + dy1 * dy1) * (dx2 * dx2 + dy2 * dy2));
+    if (std::fabs(cos_dtheta) > config.cos_critical_rad || dx1 * dy2 < dy1 * dx2) {
+      reject = true;
+    }
+  }
+  if (reject) return false;
+
+  // Decimated grid to full-resolution pixels: a plain scale. decimate.comp point-samples the
+  // top-left pixel of each block, so no pixel-centre adjustment applies.
+  const double decimation = static_cast<double>(config.decimation);
+  for (int i = 0; i < 4; ++i) {
+    out->p[i][0] = corners[i][0] * decimation;
+    out->p[i][1] = corners[i][1] * decimation;
+  }
+  return true;
+}
+
 }  // namespace
 
 QuadDecode::QuadDecode(const DetectorConfig &config)
@@ -461,105 +534,34 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
   }
 
-  // Fit every blob independently; each entry is written by exactly one task.
-  std::vector<FitQuadResult> per_span(spans.size());
+  // Fit and refit every blob independently; each entry is written by exactly one task.
+  struct SpanResult {
+    bool dp_attempted = false, dp_used = false, has_quad = false;
+    DetectedQuad quad;
+  };
+  std::vector<SpanResult> per_span(spans.size());
   pool_->ParallelFor(spans.size(), [&](size_t s, unsigned slot) {
     prof::Scope fit_scope("quad.fit_blob");
     fit_scope.set_arg(static_cast<int64_t>(spans[s].end - spans[s].begin));
-    per_span[s] =
+    const FitQuadResult fq =
         FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
+    SpanResult &r = per_span[s];
+    r.dp_attempted = fq.dp_attempted;
+    r.dp_used = fq.dp_used;
+    r.has_quad = fq.valid && UpdateFitQuad(config_, fq, &r.quad);
   });
 
   last_dp_stats_ = DpStats{};
-  for (const FitQuadResult &fq : per_span) {
-    if (fq.dp_attempted) {
+  for (const SpanResult &r : per_span) {
+    if (r.dp_attempted) {
       ++last_dp_stats_.attempts;
-      if (!fq.dp_used) ++last_dp_stats_.fallbacks;
+      if (!r.dp_used) ++last_dp_stats_.fallbacks;
     }
   }
 
   // Collect survivors in span order so the output is independent of thread scheduling.
-  std::vector<FitQuadResult> fit_quads;
-  fit_quads.reserve(per_span.size());
-  for (const FitQuadResult &fq : per_span) {
-    if (fq.valid) fit_quads.push_back(fq);
-  }
-
-  // UpdateFitQuads: refit lines from the moments, intersect adjacent lines
-  // to get corners, and apply geometric sanity checks.
-  VKA_PROF_SCOPE("quad.update_fit");
-  const double min_tag_width =
-      std::max(3.0, config_.tag_width / static_cast<double>(config_.decimation));
-  for (const FitQuadResult &quad : fit_quads) {
-    double lines[4][4];
-    bool line_ok = true;
-    for (int i = 0; i < 4; ++i) {
-      double err, mse;
-      FitLine(quad.moments[i], lines[i], lines[i] + 2, &err, &mse);
-    }
-
-    double corners[4][2];
-    bool bad_determinant = false;
-    for (int i = 0; i < 4; ++i) {
-      const int j = (i + 1) & 3;
-      double A00 = lines[i][3], A01 = -lines[j][3];
-      double A10 = -lines[i][2], A11 = lines[j][2];
-      double B0 = -lines[i][0] + lines[j][0];
-      double B1 = -lines[i][1] + lines[j][1];
-
-      double det = A00 * A11 - A10 * A01;
-      if (std::fabs(det) < 0.001) {
-        bad_determinant = true;
-        break;
-      }
-      double W00 = A11 / det, W01 = -A01 / det;
-      double L0 = W00 * B0 + W01 * B1;
-
-      corners[i][0] = lines[i][0] + L0 * A00;
-      corners[i][1] = lines[i][1] + L0 * A10;
-    }
-    if (bad_determinant) continue;
-    (void)line_ok;
-
-    // Area check: sum of the two triangles (0,1,2) and (2,3,0).
-    {
-      auto triangle_area = [&](int a, int b, int c) {
-        double la = std::hypot(corners[b][0] - corners[a][0], corners[b][1] - corners[a][1]);
-        double lb = std::hypot(corners[c][0] - corners[b][0], corners[c][1] - corners[b][1]);
-        double lc = std::hypot(corners[a][0] - corners[c][0], corners[a][1] - corners[c][1]);
-        double p = (la + lb + lc) / 2;
-        double v = p * (p - la) * (p - lb) * (p - lc);
-        return v > 0 ? std::sqrt(v) : 0.0;
-      };
-      double area = triangle_area(0, 1, 2) + triangle_area(2, 3, 0);
-      if (area < 0.95 * min_tag_width * min_tag_width) continue;
-    }
-
-    // Reject quads that are not convex and consistently wound.
-    bool reject = false;
-    for (int i = 0; i < 4 && !reject; ++i) {
-      int i0 = i, i1 = (i + 1) & 3, i2 = (i + 2) & 3;
-      double dx1 = corners[i1][0] - corners[i0][0];
-      double dy1 = corners[i1][1] - corners[i0][1];
-      double dx2 = corners[i2][0] - corners[i1][0];
-      double dy2 = corners[i2][1] - corners[i1][1];
-      double cos_dtheta = (dx1 * dx2 + dy1 * dy2) /
-                         std::sqrt((dx1 * dx1 + dy1 * dy1) * (dx2 * dx2 + dy2 * dy2));
-      if (std::fabs(cos_dtheta) > config_.cos_critical_rad || dx1 * dy2 < dy1 * dx2) {
-        reject = true;
-      }
-    }
-    if (reject) continue;
-
-    // Decimated grid to full-resolution pixels: a plain scale. decimate.comp point-samples the
-    // top-left pixel of each block, so no pixel-centre adjustment applies.
-    const double decimation = static_cast<double>(config_.decimation);
-    DetectedQuad out;
-    for (int i = 0; i < 4; ++i) {
-      out.p[i][0] = corners[i][0] * decimation;
-      out.p[i][1] = corners[i][1] * decimation;
-    }
-    output.push_back(out);
+  for (const SpanResult &r : per_span) {
+    if (r.has_quad) output.push_back(r.quad);
   }
 
   return output;
