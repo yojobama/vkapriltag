@@ -4,13 +4,13 @@
      struct quick_decode_entry e;
  };
  
-+// APRILTAG_VK_DECODE_NOALLOC=1: the decode below avoids its per-quad heap allocations.
++// The decode below avoids its per-quad heap allocations unless APRILTAG_VK_DECODE_NOALLOC=0.
 +static int decode_noalloc(void)
 +{
 +    static int v = -1;
 +    if (v < 0) {
 +        const char *e = getenv("APRILTAG_VK_DECODE_NOALLOC");
-+        v = e != NULL && e[0] == '1';
++        v = e == NULL || e[0] != '0';
 +    }
 +    return v;
 +}

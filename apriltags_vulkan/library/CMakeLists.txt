@@ -17,7 +17,7 @@ set(APRILTAG_MINGW_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/april
 # Patch exposing the bit-sampling step without the code lookup (quad_sample_code, apriltag_min_hamming).
 set(APRILTAG_PROBE_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-code-probe.patch)
 # Patch removing the decode's per-quad heap allocations (the unused inverse homography, the quad copy
-# per family and two scratch buffers); APRILTAG_VK_DECODE_NOALLOC=1 selects it.
+# per family and two scratch buffers); APRILTAG_VK_DECODE_NOALLOC=0 restores them.
 set(APRILTAG_NOALLOC_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-decode-no-alloc.patch)
 FetchContent_Declare(
   apriltag
