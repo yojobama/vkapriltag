@@ -1,6 +1,12 @@
 # Applies each patch in -DPATCHES="a,b,c" (comma-separated) in order, skipping any already applied.
 # Invoked via cmake -P.
 string(REPLACE "," ";" PATCHES "${PATCHES}")
+# Restore a git checkout first: a later patch can edit lines an earlier one added, and then the
+# earlier one no longer reverse-applies to the patched tree.
+execute_process(COMMAND git checkout -- . RESULT_VARIABLE reset_result OUTPUT_QUIET ERROR_QUIET)
+if(reset_result EQUAL 0)
+  execute_process(COMMAND git clean -fdq OUTPUT_QUIET ERROR_QUIET)
+endif()
 foreach(patch ${PATCHES})
   # Already applied if the reverse patch checks cleanly.
   execute_process(
