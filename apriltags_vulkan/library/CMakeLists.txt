@@ -165,6 +165,32 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   set_source_files_properties(src/gpu/QuadDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
+# Code generation for a specific CPU, e.g. cortex-a76.cortex-a55 (GCC/Clang -mcpu) or AVX2 (MSVC
+# /arch, with /fp:contract outside QuadDecode.cpp). The binaries then need that CPU; empty = generic.
+set(VKAPRILTAG_CPU_TUNE "" CACHE STRING "Target CPU for the library and libapriltag (empty = generic)")
+if(VKAPRILTAG_CPU_TUNE)
+  if(MSVC)
+    foreach(tgt vkapriltag apriltag)
+      if(TARGET ${tgt})
+        target_compile_options(${tgt} PRIVATE /arch:${VKAPRILTAG_CPU_TUNE})
+        get_target_property(tgt_sources ${tgt} SOURCES)
+        foreach(src ${tgt_sources})
+          if(src MATCHES "\\.(c|cpp)$" AND NOT src MATCHES "QuadDecode\\.cpp$")
+            set_source_files_properties(${src} TARGET_DIRECTORY ${tgt}
+                                        PROPERTIES COMPILE_OPTIONS /fp:contract)
+          endif()
+        endforeach()
+      endif()
+    endforeach()
+  else()
+    foreach(tgt vkapriltag apriltag)
+      if(TARGET ${tgt})
+        target_compile_options(${tgt} PRIVATE -mcpu=${VKAPRILTAG_CPU_TUNE})
+      endif()
+    endforeach()
+  endif()
+endif()
+
 set_target_properties(vkapriltag PROPERTIES OUTPUT_NAME vkapriltag)
 
 # ---------------------------------------------------------------------------
