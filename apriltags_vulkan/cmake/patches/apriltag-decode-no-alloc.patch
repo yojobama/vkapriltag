@@ -1,20 +1,37 @@
 --- a/apriltag.c
 +++ b/apriltag.c
-@@ -419,6 +419,57 @@
+@@ -148,27 +148,6 @@
+     return w;
+ }
+ 
+-static void quad_destroy(struct quad *quad)
+-{
+-    if (!quad)
+-        return;
+-
+-    matd_destroy(quad->H);
+-    matd_destroy(quad->Hinv);
+-    free(quad);
+-}
+-
+-static struct quad *quad_copy(struct quad *quad)
+-{
+-    struct quad *q = calloc(1, sizeof(struct quad));
+-    memcpy(q, quad, sizeof(struct quad));
+-    if (quad->H)
+-        q->H = matd_copy(quad->H);
+-    if (quad->Hinv)
+-        q->Hinv = matd_copy(quad->Hinv);
+-    return q;
+-}
+-
+ static void quick_decode_add(struct quick_decode *qd, uint64_t code, int id, int hamming)
+ {
+     uint32_t bucket = code % qd->nentries;
+@@ -419,6 +398,46 @@
      struct quick_decode_entry e;
  };
  
-+// The decode below avoids its per-quad heap allocations unless APRILTAG_VK_DECODE_NOALLOC=0.
-+static int decode_noalloc(void)
-+{
-+    static int v = -1;
-+    if (v < 0) {
-+        const char *e = getenv("APRILTAG_VK_DECODE_NOALLOC");
-+        v = e == NULL || e[0] != '0';
-+    }
-+    return v;
-+}
-+
 +// matd_plu()'s singular flag for a 3x3 matrix, computed the same way on the stack.
 +static int plu_singular3(const matd_t *a)
 +{
@@ -58,33 +75,30 @@
  static matd_t* homography_compute2(double c[4][4]) {
      double A[] =  {
              c[0][0], c[0][1], 1,       0,       0, 0, -c[0][0]*c[0][2], -c[0][1]*c[0][2], c[0][2],
-@@ -506,6 +557,15 @@
+@@ -506,9 +525,10 @@
  
      // XXX Tunable
      quad->H = homography_compute2(corr_arr);
++    // Hinv is not used by the decode; only matd_inverse()'s singularity test is kept.
 +    quad->Hinv = NULL;
-+    if (quad->H != NULL && decode_noalloc()) {
-+        // Hinv is not used by the decode; only matd_inverse()'s singularity test is kept.
-+        if (!plu_singular3(quad->H))
-+            return 0;
-+        matd_destroy(quad->H);
-+        quad->H = NULL;
-+        return -1;
-+    }
      if (quad->H != NULL) {
-         quad->Hinv = matd_inverse(quad->H);
-         if (quad->Hinv != NULL) {
-@@ -535,7 +595,8 @@
+-        quad->Hinv = matd_inverse(quad->H);
+-        if (quad->Hinv != NULL) {
++        if (!plu_singular3(quad->H)) {
+ 	    // Success!
+             return 0;
+         }
+@@ -535,7 +555,8 @@
  }
  
  static void sharpen(apriltag_detector_t* td, double* values, int size) {
 -    double *sharpened = malloc(sizeof(double)*size*size);
 +    double sharpened_stack[256];
-+    double *sharpened = (decode_noalloc() && size*size <= 256) ? sharpened_stack : malloc(sizeof(double)*size*size);
++    double *sharpened = size*size <= 256 ? sharpened_stack : malloc(sizeof(double)*size*size);
      double kernel[9] = {
          0, -1, 0,
          -1, 4, -1,
-@@ -563,7 +624,8 @@
+@@ -563,7 +584,8 @@
          }
      }
  
@@ -94,7 +108,7 @@
  }
  
  // returns the decision margin. Return < 0 if the detection should be rejected.
-@@ -691,7 +753,15 @@
+@@ -691,7 +713,15 @@
      float black_score = 0, white_score = 0;
      float black_score_count = 1, white_score_count = 1;
  
@@ -102,7 +116,7 @@
 +    const int nvalues = family->total_width*family->total_width;
 +    double values_stack[256];
 +    double *values;
-+    if (decode_noalloc() && nvalues <= 256) {
++    if (nvalues <= 256) {
 +        memset(values_stack, 0, sizeof(double)*nvalues);
 +        values = values_stack;
 +    } else {
@@ -111,7 +125,7 @@
  
      int min_coord = (family->width_at_border - family->total_width)/2;
      for (uint32_t i = 0; i < family->nbits; i++) {
-@@ -745,7 +815,8 @@
+@@ -745,7 +775,8 @@
  
      probe_last_rcode = rcode;
      quick_decode_codeword(family, rcode, entry);
@@ -121,34 +135,26 @@
      return fmin(white_score / white_score_count, black_score / black_score_count);
  }
  
-@@ -948,7 +1019,15 @@
+@@ -948,7 +979,8 @@
  
          // since the geometry of tag families can vary, start any
          // optimization process over with the original quad.
 -        struct quad *quad = quad_copy(quad_original);
-+        // quad_decode() only reads the quad, so the no-allocation path shares the original.
-+        struct quad quad_shared;
-+        struct quad *quad;
-+        if (decode_noalloc()) {
-+            quad_shared = *quad_original;
-+            quad = &quad_shared;
-+        } else {
-+            quad = quad_copy(quad_original);
-+        }
++        // quad_decode() only reads the quad, so it shares the original's homography.
++        struct quad *quad = quad_original;
  
          struct quick_decode_entry entry;
  
-@@ -1000,7 +1079,8 @@
+@@ -999,8 +1031,6 @@
+             zarray_add(detections, &det);
              pthread_mutex_unlock(&td->mutex);
          }
- 
+-
 -        quad_destroy(quad);
-+        if (quad != &quad_shared)
-+            quad_destroy(quad);
      }
  }
  
-@@ -1517,11 +1597,16 @@
+@@ -1517,11 +1547,9 @@
          if (family->reversed_border != quad_original->reversed_border)
              continue;
  
@@ -157,14 +163,7 @@
          probe_last_rcode = 0;
 -        float margin = quad_decode(td, family, im, quad, &entry, NULL);
 -        quad_destroy(quad);
-+        float margin;
-+        if (decode_noalloc()) {
-+            margin = quad_decode(td, family, im, quad_original, &entry, NULL);
-+        } else {
-+            struct quad *quad = quad_copy(quad_original);
-+            margin = quad_decode(td, family, im, quad, &entry, NULL);
-+            quad_destroy(quad);
-+        }
++        float margin = quad_decode(td, family, im, quad_original, &entry, NULL);
          *rcode = probe_last_rcode;
          return margin;
      }
