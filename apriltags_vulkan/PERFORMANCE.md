@@ -2097,6 +2097,52 @@ switches for the fallbacks.
 The remaining Mali stages are each load/store-bound at full occupancy, and the changes tried on them
 this round were slower; what remains on the CPU side is the serial part of the quad fit.
 
+## 8x. Version 1.9.0 against v1.8.0
+
+Version 1.9.0 (sections 8t to 8w) against v1.8.0 (`5400c69`). Both sides built the same way
+(`Release` on the Orange Pi, `RelWithDebInfo` on the RX 9060 XT), run alternately: six rounds of 1,000
+frames of `apriltag_vulkan_validate` (medians of the round medians) and three rounds of
+`bench_multiqueue` (800 frames per round on the Orange Pi, 3,000 on the desktop), governors on
+`performance` and LumenVision stopped on the Orange Pi. No `bench_multiqueue` mismatches.
+
+Checks before the release, on both machines: the 15 canonical dumps; quad dumps and detections
+against v1.8.0 in 95 configurations (seven images, decimations 1, 2 and 4, plain and four stress
+frames), 42 record paths and 84 fallback configurations, all identical; the four synthetic sweeps give
+the same CSVs (659/767 and 687/768 on the Orange Pi, 658/767 and 687/768 on the desktop); no messages
+from the validation layer with synchronisation validation and shader-access analysis (forced
+fallbacks and every labelling and sort switch, with the best-practices positive control reporting);
+AddressSanitizer clean on the desktop (84 runs); AddressSanitizer, UBSan and LeakSanitizer (88 runs)
+and ThreadSanitizer (23 runs) clean on the Orange Pi.
+
+Orange Pi 5 (decimation 1 on `hd720.pgm`, decimation 2 on the 1280x800 corpus image; depth 2 on
+`grayimage.pgm`):
+
+| | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 4.492 -> 3.230 ms (-28%) | 2.003 -> 1.582 ms (-21%) | 2.001 -> 1.591 ms (-20%) |
+| `quad_decode` | 0.462 -> 0.482 ms | 0.188 -> 0.176 ms | 0.182 -> 0.173 ms |
+| `tag_decode` | 0.127 -> 0.141 ms | 0.635 -> 0.632 ms | 0.170 -> 0.151 ms |
+| `pipeline_total` | 5.085 -> 3.862 ms (-24%) | 2.837 -> 2.405 ms (-15%) | 2.369 -> 1.922 ms (-19%) |
+| 1 stream | 213 -> 300 fps (+41%) | 442 -> 588 fps (+33%) | 445 -> 571 fps (+29%) |
+| 1 stream, depth 2 | 233 -> 329 fps (+41%) | 556 -> 716 fps (+29%) | 555 -> 717 fps (+29%) |
+| 4 streams, one queue | 230 -> 326 fps (+42%) | 534 -> 692 fps (+30%) | 533 -> 693 fps (+30%) |
+| latency, 1 stream (depth 1 / depth 2) | 9.37 -> 6.66 / 12.85 -> 9.10 ms | 4.53 -> 3.38 / 5.39 -> 4.19 ms | 4.50 -> 3.51 / 5.40 -> 4.18 ms |
+
+RX 9060 XT (decimation 1 on `hd720.pgm`, decimation 2 on `grayimage.pgm`):
+
+| | dec. 1, `ultrafast`, gate 4 | dec. 2, `exact` | dec. 2, `ultrafast`, gate 4 |
+| --- | --- | --- | --- |
+| `Detect()` | 0.602 -> 0.474 ms (-21%) | 0.462 -> 0.349 ms (-24%) | 0.445 -> 0.325 ms (-27%) |
+| `quad_decode` | 0.222 -> 0.220 ms | 0.109 -> 0.110 ms | 0.110 -> 0.111 ms |
+| `tag_decode` | 0.079 -> 0.082 ms | 0.223 -> 0.219 ms | 0.095 -> 0.093 ms |
+| `pipeline_total` | 0.905 -> 0.778 ms (-14%) | 0.792 -> 0.704 ms (-11%) | 0.648 -> 0.533 ms (-18%) |
+| 1 stream | 2,086 -> 2,305 fps (+11%) | 2,349 -> 2,319 fps (-1%) | 2,474 -> 2,848 fps (+15%) |
+| 4 streams, one queue | 3,141 -> 4,145 fps (+32%) | 3,525 -> 3,451 fps (-2%) | 4,944 -> 8,344 fps (+69%) |
+| 4 streams, both compute families | 3,583 -> 5,144 fps (+44%) | 3,397 -> 3,384 fps (0%) | 7,411 -> 8,426 fps (+14%) |
+
+With `exact` refinement at decimation 2 the desktop is limited by the CPU tail, and its throughput is
+unchanged within the run-to-run spread.
+
 ## 9. Measuring
 
 ```

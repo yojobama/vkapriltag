@@ -355,6 +355,48 @@ Spreading streams over queue families (`ContextOptions::expected_streams`, `Cont
 helps only where the device has two compute families (the desktop: +82% at four streams over one
 queue); on the Mali one queue shared by all streams is faster, and the helper then changes nothing.
 
+### What changed in 1.9.0 (against 1.8.0)
+
+Same output: the 15 canonical quad dumps match, and quad dumps and detections are byte-identical to
+1.8.0's in 95 configurations on each machine (seven images, decimations 1, 2 and 4, plain and four
+stress frames), 42 record paths and 84 fallback configurations; the synthetic sweeps give the same
+CSVs. Both versions built the same way and run alternately (`apriltags_vulkan/PERFORMANCE.md` section
+8x):
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| `Detect()`, decimation 1 (1280x720, `ultrafast`, gate 4) | 4.49 -> 3.23 ms (-28%) | 0.60 -> 0.47 ms (-21%) |
+| `pipeline_total`, decimation 1 | 5.09 -> 3.86 ms (-24%) | 0.91 -> 0.78 ms (-14%) |
+| `Detect()`, decimation 2, `exact` | 2.00 -> 1.58 ms (-21%) | 0.46 -> 0.35 ms (-24%) |
+| `pipeline_total`, decimation 2, `exact` | 2.84 -> 2.41 ms (-15%) | 0.79 -> 0.70 ms (-11%) |
+| 1 stream, decimation 1 | 213 -> 300 fps (+41%) | 2,086 -> 2,305 fps (+11%) |
+| 1 stream, decimation 1, depth 2 | 233 -> 329 fps (+41%) | |
+| 1 stream, decimation 2, `exact`, depth 2 | 556 -> 716 fps (+29%) | |
+| 4 streams, one queue, decimation 1 | 230 -> 326 fps (+42%) | 3,141 -> 4,145 fps (+32%) |
+| 4 streams, one queue, decimation 2, `exact` | 534 -> 692 fps (+30%) | 3,525 -> 3,451 fps (-2%) |
+| 4 streams, one queue, decimation 2, `ultrafast`, gate 4 | 533 -> 693 fps (+30%) | 4,944 -> 8,344 fps (+69%) |
+
+With `exact` refinement at decimation 2 the desktop is limited by the CPU tail, so the GPU savings do
+not show in its throughput there.
+
+- **Labelling:** one `uf_merge` pass (the verification merge never found a change and is off;
+  `APRILTAG_VK_UF_VERIFY=1` restores it); each pixel starts pointing at its run start, found with a
+  subgroup scan, so no compression precedes the merge. Integrated GPUs merge 4 pixels per thread and
+  count blob sizes per run piece; discrete GPUs merge in 8-row bands, then across them.
+- **Fewer and wider passes:** six fewer dispatches, two threshold passes instead of four, word-wide
+  loads and stores, 4 boundary points per thread in the atomic extents reductions, blobs of up to 256
+  points sorted by ranking every key in one pass, and sort workgroups of up to 1,024 threads on
+  discrete GPUs.
+- **Discrete GPUs:** frames are written straight into device memory the host can map, removing a
+  38 us copy per frame (`APRILTAG_VK_GRAY_MAPPED=0` keeps the staging copy).
+- **Fixes:** the validation layer's synchronisation checks now also cover compute shaders' buffer
+  accesses (`syncval_shader_accesses_heuristic`); the three reports it then raised (on disjoint byte
+  ranges, one also present in 1.8.0) are gone, with no extra barriers. AddressSanitizer, UBSan, LeakSanitizer and ThreadSanitizer are clean on the Orange
+  Pi and AddressSanitizer on the desktop.
+- **Tooling:** `APRILTAG_VK_DISPATCH_TIMES=1` prints every dispatch's median GPU time;
+  `apriltag_vulkan_validate --renderdoc-capture` and `tools/renderdoc/rdoc_counters.py` capture a frame
+  and read AMD's counters per command.
+
 ### What changed in 1.8.0 (against 1.7.0)
 
 Same output: the quad dumps are byte-identical to 1.7.0's in 60 configurations on each machine

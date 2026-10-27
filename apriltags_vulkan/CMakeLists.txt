@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
-project(ApriltagVulkan VERSION 1.8.0 LANGUAGES C CXX)
+project(ApriltagVulkan VERSION 1.9.0 LANGUAGES C CXX)
 
 # Policy floor so the fetched apriltag's old cmake_minimum_required() configures.
 
