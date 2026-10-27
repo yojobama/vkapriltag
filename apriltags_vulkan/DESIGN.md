@@ -27,6 +27,10 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Result packed as (min | max<<8) in one uint so 8-bit storage support is not needed in the base variant; in the _u8 variant it stays packed because it is already 4x smaller than the per-pixel image (one entry per 4x4 block).
 - Decimated width/height need not be a multiple of 4 (only the original image dimensions are guaranteed even). Edge-clamping (rather than bounds-check-and-skip) repeats the edge pixel, a harmless way to extend a min/max window past the border.
 
+### fit_quad_dp.comp
+- QuadDecode's DP path on discrete GPUs (APRILTAG_VK_GPU_QUADFIT=1). The sort also writes each RawLineFitPoint to a device-local Mirror (kMirror), so the fit reads VRAM instead of the host-cached line-fit buffer across PCIe. Pass 0, one workgroup of 256 per selected blob: the two farthest-point argmaxes and the two arcs' perpendicular argmaxes (subgroup max/min, lowest index on ties, as the CPU's ArgMax), then the four segments' moments as half-open ranges plus each segment's end point, with 64-bit subgroup adds (VK_KHR_shader_subgroup_extended_types). Pass 1, four invocations per blob, 16 blobs per workgroup: each fits one line, intersects one corner and tests one angle; the first also tests the area.
+- Identical to the CPU: integer sums are exact (Mx, My, W wrap as int32 like the CPU's prefix sums), float divisions and square roots are done in double and refined with one fma correction step to be correctly rounded, then rounded to float (exact for one operation), and every computation is `precise`. Any test within 1e-4 of its limit, and any blob whose seeding fails (the CPU then runs the peak search), is status 2 and fitted on the CPU. One fit invocation per blob took 338 us on the RX 9060 XT (the double-precision chain runs at a fraction of the float rate on one lane while the others wait); splitting it into the two passes brought them to about 70 to 190 us together.
+
 ### build_indirect_args.comp
 - Purpose: dispatch select_blobs over the actual raw blob count rather than max_raw_blobs (65536 default vs a few hundred to a few thousand real blobs); the count only exists on the device, so building args here avoids a host round trip. Single invocation, negligible cost.
 - groupCountX rounds up; select_blobs bounds-checks against the raw blob count itself (only assigned ids have initialised extents), so the shader only needs "large enough", not exact.
@@ -259,6 +263,9 @@ Design decisions and rationale removed from source comments. Measurements live i
 - Timestamp profiling is opt-in (APRILTAG_VK_TIMESTAMPS=1) so a normal run pays for no query pool.
 - Line-fit direct read: invalidate the range when the mapping is non-coherent, since skipping the copy must not skip Buffer::Read()'s invalidate.
 - The uf_final min-size floor must equal label_pc's value, or its counter saturation stops matching the predicate.
+
+### libapriltag decode without allocations (apriltag-decode-no-alloc.patch)
+- quad_update_homographies() builds Hinv only to test that H is invertible; the patch keeps that test (matd_plu()'s pivot loop on a stack 3x3, the same "singular" decision) and leaves Hinv NULL. quad_decode_index() and quad_sample_code() pass the original quad instead of quad_copy() (calloc plus copies of H and Hinv per family): quad_decode() only reads quad->H. values and sharpened in quad_decode()/sharpen() are stack arrays for total_width <= 16. quad_copy() and quad_destroy() are removed, being unused.
 
 ### QuadDecode.cpp
 - ReadMomentsWindow bug fix: the wrap-around branch used to read cs[index0 - 1] unconditionally, unlike the index0 < index1 branch (guarded by index0 > 0). index0 == 0 reaches it whenever ksz == 0 (blobs under 12 points), reading cs[SIZE_MAX]. Found while porting the window read to GPU (compute_window_error.comp has the mirrored guard). index0 == index1 falls into the wrap branch exactly as in the original.

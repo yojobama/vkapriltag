@@ -92,6 +92,8 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_PROBE_STATS=1`, `APRILTAG_VK_PROBE_CSV=<file>` | Per-quad probe histograms and one CSV row per quad (analysis aid). |
 | `APRILTAG_VK_TRACE=<file>` | Write a Chrome-trace JSON of the CPU and GPU spans. See section 9. |
 | `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
+| `APRILTAG_VK_DP_PEAKS_CHECK=1` | Keep a DP-seeded quad only if the peak search also accepts its blob (`DetectorConfig::dp_peaks_check`; off by default). See section 8z. |
+| `APRILTAG_VK_GPU_QUADFIT=1` | Run QuadDecode's DP fit on the GPU (`fit_quad_dp.comp`; needs fp64, so discrete GPUs only; off by default). See section 8z. |
 | `APRILTAG_VK_REFINE=exact\|fast\|ultrafast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
 | `APRILTAG_VK_FORCE_NO_8BIT=1` | Force the 32-bit-per-pixel shader variants even where `VK_KHR_8bit_storage` is available. |
@@ -2208,6 +2210,78 @@ refinement:
 
 The Orange Pi figures include whatever turning off multiply-add fusion in `QuadDecode.cpp` costs;
 it was not measured on its own.
+
+## 8z. Four more items: tuned builds, allocation-free decode, a peak check, the quad fit on the GPU
+
+Four of the suggestions left after section 8y, each behind a switch so one binary covers every
+combination. Benchmarked alone and cumulatively (2, 2+3, 2+3+5, 2+3+5+6) in three refinement states:
+S1 `exact` without the margin gate, S2 `ultrafast` with `APRILTAG_VK_PROBE_MARGIN=4` (the gate has
+no effect under `ultrafast`, which already decodes every quad unrefined first), S3 `fast` with a gate
+of 4. Images `field2.png` (1200x800, five tags), `hd720.pgm` and the 1280x800 corpus image at
+decimations 1 and 2; all variants interleaved in rotating order, six rounds of 1,000 frames on the
+desktop and 600 on the Orange Pi.
+
+- **Item 2, `VKAPRILTAG_CPU_TUNE`** (CMake, empty by default): `-mcpu=<cpu>` on GCC and Clang
+  (`cortex-a76.cortex-a55` for the RK3588), `/arch:<arch>` with `/fp:contract` on MSVC (`AVX2`),
+  for the library and libapriltag; `QuadDecode.cpp` keeps fusion off. The binaries then need that
+  CPU. Output identical to the generic build on both machines (all 331 dump files).
+- **Item 3, allocation-free decode** (a fourth libapriltag patch; benchmarked behind a switch, now
+  unconditional): `quad_update_homographies()` keeps only
+  `matd_inverse()`'s singularity test instead of building the unused inverse, `quad_decode_index()`
+  and `quad_sample_code()` share the quad instead of copying it and both homographies per family,
+  and `quad_decode()`'s two scratch buffers live on the stack. Identical output.
+- **Item 5, `dp_peaks_check`** (`APRILTAG_VK_DP_PEAKS_CHECK=1`, off): a DP-seeded quad is kept only
+  if the peak search would also accept its blob, as libapriltag's fit does. It halves the quads
+  (160 -> 79 on `hd720.pgm` at decimation 1, 133 -> 67 on `field2.png`) but loses 1 of 369 decoded
+  tags on the contrast-0.25 synthetic set in S1 and S3 (a tag under 20 px); S2 and the real images
+  are unchanged. On the three synthetic sets and ten real images it removed 64% to 69% of the quads
+  that never decode and lost 2 of 2,038 decoded tags, both among the smallest (93 and 117 px^2).
+- **Item 6, `APRILTAG_VK_GPU_QUADFIT=1`** (off): `fit_quad_dp.comp` runs QuadDecode's DP path on the
+  GPU, a seeding pass with one workgroup per blob over a device-local copy of the sorted points and a
+  fit pass with four invocations per blob. Float divisions and square roots are done in double and
+  refined to be correctly rounded, nothing is contracted, and any test within 1e-4 of its limit goes
+  to the CPU, so the output is identical to the CPU's (all 331 dump files). Needs `shaderFloat64`,
+  `shaderInt64` and `VK_KHR_shader_subgroup_extended_types`, so not on the Mali-G610.
+
+Change in `pipeline_total` against the base build, the range over the three images (negative is
+faster):
+
+| RX 9060 XT | 2 | 3 | 5 | 6 | 2+3 | 2+3+5 | 2+3+5+6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| S1, dec. 1 | -2.3 to -1.8% | -0.4 to +0.4% | -0.4 to +5.7% | +4.2 to +4.8% | -3.1 to -2.6% | -3.0 to +4.8% | +2.7 to +9.3% |
+| S1, dec. 2 | -2.0 to +7.6% | -0.4 to +4.4% | -10.5 to -3.6% | +4.6 to +8.2% | -3.1 to -1.3% | -12.3 to -3.7% | -6.2 to +2.2% |
+| S2, dec. 1 | -3.5 to -0.5% | +0.3 to +1.3% | +9.6 to +14.5% | +5.0 to +7.0% | -3.3 to -2.2% | +5.2 to +11.3% | +11.4 to +16.2% |
+| S2, dec. 2 | -5.3 to -1.4% | -3.4 to +0.2% | -2.7 to +6.9% | +4.8 to +7.4% | -5.5 to -2.8% | -5.0 to +3.3% | +3.7 to +11.8% |
+| S3, dec. 1 | -4.2 to -1.9% | -0.1 to +1.3% | +1.4 to +10.7% | +5.4 to +6.3% | -4.8 to -2.6% | -3.9 to +8.9% | +3.6 to +15.3% |
+| S3, dec. 2 | -5.8 to -1.6% | -0.3 to +5.2% | -8.5 to +5.2% | +4.0 to +7.6% | -7.3 to -3.1% | -13.1 to +1.4% | -6.1 to +8.9% |
+
+| Orange Pi 5 | 2 | 3 | 5 | 6 (not available) | 2+3 | 2+3+5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| S1, dec. 1 | -0.3 to +0.5% | -0.3 to +1.2% | -1.0 to -0.3% | | -0.5 to -0.4% | -1.3 to -0.6% |
+| S1, dec. 2 | -0.3 to 0.0% | -0.2 to 0.0% | -6.3 to -2.8% | | -0.7 to -0.2% | -6.5 to -2.9% |
+| S2, dec. 1 | -0.4 to +0.1% | -0.3 to -0.1% | +2.6 to +3.9% | | -0.6 to +0.5% | +2.2 to +3.5% |
+| S2, dec. 2 | -0.7 to -0.2% | -0.3 to +0.2% | +3.4 to +6.7% | | -0.7 to +1.3% | +3.9 to +5.1% |
+| S3, dec. 1 | -0.3 to -0.2% | -0.5 to -0.1% | -0.3 to +2.1% | | -0.7 to +0.3% | -0.4 to +1.9% |
+| S3, dec. 2 | -0.3 to +1.2% | -1.1 to -0.5% | -4.0 to +4.5% | | -1.1 to +0.6% | -4.1 to +3.5% |
+
+The desktop's two clock states make single cells noisy (item 2's +7.6% and item 3's +4.4% and +5.2%
+are each one image); the consistent results are item 2 at -1.4% to -5.8% on the desktop
+(`tag_decode` -5% to -18%), item 3 at `tag_decode` -1% to -6% on the Orange Pi, and items 2+3 at -1.3%
+to -7.3% on the desktop in every cell.
+
+Item 5 saves refinement but spends a peak search on every DP quad that passes the checks: it pays only
+with `exact` refinement at decimation 2 (-3% to -12%) and loses under `ultrafast`, which already
+skips refining quads that do not decode. Item 6 adds 0.05 to 0.18 ms of GPU work against 0.02 to
+0.13 ms of CPU, so serial frames are 4% to 8% slower on the desktop; where the desktop is limited by
+the CPU tail it raises throughput instead (`bench_multiqueue`, `exact`, decimation 2: 4 streams 3,428
+-> 3,709 fps, +8%; one stream at depth 2 2,598 -> 2,844 fps, +9%), and where the GPU is the limit it
+costs (decimation 1, 4 streams: 2,651 -> 2,300 fps, -13%).
+
+Defaults: item 3 always on (its switch's lazily read flag was itself a data race under TSan, so it was
+removed once the output proved identical); items 2, 5 and 6 opt-in. Checks: the validation layer with synchronisation and
+shader-access analysis reports nothing with every switch on (both machines); MSVC ASan clean with
+every switch on (84 runs); on the Orange Pi ASan, UBSan, LSan and TSan clean with and without the peak
+check.
 
 ## 9. Measuring
 

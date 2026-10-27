@@ -2105,3 +2105,18 @@ its CPU part was 0.34 to 0.75 ms against 0.15 to 0.23 ms.
   Orange Pi; `pipeline_total` -4% to -11% and -0.6% to -2.5%. Identical on MSVC; on GCC/AArch64 the
   last bit of some corners changes once (at most 1.1e-13 px, same quads and detections).
 
+## 32. Tuned builds, allocation-free decode, a peak check, the quad fit on the GPU
+
+Four items, each behind a switch, benchmarked alone and cumulatively in three refinement states
+(`PERFORMANCE.md` 8z).
+
+- **Shipped, unconditional:** libapriltag's decode without its per-quad heap allocations (the unused inverse
+  homography, the quad copy per family, two scratch buffers); identical output, `tag_decode` -1% to
+  -6% on the Orange Pi, neutral on the desktop. `ApplyPatches.cmake` now restores the checkout before
+  applying the list, since this patch edits lines another adds.
+- **Shipped, opt-in:** `VKAPRILTAG_CPU_TUNE` (identical output; -1.4% to -5.8% `pipeline_total` on the
+  RX 9060 XT with AVX2, nothing measurable on the A76), `dp_peaks_check` (halves the quads; -3% to
+  -12% with `exact` refinement at decimation 2, slower under `ultrafast`; loses 1 of 369 tiny tags on
+  one synthetic set) and the GPU DP fit (identical output; +4% to +8% serial time, +8% to +9%
+  throughput where the desktop is CPU-bound, -13% where it is GPU-bound).
+
