@@ -359,7 +359,7 @@ int main(int argc, char **argv) {
           ++uf_histogram[profile.uf_iterations];
 
           const auto t_quad0 = std::chrono::steady_clock::now();
-          quads = quad_decode.Decode(detector.last_line_fit_points);
+          quads = quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits);
           const auto t_quad1 = std::chrono::steady_clock::now();
           quad_decode_totals.push_back(
               std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());

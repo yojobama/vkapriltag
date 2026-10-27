@@ -93,6 +93,21 @@ bool SupportsInt64Atomics(VkPhysicalDevice physical_device) {
          features2.features.shaderInt64 == VK_TRUE;
 }
 
+// Queries VK_KHR_shader_subgroup_extended_types and its shaderSubgroupExtendedTypes feature.
+bool SupportsSubgroupExtendedTypes(VkPhysicalDevice physical_device) {
+  if (!DeviceHasExtension(physical_device, "VK_KHR_shader_subgroup_extended_types")) return false;
+
+  VkPhysicalDeviceShaderSubgroupExtendedTypesFeaturesKHR extended{};
+  extended.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES_KHR;
+
+  VkPhysicalDeviceFeatures2 features2{};
+  features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  features2.pNext = &extended;
+
+  vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+  return extended.shaderSubgroupExtendedTypes == VK_TRUE;
+}
+
 // Queries VK_EXT_conditional_rendering and its conditionalRendering feature.
 bool SupportsConditionalRendering(VkPhysicalDevice physical_device) {
   if (!DeviceHasExtension(physical_device, "VK_EXT_conditional_rendering")) return false;
@@ -544,6 +559,12 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   atomic64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR;
   atomic64.shaderBufferInt64Atomics = VK_TRUE;
 
+  supports_subgroup_extended_types_ = SupportsSubgroupExtendedTypes(physical_device_);
+  VkPhysicalDeviceShaderSubgroupExtendedTypesFeaturesKHR extended_types{};
+  extended_types.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES_KHR;
+  extended_types.shaderSubgroupExtendedTypes = VK_TRUE;
+
   VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{};
   conditional.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT;
   conditional.conditionalRendering = VK_TRUE;
@@ -565,6 +586,17 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     conditional.pNext = features2.pNext;
     features2.pNext = &conditional;
   }
+  if (supports_subgroup_extended_types_) {
+    extended_types.pNext = features2.pNext;
+    features2.pNext = &extended_types;
+  }
+  // 64-bit floats and integers in shaders where supported, for fit_quad_dp.comp.
+  {
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(physical_device_, &supported);
+    if (supported.shaderFloat64) features2.features.shaderFloat64 = VK_TRUE;
+    if (supported.shaderInt64) features2.features.shaderInt64 = VK_TRUE;
+  }
 
   std::vector<const char *> enabled_extensions;
   if (supports_8bit_storage_) {
@@ -580,6 +612,9 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   }
   if (supports_conditional_rendering_) {
     enabled_extensions.push_back("VK_EXT_conditional_rendering");
+  }
+  if (supports_subgroup_extended_types_) {
+    enabled_extensions.push_back("VK_KHR_shader_subgroup_extended_types");
   }
   if (supports_external_memory_host_) {
     enabled_extensions.push_back("VK_EXT_external_memory_host");
@@ -675,6 +710,7 @@ void Context::QueryCaps(const ContextOptions &options) {
   // extension), not re-queried here.
   caps_.has_8bit_storage = supports_8bit_storage_;
   caps_.has_int64_atomics = supports_int64_atomics_;
+  caps_.has_subgroup_extended_types = supports_subgroup_extended_types_;
   caps_.has_conditional_rendering = supports_conditional_rendering_;
   caps_.has_external_memory_host = supports_external_memory_host_;
   caps_.has_external_memory_dma_buf = supports_dma_buf_;

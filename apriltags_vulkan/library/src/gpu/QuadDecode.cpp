@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <string>
@@ -515,7 +516,15 @@ QuadDecode::QuadDecode(const DetectorConfig &config)
 
 std::vector<DetectedQuad> QuadDecode::Decode(
     std::span<const RawLineFitPoint> line_fit_points) const {
+  return Decode(line_fit_points, {});
+}
+
+std::vector<DetectedQuad> QuadDecode::Decode(std::span<const RawLineFitPoint> line_fit_points,
+                                             std::span<const GpuQuadFit> gpu_fits) const {
   VKA_PROF_SCOPE("quad.decode_all");
+  // fit_quad_dp.comp runs the DP path, so its results stand in only for that method.
+  const bool use_gpu =
+      !gpu_fits.empty() && config_.quad_fit_method == DetectorConfig::QuadFitMethod::kDp;
   std::vector<DetectedQuad> output;
 
   // Group the points into contiguous per-blob spans (sorted by blob_index, then theta).
@@ -544,9 +553,27 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   pool_->ParallelFor(spans.size(), [&](size_t s, unsigned slot) {
     prof::Scope fit_scope("quad.fit_blob");
     fit_scope.set_arg(static_cast<int64_t>(spans[s].end - spans[s].begin));
+    SpanResult &r = per_span[s];
+    const uint32_t blob = line_fit_points[spans[s].begin].blob_index();
+    if (use_gpu && blob < gpu_fits.size() && gpu_fits[blob].status != 2u) {
+      r.dp_attempted = true;
+      r.dp_used = true;
+      if (gpu_fits[blob].status == 1u) {
+        std::memcpy(r.quad.p, gpu_fits[blob].p, sizeof(r.quad.p));
+        r.has_quad = true;
+        if (config_.dp_peaks_check) {
+          DetectorConfig peaks_config = config_;
+          peaks_config.quad_fit_method = DetectorConfig::QuadFitMethod::kPeaks;
+          const FitQuadResult fp = FitQuadForBlob(peaks_config, line_fit_points, spans[s].begin,
+                                                  spans[s].end, scratch_[slot]);
+          DetectedQuad unused;
+          r.has_quad = fp.valid && UpdateFitQuad(config_, fp, &unused);
+        }
+      }
+      return;
+    }
     const FitQuadResult fq =
         FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
-    SpanResult &r = per_span[s];
     r.dp_attempted = fq.dp_attempted;
     r.dp_used = fq.dp_used;
     r.has_quad = fq.valid && UpdateFitQuad(config_, fq, &r.quad);

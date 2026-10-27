@@ -283,6 +283,9 @@ class GpuDetector {
   vk::Buffer blob_point_offsets_buf_;
   // Written by sort_points_local.comp (sort fused with line-fit moments).
   vk::Buffer line_fit_points_buf_;
+  // With gpu_quadfit_: the sort's device-local copy of the line-fit points, fit_quad_dp.comp's
+  // per-blob segment moments, and its results (host-visible and cached, read in place).
+  vk::Buffer quad_fit_points_buf_, quad_fit_segments_buf_, quad_fits_buf_;
 
   // --- Hash grouping (replaces the global (rep0, rep1) sort) ---
   // hash_owner_buf_[slot]: 0 if free, else 1 + index of the claiming point; point_slot_buf_[i]: point i's slot.
@@ -319,6 +322,9 @@ class GpuDetector {
   bool extents_direct_read_ = false;
   // True when the last three submissions are recorded as one (requires both direct-read paths).
   bool fused_submits_ = false;
+  // QuadDecode's DP fit runs on the GPU (fit_quad_dp.comp); needs the fused path and 64-bit shader
+  // arithmetic. APRILTAG_VK_GPU_QUADFIT=0|1.
+  bool gpu_quadfit_ = false;
   // True when each labelling chunk's last uf_compress is predicated on uf_changed_buf_ with
   // VK_EXT_conditional_rendering; otherwise uf_compress.comp's honour_changed_flag guard applies.
   bool predicated_compress_ = false;
@@ -396,6 +402,7 @@ class GpuDetector {
   vk::ComputePipeline scan_blob_counts_pl_;
   vk::ComputePipeline sort_points_local_pl_;
   vk::ComputePipeline sort_large_runs_pl_, sort_large_merge_pl_;
+  vk::ComputePipeline fit_quad_seed_pl_, fit_quad_fit_pl_, build_fit_args_pl_;
 
   DetectProfile last_profile_;
   uint64_t device_bytes_ = 0;
@@ -496,6 +503,9 @@ class GpuDetector {
   // Non-owning view, valid until the next Detect(). Points into device memory when it is
   // host-visible and cached, otherwise into an internal scratch vector.
   std::span<const RawLineFitPoint> last_line_fit_points;
+  // fit_quad_dp.comp's per-blob results for QuadDecode::Decode, indexed by blob; empty when the GPU
+  // fit is off or did not cover the frame. Valid until the next Detect().
+  std::span<const GpuQuadFit> last_quad_fits;
 };
 
 }  // namespace apriltag_vulkan

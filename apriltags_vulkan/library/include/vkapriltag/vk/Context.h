@@ -99,6 +99,8 @@ struct DeviceCaps {
   bool has_int64_atomics = false;
   // VK_EXT_conditional_rendering + conditionalRendering; enabled at device creation.
   bool has_conditional_rendering = false;
+  // VK_KHR_shader_subgroup_extended_types: subgroup operations on 64-bit types (fit_quad_dp.comp).
+  bool has_subgroup_extended_types = false;
   // VK_EXT_external_memory_host: caller memory can back a buffer; imports must be aligned to
   // min_host_pointer_alignment.
   bool has_external_memory_host = false;
@@ -250,6 +252,7 @@ public:
   bool supports_8bit_storage_ = false;
   bool supports_int64_atomics_ = false;
   bool supports_conditional_rendering_ = false;
+  bool supports_subgroup_extended_types_ = false;
   // Extension entry points, loaded only when supports_conditional_rendering_.
   PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering_ = nullptr;
   PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering_ = nullptr;

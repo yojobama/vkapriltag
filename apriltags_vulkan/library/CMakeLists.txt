@@ -74,6 +74,7 @@ set(SHADER_SOURCES
   shaders/sort_points_local_u8.comp
   shaders/sort_points_large.comp
   shaders/sort_points_large_u8.comp
+  shaders/fit_quad_dp.comp
   shaders/hash_group.comp
   shaders/build_indirect_args.comp
   shaders/reduce_extents_hash.comp

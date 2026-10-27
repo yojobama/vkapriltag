@@ -1,0 +1,435 @@
+#version 450
+// QuadDecode's DP path on the GPU (FindDpCornerIndices, the segment fits and UpdateFitQuad's
+// checks), reading the sort's device-local Mirror. kPass 0: one workgroup per selected blob seeds
+// the corners and sums the four segments' moments into Segments. kPass 1: one thread per blob fits
+// the lines and applies the checks. Writes per blob: status 0 (rejected), 1 (a quad, corners in
+// full-resolution pixels) or 2 (left to the CPU: the DP seeding failed, or a test came within
+// kMargin of its limit).
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_subgroup_extended_types_int64 : require
+#include "common.glsl"
+
+layout(local_size_x_id = 0, local_size_x = 256) in;
+layout(constant_id = 3) const uint kPass = 0;
+
+struct QuadFit {
+  uint status;
+  uint pad;
+  double p[8];
+};
+
+layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
+layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
+layout(std430, binding = 2) readonly buffer Mirror { RawLineFitPoint points[]; };
+layout(std430, binding = 3) writeonly buffer Fits { QuadFit fits[]; };
+layout(std430, binding = 4) readonly buffer CountBuf { uint count_buf; };
+// Per blob: the seeding outcome (2 = failed) and the four segments' moments.
+struct Segments {
+  uint status;
+  uint pad;
+  int m32[16];
+  int64_t m64[12];
+};
+layout(std430, binding = 5) buffer SegmentsBuf { Segments segs[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint max_blobs;
+  uint decimation;
+  float max_line_fit_mse;
+  uint pad;
+  double min_tag_width;
+  double cos_critical;
+} pc;
+
+// Relative distance from a test's limit below which the CPU decides.
+const double kMargin = 1e-4;
+const uint kNone = 0xFFFFFFFFu;
+// Subgroups per workgroup, at most.
+const uint kMaxSubgroups = 64u;
+
+shared uint s_u[kMaxSubgroups];
+shared uint s_i[kMaxSubgroups];
+shared double s_d[kMaxSubgroups];
+shared int s_m32[kMaxSubgroups][16];
+shared int64_t s_m64[kMaxSubgroups][12];
+shared uint s_result;
+
+// x2, y2 and W of point i.
+ivec3 Point(uint i) {
+  RawLineFitPoint p = points[i];
+  return ivec3(int(p.xy2 & 0x3FFFu), int((p.xy2 >> 14u) & 0x3FFFu), int(p.w_blob & 0x3FFu));
+}
+
+// Correctly rounded double division and square root, refined from the hardware results.
+double DivD(double a, double b) {
+  precise double q = a / b;
+  precise double r = fma(-q, b, a);
+  precise double q2 = q + r / b;
+  return q2;
+}
+double SqrtD(double v) {
+  if (v <= 0.0) return sqrt(v);
+  precise double s = sqrt(v);
+  precise double r = fma(-s, s, v);
+  precise double s2 = s + r / (2.0 * s);
+  return s2;
+}
+// float a / b and the float Hypot of QuadDecode.cpp, via double (exact for one float operation).
+float DivF(float a, float b) { return float(DivD(double(a), double(b))); }
+float HypotF(float x, float y) {
+  precise double dx = double(x);
+  precise double dy = double(y);
+  precise double v = dx * dx + dy * dy;
+  return float(SqrtD(v));
+}
+bool Near(double v, double limit) { return abs(v - limit) <= kMargin * max(abs(limit), 1e-30); }
+
+struct Moments {
+  int Mx, My, W, N;
+  int64_t Mxx, Myy, Mxy;
+};
+
+// FitLine's line parameters and mean squared error.
+void FitLine(Moments m, out double l0, out double l1, out double l2, out double l3,
+             out double mse) {
+  precise int64_t Mx = int64_t(m.Mx);
+  precise int64_t My = int64_t(m.My);
+  precise int64_t W = int64_t(m.W);
+  precise int64_t Cxx = m.Mxx * W - Mx * Mx;
+  precise int64_t Cxy = m.Mxy * W - Mx * My;
+  precise int64_t Cyy = m.Myy * W - My * My;
+  float hyp = HypotF(float(Cxx - Cyy), float(2 * Cxy));
+  precise float eight_w_sq = float(double(W * W) * 8.0);
+  precise float num = float(Cxx + Cyy) - hyp;
+  float eig_small = DivF(num, eight_w_sq);
+  l0 = double(DivF(float(Mx), float(W * 2)));
+  l1 = double(DivF(float(My), float(W * 2)));
+  precise float nx1 = float(Cxx - Cyy) - hyp;
+  precise float ny1 = float(Cxy) * 2.0;
+  precise float M1 = nx1 * nx1 + ny1 * ny1;
+  precise float nx2 = float(Cxy) * 2.0;
+  precise float ny2 = float(Cyy - Cxx) - hyp;
+  precise float M2 = nx2 * nx2 + ny2 * ny2;
+  float nx = M1 > M2 ? nx1 : nx2;
+  float ny = M1 > M2 ? ny1 : ny2;
+  float len = HypotF(nx, ny);
+  l2 = double(DivF(nx, len));
+  l3 = double(DivF(ny, len));
+  mse = double(eig_small);
+}
+
+// The lowest index holding the largest v over the workgroup (kNone if no thread has one); every
+// invocation calls it.
+uint ArgMaxU(uint v, uint i) {
+  uint m = subgroupMax(i != kNone ? v : 0u);
+  uint mi = subgroupMin(i != kNone && v == m ? i : kNone);
+  if (subgroupElect()) {
+    s_u[gl_SubgroupID] = m;
+    s_i[gl_SubgroupID] = mi;
+  }
+  barrier();
+  if (gl_LocalInvocationID.x == 0u) {
+    uint bv = 0u, bi = kNone;
+    for (uint g = 0u; g < gl_NumSubgroups; ++g) {
+      uint gi = s_i[g];
+      if (gi != kNone && (bi == kNone || s_u[g] > bv || (s_u[g] == bv && gi < bi))) {
+        bv = s_u[g];
+        bi = gi;
+      }
+    }
+    s_result = bi;
+  }
+  barrier();
+  uint r = s_result;
+  barrier();
+  return r;
+}
+
+// As ArgMaxU for non-negative doubles.
+uint ArgMaxD(double v, uint i) {
+  double m = subgroupMax(i != kNone ? v : -1.0);
+  uint mi = subgroupMin(i != kNone && v == m ? i : kNone);
+  if (subgroupElect()) {
+    s_d[gl_SubgroupID] = m;
+    s_i[gl_SubgroupID] = mi;
+  }
+  barrier();
+  if (gl_LocalInvocationID.x == 0u) {
+    double bv = -1.0;
+    uint bi = kNone;
+    for (uint g = 0u; g < gl_NumSubgroups; ++g) {
+      uint gi = s_i[g];
+      if (gi != kNone && (bi == kNone || s_d[g] > bv || (s_d[g] == bv && gi < bi))) {
+        bv = s_d[g];
+        bi = gi;
+      }
+    }
+    s_result = bi;
+  }
+  barrier();
+  uint r = s_result;
+  barrier();
+  return r;
+}
+
+// The squared perpendicular deviation of point p from the line through a with direction (dx, dy).
+double Perp(ivec3 p, ivec3 a, int dx, int dy) {
+  precise double cross =
+      double(int64_t(dx) * int64_t(p.y - a.y) - int64_t(dy) * int64_t(p.x - a.x));
+  precise double perp = cross * cross;
+  return perp;
+}
+
+void SeedBlob() {
+  uint blob = gl_WorkGroupID.x;
+  if (blob >= min(count_buf, pc.max_blobs)) return;
+  uint tid = gl_LocalInvocationID.x;
+  uint threads = gl_WorkGroupSize.x;
+  uint n = selected[blob].count;
+  uint base = blob_point_offsets[blob] - n;
+
+  // FindDpCornerIndices: the farthest point from point 0, then the farthest from that one.
+  uint bv = 0u, bi = kNone;
+  if (n >= 8u) {
+    ivec3 p0 = Point(base);
+    for (uint i = 1u + tid; i < n; i += threads) {
+      ivec3 p = Point(base + i);
+      int dx = p.x - p0.x, dy = p.y - p0.y;
+      uint d = uint(dx * dx + dy * dy);
+      if (bi == kNone || d > bv) { bv = d; bi = i; }
+    }
+  }
+  uint a_idx = ArgMaxU(bv, bi);
+  bool dp_ok = n >= 8u && a_idx != kNone;
+  bv = 0u;
+  bi = kNone;
+  ivec3 pa = dp_ok ? Point(base + a_idx) : ivec3(0);
+  if (dp_ok) {
+    for (uint i = tid; i < n; i += threads) {
+      ivec3 p = Point(base + i);
+      int dx = p.x - pa.x, dy = p.y - pa.y;
+      uint d = uint(dx * dx + dy * dy);
+      if (bi == kNone || d > bv) { bv = d; bi = i; }
+    }
+  }
+  uint b_idx = ArgMaxU(bv, bi);
+  ivec3 pb = b_idx != kNone ? Point(base + b_idx) : ivec3(0);
+  int dbx = pb.x - pa.x, dby = pb.y - pa.y;
+  uint b_v = uint(dbx * dbx + dby * dby);
+  dp_ok = dp_ok && b_idx != kNone && a_idx != b_idx && b_v != 0u;
+
+  // The points of largest perpendicular deviation from the diameter on each arc.
+  uint lo = min(a_idx, b_idx), hi = max(a_idx, b_idx);
+  double best1 = -1.0, best2 = -1.0;
+  uint c1 = kNone, c2 = kNone;
+  if (dp_ok) {
+    for (uint i = tid; i < n; i += threads) {
+      if (i == lo || i == hi) continue;
+      double perp = Perp(Point(base + i), pa, dbx, dby);
+      if (i > lo && i < hi) {
+        if (c1 == kNone || perp > best1) { best1 = perp; c1 = i; }
+      } else {
+        if (c2 == kNone || perp > best2) { best2 = perp; c2 = i; }
+      }
+    }
+  }
+  c1 = ArgMaxD(best1, c1);
+  c2 = ArgMaxD(best2, c2);
+  if (dp_ok) {
+    precise double diameter_sq = double(b_v);
+    precise double min_perp = 0.0001 * diameter_sq * diameter_sq;
+    dp_ok = c1 != kNone && c2 != kNone &&
+            !(Perp(Point(base + c1), pa, dbx, dby) < min_perp) &&
+            !(Perp(Point(base + c2), pa, dbx, dby) < min_perp);
+  }
+  if (!dp_ok) {
+    if (tid == 0u) segs[blob].status = 2u;
+    return;
+  }
+
+  // Moments of the half-open segments [lo, c1), [c1, hi), [hi, c2) and [c2, lo), circular; c2 lies
+  // above hi or below lo. Each inclusive segment of TryDpQuad then adds its end point.
+  int mx[4] = int[4](0, 0, 0, 0), my[4] = int[4](0, 0, 0, 0), mw[4] = int[4](0, 0, 0, 0),
+      mn[4] = int[4](0, 0, 0, 0);
+  int64_t mxx[4] = int64_t[4](0, 0, 0, 0), myy[4] = int64_t[4](0, 0, 0, 0),
+          mxy[4] = int64_t[4](0, 0, 0, 0);
+  for (uint i = tid; i < n; i += threads) {
+    uint k;
+    if (i >= lo && i < c1) {
+      k = 0u;
+    } else if (i >= c1 && i < hi) {
+      k = 1u;
+    } else if (i >= hi) {
+      k = (c2 > hi && i >= c2) ? 3u : 2u;
+    } else {
+      k = (c2 < lo && i < c2) ? 2u : 3u;
+    }
+    ivec3 p = Point(base + i);
+    int64_t x = p.x, y = p.y, w = p.z;
+    int64_t wx = w * x, wy = w * y;
+    for (uint s = 0u; s < 4u; ++s) {
+      if (s != k) continue;
+      mx[s] += int(wx);
+      my[s] += int(wy);
+      mw[s] += int(w);
+      mn[s] += 1;
+      mxx[s] += wx * x;
+      myy[s] += wy * y;
+      mxy[s] += wx * y;
+    }
+  }
+  for (uint s = 0u; s < 4u; ++s) {
+    int sx = subgroupAdd(mx[s]), sy = subgroupAdd(my[s]), sw = subgroupAdd(mw[s]),
+        sn = subgroupAdd(mn[s]);
+    int64_t sxx = subgroupAdd(mxx[s]), syy = subgroupAdd(myy[s]), sxy = subgroupAdd(mxy[s]);
+    if (subgroupElect()) {
+      s_m32[gl_SubgroupID][4u * s] = sx;
+      s_m32[gl_SubgroupID][4u * s + 1u] = sy;
+      s_m32[gl_SubgroupID][4u * s + 2u] = sw;
+      s_m32[gl_SubgroupID][4u * s + 3u] = sn;
+      s_m64[gl_SubgroupID][3u * s] = sxx;
+      s_m64[gl_SubgroupID][3u * s + 1u] = syy;
+      s_m64[gl_SubgroupID][3u * s + 2u] = sxy;
+    }
+  }
+  barrier();
+  if (tid >= 28u) return;
+  // 28 threads add up the subgroups' partial sums, one value each, plus segment k's end point.
+  uint idx[4] = uint[4](lo, c1, hi, c2);
+  uint k = tid < 16u ? tid / 4u : (tid - 16u) / 3u;
+  ivec3 e = Point(base + idx[(k + 1u) & 3u]);
+  int64_t ex = e.x, ey = e.y, ew = e.z;
+  if (tid < 16u) {
+    int sum = 0;
+    for (uint g = 0u; g < gl_NumSubgroups; ++g) sum += s_m32[g][tid];
+    uint f = tid & 3u;
+    sum += f == 0u ? int(ew * ex) : (f == 1u ? int(ew * ey) : (f == 2u ? int(ew) : 1));
+    segs[blob].m32[tid] = sum;
+  } else {
+    uint j = tid - 16u;
+    int64_t sum = 0;
+    for (uint g = 0u; g < gl_NumSubgroups; ++g) sum += s_m64[g][j];
+    uint f = j % 3u;
+    sum += f == 0u ? ew * ex * ex : (f == 1u ? ew * ey * ey : ew * ex * ey);
+    segs[blob].m64[j] = sum;
+  }
+  if (tid == 0u) segs[blob].status = 0u;
+}
+
+// kPass 1: four invocations per blob, 16 blobs per workgroup of 64. Invocation q fits segment q's
+// line, intersects lines q and q + 1 into corner q, and tests the angle at corner q + 1; the first of
+// the four also tests the area. s_flag collects the outcome: 0 accepted so far, 1 rejected, 2 left
+// to the CPU (a test within kMargin of its limit), the larger winning.
+const uint kBlobsPerGroup = 16u;
+shared double s_lines[kBlobsPerGroup][4][4];
+shared double s_corners[kBlobsPerGroup][4][2];
+shared uint s_flag[kBlobsPerGroup];
+
+void FitPass() {
+  uint lb = gl_LocalInvocationID.x >> 2u;
+  uint q = gl_LocalInvocationID.x & 3u;
+  uint blob = gl_WorkGroupID.x * kBlobsPerGroup + lb;
+  bool in_range = blob < min(count_buf, pc.max_blobs);
+  bool seeded = in_range && segs[blob].status != 2u;
+  if (q == 0u) s_flag[lb] = seeded ? 0u : 2u;
+  barrier();
+
+  // The segment test of TryDpQuad, then UpdateFitQuad's lines.
+  if (seeded) {
+    Moments m;
+    m.Mx = segs[blob].m32[4u * q];
+    m.My = segs[blob].m32[4u * q + 1u];
+    m.W = segs[blob].m32[4u * q + 2u];
+    m.N = segs[blob].m32[4u * q + 3u];
+    m.Mxx = segs[blob].m64[3u * q];
+    m.Myy = segs[blob].m64[3u * q + 1u];
+    m.Mxy = segs[blob].m64[3u * q + 2u];
+    double mse;
+    FitLine(m, s_lines[lb][q][0], s_lines[lb][q][1], s_lines[lb][q][2], s_lines[lb][q][3], mse);
+    double limit = double(pc.max_line_fit_mse);
+    if (mse > limit || Near(mse, limit)) atomicMax(s_flag[lb], 2u);
+  }
+  barrier();
+
+  bool go = seeded && s_flag[lb] == 0u;
+  if (go) {
+    uint i = q, j = (q + 1u) & 3u;
+    precise double A00 = s_lines[lb][i][3], A01 = -s_lines[lb][j][3];
+    precise double A10 = -s_lines[lb][i][2], A11 = s_lines[lb][j][2];
+    precise double B0 = -s_lines[lb][i][0] + s_lines[lb][j][0];
+    precise double B1 = -s_lines[lb][i][1] + s_lines[lb][j][1];
+    precise double det = A00 * A11 - A10 * A01;
+    if (Near(abs(det), 0.001)) {
+      atomicMax(s_flag[lb], 2u);
+    } else if (abs(det) < 0.001) {
+      atomicMax(s_flag[lb], 1u);
+    } else {
+      precise double W00 = DivD(A11, det), W01 = DivD(-A01, det);
+      precise double L0 = W00 * B0 + W01 * B1;
+      s_corners[lb][i][0] = s_lines[lb][i][0] + L0 * A00;
+      s_corners[lb][i][1] = s_lines[lb][i][1] + L0 * A10;
+    }
+  }
+  barrier();
+
+  go = go && s_flag[lb] == 0u;
+  if (go && q == 0u) {
+    // Area: the two triangles (0, 1, 2) and (2, 3, 0) by Heron's formula.
+    precise double area = 0.0;
+    for (int t = 0; t < 2; ++t) {
+      int a = t == 0 ? 0 : 2, b = t == 0 ? 1 : 3, c = t == 0 ? 2 : 0;
+      precise double ax = s_corners[lb][a][0], ay = s_corners[lb][a][1];
+      precise double bx = s_corners[lb][b][0], by = s_corners[lb][b][1];
+      precise double cx = s_corners[lb][c][0], cy = s_corners[lb][c][1];
+      precise double la = SqrtD((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+      precise double lb2 = SqrtD((cx - bx) * (cx - bx) + (cy - by) * (cy - by));
+      precise double lc = SqrtD((ax - cx) * (ax - cx) + (ay - cy) * (ay - cy));
+      precise double p = (la + lb2 + lc) / 2.0;
+      precise double v = p * (p - la) * (p - lb2) * (p - lc);
+      area += v > 0.0 ? SqrtD(v) : 0.0;
+    }
+    precise double min_area = 0.95 * pc.min_tag_width * pc.min_tag_width;
+    if (Near(area, min_area)) {
+      atomicMax(s_flag[lb], 2u);
+    } else if (area < min_area) {
+      atomicMax(s_flag[lb], 1u);
+    }
+  }
+  if (go) {
+    // Convex and consistently wound, with no corner sharper or flatter than cos_critical.
+    uint i0 = q, i1 = (q + 1u) & 3u, i2 = (q + 2u) & 3u;
+    precise double dx1 = s_corners[lb][i1][0] - s_corners[lb][i0][0];
+    precise double dy1 = s_corners[lb][i1][1] - s_corners[lb][i0][1];
+    precise double dx2 = s_corners[lb][i2][0] - s_corners[lb][i1][0];
+    precise double dy2 = s_corners[lb][i2][1] - s_corners[lb][i1][1];
+    precise double cos_dtheta =
+        DivD(dx1 * dx2 + dy1 * dy2, SqrtD((dx1 * dx1 + dy1 * dy1) * (dx2 * dx2 + dy2 * dy2)));
+    precise double cross_a = dx1 * dy2, cross_b = dy1 * dx2;
+    if (Near(abs(cos_dtheta), pc.cos_critical) ||
+        abs(cross_a - cross_b) <= kMargin * max(abs(cross_a), abs(cross_b))) {
+      atomicMax(s_flag[lb], 2u);
+    } else if (abs(cos_dtheta) > pc.cos_critical || cross_a < cross_b) {
+      atomicMax(s_flag[lb], 1u);
+    }
+  }
+  barrier();
+
+  if (!in_range) return;
+  uint flag = s_flag[lb];
+  if (q == 0u) fits[blob].status = flag == 0u ? 1u : (flag == 1u ? 0u : 2u);
+  if (flag == 0u) {
+    fits[blob].p[2u * q] = s_corners[lb][q][0] * double(pc.decimation);
+    fits[blob].p[2u * q + 1u] = s_corners[lb][q][1] * double(pc.decimation);
+  }
+}
+
+void main() {
+  if (kPass == 0u) {
+    SeedBlob();
+  } else {
+    FitPass();
+  }
+}

@@ -57,6 +57,15 @@ struct RawLineFitPoint {
 };
 static_assert(sizeof(RawLineFitPoint) == 8, "RawLineFitPoint must match std430 layout");
 
+// fit_quad_dp.comp's result for one selected blob: status 0 (rejected), 1 (a quad, corners p in
+// full-resolution pixels, in QuadDecode's order) or 2 (left to the CPU).
+struct GpuQuadFit {
+  uint32_t status = 0;
+  uint32_t pad = 0;
+  double p[4][2] = {};
+};
+static_assert(sizeof(GpuQuadFit) == 72, "GpuQuadFit must match std430 layout");
+
 // Cumulative line-fit moments for a range of points, prefix-summed from RawLineFitPoint.
 struct LineFitMoments {
   int32_t Mx = 0;

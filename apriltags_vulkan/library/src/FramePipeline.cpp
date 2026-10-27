@@ -102,6 +102,7 @@ void FramePipeline::HarvestInFlight(Slot &slot) {
   // last_line_fit_points is a non-owning span overwritten by the next Detect(), so it is copied.
   done_points_.assign(detector.last_line_fit_points.begin(),
                       detector.last_line_fit_points.end());
+  done_quad_fits_.assign(detector.last_quad_fits.begin(), detector.last_quad_fits.end());
   done_profile_ = detector.last_profile();
   done_frame_ = slot.frame;
   done_width_ = slot.width;
@@ -113,7 +114,7 @@ void FramePipeline::HarvestInFlight(Slot &slot) {
 zarray_t *FramePipeline::DecodeHarvested() {
   if (!have_done_) return nullptr;
   VKA_PROF_SCOPE("pipeline.cpu_tail");
-  quads_ = quad_decode_.Decode(done_points_);
+  quads_ = quad_decode_.Decode(done_points_, done_quad_fits_);
   return tag_decoder_.Decode(quads_, done_frame_, done_width_, done_height_,
                              done_reversed_border_);
 }

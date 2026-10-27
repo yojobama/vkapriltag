@@ -322,6 +322,22 @@ void GpuDetector::CreateBuffers() {
     fused_submits_ = (v[0] != '0') && linefit_direct_read_ && extents_direct_read_;
   }
 
+  if (const char *v = std::getenv("APRILTAG_VK_GPU_QUADFIT")) gpu_quadfit_ = v[0] == '1';
+  gpu_quadfit_ = gpu_quadfit_ && fused_submits_ && ctx_.caps().has_shader_float64 &&
+                 ctx_.caps().has_shader_int64 && ctx_.caps().has_subgroup_arithmetic &&
+                 ctx_.caps().has_subgroup_extended_types && ctx_.caps().subgroup_size >= 4u &&
+                 ctx_.caps().max_workgroup_invocations >= 256u;
+  if (gpu_quadfit_) {
+    quad_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
+    // fit_quad_dp.comp's Segments: 168 bytes per blob.
+    quad_fit_segments_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 168);
+    vk::Buffer b(ctx_, VkDeviceSize(std::max(config_.max_blobs, 1u)) * sizeof(GpuQuadFit),
+                 kSsboUsage, vk::MemoryKind::HostVisibleCached);
+    device_bytes_ += b.size();
+    quad_fits_buf_ = std::move(b);
+    gpu_quadfit_ = quad_fits_buf_.host_visible() && quad_fits_buf_.host_cached();
+  }
+
   if (const char *v = std::getenv("APRILTAG_VK_UF_VERIFY")) uf_verify_ = v[0] != '0';
 
   // Replays pre-recorded command buffers on the fused path (APRILTAG_VK_PRERECORD=0 records every
@@ -354,8 +370,9 @@ void GpuDetector::CreateBuffers() {
 
   // VkDispatchIndirectCommands built on the device by build_indirect_args_pl_.
   {
-    // Slot 1: the boundary points, one per thread; slot 2: 4 per thread.
-    vk::Buffer b(ctx_, 3 * 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+    // Slot 1: the boundary points, one per thread; slot 2: 4 per thread; slot 3: the selected blobs,
+    // one per thread of fit_quad_dp.comp's line-fit pass.
+    vk::Buffer b(ctx_, 4 * 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                 vk::MemoryKind::DeviceLocal);
     device_bytes_ += b.size();
     indirect_args_buf_ = std::move(b);
@@ -562,12 +579,28 @@ void GpuDetector::CreatePipelines() {
          selected_counter_buf_.get(), large_sort_buf_.get(),
          sort_split ? sort_scratch_buf_.get() : large_sort_buf_.get(),
          // binding 9: the line-fit buffer again, as words for the merge rounds.
-         line_fit_points_buf_.get()},
+         line_fit_points_buf_.get(),
+         // binding 10: the device-local copy for fit_quad_dp.comp (unused without it).
+         gpu_quadfit_ ? quad_fit_points_buf_.get() : line_fit_points_buf_.get()},
         32, vk::WorkgroupSize{local_sort_cap_, 1, 1},
         {local_sort_split_, sort_chunk, mode, local_sort_virtual_cap_,
-         mode == 0u ? sort_rank_all : 0u});
+         mode == 0u ? sort_rank_all : 0u, gpu_quadfit_ ? 1u : 0u});
   };
   sort_points_local_pl_ = make_sort(0u);
+  if (gpu_quadfit_) {
+    auto make_fit = [&](uint32_t pass, uint32_t threads) {
+      return vk::ComputePipeline(
+          ctx_, ShaderPath("fit_quad_dp"),
+          {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), quad_fit_points_buf_.get(),
+           quad_fits_buf_.get(), selected_counter_buf_.get(), quad_fit_segments_buf_.get()},
+          32, vk::WorkgroupSize{threads, 1, 1}, {pass});
+    };
+    fit_quad_seed_pl_ = make_fit(0u, 256u);
+    fit_quad_fit_pl_ = make_fit(1u, 64u);
+    build_fit_args_pl_ = vk::ComputePipeline(
+        ctx_, ShaderPath("build_indirect_args"),
+        {selected_counter_buf_.get(), indirect_args_buf_.get()}, 20, vk::WorkgroupSize{1, 1, 1});
+  }
   if (sort_split) {
     sort_large_runs_pl_ = make_sort(1u);
     sort_large_merge_pl_ = make_sort(2u);
@@ -965,11 +998,33 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
       VkDeviceSize(kSlotPointCount) * 4);
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
 
+  if (gpu_quadfit_) {
+    // Slot 3: fit_quad_dp.comp's line-fit pass, 16 selected blobs per workgroup.
+    struct { uint32_t wg, slot, divide, clamp, quarter_slot; } fit_args_pc{
+        16u, 3u, 1u, config_.max_blobs, 0xFFFFFFFFu};
+    build_fit_args_pl_.DispatchRaw(cmd, 1, 1, 1, &fit_args_pc, BarrierKind::None);
+  }
   // The sort's arguments (one workgroup per selected blob) were written by scan_blob_counts.
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
   RecordSort(cmd, 0u, true);
+  if (gpu_quadfit_) {
+    // The DP quad fit: seeding with one workgroup per selected blob (the sort's arguments), then
+    // the line fits with one thread per blob; timed with the sort.
+    struct {
+      uint32_t max_blobs, decimation;
+      float max_line_fit_mse;
+      uint32_t pad;
+      double min_tag_width, cos_critical;
+    } fit_pc{config_.max_blobs, config_.decimation, config_.max_line_fit_mse, 0u,
+             std::max(3.0, config_.tag_width / static_cast<double>(config_.decimation)),
+             config_.cos_critical_rad};
+    fit_quad_seed_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 12, &fit_pc,
+                                       BarrierKind::Compute);
+    fit_quad_fit_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 36, &fit_pc,
+                                      BarrierKind::ComputeAndTransfer);
+  }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
 
   // Both readbacks are read in place on the fused path, so there is nothing to copy; the span
@@ -1136,6 +1191,7 @@ void GpuDetector::SubmitTimed(const Submission &s) {
 }
 
 void GpuDetector::Detect(const uint8_t *gray_frame) {
+  last_quad_fits = {};
   if (!fused_submits_) {
     DetectUnfused(gray_frame);
     return;
@@ -1255,6 +1311,14 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
   if (!line_fit_points_buf_.coherent()) line_fit_points_buf_.InvalidateRange(0, linefit_bytes);
   last_line_fit_points = std::span<const RawLineFitPoint>(
       static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), num_points);
+  // The GPU fit read every selected blob's points, so it is used only when none were dropped.
+  last_quad_fits = {};
+  if (gpu_quadfit_ && selected_blobs > 0 && ReadCounterSlot(kSlotPointCount) <= ipoint_capacity_) {
+    const VkDeviceSize fits_bytes = VkDeviceSize(selected_blobs) * sizeof(GpuQuadFit);
+    if (!quad_fits_buf_.coherent()) quad_fits_buf_.InvalidateRange(0, fits_bytes);
+    last_quad_fits = std::span<const GpuQuadFit>(
+        static_cast<const GpuQuadFit *>(quad_fits_buf_.mapped()), selected_blobs);
+  }
   const auto t_end = Clock::now();
 
   // Host phases: recording time is reported as threshold_label_ms and the submission as

@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
 
       const auto t0 = std::chrono::steady_clock::now();
       std::vector<apriltag_vulkan::DetectedQuad> quads =
-          quad_decode.Decode(detector.last_line_fit_points);
+          quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits);
       const auto t1 = std::chrono::steady_clock::now();
 
       zarray_t *detections = tag_decoder.Decode(quads, gray.data(), width, height,

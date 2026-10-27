@@ -9,6 +9,7 @@ layout(local_size_x_id = 0, local_size_x = 1) in;
 //   raw blob count       -> select_blobs (slot 0 of GpuDetector's blob_args_buf_)
 //   boundary point count -> hash_group, reduce_extents_hash, scatter (slot 1 of
 //                           indirect_args_buf_), and the 4-points-per-thread reduction (slot 2)
+//   selected blob count  -> fit_quad_dp.comp's line-fit pass (slot 3 of indirect_args_buf_)
 //
 // The sort's arguments (one workgroup per selected blob) are written by
 // scan_blob_counts.comp.

@@ -96,6 +96,7 @@ class FramePipeline {
   // Extents are swapped with the detector's vector; points are copied (see HarvestInFlight).
   std::vector<MinMaxExtentsGpu> done_extents_;
   std::vector<RawLineFitPoint> done_points_;
+  std::vector<GpuQuadFit> done_quad_fits_;
   GpuDetector::DetectProfile done_profile_{};
   std::vector<DetectedQuad> quads_;
 };

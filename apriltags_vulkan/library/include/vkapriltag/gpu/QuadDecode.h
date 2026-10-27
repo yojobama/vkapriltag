@@ -31,6 +31,10 @@ class QuadDecode {
   // Fits quads to the line-fit points and returns their corners in
   // full-resolution (un-decimated) pixel coordinates.
   std::vector<DetectedQuad> Decode(std::span<const RawLineFitPoint> line_fit_points) const;
+  // As above, using GpuDetector::last_quad_fits for the blobs the GPU already fitted (status 0 and
+  // 1) and fitting the rest here; an empty `gpu_fits` fits every blob.
+  std::vector<DetectedQuad> Decode(std::span<const RawLineFitPoint> line_fit_points,
+                                   std::span<const GpuQuadFit> gpu_fits) const;
 
   unsigned threads() const { return pool_->threads(); }
 

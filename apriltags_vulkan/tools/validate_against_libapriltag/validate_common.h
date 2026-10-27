@@ -411,7 +411,7 @@ inline int RunIngestAb(apriltag_vulkan::GpuDetector &detector,
       const double clear_span = profile.gpu_stage_ms[0];
       const double threshold_span = profile.gpu_stage_ms[1];
       const std::vector<apriltag_vulkan::DetectedQuad> quads =
-          quad_decode.Decode(detector.last_line_fit_points);
+          quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits);
       tag_decoder.Decode(quads, frame, width, height, reversed_border);
       const double pipeline = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
       if (!have_reference) {
