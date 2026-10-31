@@ -3,7 +3,8 @@
 //
 // Sorts each selected blob's points by theta_key and writes their RawLineFitPoints in that order.
 // Mode 0: one workgroup per blob; lists blobs above kLocalCap points for modes 1 and 2 and writes
-// blobs above kLargeCap unsorted. Mode 1: sorts a run of a listed blob. Mode 2: one merge round.
+// blobs above kLargeCap unsorted. Mode 1: sorts one kLocalCap run of a listed blob. Mode 2: places
+// each point of a listed blob by ranking it against the blob's other runs.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 // Shared-memory slots per workgroup (one word per point), independent of the workgroup size; see
 // local_sort_split_ in GpuDetector.cpp.
@@ -12,8 +13,7 @@ layout(constant_id = 3) const uint kLocalCap = 1024;
 // merged pairwise by binary search. 0 selects the sorting network.
 layout(constant_id = 4) const uint kChunk = 0;
 layout(constant_id = 5) const uint kMode = 0;
-// Largest blob that is sorted (a power of two, a multiple of kLocalCap, at most
-// 1 << kLocalIndexBits); see local_sort_virtual_cap_ in GpuDetector.cpp.
+// Largest blob that is sorted; larger ones are written unsorted (kLargeSortCap, GpuDetector.cpp).
 layout(constant_id = 6) const uint kLargeCap = 1024;
 // Blobs of at most this many points are sorted by ranking every key against all of them, read 4 at a
 // time; 0 disables.
@@ -31,8 +31,14 @@ layout(std430, binding = 5) buffer OversizedBlobs { uint oversized_blobs; };
 // Point count read from this buffer when count_from_buffer is set, otherwise from the push
 // constant.
 layout(std430, binding = 6) readonly buffer CountBuf { uint count_buf; };
+// A blob of more than kLocalCap points and the first workgroup of its share of modes 1 and 2.
+struct LargeBlob {
+  uint blob;
+  uint first_run_group;
+  uint first_merge_group;
+};
 // Blobs of more than kLocalCap points: [0..2] mode 1's dispatch, [3..5] mode 2's, [6] the count,
-// then the blob indices. Zeroed each frame. Read-only in the modes 1 and 2 build
+// then the blobs. Zeroed each frame. Read-only in the modes 1 and 2 build
 // (sort_points_large*.comp), which the validation layer's shader-access analysis relies on.
 #ifdef SORT_LARGE_ONLY
 layout(std430, binding = 7) readonly buffer LargeBlobs {
@@ -40,12 +46,11 @@ layout(std430, binding = 7) readonly buffer LargeBlobs {
 layout(std430, binding = 7) buffer LargeBlobs {
 #endif
   uint large_args[8];
-  uint large_blobs[];
+  LargeBlob large_blobs[];
 };
-// Packed keys between rounds, indexed like Output; the other buffer is Output's first word.
+// Mode 1's sorted runs, indexed like Output: packed keys whose low bits index into the run.
 layout(std430, binding = 8) buffer SortScratch { uint scratch_keys[]; };
-layout(std430, binding = 9) buffer OutputWords { uint output_words[]; };
-layout(std430, binding = 10) writeonly buffer Mirror { RawLineFitPoint mirror_points[]; };
+layout(std430, binding = 9) writeonly buffer Mirror { RawLineFitPoint mirror_points[]; };
 
 layout(push_constant) uniform PushConstants {
   uint num_selected_blobs;
@@ -54,11 +59,6 @@ layout(push_constant) uniform PushConstants {
   uint max_blobs;
   int decimated_width;
   int decimated_height;
-  // Modes 1 and 2: the sorted run length this round reads, whether the round's source (mode 2) or
-  // destination (mode 1) is SortScratch, and whether it is the final round.
-  uint run_len;
-  uint scratch_flag;
-  uint final_round;
 } pc;
 
 // TransformLineFitPoint's gradient-weight computation; emits only (x2, y2, W, blob_index),
@@ -84,8 +84,8 @@ RawLineFitPoint ComputeLineFitPoint(IPoint p) {
   return out_pt;
 }
 
-// Packs theta_key (20 bits) in the high bits and the point's index within its blob (12 bits) in
-// the low bits, so comparing packed words sorts by key. kLargeCap must not exceed 1 << 12.
+// Packs theta_key (20 bits) in the high bits and the point's index within the sorted range
+// (12 bits) in the low bits, so comparing packed words sorts by key. kLocalCap is at most 1 << 12.
 const uint kLocalIndexBits = 12u;
 const uint kLocalIndexMask = (1u << kLocalIndexBits) - 1u;
 const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
@@ -103,19 +103,18 @@ void WritePoint(uint i, RawLineFitPoint p) {
 
 uint SortedAt(bool from_merge, uint i) { return from_merge ? s_merge[i] : s_packed[i]; }
 
-uint PackedKey(uint base, uint index) {
-  return (min(src[base + index].theta_key, kMaxThetaKey) << kLocalIndexBits) | index;
+// The packed key of the point `index` places after `first` in the blob.
+uint PackedKey(uint base, uint first, uint index) {
+  return (min(src[base + first + index].theta_key, kMaxThetaKey) << kLocalIndexBits) | index;
 }
 
-// Places the packed key at sorted position `pos` of the blob: mode 0 writes the point's
-// RawLineFitPoint, mode 1 the key itself.
-void Emit(uint base, uint pos, uint packed) {
+// Places the packed key at position `pos` of the range starting at `first`: mode 0 (whose range is
+// the whole blob) writes the point's RawLineFitPoint, mode 1 the key itself.
+void Emit(uint base, uint first, uint pos, uint packed) {
   if (kMode == 0u) {
     WritePoint(base + pos, ComputeLineFitPoint(src[base + (packed & kLocalIndexMask)]));
-  } else if (pc.scratch_flag != 0u) {
-    scratch_keys[base + pos] = packed;
   } else {
-    output_words[2u * (base + pos)] = packed;
+    scratch_keys[base + first + pos] = packed;
   }
 }
 
@@ -128,7 +127,7 @@ void SortRange(uint base, uint first, uint count) {
   if (kRankAll != 0u && count <= kRankAll) {
     uint padded = (count + 3u) & ~3u;
     for (uint idx = tid; idx < padded; idx += threads) {
-      s_rank[idx >> 2u][idx & 3u] = (idx < count) ? PackedKey(base, first + idx) : 0xFFFFFFFFu;
+      s_rank[idx >> 2u][idx & 3u] = (idx < count) ? PackedKey(base, first, idx) : 0xFFFFFFFFu;
     }
     memoryBarrierShared();
     barrier();
@@ -136,14 +135,14 @@ void SortRange(uint base, uint first, uint count) {
       uint v = s_rank[idx >> 2u][idx & 3u];
       uvec4 ranks = uvec4(0u);
       for (uint j = 0u; j < padded / 4u; ++j) ranks += uvec4(lessThan(s_rank[j], uvec4(v)));
-      Emit(base, first + ranks.x + ranks.y + ranks.z + ranks.w, v);
+      Emit(base, first, ranks.x + ranks.y + ranks.z + ranks.w, v);
     }
     return;
   }
 
   if (kChunk != 0u) {
     for (uint idx = tid; idx < count; idx += threads) {
-      s_packed[idx] = PackedKey(base, first + idx);
+      s_packed[idx] = PackedKey(base, first, idx);
     }
     memoryBarrierShared();
     barrier();
@@ -153,7 +152,7 @@ void SortRange(uint base, uint first, uint count) {
         uint v = s_packed[idx];
         uint rank = 0u;
         for (uint j = 0u; j < count; ++j) rank += uint(s_packed[j] < v);
-        Emit(base, first + rank, v);
+        Emit(base, first, rank, v);
       }
       return;
     }
@@ -194,7 +193,7 @@ void SortRange(uint base, uint first, uint count) {
         }
         uint pos = pair_start + (idx - own_start) + lo;
         if (last) {
-          Emit(base, first + pos, v);
+          Emit(base, first, pos, v);
         } else if (in_merge) {
           s_packed[pos] = v;
         } else {
@@ -219,8 +218,8 @@ void SortRange(uint base, uint first, uint count) {
   }
 
   for (uint idx = tid; idx < cap; idx += threads) {
-    s_packed[idx] = (idx < count) ? PackedKey(base, first + idx)
-                                  : ((kMaxThetaKey << kLocalIndexBits) | (first + idx));
+    s_packed[idx] = (idx < count) ? PackedKey(base, first, idx)
+                                  : ((kMaxThetaKey << kLocalIndexBits) | idx);
   }
   memoryBarrierShared();
   barrier();
@@ -269,11 +268,31 @@ void SortRange(uint base, uint first, uint count) {
   }
 
   for (uint idx = tid; idx < count; idx += threads) {
-    Emit(base, first + idx, s_packed[idx]);
+    Emit(base, first, idx, s_packed[idx]);
   }
 }
 
-uint MergedAt(uint i) { return pc.scratch_flag != 0u ? scratch_keys[i] : output_words[2u * i]; }
+const uint kNone = 0xFFFFFFFFu;
+shared uint s_large_slot;
+
+// The listed blob whose share of mode 1 (`runs`) or mode 2 holds workgroup `group`, or kNone.
+// Every invocation calls it.
+uint FindLargeBlob(uint group, bool runs) {
+  uint tid = gl_LocalInvocationID.x;
+  uint threads = gl_WorkGroupSize.x;
+  if (tid == 0u) s_large_slot = kNone;
+  barrier();
+  uint n = large_args[6];
+  for (uint s = tid; s < n; s += threads) {
+    LargeBlob e = large_blobs[s];
+    uint count = selected[e.blob].count;
+    uint first = runs ? e.first_run_group : e.first_merge_group;
+    uint groups = runs ? (count + kLocalCap - 1u) / kLocalCap : (count + threads - 1u) / threads;
+    if (group >= first && group < first + groups) s_large_slot = s;
+  }
+  barrier();
+  return s_large_slot;
+}
 
 void main() {
   uint tid = gl_LocalInvocationID.x;
@@ -295,12 +314,15 @@ void main() {
       return;
     }
     if (count > kLocalCap) {
-      // Listed for modes 1 and 2; the y and z group counts are 1 whenever x is non-zero.
+      // Listed for modes 1 and 2 with its own share of their workgroups; the y and z group counts
+      // are 1 whenever x is non-zero.
 #ifndef SORT_LARGE_ONLY
       if (tid == 0u) {
-        large_blobs[atomicAdd(large_args[6], 1u)] = blob;
-        atomicAdd(large_args[0], kLargeCap / kLocalCap);
-        atomicAdd(large_args[3], max(kLargeCap / threads, 1u));
+        LargeBlob e;
+        e.blob = blob;
+        e.first_run_group = atomicAdd(large_args[0], (count + kLocalCap - 1u) / kLocalCap);
+        e.first_merge_group = atomicAdd(large_args[3], (count + threads - 1u) / threads);
+        large_blobs[atomicAdd(large_args[6], 1u)] = e;
         large_args[1] = 1u;
         large_args[2] = 1u;
         large_args[4] = 1u;
@@ -314,51 +336,46 @@ void main() {
   }
 
   if (kMode == 1u) {
-    uint runs = kLargeCap / kLocalCap;
-    uint slot = gl_WorkGroupID.x / runs;
-    if (slot >= large_args[6]) return;
-    uint blob = large_blobs[slot];
-    uint count = selected[blob].count;
-    uint base = blob_point_offsets[blob] - count;
-    uint first = (gl_WorkGroupID.x % runs) * kLocalCap;
-    if (first >= count) return;
+    uint slot = FindLargeBlob(gl_WorkGroupID.x, true);
+    if (slot == kNone) return;
+    LargeBlob e = large_blobs[slot];
+    uint count = selected[e.blob].count;
+    uint base = blob_point_offsets[e.blob] - count;
+    uint first = (gl_WorkGroupID.x - e.first_run_group) * kLocalCap;
     SortRange(base, first, min(kLocalCap, count - first));
     return;
   }
 
-  // Mode 2: one merge round. A run that already covers the blob is copied through unchanged.
-  uint groups_per_blob = max(kLargeCap / threads, 1u);
-  uint slot = gl_WorkGroupID.x / groups_per_blob;
-  if (slot >= large_args[6]) return;
-  uint blob = large_blobs[slot];
-  uint count = selected[blob].count;
-  uint base = blob_point_offsets[blob] - count;
-  uint idx = (gl_WorkGroupID.x % groups_per_blob) * threads + tid;
+  // Mode 2: a point's position is its rank in its own run plus, in every other run, the number of
+  // smaller keys; earlier runs hold lower indices, so their equal keys also come first.
+  uint slot = FindLargeBlob(gl_WorkGroupID.x, false);
+  if (slot == kNone) return;
+  LargeBlob e = large_blobs[slot];
+  uint count = selected[e.blob].count;
+  uint base = blob_point_offsets[e.blob] - count;
+  uint idx = (gl_WorkGroupID.x - e.first_merge_group) * threads + tid;
   if (idx >= count) return;
 
-  uint run = pc.run_len;
-  uint v = MergedAt(base + idx);
-  uint pair_start = idx & ~((run << 1u) - 1u);
-  bool left = (idx - pair_start) < run;
-  uint own_start = left ? pair_start : pair_start + run;
-  uint other_start = left ? pair_start + run : pair_start;
-  uint other_len = other_start < count ? min(run, count - other_start) : 0u;
-  uint lo = 0u;
-  uint hi = other_len;
-  while (lo < hi) {
-    uint mid = (lo + hi) >> 1u;
-    if (MergedAt(base + other_start + mid) < v) {
-      lo = mid + 1u;
-    } else {
-      hi = mid;
+  uint run = idx / kLocalCap;
+  uint v = scratch_keys[base + idx];
+  uint key = v >> kLocalIndexBits;
+  uint pos = idx - run * kLocalCap;
+  uint runs = (count + kLocalCap - 1u) / kLocalCap;
+  for (uint r = 0u; r < runs; ++r) {
+    if (r == run) continue;
+    uint start = r * kLocalCap;
+    uint lo = 0u;
+    uint hi = min(kLocalCap, count - start);
+    while (lo < hi) {
+      uint mid = (lo + hi) >> 1u;
+      uint k = scratch_keys[base + start + mid] >> kLocalIndexBits;
+      if (r < run ? k <= key : k < key) {
+        lo = mid + 1u;
+      } else {
+        hi = mid;
+      }
     }
+    pos += lo;
   }
-  uint pos = pair_start + (idx - own_start) + lo;
-  if (pc.final_round != 0u) {
-    WritePoint(base + pos, ComputeLineFitPoint(src[base + (v & kLocalIndexMask)]));
-  } else if (pc.scratch_flag != 0u) {
-    output_words[2u * (base + pos)] = v;
-  } else {
-    scratch_keys[base + pos] = v;
-  }
+  WritePoint(base + pos, ComputeLineFitPoint(src[base + run * kLocalCap + (v & kLocalIndexMask)]));
 }

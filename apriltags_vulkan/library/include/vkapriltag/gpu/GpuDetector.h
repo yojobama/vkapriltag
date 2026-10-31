@@ -128,9 +128,8 @@ class GpuDetector {
     // Blobs that passed select_blobs.comp but found no slot because more than max_blobs qualified.
     // Which are dropped depends on GPU scheduling, so detections are then not reproducible.
     uint32_t selected_blob_drops = 0;
-    // Selected blobs with more points than local_sort_virtual_cap_; they stay unsorted, so their
-    // quads are meaningless. Nonzero is normal for large background blobs; suspect it when an
-    // expected tag is missing.
+    // Selected blobs of more than 65,536 points (kLargeSortCap); they stay unsorted, so their quads
+    // are meaningless. No tag border at a supported frame size is that large.
     uint32_t oversized_sort_blobs = 0;
     uint32_t uf_iterations = 0;       // labelling passes until convergence
     uint32_t submits = 0;             // queue submissions this frame
@@ -305,7 +304,7 @@ class GpuDetector {
   // DetectProfile::oversized_sort_blobs.
   vk::Buffer oversized_sort_counter_buf_;
   // Blobs of more than local_sort_split_ points and their indirect dispatch args (see
-  // sort_points_local_body.glsl), and the packed keys between merge rounds.
+  // sort_points_local_body.glsl), and their sorted runs.
   vk::Buffer large_sort_buf_, sort_scratch_buf_;
   uint32_t hash_table_size_ = 0;
 
@@ -345,12 +344,10 @@ class GpuDetector {
   std::vector<RawLineFitPoint> linefit_scratch_;
 
   // Scan chain for the per-blob point-offset assignment (sized to config_.max_blobs).
-  // Largest per-blob point count sort_points_local.comp sorts in shared memory (power of two).
-  // local_sort_cap_ is the workgroup thread count; the virtual cap may exceed it (threads stride).
+  // sort_points_local.comp's workgroup thread count.
   uint32_t local_sort_cap_ = 0;
-  uint32_t local_sort_virtual_cap_ = 0;
-  // Blobs above this many points are sorted in runs of this length by several workgroups and
-  // merged by whole-dispatch rounds; equal to local_sort_virtual_cap_ when that is not needed.
+  // Blobs of up to this many points (a power of two) are sorted whole in shared memory; larger
+  // ones in runs of this length by several workgroups, then placed by one ranking pass.
   uint32_t local_sort_split_ = 0;
   // Rank-merge run length (a power of two, 0 for the sorting network) and the largest blob ranked
   // in one pass (0 disables); APRILTAG_VK_SORT_CHUNK and APRILTAG_VK_SORT_RANK_ALL override them.
