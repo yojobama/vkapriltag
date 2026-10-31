@@ -17,8 +17,8 @@ layout(std430, binding = 4) readonly buffer Selected { MinMaxExtentsGpu selected
 layout(std430, binding = 5) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
 layout(std430, binding = 6) buffer BlobCursor { uint blob_cursor[]; };
 layout(std430, binding = 7) writeonly buffer Output { IPoint output_points[]; };
-// Point count read from this buffer when count_from_buffer is set, else from
-// the push constant.
+// Point count read from this buffer, capped at pc.count, when count_from_buffer is set, else
+// from the push constant.
 layout(std430, binding = 8) readonly buffer CountBuf { uint count_buf; };
 
 layout(push_constant) uniform PushConstants {
@@ -30,7 +30,7 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
-  if (i >= (pc.count_from_buffer != 0u ? count_buf : pc.count)) return;
+  if (i >= (pc.count_from_buffer != 0u ? min(count_buf, pc.count) : pc.count)) return;
 
   uint slot = point_slot[i];
   if (slot == 0xFFFFFFFFu) return;

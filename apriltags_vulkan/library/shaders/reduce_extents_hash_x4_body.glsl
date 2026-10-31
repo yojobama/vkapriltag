@@ -42,7 +42,7 @@ void Flush(uint s, Acc a) {
 }
 
 void main() {
-  uint n = pc.count_from_buffer != 0u ? count_buf : pc.count;
+  uint n = pc.count_from_buffer != 0u ? min(count_buf, pc.count) : pc.count;
   uint first = gl_GlobalInvocationID.x * 4u;
   if (first >= n) return;
   uint copy = gl_WorkGroupID.x & (kExtentsCopies - 1u);

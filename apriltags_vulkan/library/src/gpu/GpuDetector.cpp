@@ -947,8 +947,9 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
+  // With count_from_buffer, `count` caps the device's counter at the buffer capacity.
   struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
-      0u, hash_table_size_ - 1u, 128u, 1u, config_.max_raw_blobs};
+      qbp_capacity_, hash_table_size_ - 1u, 128u, 1u, config_.max_raw_blobs};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
   hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
@@ -960,8 +961,8 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
-  struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{0u, config_.max_raw_blobs,
-                                                                         1u};
+  struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{qbp_capacity_,
+                                                                         config_.max_raw_blobs, 1u};
   reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), reduce_x4_ ? 24 : 12,
                                            &reduce_pc);
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
@@ -987,7 +988,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
   struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
-      0u, ipoint_capacity_, config_.max_raw_blobs, 1u};
+      qbp_capacity_, ipoint_capacity_, config_.max_raw_blobs, 1u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
   scatter_index_points_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
                                             BarrierKind::ComputeAndTransfer);
@@ -1592,6 +1593,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // When fusing, the count stays on the device; the host value is used only on the unfused path.
   const uint32_t qbp_count =
       fuse ? 0u : std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
+  // The shaders' `count`: with count_from_buffer it caps the device's counter at the capacity.
+  const uint32_t qbp_pc_count = fuse ? qbp_capacity_ : qbp_count;
   const auto t_boundary = Clock::now();
 
   // ------------------------------------------------------------------
@@ -1610,7 +1613,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   if (fuse || qbp_count > 0) {
     // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
     struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
-        qbp_count, hash_table_size_ - 1u, 128u, fuse ? 1u : 0u, config_.max_raw_blobs};
+        qbp_pc_count, hash_table_size_ - 1u, 128u, fuse ? 1u : 0u, config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
     if (fuse) {
       hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
@@ -1627,7 +1630,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
 
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
     struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{
-        qbp_count, config_.max_raw_blobs, fuse ? 1u : 0u};
+        qbp_pc_count, config_.max_raw_blobs, fuse ? 1u : 0u};
     if (fuse) {
       reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(),
                                                reduce_x4_ ? 24 : 12, &reduce_pc);
@@ -1658,7 +1661,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
     struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
-        qbp_count, ipoint_capacity_, config_.max_raw_blobs, fuse ? 1u : 0u};
+        qbp_pc_count, ipoint_capacity_, config_.max_raw_blobs, fuse ? 1u : 0u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
     if (fuse) {
       scatter_index_points_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,

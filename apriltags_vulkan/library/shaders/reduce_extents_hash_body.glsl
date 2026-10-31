@@ -5,7 +5,8 @@ layout(std430, binding = 0) readonly buffer Compacted { uint compacted[]; };
 layout(std430, binding = 1) readonly buffer PointSlot { uint point_slot[]; };
 layout(std430, binding = 2) readonly buffer SlotDense { uint slot_dense[]; };
 layout(std430, binding = 3) buffer Extents { MinMaxExtentsGpu extents[]; };
-// Point count read from this buffer when count_from_buffer is set, otherwise from pc.count.
+// Point count read from this buffer, capped at pc.count, when count_from_buffer is set, otherwise
+// pc.count.
 layout(std430, binding = 5) readonly buffer CountBuf { uint count_buf; };
 #ifdef USE_INT64_ATOMIC
 // Binding 3 viewed as 64-bit words.
@@ -20,7 +21,7 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
   uint i = gl_GlobalInvocationID.x;
-  if (i >= (pc.count_from_buffer != 0u ? count_buf : pc.count)) return;
+  if (i >= (pc.count_from_buffer != 0u ? min(count_buf, pc.count) : pc.count)) return;
 
   uint slot = point_slot[i];
   if (slot == 0xFFFFFFFFu) return;
