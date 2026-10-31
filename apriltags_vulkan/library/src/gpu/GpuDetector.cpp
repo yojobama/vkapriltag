@@ -77,7 +77,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig 
     : GpuDetector(ctx, lane, nullptr, config) {}
 
 GpuDetector::~GpuDetector() {
-  vk::DispatchProbe::Report(ctx_.device());
+  vk::DispatchProbe::Report(ctx_.device(), this);
   // Detect() returns only after its submission completes, so nothing recorded is in flight.
   for (const RecordedFrame &r : recorded_frames_) lane_.FreePersistentCommands(r.cmd);
   if (upload_semaphore_ != VK_NULL_HANDLE) {
@@ -859,7 +859,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
 
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
-  vk::DispatchProbe::Begin(cmd, ctx_.device());
+  if (ctx_.caps().timestamps_supported) vk::DispatchProbe::Begin(cmd, ctx_.device(), this);
   if (!gray_direct_write_ && imported == nullptr && transfer_lane_ == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
@@ -1404,7 +1404,7 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
   // uf_iterations and uf_converged are set by DetectFused, once any retry is resolved.
   last_profile_.submits = static_cast<uint32_t>(lane_.submit_count - frame.submits_at_start);
 
-  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns);
+  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns, this);
   if (timestamps_enabled_) {
     const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
     const double ns_per_tick = ctx_.caps().timestamp_period_ns;
@@ -1511,7 +1511,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   VkCommandBuffer cmd = BeginTimedCommands();
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
-  vk::DispatchProbe::Begin(cmd, ctx_.device());
+  if (ctx_.caps().timestamps_supported) vk::DispatchProbe::Begin(cmd, ctx_.device(), this);
   if (!gray_direct_write_ && imported == nullptr && transfer_lane_ == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
@@ -1874,7 +1874,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // uf_iterations and uf_converged are set at the end of Detect(), once the fused retry is resolved.
   last_profile_.submits = static_cast<uint32_t>(lane_.submit_count - submits_at_start);
 
-  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns);
+  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns, this);
   if (timestamps_enabled_) {
     const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
     const double ns_per_tick = ctx_.caps().timestamp_period_ns;

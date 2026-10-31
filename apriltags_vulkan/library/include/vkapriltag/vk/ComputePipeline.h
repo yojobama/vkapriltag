@@ -37,17 +37,19 @@ struct WorkgroupSize {
   uint32_t invocations() const { return x * y * z; }
 };
 
-// Per-dispatch GPU timestamps for profiling, on when APRILTAG_VK_DISPATCH_TIMES is set; one
-// detector per process. Report() prints the median time of each step and frees the query pool.
+// Per-dispatch GPU timestamps for profiling, on when APRILTAG_VK_DISPATCH_TIMES is set. It times
+// the first `owner` (a detector) to call Begin, until that owner's Report(); others are skipped.
+// Report() prints the median time of each step and frees the query pool.
 struct DispatchProbe {
   static bool Enabled();
-  // Resets the timestamps at the start of a frame's command buffer.
-  static void Begin(VkCommandBuffer cmd, VkDevice device);
+  // Resets the timestamps at the start of a frame's command buffer; later Marks on this thread
+  // belong to the frame.
+  static void Begin(VkCommandBuffer cmd, VkDevice device, const void *owner);
   // Timestamps the end of `name`; every dispatch calls it.
   static void Mark(VkCommandBuffer cmd, const char *name);
   // Reads the frame's timestamps after its submission completes.
-  static void Collect(VkDevice device, double ns_per_tick);
-  static void Report(VkDevice device);
+  static void Collect(VkDevice device, double ns_per_tick, const void *owner);
+  static void Report(VkDevice device, const void *owner);
 };
 
 // A compute pipeline bound to a fixed list of SSBOs (in order from binding 0) plus an optional push

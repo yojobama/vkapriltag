@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace apriltag_vulkan::vk {
@@ -11,6 +13,10 @@ namespace apriltag_vulkan::vk {
 namespace {
 
 struct ProbeState {
+  std::mutex mutex;
+  const void *owner = nullptr;
+  std::thread::id recording;  // the thread recording the owner's frame
+  bool noted_other = false;
   VkQueryPool pool = VK_NULL_HANDLE;
   uint32_t idx = 0;
   std::vector<std::string> names;
@@ -30,34 +36,55 @@ bool DispatchProbe::Enabled() {
   return on;
 }
 
-void DispatchProbe::Begin(VkCommandBuffer cmd, VkDevice device) {
+void DispatchProbe::Begin(VkCommandBuffer cmd, VkDevice device, const void *owner) {
   if (!Enabled()) return;
   ProbeState &p = Probe();
-  if (p.pool == VK_NULL_HANDLE) {
+  std::lock_guard<std::mutex> lock(p.mutex);
+  if (p.owner == nullptr) {
     VkQueryPoolCreateInfo qi{};
     qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
     qi.queryCount = kProbeSlots;
-    vkCreateQueryPool(device, &qi, nullptr, &p.pool);
+    if (vkCreateQueryPool(device, &qi, nullptr, &p.pool) != VK_SUCCESS) {
+      p.pool = VK_NULL_HANDLE;
+      return;
+    }
+    p.owner = owner;
   }
+  if (owner != p.owner) {
+    // Another detector's frame: its Marks on this thread must not land in the owner's pool.
+    if (p.recording == std::this_thread::get_id()) p.recording = std::thread::id();
+    if (!p.noted_other) {
+      std::fprintf(stderr, "APRILTAG_VK_DISPATCH_TIMES: timing the first detector only\n");
+      p.noted_other = true;
+    }
+    return;
+  }
+  p.recording = std::this_thread::get_id();
   vkCmdResetQueryPool(cmd, p.pool, 0, kProbeSlots);
   p.idx = 0;
   p.names.clear();
-  Mark(cmd, "<start>");
+  vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, p.pool, p.idx++);
+  p.names.push_back("<start>");
 }
 
 void DispatchProbe::Mark(VkCommandBuffer cmd, const char *name) {
   if (!Enabled()) return;
   ProbeState &p = Probe();
-  if (p.pool == VK_NULL_HANDLE || p.idx >= kProbeSlots) return;
+  std::lock_guard<std::mutex> lock(p.mutex);
+  if (p.pool == VK_NULL_HANDLE || p.recording != std::this_thread::get_id() ||
+      p.idx >= kProbeSlots) {
+    return;
+  }
   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, p.pool, p.idx++);
   p.names.push_back(name);
 }
 
-void DispatchProbe::Collect(VkDevice device, double ns_per_tick) {
+void DispatchProbe::Collect(VkDevice device, double ns_per_tick, const void *owner) {
   if (!Enabled()) return;
   ProbeState &p = Probe();
-  if (p.pool == VK_NULL_HANDLE || p.idx < 2) return;
+  std::lock_guard<std::mutex> lock(p.mutex);
+  if (owner != p.owner || p.pool == VK_NULL_HANDLE || p.idx < 2) return;
   std::vector<uint64_t> t(p.idx);
   if (vkGetQueryPoolResults(device, p.pool, 0, p.idx, t.size() * 8, t.data(), 8,
                             VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
@@ -73,11 +100,15 @@ void DispatchProbe::Collect(VkDevice device, double ns_per_tick) {
   ++p.frames;
 }
 
-void DispatchProbe::Report(VkDevice device) {
+void DispatchProbe::Report(VkDevice device, const void *owner) {
   if (!Enabled()) return;
   ProbeState &p = Probe();
+  std::lock_guard<std::mutex> lock(p.mutex);
+  if (owner != p.owner) return;
   if (p.pool != VK_NULL_HANDLE) vkDestroyQueryPool(device, p.pool, nullptr);
   p.pool = VK_NULL_HANDLE;
+  p.owner = nullptr;
+  p.recording = std::thread::id();
   std::fprintf(stderr, "dispatch times over %u frames (median us, previous timestamp to this one):\n",
                p.frames);
   double total = 0;
@@ -94,6 +125,8 @@ void DispatchProbe::Report(VkDevice device) {
     std::fprintf(stderr, "  %-40s %9.1f\n", n.c_str(), m);
   }
   std::fprintf(stderr, "  %-40s %9.1f\n", "sum of medians", total);
+  p.rows.clear();
+  p.frames = 0;
 }
 
 ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_source,
