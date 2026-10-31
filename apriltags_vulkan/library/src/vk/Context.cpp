@@ -1094,10 +1094,10 @@ VkCommandBuffer Lane::BeginCommands() {
   ring_next_ = (ring_next_ + 1) % kCommandRing;
   ring_active_ = i;
 
-  // Wait for this slot's previous submission (if any) before reusing its command buffer.
+  // Wait for this slot's previous submission (if any) before reusing its command buffer. The fence
+  // is reset only at the next submit (SubmitRing), so a throw before then leaves it signalled.
   CheckVk(vkWaitForFences(device_, 1, &fence_ring_[i], VK_TRUE, UINT64_MAX),
           "vkWaitForFences");
-  CheckVk(vkResetFences(device_, 1, &fence_ring_[i]), "vkResetFences");
   CheckVk(vkResetCommandBuffer(cmd_ring_[i], 0), "vkResetCommandBuffer");
 
   VkCommandBufferBeginInfo begin_info{};
@@ -1117,10 +1117,26 @@ void Lane::SubmitSignal(VkCommandBuffer cmd, VkSemaphore signal) {
   submit_info.pCommandBuffers = &cmd;
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &signal;
+  SubmitRing(i, submit_info);
+}
 
+void Lane::SubmitRing(size_t i, const VkSubmitInfo &submit_info) {
+  CheckVk(vkResetFences(device_, 1, &fence_ring_[i]), "vkResetFences");
+  VkResult result;
   {
     std::lock_guard<std::mutex> lock(*submit_mutex_);
-    CheckVk(vkQueueSubmit(queue_, 1, &submit_info, fence_ring_[i]), "vkQueueSubmit");
+    result = vkQueueSubmit(queue_, 1, &submit_info, fence_ring_[i]);
+  }
+  if (result != VK_SUCCESS) {
+    VkFenceCreateInfo fence_info{};
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    VkFence signalled = VK_NULL_HANDLE;
+    if (vkCreateFence(device_, &fence_info, nullptr, &signalled) == VK_SUCCESS) {
+      vkDestroyFence(device_, fence_ring_[i], nullptr);
+      fence_ring_[i] = signalled;
+    }
+    CheckVk(result, "vkQueueSubmit");
   }
   ++submit_count;
 }
@@ -1138,12 +1154,7 @@ void Lane::SubmitAndWait(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageF
     submit_info.pWaitSemaphores = &wait;
     submit_info.pWaitDstStageMask = &wait_stage;
   }
-
-  {
-    std::lock_guard<std::mutex> lock(*submit_mutex_);
-    CheckVk(vkQueueSubmit(queue_, 1, &submit_info, fence_ring_[i]), "vkQueueSubmit");
-  }
-  ++submit_count;
+  SubmitRing(i, submit_info);
   CheckVk(vkWaitForFences(device_, 1, &fence_ring_[i], VK_TRUE, UINT64_MAX),
           "vkWaitForFences");
 }

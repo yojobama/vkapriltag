@@ -302,6 +302,9 @@ class Lane {
  private:
   friend class Context;
   Lane(VkDevice device, VkQueue queue, uint32_t family, std::mutex *submit_mutex);
+  // Resets ring slot i's fence and submits with it; a failed submit replaces the fence with a
+  // signalled one, so every ring fence is always either signalled or pending.
+  void SubmitRing(size_t i, const VkSubmitInfo &submit_info);
 
   static constexpr size_t kCommandRing = 4;
 
