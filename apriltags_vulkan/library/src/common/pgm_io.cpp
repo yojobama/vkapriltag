@@ -1,7 +1,9 @@
 #include "vkapriltag/common/pgm_io.h"
 
 #include <cctype>
+#include <cstdint>
 #include <fstream>
+#include <new>
 
 namespace apriltag_vulkan {
 namespace {
@@ -48,8 +50,23 @@ bool LoadGrayPgm(const std::string &path, std::vector<uint8_t> *out_pixels, uint
 
   f.get();  // Consume the single separator after maxval.
 
-  std::vector<uint8_t> pixels(static_cast<size_t>(width) * height);
-  f.read(reinterpret_cast<char *>(pixels.data()), pixels.size());
+  // The header's size must be backed by the file before anything is allocated for it.
+  const std::streampos data_start = f.tellg();
+  f.seekg(0, std::ios::end);
+  const std::streamoff available = f.tellg() - data_start;
+  f.seekg(data_start);
+  const uint64_t bytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+  if (!f || data_start < 0 || available < 0 || bytes > static_cast<uint64_t>(available)) {
+    return false;
+  }
+
+  std::vector<uint8_t> pixels;
+  try {
+    pixels.resize(static_cast<size_t>(bytes));
+  } catch (const std::bad_alloc &) {
+    return false;
+  }
+  f.read(reinterpret_cast<char *>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
   if (!f) return false;
 
   *out_pixels = std::move(pixels);
