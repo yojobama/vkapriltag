@@ -66,14 +66,15 @@ struct GpuQuadFit {
 };
 static_assert(sizeof(GpuQuadFit) == 72, "GpuQuadFit must match std430 layout");
 
-// Cumulative line-fit moments for a range of points, prefix-summed from RawLineFitPoint.
+// Cumulative line-fit moments for a range of points, prefix-summed from RawLineFitPoint with x2
+// and y2 taken relative to the blob's first point.
 struct LineFitMoments {
-  int32_t Mx = 0;
-  int32_t My = 0;
-  int32_t W = 0;
+  int64_t Mx = 0;
+  int64_t My = 0;
   int64_t Mxx = 0;
   int64_t Myy = 0;
   int64_t Mxy = 0;
+  int32_t W = 0;
   int32_t N = 0;
 };
 

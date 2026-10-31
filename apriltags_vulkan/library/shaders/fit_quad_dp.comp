@@ -26,12 +26,13 @@ layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_o
 layout(std430, binding = 2) readonly buffer Mirror { RawLineFitPoint points[]; };
 layout(std430, binding = 3) writeonly buffer Fits { QuadFit fits[]; };
 layout(std430, binding = 4) readonly buffer CountBuf { uint count_buf; };
-// Per blob: the seeding outcome (2 = failed) and the four segments' moments.
+// Per blob: the seeding outcome (2 = left to the CPU), the moments' origin (point 0's xy2), and per
+// segment its point count and Mx, My, W, Mxx, Myy, Mxy relative to that origin.
 struct Segments {
   uint status;
-  uint pad;
-  int m32[16];
-  int64_t m64[12];
+  uint origin;
+  int n[4];
+  int64_t m[24];
 };
 layout(std430, binding = 5) buffer SegmentsBuf { Segments segs[]; };
 
@@ -53,8 +54,9 @@ const uint kMaxSubgroups = 64u;
 shared uint s_u[kMaxSubgroups];
 shared uint s_i[kMaxSubgroups];
 shared double s_d[kMaxSubgroups];
-shared int s_m32[kMaxSubgroups][16];
-shared int64_t s_m64[kMaxSubgroups][12];
+shared int s_n[kMaxSubgroups][4];
+shared int64_t s_m64[kMaxSubgroups][24];
+shared int s_ext[kMaxSubgroups];
 shared uint s_result;
 
 // x2, y2 and W of point i.
@@ -88,16 +90,16 @@ float HypotF(float x, float y) {
 bool Near(double v, double limit) { return abs(v - limit) <= kMargin * max(abs(limit), 1e-30); }
 
 struct Moments {
-  int Mx, My, W, N;
-  int64_t Mxx, Myy, Mxy;
+  int64_t Mx, My, W, Mxx, Myy, Mxy;
+  int N;
 };
 
-// FitLine's line parameters and mean squared error.
-void FitLine(Moments m, out double l0, out double l1, out double l2, out double l3,
-             out double mse) {
-  precise int64_t Mx = int64_t(m.Mx);
-  precise int64_t My = int64_t(m.My);
-  precise int64_t W = int64_t(m.W);
+// FitLine's line parameters and mean squared error, for moments relative to (x0, y0).
+void FitLine(Moments m, int64_t x0, int64_t y0, out double l0, out double l1, out double l2,
+             out double l3, out double mse) {
+  precise int64_t Mx = m.Mx;
+  precise int64_t My = m.My;
+  precise int64_t W = m.W;
   precise int64_t Cxx = m.Mxx * W - Mx * Mx;
   precise int64_t Cxy = m.Mxy * W - Mx * My;
   precise int64_t Cyy = m.Myy * W - My * My;
@@ -105,8 +107,8 @@ void FitLine(Moments m, out double l0, out double l1, out double l2, out double 
   precise float eight_w_sq = float(double(W * W) * 8.0);
   precise float num = float(Cxx + Cyy) - hyp;
   float eig_small = DivF(num, eight_w_sq);
-  l0 = double(DivF(float(Mx), float(W * 2)));
-  l1 = double(DivF(float(My), float(W * 2)));
+  l0 = double(DivF(float(Mx + x0 * W), float(W * 2)));
+  l1 = double(DivF(float(My + y0 * W), float(W * 2)));
   precise float nx1 = float(Cxx - Cyy) - hyp;
   precise float ny1 = float(Cxy) * 2.0;
   precise float M1 = nx1 * nx1 + ny1 * ny1;
@@ -252,10 +254,12 @@ void SeedBlob() {
 
   // Moments of the half-open segments [lo, c1), [c1, hi), [hi, c2) and [c2, lo), circular; c2 lies
   // above hi or below lo. Each inclusive segment of TryDpQuad then adds its end point.
-  int mx[4] = int[4](0, 0, 0, 0), my[4] = int[4](0, 0, 0, 0), mw[4] = int[4](0, 0, 0, 0),
-      mn[4] = int[4](0, 0, 0, 0);
-  int64_t mxx[4] = int64_t[4](0, 0, 0, 0), myy[4] = int64_t[4](0, 0, 0, 0),
-          mxy[4] = int64_t[4](0, 0, 0, 0);
+  ivec3 p0 = Point(base);
+  int mn[4] = int[4](0, 0, 0, 0);
+  int64_t mx[4] = int64_t[4](0, 0, 0, 0), my[4] = int64_t[4](0, 0, 0, 0),
+          mw[4] = int64_t[4](0, 0, 0, 0), mxx[4] = int64_t[4](0, 0, 0, 0),
+          myy[4] = int64_t[4](0, 0, 0, 0), mxy[4] = int64_t[4](0, 0, 0, 0);
+  int ext = 0;  // largest |x - x0| or |y - y0|
   for (uint i = tid; i < n; i += threads) {
     uint k;
     if (i >= lo && i < c1) {
@@ -268,55 +272,71 @@ void SeedBlob() {
       k = (c2 < lo && i < c2) ? 2u : 3u;
     }
     ivec3 p = Point(base + i);
-    int64_t x = p.x, y = p.y, w = p.z;
+    ext = max(ext, max(abs(p.x - p0.x), abs(p.y - p0.y)));
+    int64_t x = p.x - p0.x, y = p.y - p0.y, w = p.z;
     int64_t wx = w * x, wy = w * y;
     for (uint s = 0u; s < 4u; ++s) {
       if (s != k) continue;
-      mx[s] += int(wx);
-      my[s] += int(wy);
-      mw[s] += int(w);
+      mx[s] += wx;
+      my[s] += wy;
+      mw[s] += w;
       mn[s] += 1;
       mxx[s] += wx * x;
       myy[s] += wy * y;
       mxy[s] += wx * y;
     }
   }
+  int sext = subgroupMax(ext);
   for (uint s = 0u; s < 4u; ++s) {
-    int sx = subgroupAdd(mx[s]), sy = subgroupAdd(my[s]), sw = subgroupAdd(mw[s]),
-        sn = subgroupAdd(mn[s]);
+    int sn = subgroupAdd(mn[s]);
+    int64_t sx = subgroupAdd(mx[s]), sy = subgroupAdd(my[s]), sw = subgroupAdd(mw[s]);
     int64_t sxx = subgroupAdd(mxx[s]), syy = subgroupAdd(myy[s]), sxy = subgroupAdd(mxy[s]);
     if (subgroupElect()) {
-      s_m32[gl_SubgroupID][4u * s] = sx;
-      s_m32[gl_SubgroupID][4u * s + 1u] = sy;
-      s_m32[gl_SubgroupID][4u * s + 2u] = sw;
-      s_m32[gl_SubgroupID][4u * s + 3u] = sn;
-      s_m64[gl_SubgroupID][3u * s] = sxx;
-      s_m64[gl_SubgroupID][3u * s + 1u] = syy;
-      s_m64[gl_SubgroupID][3u * s + 2u] = sxy;
+      s_n[gl_SubgroupID][s] = sn;
+      s_m64[gl_SubgroupID][6u * s] = sx;
+      s_m64[gl_SubgroupID][6u * s + 1u] = sy;
+      s_m64[gl_SubgroupID][6u * s + 2u] = sw;
+      s_m64[gl_SubgroupID][6u * s + 3u] = sxx;
+      s_m64[gl_SubgroupID][6u * s + 4u] = syy;
+      s_m64[gl_SubgroupID][6u * s + 5u] = sxy;
     }
   }
+  if (subgroupElect()) s_ext[gl_SubgroupID] = sext;
   barrier();
   if (tid >= 28u) return;
   // 28 threads add up the subgroups' partial sums, one value each, plus segment k's end point.
   uint idx[4] = uint[4](lo, c1, hi, c2);
-  uint k = tid < 16u ? tid / 4u : (tid - 16u) / 3u;
+  uint k = tid < 4u ? tid : (tid - 4u) / 6u;
   ivec3 e = Point(base + idx[(k + 1u) & 3u]);
-  int64_t ex = e.x, ey = e.y, ew = e.z;
-  if (tid < 16u) {
-    int sum = 0;
-    for (uint g = 0u; g < gl_NumSubgroups; ++g) sum += s_m32[g][tid];
-    uint f = tid & 3u;
-    sum += f == 0u ? int(ew * ex) : (f == 1u ? int(ew * ey) : (f == 2u ? int(ew) : 1));
-    segs[blob].m32[tid] = sum;
+  int64_t ex = e.x - p0.x, ey = e.y - p0.y, ew = e.z;
+  if (tid < 4u) {
+    int sum = 1;
+    for (uint g = 0u; g < gl_NumSubgroups; ++g) sum += s_n[g][tid];
+    segs[blob].n[tid] = sum;
   } else {
-    uint j = tid - 16u;
+    uint j = tid - 4u;
     int64_t sum = 0;
     for (uint g = 0u; g < gl_NumSubgroups; ++g) sum += s_m64[g][j];
-    uint f = j % 3u;
-    sum += f == 0u ? ew * ex * ex : (f == 1u ? ew * ey * ey : ew * ex * ey);
-    segs[blob].m64[j] = sum;
+    uint f = j % 6u;
+    sum += f == 0u ? ew * ex
+         : f == 1u ? ew * ey
+         : f == 2u ? ew
+         : f == 3u ? ew * ex * ex
+         : f == 4u ? ew * ey * ey
+                   : ew * ex * ey;
+    segs[blob].m[j] = sum;
   }
-  if (tid == 0u) segs[blob].status = 0u;
+  if (tid == 0u) {
+    // int64 covariances are exact while W * extent < 2^31 (FitQuadForBlob); larger blobs go to the CPU.
+    int extent = 0;
+    int64_t w_total = 0;
+    for (uint g = 0u; g < gl_NumSubgroups; ++g) {
+      extent = max(extent, s_ext[g]);
+      for (uint s = 0u; s < 4u; ++s) w_total += s_m64[g][6u * s + 2u];
+    }
+    segs[blob].status = w_total * int64_t(extent) >= (int64_t(1) << 31) ? 2u : 0u;
+    segs[blob].origin = points[base].xy2;
+  }
 }
 
 // kPass 1: four invocations per blob, 16 blobs per workgroup of 64. Invocation q fits segment q's
@@ -340,15 +360,17 @@ void FitPass() {
   // The segment test of TryDpQuad, then UpdateFitQuad's lines.
   if (seeded) {
     Moments m;
-    m.Mx = segs[blob].m32[4u * q];
-    m.My = segs[blob].m32[4u * q + 1u];
-    m.W = segs[blob].m32[4u * q + 2u];
-    m.N = segs[blob].m32[4u * q + 3u];
-    m.Mxx = segs[blob].m64[3u * q];
-    m.Myy = segs[blob].m64[3u * q + 1u];
-    m.Mxy = segs[blob].m64[3u * q + 2u];
+    m.Mx = segs[blob].m[6u * q];
+    m.My = segs[blob].m[6u * q + 1u];
+    m.W = segs[blob].m[6u * q + 2u];
+    m.Mxx = segs[blob].m[6u * q + 3u];
+    m.Myy = segs[blob].m[6u * q + 4u];
+    m.Mxy = segs[blob].m[6u * q + 5u];
+    m.N = segs[blob].n[q];
+    uint origin = segs[blob].origin;
     double mse;
-    FitLine(m, s_lines[lb][q][0], s_lines[lb][q][1], s_lines[lb][q][2], s_lines[lb][q][3], mse);
+    FitLine(m, int64_t(origin & 0x3FFFu), int64_t((origin >> 14u) & 0x3FFFu), s_lines[lb][q][0],
+            s_lines[lb][q][1], s_lines[lb][q][2], s_lines[lb][q][3], mse);
     double limit = double(pc.max_line_fit_mse);
     if (mse > limit || Near(mse, limit)) atomicMax(s_flag[lb], 2u);
   }

@@ -11,6 +11,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <type_traits>
 
 namespace apriltag_vulkan {
 namespace {
@@ -77,41 +78,83 @@ inline LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, s
   return result;
 }
 
-// Sum of squared error of a line fit from its moments.
-double FitLineError(int N, int64_t Mx, int64_t My, int64_t Mxx, int64_t Myy, int64_t Mxy,
-                    int64_t W) {
-  int64_t Cxx = Mxx * W - Mx * Mx;
-  int64_t Cxy = Mxy * W - Mx * My;
-  int64_t Cyy = Myy * W - My * My;
-  const float hypot_cached = Hypot(static_cast<float>(Cxx - Cyy), static_cast<float>(2 * Cxy));
-  const float eight_w_squared = static_cast<float>(static_cast<int64_t>(W) * static_cast<int64_t>(W) * 8.0);
-  const float eig_small = (static_cast<float>(Cxx + Cyy) - hypot_cached) / eight_w_squared;
-  return N * eig_small;
+// A two's-complement 128-bit integer, for the covariances of blobs too large for int64.
+struct Int128 {
+  uint64_t hi = 0, lo = 0;
+};
+
+Int128 Mul128(int64_t a, int64_t b) {
+  const uint64_t ua = a < 0 ? 0 - static_cast<uint64_t>(a) : static_cast<uint64_t>(a);
+  const uint64_t ub = b < 0 ? 0 - static_cast<uint64_t>(b) : static_cast<uint64_t>(b);
+  const uint64_t a0 = ua & 0xFFFFFFFFu, a1 = ua >> 32, b0 = ub & 0xFFFFFFFFu, b1 = ub >> 32;
+  const uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0;
+  const uint64_t mid = (p00 >> 32) + (p01 & 0xFFFFFFFFu) + (p10 & 0xFFFFFFFFu);
+  Int128 r{a1 * b1 + (p01 >> 32) + (p10 >> 32) + (mid >> 32), (mid << 32) | (p00 & 0xFFFFFFFFu)};
+  if ((a < 0) != (b < 0)) r = {~r.hi + (r.lo == 0 ? 1u : 0u), ~r.lo + 1};
+  return r;
+}
+Int128 Add128(Int128 a, Int128 b) { return {a.hi + b.hi + (a.lo + b.lo < a.lo ? 1u : 0u), a.lo + b.lo}; }
+Int128 Sub128(Int128 a, Int128 b) { return {a.hi - b.hi - (a.lo < b.lo ? 1u : 0u), a.lo - b.lo}; }
+
+// Rounded to float: once, as from int64, whenever the value fits in an int64.
+float ToFloat(Int128 v) {
+  const int64_t lo = static_cast<int64_t>(v.lo);
+  if (v.hi == static_cast<uint64_t>(lo >> 63)) return static_cast<float>(lo);
+  return static_cast<float>(static_cast<double>(static_cast<int64_t>(v.hi)) * 0x1p64 +
+                            static_cast<double>(v.lo));
+}
+
+// Cxx - Cyy, Cxx + Cyy and Cxy of a moments window, from exact integers rounded once to float.
+// `wide` blobs need 128 bits; for the others int64 is exact (see FitQuadForBlob).
+struct LineCovariances {
+  float diff, sum, xy;
+};
+
+LineCovariances Covariances(const LineFitMoments &m, bool wide) {
+  const int64_t W = m.W;
+  if (!wide) {
+    const int64_t Cxx = m.Mxx * W - m.Mx * m.Mx;
+    const int64_t Cxy = m.Mxy * W - m.Mx * m.My;
+    const int64_t Cyy = m.Myy * W - m.My * m.My;
+    return {static_cast<float>(Cxx - Cyy), static_cast<float>(Cxx + Cyy), static_cast<float>(Cxy)};
+  }
+  const Int128 Cxx = Sub128(Mul128(m.Mxx, W), Mul128(m.Mx, m.Mx));
+  const Int128 Cxy = Sub128(Mul128(m.Mxy, W), Mul128(m.Mx, m.My));
+  const Int128 Cyy = Sub128(Mul128(m.Myy, W), Mul128(m.My, m.My));
+  return {ToFloat(Sub128(Cxx, Cyy)), ToFloat(Add128(Cxx, Cyy)), ToFloat(Cxy)};
+}
+
+// Sum of squared error of a line fit from its moments; kWide as Covariances' `wide`.
+template <bool kWide>
+double FitLineError(const LineFitMoments &m) {
+  const LineCovariances c = Covariances(m, kWide);
+  const float hypot_cached = Hypot(c.diff, 2 * c.xy);
+  const float eight_w_squared = static_cast<float>(static_cast<double>(m.W) * m.W * 8.0);
+  const float eig_small = (c.sum - hypot_cached) / eight_w_squared;
+  return m.N * eig_small;
 }
 
 // Point-on-line (lineparam01), unit normal (lineparam23), sum and mean squared error from a
-// moments window.
-void FitLine(const LineFitMoments &moments, double *lineparam01, double *lineparam23, double *err,
-            double *mse) {
-  int64_t Mx = moments.Mx, My = moments.My, W = moments.W;
-  int64_t Cxx = moments.Mxx * W - Mx * Mx;
-  int64_t Cxy = moments.Mxy * W - Mx * My;
-  int64_t Cyy = moments.Myy * W - My * My;
+// moments window whose coordinates are relative to (x0, y0).
+void FitLine(const LineFitMoments &moments, bool wide, int64_t x0, int64_t y0,
+             double *lineparam01, double *lineparam23, double *err, double *mse) {
+  const int64_t W = moments.W;
+  const LineCovariances c = Covariances(moments, wide);
 
-  const float hypot_cached = Hypot(static_cast<float>(Cxx - Cyy), static_cast<float>(2 * Cxy));
-  const float eight_w_squared = static_cast<float>(static_cast<int64_t>(W) * static_cast<int64_t>(W) * 8.0);
-  const float eig_small = (static_cast<float>(Cxx + Cyy) - hypot_cached) / eight_w_squared;
+  const float hypot_cached = Hypot(c.diff, 2 * c.xy);
+  const float eight_w_squared = static_cast<float>(static_cast<double>(W) * W * 8.0);
+  const float eig_small = (c.sum - hypot_cached) / eight_w_squared;
 
   if (lineparam01) {
-    lineparam01[0] = static_cast<float>(Mx) / static_cast<float>(W * 2);
-    lineparam01[1] = static_cast<float>(My) / static_cast<float>(W * 2);
+    lineparam01[0] = static_cast<float>(moments.Mx + x0 * W) / static_cast<float>(W * 2);
+    lineparam01[1] = static_cast<float>(moments.My + y0 * W) / static_cast<float>(W * 2);
   }
   if (lineparam23) {
-    const float nx1 = static_cast<float>(Cxx - Cyy) - hypot_cached;
-    const float ny1 = static_cast<float>(Cxy) * 2;
+    const float nx1 = c.diff - hypot_cached;
+    const float ny1 = c.xy * 2;
     const float M1 = nx1 * nx1 + ny1 * ny1;
-    const float nx2 = static_cast<float>(Cxy) * 2;
-    const float ny2 = static_cast<float>(Cyy - Cxx) - hypot_cached;
+    const float nx2 = c.xy * 2;
+    const float ny2 = (0.0f - c.diff) - hypot_cached;  // float(Cyy - Cxx), +0 when equal
     const float M2 = nx2 * nx2 + ny2 * ny2;
 
     float nx, ny;
@@ -140,6 +183,9 @@ struct FitQuadResult {
   bool dp_used = false;
   uint32_t indices[4] = {};
   LineFitMoments moments[4];
+  // The moments' origin (the blob's first point) and whether they need 128-bit covariances.
+  int32_t x0 = 0, y0 = 0;
+  bool wide = false;
 };
 
 // Index of the largest value(i) over [begin, end), the lowest such index on ties, folded into
@@ -231,7 +277,7 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
 // seeding fails or a segment exceeds max_line_fit_mse (the caller then falls back to peaks).
 FitQuadResult TryDpQuad(const DetectorConfig &config, std::span<const RawLineFitPoint> points,
                         size_t begin, size_t total_points,
-                        const std::vector<LineFitMoments> &cs) {
+                        const std::vector<LineFitMoments> &cs, bool wide) {
   FitQuadResult result;
   uint32_t idx[4];
   if (!FindDpCornerIndices(points, begin, total_points, idx)) return result;
@@ -240,7 +286,7 @@ FitQuadResult TryDpQuad(const DetectorConfig &config, std::span<const RawLineFit
   for (int k = 0; k < 4; ++k) {
     seg_moments[k] = ReadMomentsWindow(cs, total_points, idx[k], idx[(k + 1) % 4]);
     double err, mse;
-    FitLine(seg_moments[k], nullptr, nullptr, &err, &mse);
+    FitLine(seg_moments[k], wide, 0, 0, nullptr, nullptr, &err, &mse);
     if (mse > config.max_line_fit_mse) return result;
   }
 
@@ -271,18 +317,21 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   filtered.resize(total_points);
   peaks.clear();
 
+  result.x0 = points[begin].x2();
+  result.y0 = points[begin].y2();
   {
     // Running sums stay in registers; each field of cs[k] is stored separately.
-    int32_t mx = 0, my = 0, w_sum = 0;
-    int64_t mxx = 0, mxy = 0, myy = 0;
+    int64_t mx = 0, my = 0, w_sum = 0, mxx = 0, mxy = 0, myy = 0;
+    int32_t extent = 0;  // largest |x2 - x0| or |y2 - y0|
     for (size_t k = 0; k < total_points; ++k) {
       const RawLineFitPoint &p = points[begin + k];
       // Unpack once: the accessors are bit extractions and cs may alias points as far as the compiler knows.
-      const int32_t x2 = p.x2(), y2 = p.y2(), w = p.W();
+      const int32_t x2 = p.x2() - result.x0, y2 = p.y2() - result.y0, w = p.W();
+      extent = std::max(extent, std::max(std::abs(x2), std::abs(y2)));
       const int64_t wx = static_cast<int64_t>(w) * x2;
       const int64_t wy = static_cast<int64_t>(w) * y2;
-      mx += static_cast<int32_t>(wx);
-      my += static_cast<int32_t>(wy);
+      mx += wx;
+      my += wy;
       w_sum += w;
       mxx += wx * x2;
       mxy += wx * y2;
@@ -290,20 +339,27 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
       LineFitMoments &c = cs[k];
       c.Mx = mx;
       c.My = my;
-      c.W = w_sum;
+      c.W = static_cast<int32_t>(w_sum);
       c.Mxx = mxx;
       c.Myy = myy;
       c.Mxy = mxy;
       c.N = 0;
     }
+    // Every window's |Mx|, |My| is at most W*extent, so int64 covariances stay exact below 2^31.
+    result.wide = w_sum * extent >= (int64_t{1} << 31);
+    // LineFitMoments::W is 32-bit: far more weight than a tag border at any supported size.
+    if (w_sum > INT32_MAX) return result;
   }
 
   if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
     result.dp_attempted = true;  // sticks even if we fall through to peaks below
-    FitQuadResult dp_result = TryDpQuad(config, points, begin, total_points, cs);
+    FitQuadResult dp_result = TryDpQuad(config, points, begin, total_points, cs, result.wide);
     if (dp_result.valid) {
       dp_result.dp_attempted = true;
       dp_result.dp_used = true;
+      dp_result.x0 = result.x0;
+      dp_result.y0 = result.y0;
+      dp_result.wide = result.wide;
       return dp_result;
     }
     // Fall back to the peaks-based search.
@@ -314,12 +370,18 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   // Windowed error per point. Circular indices use conditional subtraction instead of `%`.
   const size_t n = total_points;
   const size_t k_off = static_cast<size_t>(ksz);
-  for (size_t i = 0; i < n; ++i) {
-    const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
-    size_t i1 = i + k_off;
-    if (i1 >= n) i1 -= n;
-    LineFitMoments m = ReadMomentsWindow(cs, n, i0, i1);
-    error[i] = FitLineError(m.N, m.Mx, m.My, m.Mxx, m.Myy, m.Mxy, m.W);
+  auto window_errors = [&](auto wide) {
+    for (size_t i = 0; i < n; ++i) {
+      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+      size_t i1 = i + k_off;
+      if (i1 >= n) i1 -= n;
+      error[i] = FitLineError<decltype(wide)::value>(ReadMomentsWindow(cs, n, i0, i1));
+    }
+  };
+  if (result.wide) {
+    window_errors(std::true_type{});
+  } else {
+    window_errors(std::false_type{});
   }
 
   // 7-tap Gaussian filter, applied circularly.
@@ -365,8 +427,8 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   for (size_t a = 0; a < K; ++a) {
     for (size_t b = 0; b < K; ++b) {
       if (a == b) continue;
-      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), nullptr,
-              seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
+      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]),
+              result.wide, 0, 0, nullptr, seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
     }
   }
   const double max_mse = config.max_line_fit_mse;
@@ -439,7 +501,7 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
   double lines[4][4];
   for (int i = 0; i < 4; ++i) {
     double err, mse;
-    FitLine(quad.moments[i], lines[i], lines[i] + 2, &err, &mse);
+    FitLine(quad.moments[i], quad.wide, quad.x0, quad.y0, lines[i], lines[i] + 2, &err, &mse);
   }
 
   double corners[4][2];

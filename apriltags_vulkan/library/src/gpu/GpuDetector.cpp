@@ -329,8 +329,8 @@ void GpuDetector::CreateBuffers() {
                  ctx_.caps().max_workgroup_invocations >= 256u;
   if (gpu_quadfit_) {
     quad_fit_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(RawLineFitPoint));
-    // fit_quad_dp.comp's Segments: 168 bytes per blob.
-    quad_fit_segments_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 168);
+    // fit_quad_dp.comp's Segments: 216 bytes per blob.
+    quad_fit_segments_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 216);
     vk::Buffer b(ctx_, VkDeviceSize(std::max(config_.max_blobs, 1u)) * sizeof(GpuQuadFit),
                  kSsboUsage, vk::MemoryKind::HostVisibleCached);
     device_bytes_ += b.size();
