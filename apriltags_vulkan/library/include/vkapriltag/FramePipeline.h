@@ -22,7 +22,8 @@ class FramePipeline {
   // Nothing is owned; everything must outlive the FramePipeline and not be used directly.
   FramePipeline(GpuDetector &detector, QuadDecode &quad_decode, TagDecoder &tag_decoder);
   // `second_detector` must have the same DetectorConfig as `detector` and its own vk::Lane (lanes
-  // are not thread-safe; both may use the same queue). It doubles the device memory.
+  // are not thread-safe; both may use the same queue). It doubles the device memory. Throws
+  // std::invalid_argument if the frame sizes or decimations differ.
   FramePipeline(GpuDetector &detector, GpuDetector &second_detector, QuadDecode &quad_decode,
                 TagDecoder &tag_decoder);
   ~FramePipeline();
@@ -37,7 +38,7 @@ class FramePipeline {
   // meanwhile. Returns that frame's detections (nullptr until depth() frames have been pushed),
   // owned by the TagDecoder and valid until the next Push()/Flush(). `gray_frame` must stay valid
   // until depth() further Push()/Flush() calls have returned. Rethrows any exception from the GPU
-  // pass.
+  // pass; throws std::invalid_argument if width or height differ from the detector's config.
   zarray_t *Push(const uint8_t *gray_frame, uint32_t width, uint32_t height,
                  bool reversed_border);
 

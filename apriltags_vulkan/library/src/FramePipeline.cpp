@@ -1,5 +1,6 @@
 #include "vkapriltag/FramePipeline.h"
 
+#include <stdexcept>
 #include <utility>
 
 #include "vkapriltag/common/Profiler.h"
@@ -17,6 +18,11 @@ FramePipeline::FramePipeline(GpuDetector &detector, QuadDecode &quad_decode,
 FramePipeline::FramePipeline(GpuDetector &detector, GpuDetector &second_detector,
                              QuadDecode &quad_decode, TagDecoder &tag_decoder)
     : quad_decode_(quad_decode), tag_decoder_(tag_decoder) {
+  const DetectorConfig &a = detector.config(), &b = second_detector.config();
+  if (a.width != b.width || a.height != b.height || a.decimation != b.decimation) {
+    throw std::invalid_argument(
+        "FramePipeline: both detectors need the same frame size and decimation");
+  }
   for (GpuDetector *d : {&detector, &second_detector}) {
     slots_.push_back(std::make_unique<Slot>());
     slots_.back()->detector = d;
@@ -121,6 +127,10 @@ zarray_t *FramePipeline::DecodeHarvested() {
 
 zarray_t *FramePipeline::Push(const uint8_t *gray_frame, uint32_t width, uint32_t height,
                               bool reversed_border) {
+  const DetectorConfig &config = slots_[next_]->detector->config();
+  if (width != config.width || height != config.height) {
+    throw std::invalid_argument("FramePipeline::Push: frame size differs from the detector's");
+  }
   Slot &slot = *slots_[next_];
   const bool harvested = slot.in_flight;
   if (harvested) HarvestInFlight(slot);
