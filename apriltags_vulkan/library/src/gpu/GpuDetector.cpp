@@ -246,6 +246,9 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     local_sort_split_ /= 2u;
     sort_rank_all_ = std::min(sort_rank_all_, local_sort_split_) & ~3u;
   }
+  // Larger blobs are sorted in runs of at most 1024: on the Mali-G610 a 2048-point run in one
+  // workgroup made a 3,000-point blob cost 0.2 ms, runs of 1024 under 0.05 ms.
+  local_sort_run_ = std::min(local_sort_split_, 1024u);
 
   // Every dispatch must fit maxComputeWorkGroupCount[0]. The per-pixel ones are checked here; the
   // capacities bound the device-built indirect counts (boundary points, blobs, large-sort runs).
@@ -261,7 +264,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
       static_cast<uint32_t>(std::min<uint64_t>(config_.max_raw_blobs, max_groups * wg1d_.x));
   // The large-blob sort launches up to one workgroup per run or per workgroup of points, plus one
   // per listed blob for the remainders; half the limit each.
-  const uint64_t sort_points_per_group = std::min(local_sort_split_, local_sort_cap_);
+  const uint64_t sort_points_per_group = std::min(local_sort_run_, local_sort_cap_);
   qbp_capacity_ = static_cast<uint32_t>(
       std::min<uint64_t>(qbp_capacity_, (max_groups / 2) * sort_points_per_group));
   ipoint_capacity_ = qbp_capacity_;
@@ -620,7 +623,7 @@ void GpuDetector::CreatePipelines() {
          gpu_quadfit_ ? quad_fit_points_buf_.get() : line_fit_points_buf_.get()},
         20, vk::WorkgroupSize{local_sort_cap_, 1, 1},
         {local_sort_split_, sort_chunk_, mode, kLargeSortCap,
-         mode == 0u ? sort_rank_all_ : 0u, gpu_quadfit_ ? 1u : 0u});
+         mode == 0u ? sort_rank_all_ : 0u, gpu_quadfit_ ? 1u : 0u, local_sort_run_});
   };
   sort_points_local_pl_ = make_sort(0u);
   if (gpu_quadfit_) {

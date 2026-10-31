@@ -3,7 +3,7 @@
 //
 // Sorts each selected blob's points by theta_key and writes their RawLineFitPoints in that order.
 // Mode 0: one workgroup per blob; lists blobs above kLocalCap points for modes 1 and 2 and writes
-// blobs above kLargeCap unsorted. Mode 1: sorts one kLocalCap run of a listed blob. Mode 2: places
+// blobs above kLargeCap unsorted. Mode 1: sorts one kRunLen run of a listed blob. Mode 2: places
 // each point of a listed blob by ranking it against the blob's other runs.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 // Shared-memory slots per workgroup (one word per point), independent of the workgroup size; see
@@ -21,6 +21,9 @@ layout(constant_id = 7) const uint kRankAll = 0;
 // Non-zero: each RawLineFitPoint is also written to Mirror, a device-local copy for
 // fit_quad_dp.comp.
 layout(constant_id = 8) const uint kMirror = 0;
+// Run length of modes 1 and 2 (a power of two, at most kLocalCap): shorter runs spread a large
+// blob over more workgroups.
+layout(constant_id = 9) const uint kRunLen = 1024;
 
 layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
@@ -287,7 +290,7 @@ uint FindLargeBlob(uint group, bool runs) {
     LargeBlob e = large_blobs[s];
     uint count = selected[e.blob].count;
     uint first = runs ? e.first_run_group : e.first_merge_group;
-    uint groups = runs ? (count + kLocalCap - 1u) / kLocalCap : (count + threads - 1u) / threads;
+    uint groups = runs ? (count + kRunLen - 1u) / kRunLen : (count + threads - 1u) / threads;
     if (group >= first && group < first + groups) s_large_slot = s;
   }
   barrier();
@@ -320,7 +323,7 @@ void main() {
       if (tid == 0u) {
         LargeBlob e;
         e.blob = blob;
-        e.first_run_group = atomicAdd(large_args[0], (count + kLocalCap - 1u) / kLocalCap);
+        e.first_run_group = atomicAdd(large_args[0], (count + kRunLen - 1u) / kRunLen);
         e.first_merge_group = atomicAdd(large_args[3], (count + threads - 1u) / threads);
         large_blobs[atomicAdd(large_args[6], 1u)] = e;
         large_args[1] = 1u;
@@ -341,8 +344,8 @@ void main() {
     LargeBlob e = large_blobs[slot];
     uint count = selected[e.blob].count;
     uint base = blob_point_offsets[e.blob] - count;
-    uint first = (gl_WorkGroupID.x - e.first_run_group) * kLocalCap;
-    SortRange(base, first, min(kLocalCap, count - first));
+    uint first = (gl_WorkGroupID.x - e.first_run_group) * kRunLen;
+    SortRange(base, first, min(kRunLen, count - first));
     return;
   }
 
@@ -356,16 +359,16 @@ void main() {
   uint idx = (gl_WorkGroupID.x - e.first_merge_group) * threads + tid;
   if (idx >= count) return;
 
-  uint run = idx / kLocalCap;
+  uint run = idx / kRunLen;
   uint v = scratch_keys[base + idx];
   uint key = v >> kLocalIndexBits;
-  uint pos = idx - run * kLocalCap;
-  uint runs = (count + kLocalCap - 1u) / kLocalCap;
+  uint pos = idx - run * kRunLen;
+  uint runs = (count + kRunLen - 1u) / kRunLen;
   for (uint r = 0u; r < runs; ++r) {
     if (r == run) continue;
-    uint start = r * kLocalCap;
+    uint start = r * kRunLen;
     uint lo = 0u;
-    uint hi = min(kLocalCap, count - start);
+    uint hi = min(kRunLen, count - start);
     while (lo < hi) {
       uint mid = (lo + hi) >> 1u;
       uint k = scratch_keys[base + start + mid] >> kLocalIndexBits;
@@ -377,5 +380,5 @@ void main() {
     }
     pos += lo;
   }
-  WritePoint(base + pos, ComputeLineFitPoint(src[base + run * kLocalCap + (v & kLocalIndexMask)]));
+  WritePoint(base + pos, ComputeLineFitPoint(src[base + run * kRunLen + (v & kLocalIndexMask)]));
 }

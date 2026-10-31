@@ -347,8 +347,9 @@ class GpuDetector {
   // sort_points_local.comp's workgroup thread count.
   uint32_t local_sort_cap_ = 0;
   // Blobs of up to this many points (a power of two) are sorted whole in shared memory; larger
-  // ones in runs of this length by several workgroups, then placed by one ranking pass.
+  // ones in runs of local_sort_run_ points by several workgroups, then placed by one ranking pass.
   uint32_t local_sort_split_ = 0;
+  uint32_t local_sort_run_ = 0;
   // Rank-merge run length (a power of two, 0 for the sorting network) and the largest blob ranked
   // in one pass (0 disables); APRILTAG_VK_SORT_CHUNK and APRILTAG_VK_SORT_RANK_ALL override them.
   uint32_t sort_chunk_ = 16u;
