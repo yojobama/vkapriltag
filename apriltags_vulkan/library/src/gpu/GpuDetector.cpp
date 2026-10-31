@@ -220,6 +220,22 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     if (wanted >= 1u) local_sort_split_ = PrevPow2(wanted);
   }
   local_sort_split_ = std::min(local_sort_split_, local_sort_virtual_cap_);
+  if (const char *v = std::getenv("APRILTAG_VK_SORT_CHUNK")) {
+    sort_chunk_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    if (sort_chunk_ != 0u && (sort_chunk_ & (sort_chunk_ - 1u)) != 0u) sort_chunk_ = 0u;
+  }
+  if (const char *v = std::getenv("APRILTAG_VK_SORT_RANK_ALL")) {
+    sort_rank_all_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) & ~3u;
+  }
+  // sort_points_local's shared memory: s_packed, and s_merge when rank-merging, of
+  // local_sort_split_ words each, plus s_rank's sort_rank_all_ words; it must fit the device.
+  sort_rank_all_ = std::min(sort_rank_all_, local_sort_split_);
+  const uint32_t shared_words = caps.max_shared_memory_bytes / 4u;
+  while (local_sort_split_ > 1u &&
+         local_sort_split_ * (sort_chunk_ != 0u ? 2u : 1u) + sort_rank_all_ > shared_words) {
+    local_sort_split_ /= 2u;
+    sort_rank_all_ = std::min(sort_rank_all_, local_sort_split_) & ~3u;
+  }
 
   // Every dispatch must fit maxComputeWorkGroupCount[0]. The per-pixel ones are checked here; the
   // capacities bound the device-built indirect counts (boundary points, blobs, large-sort runs).
@@ -577,18 +593,6 @@ void GpuDetector::CreatePipelines() {
        blob_args_buf_.get()},
       8, vk::WorkgroupSize{scan_wg_, 1, 1});
 
-  // Rank-merge sort run length (a power of two, 0 for the sorting network);
-  // APRILTAG_VK_SORT_CHUNK overrides it.
-  uint32_t sort_chunk = 16u;
-  if (const char *v = std::getenv("APRILTAG_VK_SORT_CHUNK")) {
-    sort_chunk = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
-    if (sort_chunk != 0u && (sort_chunk & (sort_chunk - 1u)) != 0u) sort_chunk = 0u;
-  }
-  // Blobs up to this size are ranked in one pass (0 disables); APRILTAG_VK_SORT_RANK_ALL overrides.
-  uint32_t sort_rank_all = 256u;
-  if (const char *v = std::getenv("APRILTAG_VK_SORT_RANK_ALL")) {
-    sort_rank_all = static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) & ~3u;
-  }
   // Mode 0 sorts whole blobs, mode 1 the runs of large blobs, mode 2 merges them (see
   // sort_points_local_body.glsl).
   const bool sort_split = local_sort_split_ < local_sort_virtual_cap_;
@@ -607,8 +611,8 @@ void GpuDetector::CreatePipelines() {
          // binding 10: the device-local copy for fit_quad_dp.comp (unused without it).
          gpu_quadfit_ ? quad_fit_points_buf_.get() : line_fit_points_buf_.get()},
         32, vk::WorkgroupSize{local_sort_cap_, 1, 1},
-        {local_sort_split_, sort_chunk, mode, local_sort_virtual_cap_,
-         mode == 0u ? sort_rank_all : 0u, gpu_quadfit_ ? 1u : 0u});
+        {local_sort_split_, sort_chunk_, mode, local_sort_virtual_cap_,
+         mode == 0u ? sort_rank_all_ : 0u, gpu_quadfit_ ? 1u : 0u});
   };
   sort_points_local_pl_ = make_sort(0u);
   if (gpu_quadfit_) {

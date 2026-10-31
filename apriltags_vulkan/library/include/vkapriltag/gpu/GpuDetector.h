@@ -352,6 +352,10 @@ class GpuDetector {
   // Blobs above this many points are sorted in runs of this length by several workgroups and
   // merged by whole-dispatch rounds; equal to local_sort_virtual_cap_ when that is not needed.
   uint32_t local_sort_split_ = 0;
+  // Rank-merge run length (a power of two, 0 for the sorting network) and the largest blob ranked
+  // in one pass (0 disables); APRILTAG_VK_SORT_CHUNK and APRILTAG_VK_SORT_RANK_ALL override them.
+  uint32_t sort_chunk_ = 16u;
+  uint32_t sort_rank_all_ = 256u;
 
   // --- Pipelines ---
   vk::ComputePipeline decimate_pl_;
