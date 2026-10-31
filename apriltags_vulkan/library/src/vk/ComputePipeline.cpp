@@ -138,6 +138,13 @@ ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_
       push_constant_bytes_(push_constant_bytes),
       workgroup_size_(workgroup_size),
       label_(shader_source.label) {
+  // Releases whatever was created so far if a later step throws.
+  struct Cleanup {
+    ComputePipeline *self;
+    ~Cleanup() {
+      if (self != nullptr) self->Destroy();
+    }
+  } cleanup{this};
   for (int i = 0; i < 3; ++i) max_workgroup_count_[i] = ctx.caps().max_workgroup_count[i];
 
   // Fail at build time rather than with an obscure driver error later.
@@ -253,6 +260,7 @@ ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0,
                           nullptr);
   }
+  cleanup.self = nullptr;
 }
 
 ComputePipeline::~ComputePipeline() { Destroy(); }

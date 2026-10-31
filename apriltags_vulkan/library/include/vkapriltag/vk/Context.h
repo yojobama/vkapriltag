@@ -224,6 +224,8 @@ public:
   void CreateInstance(const ContextOptions &options);
   // Both constructors: environment overrides, then the instance, device, caps and default lane.
   void Init(const ContextOptions &options, const std::string *device_name);
+  // The destructor's work; also releases a partly built Context when Init throws.
+  void Destroy();
   // An explicit index, else the device named `device_name` (if not null), else the best usable one.
   void SelectPhysicalDevice(const ContextOptions &options, const std::string *device_name);
   void CreateLogicalDevice(const ContextOptions &options);
@@ -307,6 +309,7 @@ class Lane {
   // Resets ring slot i's fence and submits with it; a failed submit replaces the fence with a
   // signalled one, so every ring fence is always either signalled or pending.
   void SubmitRing(size_t i, const VkSubmitInfo &submit_info);
+  void Destroy();
 
   static constexpr size_t kCommandRing = 4;
 

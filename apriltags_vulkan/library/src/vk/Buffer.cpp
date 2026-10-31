@@ -50,6 +50,13 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
 Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, MemoryKind kind,
                const std::vector<uint32_t> &concurrent_families)
     : device_(ctx.device()), size_(std::max<VkDeviceSize>(size, 4)) {
+  // Releases whatever was created so far if a later step throws.
+  struct Cleanup {
+    Buffer *self;
+    ~Cleanup() {
+      if (self != nullptr) self->Destroy();
+    }
+  } cleanup{this};
   VkBufferCreateInfo buffer_info{};
   buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   buffer_info.size = size_;
@@ -76,8 +83,6 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
     type_index = ctx.FindMemoryType(mem_reqs.memoryTypeBits, request.required, request.preferred);
   }
   if (type_index == UINT32_MAX) {
-    vkDestroyBuffer(device_, buffer_, nullptr);
-    buffer_ = VK_NULL_HANDLE;
     throw std::runtime_error("No Vulkan memory type satisfies this buffer's requirements");
   }
 
@@ -95,6 +100,7 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
     host_cached_ = (ctx.MemoryTypeFlags(type_index) & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
     non_coherent_atom_size_ = ctx.caps().non_coherent_atom_size;
   }
+  cleanup.self = nullptr;
 }
 
 Buffer::~Buffer() { Destroy(); }
@@ -239,13 +245,14 @@ Buffer &Buffer::operator=(Buffer &&other) noexcept {
 
 namespace {
 // Flush/invalidate need an offset aligned to nonCoherentAtomSize and a size that is a multiple of
-// it or VK_WHOLE_SIZE; the range is rounded outward.
+// it or VK_WHOLE_SIZE; the range is rounded outward. A range reaching the buffer's end takes
+// VK_WHOLE_SIZE, since the rounded size may pass the end of the allocation.
 VkMappedMemoryRange AlignedRange(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize bytes,
                                  VkDeviceSize atom, VkDeviceSize buffer_size) {
   const VkDeviceSize aligned_offset = (offset / atom) * atom;
   const VkDeviceSize end = std::min(offset + bytes, buffer_size);
   VkDeviceSize aligned_size = ((end - aligned_offset + atom - 1) / atom) * atom;
-  aligned_size = std::min(aligned_size, buffer_size - aligned_offset);
+  if (aligned_offset + aligned_size >= buffer_size) aligned_size = VK_WHOLE_SIZE;
 
   VkMappedMemoryRange range{};
   range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;

@@ -216,6 +216,13 @@ Context::Context(const std::string &deviceName, const ContextOptions &options) {
 }
 
 void Context::Init(const ContextOptions &options_in, const std::string *device_name) {
+  // Releases whatever was created so far if a later step throws.
+  struct Cleanup {
+    Context *self;
+    ~Cleanup() {
+      if (self != nullptr) self->Destroy();
+    }
+  } cleanup{this};
   ContextOptions options = options_in;
   // Environment overrides, so the same binary can be retargeted at runtime.
   if (EnvFlag("APRILTAG_VK_ALLOW_CPU")) options.allow_cpu_device = true;
@@ -251,9 +258,12 @@ void Context::Init(const ContextOptions &options_in, const std::string *device_n
   if (options.verbose) {
     std::cerr << DescribeDevice() << std::endl;
   }
+  cleanup.self = nullptr;
 }
 
-Context::~Context() {
+Context::~Context() { Destroy(); }
+
+void Context::Destroy() {
   if (device_) {
     // Nothing may still be in flight when we start destroying pools.
     vkDeviceWaitIdle(device_);
@@ -261,8 +271,10 @@ Context::~Context() {
     pipeline_cache_.ReleaseBeforeDeviceDestruction();
     default_lane_.reset();
     vkDestroyDevice(device_, nullptr);
+    device_ = VK_NULL_HANDLE;
   }
   if (instance_) vkDestroyInstance(instance_, nullptr);
+  instance_ = VK_NULL_HANDLE;
 }
 
 void Context::CreateInstance(const ContextOptions &options) {
@@ -955,6 +967,13 @@ std::unique_ptr<Lane> Context::CreateLane(size_t slot) const {
 
 Lane::Lane(VkDevice device, VkQueue queue, uint32_t family, std::mutex *submit_mutex)
     : device_(device), queue_(queue), family_(family), submit_mutex_(submit_mutex) {
+  // Releases whatever was created so far if a later step throws.
+  struct Cleanup {
+    Lane *self;
+    ~Cleanup() {
+      if (self != nullptr) self->Destroy();
+    }
+  } cleanup{this};
   VkCommandPoolCreateInfo pool_info{};
   pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -977,9 +996,12 @@ Lane::Lane(VkDevice device, VkQueue queue, uint32_t family, std::mutex *submit_m
   for (size_t i = 0; i < kCommandRing; ++i) {
     CheckVk(vkCreateFence(device_, &fence_info, nullptr, &fence_ring_[i]), "vkCreateFence");
   }
+  cleanup.self = nullptr;
 }
 
-Lane::~Lane() {
+Lane::~Lane() { Destroy(); }
+
+void Lane::Destroy() {
   for (size_t i = 0; i < kCommandRing; ++i) {
     if (fence_ring_[i]) vkDestroyFence(device_, fence_ring_[i], nullptr);
   }
