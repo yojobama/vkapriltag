@@ -1,6 +1,7 @@
 // Measures the cost of a pipeline barrier: K independent dispatches are replayed with no barrier, an
 // execution-only barrier or a memory barrier between them, and frame-time slopes are compared.
 // Usage: bench_barrier [--spv <file>] [--rounds N] [--replays N] [--queue-family N]
+#include <stdexcept>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -42,7 +43,7 @@ double Median(std::vector<double> v) {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int Run(int argc, char **argv) {
   std::string spv = BARRIER_PROBE_SPV;
   int rounds = 7, replays = 60, family = -1;
   for (int i = 1; i < argc; ++i) {
@@ -128,4 +129,13 @@ int main(int argc, char **argv) {
 
   for (Config &c : configs) lane->FreePersistentCommands(c.cmd);
   return 0;
+}
+
+int main(int argc, char **argv) {
+  try {
+    return Run(argc, argv);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }

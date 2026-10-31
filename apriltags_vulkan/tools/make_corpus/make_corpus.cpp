@@ -2,6 +2,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <cstdio>
+#include <stdexcept>
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
@@ -22,7 +24,7 @@ int RoundToEven(double value) {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int Run(int argc, char **argv) {
   std::string input_path;
   std::string out_dir;
   // Downscale only (<= 1.0).
@@ -87,4 +89,13 @@ int main(int argc, char **argv) {
   }
 
   return 0;
+}
+
+int main(int argc, char **argv) {
+  try {
+    return Run(argc, argv);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }

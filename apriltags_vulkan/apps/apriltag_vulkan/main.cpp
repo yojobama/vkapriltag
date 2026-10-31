@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,22 @@ void DumpPgm(const std::string &path, const std::vector<uint8_t> &gray, uint32_t
   f.write(reinterpret_cast<const char *>(gray.data()), gray.size());
 }
 
+// A positive integer argument up to 65535; throws std::invalid_argument otherwise.
+uint32_t ParsePositive(const char *name, const std::string &text) {
+  size_t used = 0;
+  unsigned long value = 0;
+  try {
+    value = std::stoul(text, &used);
+  } catch (const std::exception &) {
+    used = 0;
+  }
+  if (used == 0 || used != text.size() || text[0] == '-' || value == 0 || value > 65535) {
+    throw std::invalid_argument(std::string(name) + " needs a positive integer, not '" + text +
+                                "'");
+  }
+  return static_cast<uint32_t>(value);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -41,28 +58,33 @@ int main(int argc, char **argv) {
   std::string dump_path;  // If non-empty, periodically dump the raw frame here.
   int dump_every_n_frames = 0;
 
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
-    auto next = [&](const char *name) -> std::string {
-      if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + name);
-      return argv[++i];
-    };
-    if (arg == "--device") {
-      device = next("--device");
-    } else if (arg == "--width") {
-      width = std::stoul(next("--width"));
-    } else if (arg == "--height") {
-      height = std::stoul(next("--height"));
-    } else if (arg == "--family") {
-      family_name = next("--family");
-    } else if (arg == "--dump") {
-      dump_path = next("--dump");
-    } else if (arg == "--dump-every") {
-      dump_every_n_frames = std::stoi(next("--dump-every"));
-    } else {
-      std::cerr << "Unknown argument: " << arg << std::endl;
-      return 1;
+  try {
+    for (int i = 1; i < argc; ++i) {
+      std::string arg = argv[i];
+      auto next = [&](const char *name) -> std::string {
+        if (i + 1 >= argc) throw std::invalid_argument(std::string("missing value for ") + name);
+        return argv[++i];
+      };
+      if (arg == "--device") {
+        device = next("--device");
+      } else if (arg == "--width") {
+        width = ParsePositive("--width", next("--width"));
+      } else if (arg == "--height") {
+        height = ParsePositive("--height", next("--height"));
+      } else if (arg == "--family") {
+        family_name = next("--family");
+      } else if (arg == "--dump") {
+        dump_path = next("--dump");
+      } else if (arg == "--dump-every") {
+        dump_every_n_frames =
+            static_cast<int>(ParsePositive("--dump-every", next("--dump-every")));
+      } else {
+        throw std::invalid_argument("unknown argument: " + arg);
+      }
     }
+  } catch (const std::exception &e) {
+    std::cerr << e.what() << std::endl;
+    return 1;
   }
 
   std::signal(SIGINT, HandleSignal);
@@ -80,6 +102,17 @@ int main(int argc, char **argv) {
   td->refine_edges = false;  // Set to true to enable edge refinement.
 
   try {
+    // The camera first: the detector is built for the size the driver actually negotiated.
+    apriltag_vulkan::V4l2Capture capture(device, width, height);
+    if (capture.width() != width || capture.height() != height) {
+      std::cerr << "Requested " << width << "x" << height << " but device negotiated "
+               << capture.width() << "x" << capture.height() << "; adjust --width/--height."
+               << std::endl;
+      apriltag_detector_destroy(td);
+      teardown_tag_family(&tf, family_name.c_str());
+      return 1;
+    }
+
     apriltag_vulkan::vk::Context ctx;
 
     apriltag_vulkan::DetectorConfig config;
@@ -94,18 +127,6 @@ int main(int argc, char **argv) {
 
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);
-
-    apriltag_vulkan::V4l2Capture capture(device, width, height);
-    // The driver negotiated a different resolution than requested; fail rather than run a
-    // mismatched pipeline.
-    if (capture.width() != width || capture.height() != height) {
-      std::cerr << "Requested " << width << "x" << height << " but device negotiated "
-               << capture.width() << "x" << capture.height() << "; adjust --width/--height."
-               << std::endl;
-      apriltag_detector_destroy(td);
-      teardown_tag_family(&tf, family_name.c_str());
-      return 1;
-    }
 
     std::vector<uint8_t> gray;
     uint64_t frame_index = 0;

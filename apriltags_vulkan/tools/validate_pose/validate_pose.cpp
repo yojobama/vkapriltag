@@ -7,6 +7,7 @@
 #define NOMINMAX
 #endif
 
+#include <stdexcept>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -390,7 +391,7 @@ double NowMs() {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int Run(int argc, char **argv) {
   CameraIntrinsics intr{1400.0, 1400.0, 960.0, 540.0};
   double tagsize = 0.1651;
   std::string data_path;
@@ -896,4 +897,13 @@ int main(int argc, char **argv) {
               "err_abs < 1e-12, err_rel < 1e-9\n",
               kMaxRotDeg, kMaxDtRelRefined, kMaxDtRelSeed);
   return all_ok ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  try {
+    return Run(argc, argv);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }

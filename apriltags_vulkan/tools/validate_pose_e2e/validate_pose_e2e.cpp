@@ -4,6 +4,7 @@
 #define NOMINMAX
 #endif
 
+#include <stdexcept>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -146,7 +147,7 @@ Stat3 Summarize(std::vector<double> v) {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int Run(int argc, char **argv) {
   std::string load_path;
   std::string family_name = "tag36h11";
   uint32_t decimation = 2;
@@ -504,4 +505,13 @@ int main(int argc, char **argv) {
   }
 
   return 0;
+}
+
+int main(int argc, char **argv) {
+  try {
+    return Run(argc, argv);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }

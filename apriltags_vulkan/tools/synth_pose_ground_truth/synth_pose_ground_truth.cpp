@@ -4,6 +4,7 @@
 #define NOMINMAX
 #endif
 
+#include <stdexcept>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -252,7 +253,7 @@ Stat3 Summarize(std::vector<double> v) {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int Run(int argc, char **argv) {
   bool refine_edges = false;  // enables refine_edges on both detectors
   // Fixed seed so cv::randn() output, and hence the CI gate, is reproducible.
   cv::theRNG() = cv::RNG(0x5eed);
@@ -587,4 +588,13 @@ int main(int argc, char **argv) {
   }
   std::printf("  %s\n", all_ok ? "ALL CHECKS PASS" : "AT LEAST ONE CHECK FAILED");
   return all_ok ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  try {
+    return Run(argc, argv);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }

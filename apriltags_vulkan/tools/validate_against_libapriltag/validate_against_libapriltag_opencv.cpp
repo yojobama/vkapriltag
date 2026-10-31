@@ -3,6 +3,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <cstdio>
+#include <stdexcept>
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -53,7 +55,7 @@ void PrintStats(const char *label, const Stats &s, int iterations) {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int Run(int argc, char **argv) {
   std::string load_path;
   std::string family_name = "tag36h11";
   std::string csv_path;
@@ -532,4 +534,13 @@ int main(int argc, char **argv) {
     return 1;
   }
   return 0;
+}
+
+int main(int argc, char **argv) {
+  try {
+    return Run(argc, argv);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }
