@@ -3,6 +3,7 @@
 #include "vkapriltag/vk/Context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -272,6 +273,7 @@ PipelineCache &PipelineCache::operator=(PipelineCache &&other) noexcept {
 
 void PipelineCache::Save() const {
   if (cache_ == VK_NULL_HANDLE || file_path_.empty()) return;
+  std::lock_guard<std::mutex> lock(save_mutex_);
 
   size_t data_size = 0;
   if (vkGetPipelineCacheData(device_, cache_, &data_size, nullptr) != VK_SUCCESS ||
@@ -303,7 +305,10 @@ void PipelineCache::Save() const {
 #else
   const long pid = static_cast<long>(getpid());
 #endif
-  const std::string tmp_path = file_path_ + ".tmp." + std::to_string(pid);
+  // Unique per save, as several Contexts in one process may share the file.
+  static std::atomic<uint64_t> save_count{0};
+  const std::string tmp_path =
+      file_path_ + ".tmp." + std::to_string(pid) + "." + std::to_string(save_count++);
 
   {
     std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);

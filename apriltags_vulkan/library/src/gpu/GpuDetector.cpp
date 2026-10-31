@@ -81,7 +81,13 @@ GpuDetector::~GpuDetector() {
   // Detect() returns only after its submission completes, so nothing recorded is in flight.
   for (const RecordedFrame &r : recorded_frames_) lane_.FreePersistentCommands(r.cmd);
   if (upload_semaphore_ != VK_NULL_HANDLE) {
-    vkDeviceWaitIdle(ctx_.device());
+    // Only this detector's lanes use the semaphore; vkDeviceWaitIdle would need every queue's lock.
+    try {
+      transfer_lane_->WaitIdle();
+      lane_.WaitIdle();
+    } catch (...) {
+      // The device is lost; nothing is executing any more.
+    }
     vkDestroySemaphore(ctx_.device(), upload_semaphore_, nullptr);
   }
 }

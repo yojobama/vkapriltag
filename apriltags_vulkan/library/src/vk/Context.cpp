@@ -1068,6 +1068,14 @@ void Lane::SubmitSignal(VkCommandBuffer cmd, VkSemaphore signal) {
   SubmitRing(i, submit_info);
 }
 
+void Lane::WaitIdle() {
+  // Every ring fence is signalled or pending (see SubmitRing); the persistent fence is waited on
+  // at each submit.
+  CheckVk(vkWaitForFences(device_, static_cast<uint32_t>(kCommandRing), fence_ring_, VK_TRUE,
+                          UINT64_MAX),
+          "vkWaitForFences");
+}
+
 void Lane::SubmitRing(size_t i, const VkSubmitInfo &submit_info) {
   CheckVk(vkResetFences(device_, 1, &fence_ring_[i]), "vkResetFences");
   VkResult result;

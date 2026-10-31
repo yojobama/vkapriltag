@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 namespace apriltag_vulkan::vk {
@@ -51,6 +52,7 @@ class PipelineCache {
   std::string file_path_;
   bool verbose_ = false;
   // FNV-1a of the payload last loaded or saved, used to skip redundant writes.
+  mutable std::mutex save_mutex_;  // Save() may run on several threads sharing one Context
   mutable uint64_t last_synced_hash_ = 0;
   mutable bool has_synced_hash_ = false;
 };

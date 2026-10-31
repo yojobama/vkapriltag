@@ -291,6 +291,9 @@ class Lane {
   // reused only after its fence signals (checked by the next BeginCommands on this slot).
   void SubmitSignal(VkCommandBuffer cmd, VkSemaphore signal);
 
+  // Waits for every submission made on this lane to complete.
+  void WaitIdle();
+
   // Persistent command buffers can be submitted repeatedly until freed or the Lane is destroyed.
   // Not thread-safe: one frame in flight per Lane.
   VkCommandBuffer BeginPersistentCommands();
