@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace apriltag_vulkan {
 namespace {
@@ -675,7 +676,14 @@ PoseEstimator::PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32
     : intrinsics_(intrinsics),
       tagsize_(tagsize),
       convergence_tol_(convergence_tol > 0.0 ? convergence_tol : 0.0),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "pose-worker")) {}
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "pose-worker")) {
+  const auto positive = [](double v) { return std::isfinite(v) && v > 0.0; };
+  if (!positive(tagsize) || !positive(intrinsics.fx) || !positive(intrinsics.fy) ||
+      !std::isfinite(intrinsics.cx) || !std::isfinite(intrinsics.cy)) {
+    throw std::invalid_argument(
+        "PoseEstimator: tagsize, fx and fy must be finite and positive, cx and cy finite");
+  }
+}
 
 TagPose PoseEstimator::EstimateSeed(const double H[3][3]) const {
   TagPose out;

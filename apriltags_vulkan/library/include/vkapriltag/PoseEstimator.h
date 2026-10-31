@@ -51,7 +51,8 @@ class PoseEstimator {
   // iteration count.
   static constexpr double kDefaultConvergenceTol = 1e-8;
 
-  // `tagsize` is the full width of the tag's black border in metres, as in libapriltag.
+  // `tagsize` is the full width of the tag's black border in metres, as in libapriltag. Throws
+  // std::invalid_argument unless tagsize, fx and fy are finite and positive and cx, cy finite.
   //
   // `cpu_threads` is the total parallelism for EstimateAll (0 = hardware_concurrency, or
   // APRILTAG_CPU_THREADS). `convergence_tol` is the early-exit threshold above.
