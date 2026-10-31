@@ -56,7 +56,6 @@ shared uint s_i[kMaxSubgroups];
 shared double s_d[kMaxSubgroups];
 shared int s_n[kMaxSubgroups][4];
 shared int64_t s_m64[kMaxSubgroups][24];
-shared int s_ext[kMaxSubgroups];
 shared uint s_result;
 
 // x2, y2 and W of point i.
@@ -259,7 +258,6 @@ void SeedBlob() {
   int64_t mx[4] = int64_t[4](0, 0, 0, 0), my[4] = int64_t[4](0, 0, 0, 0),
           mw[4] = int64_t[4](0, 0, 0, 0), mxx[4] = int64_t[4](0, 0, 0, 0),
           myy[4] = int64_t[4](0, 0, 0, 0), mxy[4] = int64_t[4](0, 0, 0, 0);
-  int ext = 0;  // largest |x - x0| or |y - y0|
   for (uint i = tid; i < n; i += threads) {
     uint k;
     if (i >= lo && i < c1) {
@@ -272,7 +270,6 @@ void SeedBlob() {
       k = (c2 < lo && i < c2) ? 2u : 3u;
     }
     ivec3 p = Point(base + i);
-    ext = max(ext, max(abs(p.x - p0.x), abs(p.y - p0.y)));
     int64_t x = p.x - p0.x, y = p.y - p0.y, w = p.z;
     int64_t wx = w * x, wy = w * y;
     for (uint s = 0u; s < 4u; ++s) {
@@ -286,7 +283,6 @@ void SeedBlob() {
       mxy[s] += wx * y;
     }
   }
-  int sext = subgroupMax(ext);
   for (uint s = 0u; s < 4u; ++s) {
     int sn = subgroupAdd(mn[s]);
     int64_t sx = subgroupAdd(mx[s]), sy = subgroupAdd(my[s]), sw = subgroupAdd(mw[s]);
@@ -301,7 +297,6 @@ void SeedBlob() {
       s_m64[gl_SubgroupID][6u * s + 5u] = sxy;
     }
   }
-  if (subgroupElect()) s_ext[gl_SubgroupID] = sext;
   barrier();
   if (tid >= 28u) return;
   // 28 threads add up the subgroups' partial sums, one value each, plus segment k's end point.
@@ -327,14 +322,20 @@ void SeedBlob() {
     segs[blob].m[j] = sum;
   }
   if (tid == 0u) {
-    // int64 covariances are exact while W * extent < 2^31 (FitQuadForBlob); larger blobs go to the CPU.
-    int extent = 0;
-    int64_t w_total = 0;
+    // int64 covariances are exact while the blob's Mxx*W and Myy*W stay below 2^61
+    // (NeedsWide in QuadDecode.cpp); larger blobs go to the CPU.
+    int64_t w_total = 0, mxx_total = 0, myy_total = 0;
     for (uint g = 0u; g < gl_NumSubgroups; ++g) {
-      extent = max(extent, s_ext[g]);
-      for (uint s = 0u; s < 4u; ++s) w_total += s_m64[g][6u * s + 2u];
+      for (uint s = 0u; s < 4u; ++s) {
+        w_total += s_m64[g][6u * s + 2u];
+        mxx_total += s_m64[g][6u * s + 3u];
+        myy_total += s_m64[g][6u * s + 4u];
+      }
     }
-    segs[blob].status = w_total * int64_t(extent) >= (int64_t(1) << 31) ? 2u : 0u;
+    const double kLimit = 2305843009213693952.0LF;  // 2^61
+    bool wide = double(mxx_total) * double(w_total) >= kLimit ||
+                double(myy_total) * double(w_total) >= kLimit;
+    segs[blob].status = wide ? 2u : 0u;
     segs[blob].origin = points[base].xy2;
   }
 }
