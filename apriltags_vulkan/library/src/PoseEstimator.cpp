@@ -114,7 +114,8 @@ bool Vec3Normalize(Vec3 v) {
 //
 // M = U * diag(sv) * V' with singular values non-negative and sorted descending, via cyclic
 // Jacobi on M'M. The column of U for a zero singular value is the cross product of the other two.
-void Svd3x3(const Mat3 M, Mat3 U, double sv[3], Mat3 V) {
+// Returns false, with U incomplete, when two or more singular values are zero.
+bool Svd3x3(const Mat3 M, Mat3 U, double sv[3], Mat3 V) {
   Mat3 A;
   Mat3TransposedMul(M, M, A);
   Mat3Identity(V);
@@ -180,7 +181,7 @@ void Svd3x3(const Mat3 M, Mat3 U, double sv[3], Mat3 V) {
         U[r][c] = acc / sv[c];
       }
     } else {
-      // At most one deficient direction arises here; further ones would be filled arbitrarily.
+      if (deficient >= 0) return false;
       deficient = c;
     }
   }
@@ -198,14 +199,17 @@ void Svd3x3(const Mat3 M, Mat3 U, double sv[3], Mat3 V) {
     }
     for (int r = 0; r < 3; ++r) U[r][deficient] = un[r];
   }
+  return true;
 }
 
-// R = U * V' for M = U S V': the closest rotation (or reflection) to M.
-void NearestOrthogonal(const Mat3 M, Mat3 out) {
+// R = U * V' for M = U S V': the closest rotation (or reflection) to M. Returns false when M has
+// rank below 2, which leaves R undetermined.
+bool NearestOrthogonal(const Mat3 M, Mat3 out) {
   Mat3 U, V;
   double sv[3];
-  Svd3x3(M, U, sv, V);
+  if (!Svd3x3(M, U, sv, V)) return false;
   Mat3MulTransposed(U, V, out);
+  return true;
 }
 
 // --- Polynomial helpers ---------------------------------------------------
@@ -381,7 +385,10 @@ double OrthogonalIteration(const Vec3 *v, const Vec3 *p, Vec3 t, Mat3 R, int n_s
       for (int a = 0; a < 3; ++a)
         for (int b = 0; b < 3; ++b) M3[a][b] += (q[j][a] - q_mean[a]) * p_res[j][b];
 
-    NearestOrthogonal(M3, R);
+    if (!NearestOrthogonal(M3, R)) {
+      if (steps_run != nullptr) *steps_run = step;
+      return HUGE_VAL;
+    }
     // libapriltag's proper-rotation fixup: negate R's third column when the
     // orthogonal factor came out as a reflection.
     if (Mat3Det(R) < 0.0) {
@@ -648,7 +655,7 @@ bool HomographyToPose(const double H[3][3], double fx, double fy, double cx, dou
 
   // Polar decomposition without a determinant fixup, as libapriltag.
   const Mat3 raw = {{R00, R01, R02}, {R10, R11, R12}, {R20, R21, R22}};
-  NearestOrthogonal(raw, R);
+  if (!NearestOrthogonal(raw, R)) return false;
 
   t[0] = TX;
   t[1] = TY;
