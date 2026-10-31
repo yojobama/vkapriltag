@@ -100,6 +100,13 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   if (config_.width % config_.decimation != 0 || config_.height % config_.decimation != 0) {
     throw std::runtime_error("width and height must each be evenly divisible by decimation");
   }
+  // The boundary passes work on the decimated interior, which needs at least one pixel.
+  if (config_.width / config_.decimation < 3 || config_.height / config_.decimation < 3) {
+    throw std::runtime_error("width/decimation and height/decimation must each be >= 3");
+  }
+  if (config_.max_uf_iterations == 0) {
+    throw std::runtime_error("max_uf_iterations must be >= 1");
+  }
   // QBPoint/IPoint pack the doubled decimated coordinate (at most 2*width/decimation) into 14 bits
   // per axis; rejects configurations that would truncate it.
   const uint32_t max_packed_x = 2u * (config_.width / config_.decimation);
@@ -179,9 +186,8 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   }
   ipoint_capacity_ = qbp_capacity_;
 
-  // The grayscale frame is uploaded packed, four 8-bit pixels per uint32 (width and height are
-  // even, so the product divides by four).
-  gray_words_ = (config_.width * config_.height) / 4u;
+  // The grayscale frame is uploaded packed, four 8-bit pixels per uint32, the last word padded.
+  gray_words_ = (config_.width * config_.height + 3u) / 4u;
 
   // sort_points_local.comp workgroup size: the device's maximum invocation count rounded down to a
   // power of two.

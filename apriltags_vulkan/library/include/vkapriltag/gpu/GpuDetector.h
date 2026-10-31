@@ -25,7 +25,7 @@ struct DetectorConfig {
   uint32_t height = 0;
 
   // Integer downsampling factor (1 disables); samples one pixel per NxN block. width and height
-  // must be divisible by it.
+  // must be divisible by it and at least 3 times it.
   uint32_t decimation = 2;
 
   uint32_t min_white_black_diff = 5;
