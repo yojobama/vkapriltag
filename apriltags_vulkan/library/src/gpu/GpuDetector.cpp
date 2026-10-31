@@ -68,9 +68,8 @@ constexpr uint32_t kSlotHashDrops = 5;
 constexpr uint32_t kSlotOversizedSortBlobs = 6;
 constexpr VkDeviceSize kCounterStagingBytes = 64;
 
-// Largest blob the sort orders; larger ones are passed through unsorted. A tag border at the largest
-// supported frame (2 * 8191 decimated pixels a side) is about 50,000 points; mode 2 ranks each point
-// against the blob's other runs, so the bound also bounds its cost.
+// Largest blob the sort orders (larger ones pass through unsorted); it also bounds mode 2's cost.
+// A tag border at the largest frame (8191 decimated pixels a side) is about 50,000 points.
 constexpr uint32_t kLargeSortCap = 65536;
 
 }  // namespace
@@ -214,16 +213,12 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     }
   }
 
-  // Blobs of up to local_sort_split_ points are sorted whole in one workgroup's shared memory,
-  // larger ones in runs of that length. The capacity is 2048 at decimation 2, scaling with
-  // 1/decimation, never below 2048, at most 4096 (the 12-bit index of sort_points_local_body.glsl)
-  // and bounded by shared memory; above 2048 the runs are 1024 long, which measured faster.
-  const uint32_t kCapAtDecimation2 = 2048u;
-  const uint32_t scaled_cap = (kCapAtDecimation2 * 2u) / config_.decimation;
+  // Blobs of up to local_sort_split_ points sort whole in shared memory, larger ones in runs of
+  // that length; at most 4096 (the 12-bit packed index) and bounded by shared memory.
   const uint32_t shared_cap =
-      std::min({std::max(scaled_cap, kCapAtDecimation2), 4096u,
-                PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u))});
-  local_sort_split_ = shared_cap > 2048u ? 1024u : shared_cap;
+      std::min(4096u, PrevPow2(std::max(caps.max_shared_memory_bytes / 4u, 1u)));
+  // 1024 rather than 2048: half the shared memory, and more workgroups on a large blob.
+  local_sort_split_ = std::min(1024u, shared_cap);
   // APRILTAG_VK_SORT_SPLIT overrides it (a power of two, at most the capacity).
   if (const char *v = std::getenv("APRILTAG_VK_SORT_SPLIT")) {
     const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
