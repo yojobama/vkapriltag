@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #ifndef SHADER_DIR
 #define SHADER_DIR "shaders"
@@ -219,6 +220,23 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     if (wanted >= 1u) local_sort_split_ = PrevPow2(wanted);
   }
   local_sort_split_ = std::min(local_sort_split_, local_sort_virtual_cap_);
+
+  // Every dispatch must fit maxComputeWorkGroupCount[0]. The per-pixel ones are checked here; the
+  // capacities bound the device-built indirect counts (boundary points, blobs, large-sort runs).
+  const uint64_t max_groups = caps.max_workgroup_count[0];
+  const uint64_t decimated_pixels = uint64_t(decimated_width_) * decimated_height_;
+  if ((decimated_pixels + wg1d_.x - 1) / wg1d_.x > max_groups) {
+    throw std::runtime_error("the decimated frame exceeds this device's workgroup-count limit; "
+                             "raise the decimation");
+  }
+  qbp_capacity_ = static_cast<uint32_t>(std::min<uint64_t>(qbp_capacity_, max_groups * wg1d_.x));
+  ipoint_capacity_ = qbp_capacity_;
+  config_.max_raw_blobs =
+      static_cast<uint32_t>(std::min<uint64_t>(config_.max_raw_blobs, max_groups * wg1d_.x));
+  const uint32_t large_sort_groups_per_blob = std::max(
+      {local_sort_virtual_cap_ / local_sort_split_, local_sort_virtual_cap_ / local_sort_cap_, 1u});
+  config_.max_blobs = static_cast<uint32_t>(
+      std::min<uint64_t>(config_.max_blobs, max_groups / large_sort_groups_per_blob));
 
   CreateBuffers();
   CreatePipelines();
@@ -682,8 +700,8 @@ void GpuDetector::SubmitTimedAndWait(VkCommandBuffer cmd) {
   VKA_PROF_SCOPE("gpu.submit_wait");
   const auto t0 = Clock::now();
   if (prof::Enabled() && frame_first_submit_ns_ == 0) frame_first_submit_ns_ = ToNs(t0);
-  lane_.SubmitAndWait(cmd, pending_wait_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  pending_wait_ = VK_NULL_HANDLE;
+  lane_.SubmitAndWait(cmd, std::exchange(pending_wait_, VK_NULL_HANDLE),
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
 
@@ -1127,6 +1145,19 @@ VkCommandBuffer GpuDetector::FindRecorded(RecordingKind kind, const uint8_t *key
   return VK_NULL_HANDLE;
 }
 
+VkCommandBuffer GpuDetector::RecordPersistent(
+    const std::function<void(VkCommandBuffer)> &record) {
+  VkCommandBuffer cmd = lane_.BeginPersistentCommands();
+  try {
+    record(cmd);
+    lane_.EndCommands(cmd);
+  } catch (...) {
+    lane_.FreePersistentCommands(cmd);
+    throw;
+  }
+  return cmd;
+}
+
 GpuDetector::Submission GpuDetector::FirstAttempt(const ImportedFrame *imported, uint32_t chunk) {
   const uint8_t *key = imported != nullptr ? imported->key : nullptr;
   if (prerecord_) {
@@ -1134,10 +1165,10 @@ GpuDetector::Submission GpuDetector::FirstAttempt(const ImportedFrame *imported,
       return {cached, true};
     }
     recorded_this_frame_ = true;
-    VkCommandBuffer cmd = lane_.BeginPersistentCommands();
-    RecordFrameHead(cmd, imported, chunk);
-    RecordFusedTail(cmd, /*speculative=*/true);
-    lane_.EndCommands(cmd);
+    VkCommandBuffer cmd = RecordPersistent([&](VkCommandBuffer c) {
+      RecordFrameHead(c, imported, chunk);
+      RecordFusedTail(c, /*speculative=*/true);
+    });
     recorded_frames_.push_back({RecordingKind::kFirstAttempt, key, chunk, cmd});
     return {cmd, true};
   }
@@ -1154,9 +1185,8 @@ GpuDetector::Submission GpuDetector::Continuation(uint32_t iterations) {
       return {cached, true};
     }
     recorded_this_frame_ = true;
-    VkCommandBuffer cmd = lane_.BeginPersistentCommands();
-    RecordUfContinuation(cmd, iterations);
-    lane_.EndCommands(cmd);
+    VkCommandBuffer cmd =
+        RecordPersistent([&](VkCommandBuffer c) { RecordUfContinuation(c, iterations); });
     recorded_frames_.push_back({RecordingKind::kContinuation, nullptr, iterations, cmd});
     return {cmd, true};
   }
@@ -1172,9 +1202,7 @@ GpuDetector::Submission GpuDetector::TailRerun() {
       return {cached, true};
     }
     recorded_this_frame_ = true;
-    VkCommandBuffer cmd = lane_.BeginPersistentCommands();
-    RecordTailRerun(cmd);
-    lane_.EndCommands(cmd);
+    VkCommandBuffer cmd = RecordPersistent([&](VkCommandBuffer c) { RecordTailRerun(c); });
     recorded_frames_.push_back({RecordingKind::kTailRerun, nullptr, 0, cmd});
     return {cmd, true};
   }
@@ -1188,16 +1216,35 @@ void GpuDetector::SubmitTimed(const Submission &s) {
   VKA_PROF_SCOPE("gpu.submit_wait");
   const auto t0 = Clock::now();
   if (prof::Enabled() && frame_first_submit_ns_ == 0) frame_first_submit_ns_ = ToNs(t0);
+  const VkSemaphore wait = std::exchange(pending_wait_, VK_NULL_HANDLE);
   if (s.persistent) {
-    lane_.SubmitPersistentAndWait(s.cmd, pending_wait_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    lane_.SubmitPersistentAndWait(s.cmd, wait, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   } else {
-    lane_.SubmitAndWait(s.cmd, pending_wait_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    lane_.SubmitAndWait(s.cmd, wait, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   }
-  pending_wait_ = VK_NULL_HANDLE;
   last_profile_.cpu_submit_wait_ms += MsSince(t0, Clock::now());
 }
 
 void GpuDetector::Detect(const uint8_t *gray_frame) {
+  try {
+    DetectFrame(gray_frame);
+  } catch (...) {
+    DropPendingWait();
+    throw;
+  }
+}
+
+void GpuDetector::DropPendingWait() noexcept {
+  const VkSemaphore wait = std::exchange(pending_wait_, VK_NULL_HANDLE);
+  if (wait == VK_NULL_HANDLE) return;
+  try {
+    lane_.SubmitAndWait(lane_.BeginCommands(), wait, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  } catch (...) {
+    // The device is failing; the next frame reports it.
+  }
+}
+
+void GpuDetector::DetectFrame(const uint8_t *gray_frame) {
   last_quad_fits = {};
   if (!fused_submits_) {
     DetectUnfused(gray_frame);

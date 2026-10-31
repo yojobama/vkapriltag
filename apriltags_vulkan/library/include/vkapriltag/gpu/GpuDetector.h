@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <span>
@@ -230,6 +231,10 @@ class GpuDetector {
   // Wrappers for lane_.BeginCommands()/SubmitAndWait() that add host-side cost to last_profile_.
   VkCommandBuffer BeginTimedCommands();
   void SubmitTimedAndWait(VkCommandBuffer cmd);
+  // Detect() without its cleanup; after a throw, DropPendingWait() consumes a signalled upload
+  // semaphore so the next frame's copy can signal it again.
+  void DetectFrame(const uint8_t *gray_frame);
+  void DropPendingWait() noexcept;
 
   // Grows the readback staging buffer if needed (never shrinks, so steady
   // state performs no allocation).
@@ -465,6 +470,8 @@ class GpuDetector {
 
   // Return the command buffer for each kind: replayed from the cache, or recorded now.
   Submission FirstAttempt(const ImportedFrame *imported, uint32_t chunk);
+  // A persistent command buffer filled by `record`, freed again if recording throws.
+  VkCommandBuffer RecordPersistent(const std::function<void(VkCommandBuffer)> &record);
   Submission Continuation(uint32_t iterations);
   Submission TailRerun();
   VkCommandBuffer FindRecorded(RecordingKind kind, const uint8_t *key, uint32_t n) const;
