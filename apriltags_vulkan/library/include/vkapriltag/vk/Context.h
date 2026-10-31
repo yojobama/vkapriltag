@@ -222,8 +222,10 @@ public:
   static std::vector<DeviceCaps> EnumerateDevices();
  private:
   void CreateInstance(const ContextOptions &options);
-  void SelectPhysicalDevice(const ContextOptions &options);
-  void SelectPhysicalDevice(const std::string& deviceName, const ContextOptions& options);
+  // Both constructors: environment overrides, then the instance, device, caps and default lane.
+  void Init(const ContextOptions &options, const std::string *device_name);
+  // An explicit index, else the device named `device_name` (if not null), else the best usable one.
+  void SelectPhysicalDevice(const ContextOptions &options, const std::string *device_name);
   void CreateLogicalDevice(const ContextOptions &options);
   void QueryCaps(const ContextOptions &options);
   void CreateCommandResources();

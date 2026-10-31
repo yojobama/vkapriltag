@@ -3,6 +3,8 @@
 #include "vkapriltag/vk/EmbeddedShaders.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -131,7 +133,13 @@ bool EnvFlag(const char *name) {
 bool EnvInt(const char *name, int *out) {
   const char *v = std::getenv(name);
   if (v == nullptr || v[0] == '\0') return false;
-  *out = std::atoi(v);
+  char *end = nullptr;
+  errno = 0;
+  const long parsed = std::strtol(v, &end, 10);
+  if (end == v || *end != '\0' || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX) {
+    throw std::runtime_error(std::string(name) + "=" + v + " is not an integer");
+  }
+  *out = static_cast<int>(parsed);
   return true;
 }
 
@@ -201,7 +209,13 @@ PipelineCache MakePipelineCache(VkDevice device, VkPhysicalDevice physical_devic
 
 }  // namespace
 
-Context::Context(const ContextOptions &options_in) {
+Context::Context(const ContextOptions &options) { Init(options, nullptr); }
+
+Context::Context(const std::string &deviceName, const ContextOptions &options) {
+  Init(options, &deviceName);
+}
+
+void Context::Init(const ContextOptions &options_in, const std::string *device_name) {
   ContextOptions options = options_in;
   // Environment overrides, so the same binary can be retargeted at runtime.
   if (EnvFlag("APRILTAG_VK_ALLOW_CPU")) options.allow_cpu_device = true;
@@ -227,7 +241,7 @@ Context::Context(const ContextOptions &options_in) {
   }
 
   CreateInstance(options);
-  SelectPhysicalDevice(options);
+  SelectPhysicalDevice(options, device_name);
   CreateLogicalDevice(options);
   QueryCaps(options);
   pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
@@ -237,44 +251,6 @@ Context::Context(const ContextOptions &options_in) {
   if (options.verbose) {
     std::cerr << DescribeDevice() << std::endl;
   }
-}
-
-Context::Context(const std::string& deviceName, const ContextOptions& options_in) {
-    ContextOptions options = options_in;
-    // Environment overrides, so the same binary can be retargeted at runtime.
-    if (EnvFlag("APRILTAG_VK_ALLOW_CPU")) options.allow_cpu_device = true;
-    if (EnvFlag("APRILTAG_VK_VALIDATION")) options.enable_validation = true;
-    int env_int = 0;
-    if (EnvInt("APRILTAG_VK_DEVICE", &env_int)) options.device_index = env_int;
-    if (EnvInt("APRILTAG_VK_WG", &env_int) && env_int > 0) {
-        options.workgroup_size_override = static_cast<uint32_t>(env_int);
-    }
-    EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
-    if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
-    if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
-    if (EnvFlag("APRILTAG_VK_FORCE_NO_INT64_ATOMIC")) options.force_no_int64_atomics = true;
-    if (EnvFlag("APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING")) {
-        options.force_no_conditional_rendering = true;
-    }
-    if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
-        options.max_invocations_override = static_cast<uint32_t>(env_int);
-    }
-    if (std::getenv("APRILTAG_VK_PIPELINE_CACHE") != nullptr &&
-        !EnvFlag("APRILTAG_VK_PIPELINE_CACHE")) {
-        options.use_pipeline_cache = false;
-    }
-
-    CreateInstance(options);
-    SelectPhysicalDevice(deviceName, options);
-    CreateLogicalDevice(options);
-    QueryCaps(options);
-    pipeline_cache_ = MakePipelineCache(device_, physical_device_, options.use_pipeline_cache,
-                                       options.verbose);
-    CreateCommandResources();
-
-    if (options.verbose) {
-        std::cerr << DescribeDevice() << std::endl;
-    }
 }
 
 Context::~Context() {
@@ -325,7 +301,7 @@ void Context::CreateInstance(const ContextOptions &options) {
   CheckVk(vkCreateInstance(&create_info, nullptr, &instance_), "vkCreateInstance");
 }
 
-void Context::SelectPhysicalDevice(const ContextOptions &options) {
+void Context::SelectPhysicalDevice(const ContextOptions &options, const std::string *device_name) {
   uint32_t count = 0;
   vkEnumeratePhysicalDevices(instance_, &count, nullptr);
   if (count == 0) {
@@ -354,30 +330,50 @@ void Context::SelectPhysicalDevice(const ContextOptions &options) {
     return os.str();
   };
 
-  // Explicit index wins, but still has to be usable.
+  // Why device i cannot be used, or nullptr if it can.
+  static constexpr const char *kCpuRefused =
+      "is a CPU implementation (set APRILTAG_VK_ALLOW_CPU=1 to allow it)";
+  auto unusable = [&](uint32_t i) -> const char * {
+    if (!HasComputeQueue(devices[i])) return "has no compute queue family";
+    if (props[i].apiVersion < VK_API_VERSION_1_1) return "supports only Vulkan 1.0";
+    if (props[i].deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && !options.allow_cpu_device) {
+      return kCpuRefused;
+    }
+    return nullptr;
+  };
+  auto use_requested = [&](uint32_t i) {
+    if (const char *why = unusable(i)) {
+      throw std::runtime_error(std::string("Requested device '") + props[i].deviceName + "' " +
+                               why + "; devices are:" + describe_all());
+    }
+    physical_device_ = devices[i];
+  };
+
+  // An explicit index wins, then a name; either still has to be usable.
   if (options.device_index >= 0) {
     if (static_cast<uint32_t>(options.device_index) >= count) {
       throw std::runtime_error("APRILTAG_VK_DEVICE=" + std::to_string(options.device_index) +
                                " is out of range; devices are:" + describe_all());
     }
-    uint32_t i = static_cast<uint32_t>(options.device_index);
-    if (!HasComputeQueue(devices[i])) {
-      throw std::runtime_error(std::string("Requested device '") + props[i].deviceName +
-                               "' has no compute queue family.");
-    }
-    physical_device_ = devices[i];
+    use_requested(static_cast<uint32_t>(options.device_index));
     return;
+  }
+  if (device_name != nullptr) {
+    for (uint32_t i = 0; i < count; ++i) {
+      if (*device_name == props[i].deviceName) {
+        use_requested(i);
+        return;
+      }
+    }
+    throw std::runtime_error("No Vulkan device named '" + *device_name + "'; devices are:" +
+                             describe_all());
   }
 
   int best_score = -1;
   bool saw_cpu_only_candidate = false;
   for (uint32_t i = 0; i < count; ++i) {
-    if (!HasComputeQueue(devices[i])) continue;
-    if (props[i].apiVersion < VK_API_VERSION_1_1) continue;
-
-    const bool is_cpu = props[i].deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
-    if (is_cpu && !options.allow_cpu_device) {
-      saw_cpu_only_candidate = true;
+    if (const char *why = unusable(i)) {
+      if (why == kCpuRefused) saw_cpu_only_candidate = true;
       continue;
     }
 
@@ -406,62 +402,6 @@ void Context::SelectPhysicalDevice(const ContextOptions &options) {
     throw std::runtime_error("No Vulkan 1.1+ device with a compute queue found. Devices seen:" +
                              describe_all());
   }
-}
-
-void Context::SelectPhysicalDevice(const std::string& deviceName, const ContextOptions& options) {
-    uint32_t count = 0;
-    vkEnumeratePhysicalDevices(instance_, &count, nullptr);
-    if (count == 0) {
-        throw std::runtime_error(
-            "No Vulkan physical devices found. No usable Vulkan driver (ICD) is installed - "
-            "check that a *_icd.json for your GPU exists under /usr/share/vulkan/icd.d and that "
-            "vulkaninfo --summary lists your device.");
-    }
-    std::vector<VkPhysicalDevice> devices(count);
-    vkEnumeratePhysicalDevices(instance_, &count, devices.data());
-
-    // Gather properties once, for both selection and the diagnostic message.
-    std::vector<VkPhysicalDeviceProperties> props(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        vkGetPhysicalDeviceProperties(devices[i], &props[i]);
-    }
-
-    auto describe_all = [&]() {
-        std::ostringstream os;
-        for (uint32_t i = 0; i < count; ++i) {
-            os << "\n  [" << i << "] " << props[i].deviceName << " ("
-                << DeviceTypeName(props[i].deviceType) << ", Vulkan "
-                << VK_API_VERSION_MAJOR(props[i].apiVersion) << "."
-                << VK_API_VERSION_MINOR(props[i].apiVersion) << ")";
-        }
-        return os.str();
-        };
-
-    // Explicit index wins, but still has to be usable.
-    if (options.device_index >= 0) {
-        if (static_cast<uint32_t>(options.device_index) >= count) {
-            throw std::runtime_error("APRILTAG_VK_DEVICE=" + std::to_string(options.device_index) +
-                " is out of range; devices are:" + describe_all());
-        }
-        uint32_t i = static_cast<uint32_t>(options.device_index);
-        if (!HasComputeQueue(devices[i])) {
-            throw std::runtime_error(std::string("Requested device '") + props[i].deviceName +
-                "' has no compute queue family.");
-        }
-        physical_device_ = devices[i];
-        return;
-    }
-
-    for (uint32_t i = 0; i < count; ++i) {
-        if (props[i].deviceName == deviceName) {
-            if (!HasComputeQueue(devices[i])) {
-                throw std::runtime_error(std::string("Requested device '") + props[i].deviceName +
-                    "' has no compute queue family.");
-            }
-            physical_device_ = devices[i];
-            return;
-        }
-    }
 }
 
 void Context::CreateLogicalDevice(const ContextOptions &options) {
@@ -836,32 +776,18 @@ std::vector<DeviceCaps> Context::EnumerateDevices() {
     app_info.pApplicationName = "apriltag_vulkan";
     // 1.1 keeps older mobile drivers eligible.
     app_info.apiVersion = VK_API_VERSION_1_1;
-    
-	// Enable the validation layer if it is available.
-    std::vector<const char*> layers;
-    uint32_t layer_count = 0;
-    vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
-    std::vector<VkLayerProperties> available(layer_count);
-    vkEnumerateInstanceLayerProperties(&layer_count, available.data());
-    const char* kValidation = "VK_LAYER_KHRONOS_validation";
-    for (const auto& l : available) {
-        if (std::strcmp(l.layerName, kValidation) == 0) {
-            layers.push_back(kValidation);
-            break;
-        }
-    }
-    if (layers.empty()) {
-        std::cerr << "apriltag_vulkan: VK_LAYER_KHRONOS_validation is not installed; continuing without it." << std::endl;
-    }
 
     VkInstanceCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &app_info;
-    create_info.enabledLayerCount = static_cast<uint32_t>(layers.size());
-    create_info.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
 
     VkInstance instance;
     CheckVk(vkCreateInstance(&create_info, nullptr, &instance), "vkCreateInstance");
+    // Destroys the instance on every return and throw below.
+    struct InstanceGuard {
+        VkInstance instance;
+        ~InstanceGuard() { vkDestroyInstance(instance, nullptr); }
+    } instance_guard{instance};
 
     
     uint32_t count = 0;
