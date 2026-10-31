@@ -2283,6 +2283,51 @@ shader-access analysis reports nothing with every switch on (both machines); MSV
 every switch on (84 runs); on the Orange Pi ASan, UBSan, LSan and TSan clean with and without the peak
 check.
 
+## 8aa. The edge-case fixes and what they cost
+
+Seventeen issues from an audit of the code (wrapped int32 line-fit sums, unchecked sizes and
+counts, races, leaks on error paths, a busy-waiting capture loop), fixed one commit each. Every fix
+was timed against its parent, interleaved, in two states (`exact` without the margin gate, `fast`
+with a gate of 4) on `field2.png`, `hd720.pgm` and the 1280x800 corpus image at decimations 1 and
+2: six rounds of 1,000 frames on the desktop, four of 400 on the Orange Pi with the performance
+governor and LumenVision stopped. Below, the median over those 12 configurations of the change in
+`quad_decode` and `pipeline_total`; desktop configurations scatter by about +-5% between processes,
+the Orange Pi's by about +-1%.
+
+| Fix | Desktop quad_decode | Desktop total | Pi quad_decode | Pi total |
+| --- | --- | --- | --- | --- |
+| 1. int64 line-fit moments (first form) | +12.0% | +3.7% | +1.7% | +0.1% |
+| 4. WorkerPool: serialised, exceptions, size | +0.7% | +0.7% | +0.3% | -0.1% |
+| 5. Size checks | +1.7% | +0.4% | -0.1% | -0.2% |
+| 6. Fused tail bounded by capacity | -0.3% | +0.6% | -0.1% | +0.1% |
+| 7. FramePipeline size checks | +0.2% | +0.5% | +0.0% | -0.1% |
+| 8. Fence reset at submit | -2.3% | -0.7% | -0.1% | +0.2% |
+| 9. Workgroup-count limits, exception safety | -1.5% | -0.9% | -0.2% | +0.1% |
+| 11. Dispatch-time probe ownership | -0.1% | -0.2% | +0.4% | +0.2% |
+| 12. Sort shared-memory budget | -0.1% | -0.1% | -0.0% | -0.0% |
+| 13. Device selection | +0.5% | +1.3% | -0.2% | -0.1% |
+| 14. Constructor cleanup, whole-size ranges | +1.3% | +0.9% | -0.6% | -0.0% |
+| 15. Pipeline-cache lock, lane waits | +1.0% | +0.9% | -0.2% | -0.1% |
+| 16-17. Tools and capture | +0.7% | +0.8% | +0.0% | +0.0% |
+| All, final (with the follow-up to 1) | -0.6% | -0.1% | +0.2% | -0.0% |
+
+Fixes 2, 3 and 10 (pose and PGM input) are outside the frame loop. Only fix 1 cost anything, and only
+on the desktop. Two things made its first form slow under MSVC: the RelWithDebInfo build (`/Ob1`)
+inlines only functions marked `inline`, and the whole blob switched to 128-bit covariances once its
+totals crossed the int64 bound, which large background blobs at decimation 1 do; running in parallel,
+one such blob sets the frame's tail (`APRILTAG_CPU_THREADS=1` showed no cost at all). The follow-up
+chooses 128 bits per line fit, keeps the peak search's windows (at most 41 points, which cannot
+overflow) in int64, and lets the DP path sum its four segments directly rather than build the prefix
+sums; `quad_decode` is then back within noise on both machines, and the GCC build of the CPU fit is
+faster than before in a stand-alone benchmark (-12% DP, -37% peak search on synthetic blobs).
+
+With the opt-in GPU quad fit (`APRILTAG_VK_GPU_QUADFIT=1`) the desktop's GPU time is 3.0% higher
+(`pipeline_total` +3.1%): `fit_quad_dp.comp` now sums six int64 moments per segment where it summed
+three int64 and four int32, which the fix needs for the same reason as the CPU path.
+
+Output is unchanged: the dump matrix (331 files, including two odd-sized crops) is identical to the
+base on the desktop with and without the GPU fit, and on the Orange Pi (291 files).
+
 ## 9. Measuring
 
 ```
