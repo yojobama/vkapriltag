@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <string>
 #include <mutex>
@@ -17,7 +18,7 @@ namespace apriltag_vulkan {
 class WorkerPool {
  public:
   // `threads` is the total parallelism including the calling thread (1 runs inline; 0 selects
-  // hardware_concurrency).
+  // hardware_concurrency), capped at 4 x hardware_concurrency (at least 16).
   // `name` labels the worker threads in profiler traces ("<name> <slot>"); it is copied.
   explicit WorkerPool(unsigned threads = 0, const char *name = "cpu-worker");
   ~WorkerPool();
@@ -28,18 +29,22 @@ class WorkerPool {
   // Invokes fn(i, slot) once for each i in [0, count) and returns when all have completed; fn must
   // be safe to call concurrently for distinct i. `slot` in [0, threads()) is fixed per thread
   // (0 is the caller), so per-thread scratch can be indexed by it instead of using thread_local.
+  // Concurrent calls run one after another. If fn throws, the remaining items are skipped and the
+  // first exception is rethrown here once every thread has left the batch.
   void ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn);
 
   unsigned threads() const { return 1 + static_cast<unsigned>(workers_.size()); }
 
  private:
   void WorkerMain(unsigned slot);
+  void StopWorkers();
   // Claims indices until the batch is exhausted; used by workers and the calling thread.
   void DrainBatch(unsigned slot);
 
   std::string name_;
   std::vector<std::thread> workers_;
 
+  std::mutex call_mutex_;  // held for a whole ParallelFor
   std::mutex mutex_;
   std::condition_variable batch_ready_;
   std::condition_variable batch_done_;
@@ -50,6 +55,7 @@ class WorkerPool {
   size_t outstanding_ = 0;  // workers still inside the current batch
   uint64_t generation_ = 0;
   bool stop_ = false;
+  std::exception_ptr error_;  // the batch's first exception
 };
 
 // Thread count for the CPU tail: explicit config value, else APRILTAG_CPU_THREADS, else 0
@@ -58,7 +64,7 @@ inline unsigned ResolveThreadCount(uint32_t configured) {
   if (configured > 0) return configured;
   if (const char *t = std::getenv("APRILTAG_CPU_THREADS")) {
     const long parsed = std::strtol(t, nullptr, 10);
-    if (parsed > 0) return static_cast<unsigned>(parsed);
+    if (parsed > 0) return static_cast<unsigned>(parsed < 65536 ? parsed : 65536);  // WorkerPool clamps further
   }
   return 0;
 }

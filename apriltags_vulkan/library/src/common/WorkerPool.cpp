@@ -1,25 +1,35 @@
 #include "vkapriltag/common/WorkerPool.h"
 
+#include <algorithm>
 #include <string>
+#include <utility>
 
 #include "vkapriltag/common/Profiler.h"
 
 namespace apriltag_vulkan {
 
 WorkerPool::WorkerPool(unsigned threads, const char *name) : name_(name) {
+  const unsigned hardware = std::thread::hardware_concurrency();
   unsigned total = threads;
-  if (total == 0) total = std::thread::hardware_concurrency();
-  if (total == 0) total = 1;
+  if (total == 0) total = hardware;
+  total = std::clamp(total, 1u, std::max(4u * hardware, 16u));
 
-  workers_.reserve(total - 1);
   // Slot 0 is the calling thread; workers get 1, 2, ... (see WorkerPool.h).
-  for (unsigned i = 0; i + 1 < total; ++i) {
-    const unsigned slot = i + 1;
-    workers_.emplace_back([this, slot] { WorkerMain(slot); });
+  try {
+    workers_.reserve(total - 1);
+    for (unsigned i = 0; i + 1 < total; ++i) {
+      const unsigned slot = i + 1;
+      workers_.emplace_back([this, slot] { WorkerMain(slot); });
+    }
+  } catch (...) {
+    StopWorkers();
+    throw;
   }
 }
 
-WorkerPool::~WorkerPool() {
+WorkerPool::~WorkerPool() { StopWorkers(); }
+
+void WorkerPool::StopWorkers() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stop_ = true;
@@ -43,7 +53,13 @@ void WorkerPool::DrainBatch(unsigned slot) {
   for (;;) {
     const size_t i = next_.fetch_add(1, std::memory_order_relaxed);
     if (i >= count) break;
-    (*fn)(i, slot);
+    try {
+      (*fn)(i, slot);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!error_) error_ = std::current_exception();
+      next_.store(count, std::memory_order_relaxed);  // skips the rest of the batch
+    }
     ++claimed;
   }
   drain.set_arg(claimed);
@@ -71,6 +87,7 @@ void WorkerPool::WorkerMain(unsigned slot) {
 
 void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn) {
   if (count == 0) return;
+  std::lock_guard<std::mutex> call_lock(call_mutex_);
 
   // A single item (or a single-threaded pool) runs inline on the calling thread as slot 0.
   if (workers_.empty() || count == 1) {
@@ -91,6 +108,7 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
   // The calling thread also drains the batch, as slot 0.
   DrainBatch(0);
 
+  std::exception_ptr error;
   {
     // The tail of the batch: time the caller idles while a worker finishes its last item.
     VKA_PROF_SCOPE("pool.join_wait");
@@ -99,7 +117,9 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
     // Every participant has returned from DrainBatch().
     fn_ = nullptr;
     count_ = 0;
+    error = std::exchange(error_, nullptr);
   }
+  if (error) std::rethrow_exception(error);
 }
 
 }  // namespace apriltag_vulkan
