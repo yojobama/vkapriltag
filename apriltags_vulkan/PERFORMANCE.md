@@ -2328,6 +2328,29 @@ three int64 and four int32, which the fix needs for the same reason as the CPU p
 Output is unchanged: the dump matrix (331 files, including two odd-sized crops) is identical to the
 base on the desktop with and without the GPU fit, and on the Orange Pi (291 files).
 
+## 8ab. Blobs of any size sorted
+
+Blobs above the sort's capacity (2048 points at decimation 2, 4096 at 1) used to pass through
+unsorted, so a tag of about 1,000 px at decimation 2 (1,300 px at 1) was never detected: a
+synthetic 3000x3000 frame with one tag36h11 lost every tag from 1,000 px to 2,600 px, which the
+reference detector found. Blobs above 1024 points are now sorted in runs of 1024 and placed by one
+ranking pass, up to 65,536 points (see DESIGN.md). All of those tags are found, at decimations 1
+and 2, with corners within 0.0003 px of libapriltag's; the dump matrix is unchanged (331 files on
+the desktop with and without the GPU fit, 291 on the Orange Pi), since the order of every blob the
+old sort handled is the same.
+
+Against the previous head, interleaved, the three images at decimations 1 and 2 in two states:
+
+| | Desktop GPU | Desktop total | Pi GPU | Pi total |
+| --- | --- | --- | --- | --- |
+| Decimation 1 | -4.7% to -7.1% | -2.3% to -5.1% | -1% | -1.0% |
+| Decimation 2, frames with a blob over 1024 points | +2.8% to +3.4% | +0.8% to +0.9% | +1.6% to +3.0% | +0.7% to +2.0% |
+| Decimation 2, other frames | within noise | within noise | +0.2% to +0.3% | 0.0% |
+
+Decimation 1 is faster because one ranking pass replaces two merge rounds. At decimation 2 the
+cost is the sorting of large background blobs that used to be skipped; with a 2048-point limit and
+run it was 0.2 ms on the Mali-G610 (+10% of a frame), hence 1024 at every decimation.
+
 ## 9. Measuring
 
 ```
