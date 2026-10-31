@@ -135,7 +135,8 @@ int main(int argc, char **argv) {
              << std::endl;
 
     while (!g_stop) {
-      capture.CaptureGrayFrame(gray);
+      // A short timeout keeps Ctrl+C responsive when the stream stalls.
+      if (!capture.CaptureGrayFrame(gray, 200)) continue;
 
       detector.Detect(gray.data());
       const auto &profile = detector.last_profile();

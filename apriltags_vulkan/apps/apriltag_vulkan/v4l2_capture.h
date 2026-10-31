@@ -18,9 +18,10 @@ class V4l2Capture {
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
 
-  // Blocks until the next frame, extracts its luma plane into `out` (resized to width() *
-  // height()); throws std::runtime_error on V4L2 failure.
-  void CaptureGrayFrame(std::vector<uint8_t> &out);
+  // Waits up to `timeout_ms` for the next frame and extracts its luma plane into `out` (resized
+  // to width() * height()). Returns false on a timeout, a signal or a frame the driver marked bad;
+  // throws std::runtime_error on V4L2 failure.
+  bool CaptureGrayFrame(std::vector<uint8_t> &out, int timeout_ms);
 
  private:
   struct MappedBuffer {
@@ -28,9 +29,12 @@ class V4l2Capture {
     size_t length = 0;
   };
 
+  void Release();
+
   int fd_ = -1;
   uint32_t width_ = 0;
   uint32_t height_ = 0;
+  uint32_t stride_ = 0;  // bytes per YUYV row
   std::vector<MappedBuffer> buffers_;
 };
 

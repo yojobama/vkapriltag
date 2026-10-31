@@ -13,11 +13,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -220,10 +222,17 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
     b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     b.memory = V4L2_MEMORY_MMAP;
     b.index = i;
-    ioctl(fd, VIDIOC_QUERYBUF, &b);
+    if (ioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
+      std::cerr << "VIDIOC_QUERYBUF failed: " << std::strerror(errno) << std::endl;
+      return 1;
+    }
+    void *start = mmap(nullptr, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+    if (start == MAP_FAILED) {
+      std::cerr << "mmap of camera buffer " << i << " failed: " << std::strerror(errno) << std::endl;
+      return 1;
+    }
     bufs[i].length = b.length;
-    bufs[i].start = static_cast<uint8_t *>(
-        mmap(nullptr, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset));
+    bufs[i].start = static_cast<uint8_t *>(start);
     v4l2_exportbuffer ex{};
     ex.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ex.index = i;
@@ -326,22 +335,33 @@ int main(int argc, char **argv) {
   int iterations = 200, frames = 60, sync_mode = 1;
   bool yuyv_heap = false;
   uint32_t width = 640, height = 480;
-  for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
-    if (arg == "--pgm") pgm = next();
-    else if (arg == "--camera") camera = next();
-    else if (arg == "--iterations") iterations = std::stoi(next());
-    else if (arg == "--decimation") g_decimation = static_cast<uint32_t>(std::stoi(next()));
-    else if (arg == "--yuyv") yuyv_heap = true;
-    else if (arg == "--frames") frames = std::stoi(next());
-    else if (arg == "--sync") sync_mode = std::stoi(next());
-    else if (arg == "--width") width = static_cast<uint32_t>(std::stoi(next()));
-    else if (arg == "--height") height = static_cast<uint32_t>(std::stoi(next()));
-    else {
-      std::cerr << "Unknown argument: " << arg << std::endl;
-      return 1;
+  try {
+    for (int i = 1; i < argc; ++i) {
+      const std::string arg = argv[i];
+      auto next = [&]() -> std::string {
+        if (i + 1 >= argc) throw std::invalid_argument("missing value for " + arg);
+        return argv[++i];
+      };
+      // A count of at least 1; std::stoi throws on text that is not a number.
+      auto count = [&]() {
+        const int v = std::stoi(next());
+        if (v < 1) throw std::invalid_argument(arg + " must be at least 1");
+        return v;
+      };
+      if (arg == "--pgm") pgm = next();
+      else if (arg == "--camera") camera = next();
+      else if (arg == "--iterations") iterations = count();
+      else if (arg == "--decimation") g_decimation = static_cast<uint32_t>(count());
+      else if (arg == "--yuyv") yuyv_heap = true;
+      else if (arg == "--frames") frames = count();
+      else if (arg == "--sync") sync_mode = std::stoi(next());
+      else if (arg == "--width") width = static_cast<uint32_t>(count());
+      else if (arg == "--height") height = static_cast<uint32_t>(count());
+      else throw std::invalid_argument("unknown argument: " + arg);
     }
+  } catch (const std::exception &e) {
+    std::cerr << e.what() << std::endl;
+    return 1;
   }
   apriltag_family_t *tf = nullptr;
   if (!setup_tag_family(&tf, "tag36h11")) return 1;
