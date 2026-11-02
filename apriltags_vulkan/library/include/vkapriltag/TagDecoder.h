@@ -82,6 +82,8 @@ class TagDecoder {
   RefineEdgesMethod refine_method_;
   // APRILTAG_VK_GREY_MARGIN=1: retry a quad that did not decode as its inner square.
   bool grey_margin_ = false;
+  // APRILTAG_VK_SIDE_ONE_OUT=1: refit a side whose border cells read white, one cell further in.
+  bool side_one_out_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;

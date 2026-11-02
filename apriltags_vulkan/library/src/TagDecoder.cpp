@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "BorderSample.h"
 #include "vkapriltag/common/Profiler.h"
 
 extern "C" {
@@ -68,6 +69,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
   if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] == '1';
+  if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -280,6 +282,59 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         quad_decode_index(td_, &inner, &im, /*im_samples=*/nullptr, per_quad_[i]);
         if (inner.H) matd_destroy(inner.H);
         if (inner.Hinv) matd_destroy(inner.Hinv);
+    // A side whose border cells read white was fitted on the quiet zone's outer edge, one cell too far
+    // out (the payload still decodes through error correction). Move it in a cell, refit, and keep the
+    // result if it decodes the same tag with a darker border.
+    if (side_one_out_ && quad_original.H && zarray_size(per_quad_[i]) == 1 &&
+        zarray_size(td_->tag_families) > 0) {
+      apriltag_family_t *family = nullptr;
+      zarray_get(td_->tag_families, 0, &family);
+      const int w = family->width_at_border;
+      BorderLevels before;
+      int bad = 0;
+      if (ReadBorder(quad_original.H, &im, w, &before)) {
+        for (int k = 0; k < 4; ++k) bad |= (before.side_level[k] > 0.3) << k;
+      }
+      if (bad != 0 && bad != 15) {
+        VKA_PROF_SCOPE("tag.side");
+        const double one = 2.0 / w;  // a cell, in the tag's [-1, 1] coordinates
+        const double u0 = (bad & 8) ? -1 + one : -1, u1 = (bad & 2) ? 1 - one : 1;
+        const double v0 = (bad & 1) ? -1 + one : -1, v1 = (bad & 4) ? 1 - one : 1;
+        const double us[4] = {u0, u1, u1, u0}, vs[4] = {v0, v0, v1, v1};
+        struct quad moved;
+        for (int k = 0; k < 4; ++k) {
+          double x, y;
+          homography_project(quad_original.H, us[k], vs[k], &x, &y);
+          moved.p[k][0] = static_cast<float>(x);
+          moved.p[k][1] = static_cast<float>(y);
+        }
+        moved.reversed_border = reversed_border;
+        moved.H = nullptr;
+        moved.Hinv = nullptr;
+        RefineEdges(refine_method_, td_, &im, &moved);
+        zarray_t *probe = probe_[slot];
+        zarray_truncate(probe, 0);
+        quad_decode_index(td_, &moved, &im, /*im_samples=*/nullptr, probe);
+        bool keep = false;
+        if (zarray_size(probe) == 1 && moved.H) {
+          apriltag_detection_t *old_det = nullptr, *new_det = nullptr;
+          zarray_get(per_quad_[i], 0, &old_det);
+          zarray_get(probe, 0, &new_det);
+          BorderLevels after;
+          if (new_det->id == old_det->id && ReadBorder(moved.H, &im, w, &after)) {
+            double level_before = 0, level_after = 0;
+            for (int k = 0; k < 4; ++k) level_before += before.side_level[k], level_after += after.side_level[k];
+            keep = level_after < level_before - 0.2;
+          }
+          if (keep) {
+            apriltag_detection_destroy(old_det);
+            zarray_set(per_quad_[i], 0, &new_det, nullptr);
+            zarray_truncate(probe, 0);  // the detection now belongs to per_quad_[i]
+          }
+        }
+        if (!keep) ClearDetections(probe);
+        if (moved.H) matd_destroy(moved.H);
+        if (moved.Hinv) matd_destroy(moved.Hinv);
       }
     }
 
