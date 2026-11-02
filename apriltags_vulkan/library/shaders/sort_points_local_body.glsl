@@ -18,9 +18,6 @@ layout(constant_id = 6) const uint kLargeCap = 1024;
 // Blobs of at most this many points are sorted by ranking every key against all of them, read 4 at a
 // time; 0 disables.
 layout(constant_id = 7) const uint kRankAll = 0;
-// Non-zero: each RawLineFitPoint is also written to Mirror, a device-local copy for
-// fit_quad_dp.comp.
-layout(constant_id = 8) const uint kMirror = 0;
 
 layout(std430, binding = 0) readonly buffer Selected { MinMaxExtentsGpu selected[]; };
 layout(std430, binding = 1) readonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
@@ -50,7 +47,6 @@ layout(std430, binding = 7) buffer LargeBlobs {
 };
 // Mode 1's sorted runs, indexed like Output: packed keys whose low bits index into the run.
 layout(std430, binding = 8) buffer SortScratch { uint scratch_keys[]; };
-layout(std430, binding = 9) writeonly buffer Mirror { RawLineFitPoint mirror_points[]; };
 
 layout(push_constant) uniform PushConstants {
   uint num_selected_blobs;
@@ -96,11 +92,6 @@ shared uint s_merge[kChunk != 0u ? kLocalCap : 1u];
 // The keys of a blob of at most kRankAll points, 4 to an entry, padded with 0xFFFFFFFF.
 shared uvec4 s_rank[kRankAll != 0u ? kRankAll / 4u : 1u];
 
-void WritePoint(uint i, RawLineFitPoint p) {
-  output_points[i] = p;
-  if (kMirror != 0u) mirror_points[i] = p;
-}
-
 uint SortedAt(bool from_merge, uint i) { return from_merge ? s_merge[i] : s_packed[i]; }
 
 // The packed key of the point `index` places after `first` in the blob.
@@ -112,7 +103,7 @@ uint PackedKey(uint base, uint first, uint index) {
 // the whole blob) writes the point's RawLineFitPoint, mode 1 the key itself.
 void Emit(uint base, uint first, uint pos, uint packed) {
   if (kMode == 0u) {
-    WritePoint(base + pos, ComputeLineFitPoint(src[base + (packed & kLocalIndexMask)]));
+    output_points[base + pos] = ComputeLineFitPoint(src[base + (packed & kLocalIndexMask)]);
   } else {
     scratch_keys[base + first + pos] = packed;
   }
@@ -309,7 +300,7 @@ void main() {
       // One bump per blob.
       if (tid == 0u) atomicAdd(oversized_blobs, 1u);
       for (uint idx = tid; idx < count; idx += threads) {
-        WritePoint(base + idx, ComputeLineFitPoint(src[base + idx]));
+        output_points[base + idx] = ComputeLineFitPoint(src[base + idx]);
       }
       return;
     }
@@ -377,5 +368,6 @@ void main() {
     }
     pos += lo;
   }
-  WritePoint(base + pos, ComputeLineFitPoint(src[base + run * kLocalCap + (v & kLocalIndexMask)]));
+  output_points[base + pos] =
+      ComputeLineFitPoint(src[base + run * kLocalCap + (v & kLocalIndexMask)]);
 }

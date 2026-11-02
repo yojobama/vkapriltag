@@ -158,11 +158,11 @@ int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf, bool 
     auto t0 = Clock::now();
     detector.Detect(gray.data());
     const double c = MsSince(t0);
-    const Quads ref = quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits);
+    const Quads ref = quad_decode.Decode(detector.last_line_fit_points);
     t0 = Clock::now();
     detector.Detect(mapped);
     const double m = MsSince(t0);
-    identical = identical && SameQuads(ref, quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits));
+    identical = identical && SameQuads(ref, quad_decode.Decode(detector.last_line_fit_points));
     if (i >= 5) {
       copy_ms.push_back(c);
       import_ms.push_back(m);
@@ -300,7 +300,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
     for (size_t p = 0; p < gray.size(); ++p) gray[p] = cb.start[2 * p];
     detector.Detect(gray.data());
     const double c = MsSince(t0);
-    const Quads ref = quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits);
+    const Quads ref = quad_decode.Decode(detector.last_line_fit_points);
     t0 = Clock::now();  // zero-copy path: the GPU reads the capture buffer in place
     detector.Detect(cb.start);
     const double m = MsSince(t0);
@@ -308,7 +308,7 @@ int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int fram
       copy_ms.push_back(c);
       import_ms.push_back(m);
       points += static_cast<double>(ref.size());
-      (SameQuads(ref, quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits)) ? identical : differing)++;
+      (SameQuads(ref, quad_decode.Decode(detector.last_line_fit_points)) ? identical : differing)++;
     }
     ioctl(fd, VIDIOC_QBUF, &b);
   }

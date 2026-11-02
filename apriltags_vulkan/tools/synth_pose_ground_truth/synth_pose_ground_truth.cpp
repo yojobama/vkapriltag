@@ -395,7 +395,7 @@ int Run(int argc, char **argv) {
               SideResult vk;
               detector.Detect(frame.data);
               std::vector<apriltag_vulkan::DetectedQuad> quads =
-                  quad_decode.Decode(detector.last_line_fit_points, detector.last_quad_fits);
+                  quad_decode.Decode(detector.last_line_fit_points);
               zarray_t *ours =
                   tag_decoder.Decode(quads, frame.data, width, height, config.reversed_border);
               for (int i = 0; i < zarray_size(ours); ++i) {
