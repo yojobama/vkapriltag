@@ -99,6 +99,8 @@ bool AllowsThirdBit(const apriltag_detector_t *td) {
   apriltag_family_t *family = nullptr;
   zarray_get(td->tag_families, 0, &family);
   return family->h >= 9;
+}
+
 // The most wrong bits worth correcting in a family (at most 2, upstream's default): the largest d
 // for which a random bit pattern lands within d bits of one of the family's codes, in any of the four
 // rotations, at most 0.5% of the time. tag16h5 gets 0 (3% at one bit), tag36h11 and tag25h9 get 2.
@@ -337,9 +339,6 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     // A tag's border is black all round: reject a quad where fewer than 22 of 28 border cells (scaled
     // per family) read dark. Quads that cannot be read through the image are kept.
     if (border_precheck_ && zarray_size(td_->tag_families) == 1) {
-    // A quad whose payload shows fewer white cells than the sparsest code has (less the two cells error
-    // correction may flip) cannot decode, so skip refining it.
-    if (dark_reject_ && !reversed_border && zarray_size(td_->tag_families) == 1) {
       apriltag_family_t *family = nullptr;
       zarray_get(td_->tag_families, 0, &family);
       struct quad unrefined = quad_original;
@@ -352,6 +351,19 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       if (unrefined.H) matd_destroy(unrefined.H);
       if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
       if (read && border.dark * 28 < 22 * border.cells) {
+        finish(false, 0.0);
+        return;
+      }
+    }
+
+    // A quad whose payload shows fewer white cells than the sparsest code has (less the two cells error
+    // correction may flip) cannot decode, so skip refining it.
+    if (dark_reject_ && !reversed_border && zarray_size(td_->tag_families) == 1) {
+      struct quad unrefined = quad_original;
+      unrefined.H = nullptr;
+      unrefined.Hinv = nullptr;
+      uint64_t rcode = 0;
+      quad_sample_code(td_, &unrefined, &im, &rcode);
       if (unrefined.H) matd_destroy(unrefined.H);
       if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
       if (std::popcount(rcode) + 2 < min_white_cells_) {
@@ -407,6 +419,9 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         quad_decode_index(td_, &inner, &im, /*im_samples=*/nullptr, per_quad_[i]);
         if (inner.H) matd_destroy(inner.H);
         if (inner.Hinv) matd_destroy(inner.Hinv);
+      }
+    }
+
     // A side whose border cells read white was fitted on the quiet zone's outer edge, one cell too far
     // out (the payload still decodes through error correction). Move it in a cell, refit, and keep the
     // result if it decodes the same tag with a darker border.
@@ -461,6 +476,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         if (moved.H) matd_destroy(moved.H);
         if (moved.Hinv) matd_destroy(moved.Hinv);
       }
+    }
+
     // A third corrected bit, accepted only when the three wrong cells touch: damage such as a finger
     // or glare is coherent, a chance match is scattered.
     if (third_bit_ && td_->refine_edges && zarray_size(per_quad_[i]) == 0 && AllowsThirdBit(td_)) {
@@ -496,6 +513,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
       if (sampled.H) matd_destroy(sampled.H);
       if (sampled.Hinv) matd_destroy(sampled.Hinv);
+    }
+
     // Drop corrections beyond what the family can bear before they count as detections.
     if (family_limits_) {
       for (int j = zarray_size(per_quad_[i]) - 1; j >= 0; --j) {
