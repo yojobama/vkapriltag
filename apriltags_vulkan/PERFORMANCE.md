@@ -2454,6 +2454,18 @@ decimation 1: every refine mode finds all 1,185; the profile fit halves the medi
 0.018 px) at the same CPU-tail time (0.42 ms), and the tuned set takes 0.22 ms. At decimation 2 the base
 sends 126 quads per frame to the tail, the tuned set 33. The Pi's tail time for this case is not measured.
 
+Desktop (RX 9060 XT), all switches together (`perf/dispatch-fusion`, four 1280x720 frames including
+a 30-tag one, 200 iterations, five interleaved rounds); mean of per-frame medians, gpu / cpu / total ms.
+Decimation 1: base 0.55 / 0.35 / 0.90; adaptive floor 0.31 / 0.10 / 0.41 (-55%); plus fused arguments
+0.42; plus compaction 0.42; both 0.44; the tuned set (floor, box, profile fit, items 8 to 13) 0.45 (-50%),
+0.52 with compaction and fused arguments; the third-bit match alone +1%. Decimation 2: base 0.70; floor
+0.37 (-47%); fused arguments 0.39; compaction 0.45; the tuned set 0.45. On the 30-tag frame alone at
+decimation 1: base 0.82, floor 0.44, tuned 0.50, whose CPU tail is 0.18 ms against 0.13 for the floor
+alone because the profile fit and the extra checks run on every tag. The desktop GPU passes take 5 to
+40 us, so the changes aimed at the Mali cost a little here: fused arguments remove 2.4 us of dispatches
+but add 1.8 us to threshold_block and 8.6 us to blob_diff (the handshake's barriers), net +7 us;
+compaction adds a pass. Neither is a desktop win; both stay opt-in pending the Pi.
+
 ## 9. Measuring
 
 ```
