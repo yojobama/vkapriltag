@@ -2428,6 +2428,32 @@ the tuned set sends 3.3 (0.36 ms), peak working set 90 MB in both, GPU memory 44
 dispatches at decimation 1 with the floor: uf_merge 68.6 to 27.3 us, blob_diff 53 to 12 us, hash_group
 29 to 5 us, sort 74 to 12 us, plus 7 us for the floor pass.
 
+## 8ad. Third-bit lookup, compacted labelling, many tags
+
+Third-bit lookup (`perf/third-bit-index`): the three-bit match looked every rotation of the word up
+against all 587 codes. A code within three bits equals the word exactly in one of four disjoint bit
+blocks, so each block's bucket is checked instead. Same output on 788 corpus frames, and the match's
+cost on them falls from 0.030 to 0.019 ms per frame.
+
+Compacted labelling (`perf/sparse-compaction`, `APRILTAG_VK_SPARSE=1`): replaces the predicated skipping.
+threshold_block appends each 64x4 cell with contrast to a list (one atomic per cell), cell_args.comp turns
+the count into indirect arguments, and uf_init_scan, uf_merge, uf_count_runs and blob_diff run one
+workgroup per cell row, so flat regions launch nothing. The segment shrinks from 512 to 64 pixels, which
+the two-hop root invariant allows. Same detections as without it on 1,278 frames at decimation 1 and 2
+(one or two last-digit differences at decimation 1, which two runs without it also show), and no
+validation-layer messages over 35 runs. On the desktop it is slower (0.37 to 0.45 ms), as expected where
+the passes take 15 to 70 us; whether it pays on the Mali (where a flat frame still costs 1.0 ms) is not
+measured, because the Orange Pi was unreachable.
+
+Dispatch count: not changed. The one-workgroup kernels take about 15 us each on the Mali, so removing
+one saves about 1% of a frame, and the natural fusions need either a global atomic histogram
+(contended: about 8,000 atomics into a few bins) or a last-workgroup handshake for small gains.
+
+Many tags: 20 to 40 tags per 1280x720 frame (the new dense-tags scenario, 40 frames, 1,185 tags), desktop,
+decimation 1: every refine mode finds all 1,185; the profile fit halves the median corner error (0.036 to
+0.018 px) at the same CPU-tail time (0.42 ms), and the tuned set takes 0.22 ms. At decimation 2 the base
+sends 126 quads per frame to the tail, the tuned set 33. The Pi's tail time for this case is not measured.
+
 ## 9. Measuring
 
 ```
