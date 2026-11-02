@@ -451,7 +451,12 @@ void GpuDetector::CreatePipelines() {
 
   // 2D dispatches recover (x, y) from gl_GlobalInvocationID.xy without a divide. decimation is
   // specialization constant 3, after the workgroup size's 0-2.
-  decimate_pl_ = vk::ComputePipeline(ctx_, ShaderPath(pick("decimate", "decimate_u8")),
+  // APRILTAG_VK_BOX_DECIMATE=1 averages each block instead of copying its top-left pixel.
+  const char *box_env = std::getenv("APRILTAG_VK_BOX_DECIMATE");
+  box_decimate_ = box_env != nullptr && box_env[0] == '1' && config_.decimation > 1;
+  decimate_pl_ = vk::ComputePipeline(ctx_,
+                                     ShaderPath(box_decimate_ ? pick("decimate_box", "decimate_box_u8")
+                                                              : pick("decimate", "decimate_u8")),
                                      {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_,
                                      {config_.decimation});
   block_minmax_pl_ = vk::ComputePipeline(
@@ -471,7 +476,7 @@ void GpuDetector::CreatePipelines() {
   // One thread per 4x4 block; APRILTAG_VK_FUSED_THRESHOLD=0 keeps the separate passes.
   const char *fused_env = std::getenv("APRILTAG_VK_FUSED_THRESHOLD");
   const bool fused_threshold = u8 && !(fused_env != nullptr && fused_env[0] == '0');
-  minmax_decimate_ = fused_threshold && !alias_decimated_;
+  minmax_decimate_ = fused_threshold && !alias_decimated_ && !box_decimate_;
   threshold_block_ = fused_threshold;
   if (minmax_decimate_) {
     block_minmax_decimate_pl_ = vk::ComputePipeline(
@@ -683,7 +688,9 @@ void GpuDetector::AddImportedFrame(const uint8_t *key, vk::Buffer buffer, bool y
   frame.key = key;
   frame.decimate = vk::ComputePipeline(
       ctx_,
-      ShaderPath(yuyv ? (u8 ? "decimate_yuyv_u8" : "decimate_yuyv") : (u8 ? "decimate_u8" : "decimate")),
+      ShaderPath(yuyv ? (u8 ? "decimate_yuyv_u8" : "decimate_yuyv")
+                      : box_decimate_ ? (u8 ? "decimate_box_u8" : "decimate_box")
+                                      : (u8 ? "decimate_u8" : "decimate")),
       {buffer.get(), alias_decimated_ ? gray_buf_.get() : decimated_buf_.get()}, 8, wg2d_,
       {config_.decimation});
   frame.buffer = std::move(buffer);

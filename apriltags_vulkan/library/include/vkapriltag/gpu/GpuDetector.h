@@ -262,6 +262,7 @@ class GpuDetector {
   vk::Buffer gray_buf_, decimated_buf_;
   // True when the threshold and sort stages read gray_buf_ as the decimated image.
   bool alias_decimated_ = false;
+  bool box_decimate_ = false;  // APRILTAG_VK_BOX_DECIMATE=1: decimate by averaging each block
   vk::Buffer minmax_unfiltered_buf_, minmax_filtered_buf_;
   vk::Buffer thresholded_buf_;
   // Reused as the per-pixel label (1 + root, or 0 if too small) once labelling converges.
