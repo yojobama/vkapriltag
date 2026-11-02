@@ -280,7 +280,7 @@ constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient fal
 constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
 
 // Optional refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once).
-enum ProfileFeature : unsigned { kDropOutliers = 1u, kCoarseToFine = 2u };
+enum ProfileFeature : unsigned { kDropOutliers = 1u, kCoarseToFine = 2u, kHalfwayCrossing = 4u };
 unsigned ProfileFeatures() {
   static const unsigned features = [] {
     const char *v = std::getenv("APRILTAG_VK_PROFILE_FEATURES");
@@ -289,10 +289,26 @@ unsigned ProfileFeatures() {
   return features;
 }
 
+constexpr double kCrossingCells = 0.6;  // ramps wider than this many cells use the halfway crossing
+
+// Bilinear sample of the image at pixel-edge coordinates (x, y); false outside it.
+bool SampleAt(const image_u8_t *im, double x, double y, double *out) {
+  const float fx = static_cast<float>(x) - 0.5f, fy = static_cast<float>(y) - 0.5f;
+  const float xt = std::floor(fx), yt = std::floor(fy);
+  const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
+  if (xi < 0 || xi + 1 >= im->width || yi < 0 || yi + 1 >= im->height) return false;
+  *out = BilinearAt<float>(im, xi, yi, fx - xt, fy - yt);
+  return true;
+}
+
 // One pass: profiles within `range` pixels either side of each current side, the sides refitted and
 // intersected into new corners. Reports the mean width of the gradient lobes in *edge_width.
+// With `cell` > 0 and kHalfwayCrossing, an edge whose ramp is wider than 0.6 of a cell is placed where
+// the image crosses halfway between the white and black a half cell either side of it, which stays
+// exact for any symmetric blur under about two cells (the gradient's centre of mass does not).
 // Returns false, leaving the quad as it was, if a side's fit is degenerate.
-bool ProfilePass(float range, const image_u8_t *im, struct quad *quad, double *edge_width) {
+bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *quad,
+                 double *edge_width) {
   const int taps = 2 * static_cast<int>(range / kProfileStep) + 3;
   constexpr int kMaxTaps = 96;
   if (taps > kMaxTaps) return false;
@@ -363,7 +379,35 @@ bool ProfilePass(float range, const image_u8_t *im, struct quad *quad, double *e
       }
       width_sum += (jr - jl + 1) * kProfileStep;
       ++width_n;
-      const double n0 = -range - kProfileStep + kProfileStep * (gj / gs);
+      double cj = gj / gs;  // the edge's position, in taps
+      if (cell > 0 && (ProfileFeatures() & kHalfwayCrossing) != 0 &&
+          (jr - jl + 1) * kProfileStep > kCrossingCells * cell) {
+        const double half = 0.5 * cell;
+        for (int iter = 0; iter < 3; ++iter) {
+          const double pos = -range - kProfileStep + kProfileStep * cj;
+          double white, black;
+          if (!SampleAt(im, x0 + (pos - half) * nx, y0 + (pos - half) * ny, &white) ||
+              !SampleAt(im, x0 + (pos + half) * nx, y0 + (pos + half) * ny, &black)) {
+            break;
+          }
+          const double mid = 0.5 * (white + black);  // along +n the image goes from black to white
+          // the profile's rising crossing of `mid` nearest the current estimate
+          double best_c = -1, best_d = 1e9;
+          for (int j = std::max(0, jl - 2); j + 1 <= std::min(taps - 1, jr + 2); ++j) {
+            if (!(prof[j] <= mid && prof[j + 1] > mid)) continue;
+            const double c = j + (mid - prof[j]) / (prof[j + 1] - prof[j]);
+            if (std::fabs(c - cj) < best_d) {
+              best_d = std::fabs(c - cj);
+              best_c = c;
+            }
+          }
+          if (best_c < 0) break;
+          const bool settled = std::fabs(best_c - cj) < 1e-3;
+          cj = best_c;
+          if (settled) break;
+        }
+      }
+      const double n0 = -range - kProfileStep + kProfileStep * cj;
       bxs[used] = x0 + n0 * nx - xm;
       bys[used] = y0 + n0 * ny - ym;
       ws[used] = best;
@@ -425,28 +469,32 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
   const int quad_decimate = static_cast<int>(td->quad_decimate);
   float reach = static_cast<float>(quad_decimate + 1);
   double edge_width = 0;
-  if (!ProfilePass(reach, im, quad, &edge_width)) {
+  // The cell size in pixels, from the first family's border width; 0 when there is none.
+  double cell = 0;
+  if (zarray_size(td->tag_families) > 0) {
+    apriltag_family_t *family = nullptr;
+    zarray_get(td->tag_families, 0, &family);
+    double side = 0;
+    for (int k = 0; k < 4; ++k) {
+      side += 0.25 * std::hypot(quad->p[(k + 1) & 3][0] - quad->p[k][0], quad->p[(k + 1) & 3][1] - quad->p[k][1]);
+    }
+    cell = side / family->width_at_border;
+  }
+  if (!ProfilePass(reach, cell, im, quad, &edge_width)) {
     RefineEdgesT<double>(quad_decimate, im, quad);
     return;
   }
-  if ((ProfileFeatures() & kCoarseToFine) == 0 || zarray_size(td->tag_families) == 0) return;
+  if ((ProfileFeatures() & kCoarseToFine) == 0 || cell <= 0) return;
 
   // Narrow the window to the measured edge width (never above half a cell, so the next payload edge
   // stays out) and refit around the refined sides, while that still shrinks it.
-  apriltag_family_t *family = nullptr;
-  zarray_get(td->tag_families, 0, &family);
-  const double side = 0.25 * (std::hypot(quad->p[1][0] - quad->p[0][0], quad->p[1][1] - quad->p[0][1]) +
-                              std::hypot(quad->p[2][0] - quad->p[1][0], quad->p[2][1] - quad->p[1][1]) +
-                              std::hypot(quad->p[3][0] - quad->p[2][0], quad->p[3][1] - quad->p[2][1]) +
-                              std::hypot(quad->p[0][0] - quad->p[3][0], quad->p[0][1] - quad->p[3][1]));
-  const double cell = side / family->width_at_border;
   for (int pass = 0; pass < 3; ++pass) {
     double next = std::max(1.5, 1.25 * edge_width);
     if (cell >= 3.0) next = std::min(next, 0.45 * cell);
     if (next >= 0.9 * reach) break;
     reach = static_cast<float>(next);
     struct quad before = *quad;
-    if (!ProfilePass(reach, im, quad, &edge_width)) {
+    if (!ProfilePass(reach, cell, im, quad, &edge_width)) {
       *quad = before;
       break;
     }
