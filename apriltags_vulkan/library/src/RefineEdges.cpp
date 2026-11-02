@@ -312,6 +312,7 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
   const int taps = 2 * static_cast<int>(range / kProfileStep) + 3;
   constexpr int kMaxTaps = 96;
   if (taps > kMaxTaps) return false;
+  const bool halfway = (ProfileFeatures() & kHalfwayCrossing) != 0;
   double width_sum = 0;
   int width_n = 0;
   const int max_x = im->width - 1;
@@ -331,6 +332,7 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
     }
     const int np = std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / kProfileSpacing)));
 
+    const float fnx = static_cast<float>(nx), fny = static_cast<float>(ny);
     const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
     const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
     // The refined points of this side, relative to its midpoint, and their weights.
@@ -341,21 +343,27 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
       const double alpha = (1.0 + s) / (np + 1);
       const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
       const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
-      float prof[kMaxTaps];
-      bool all_in = true;
+      // The tap positions first (a loop the compiler can vectorise), then the loads. The positions
+      // move along a line, so the first and last taps bound every tap's pixel.
+      int xis[kMaxTaps], yis[kMaxTaps];
+      float fxs[kMaxTaps], fys[kMaxTaps];
+      const float fx0 = static_cast<float>(x0), fy0 = static_cast<float>(y0);
       for (int m = 0; m < taps; ++m) {
         const float u = -range - kProfileStep + kProfileStep * m;
-        const float x = static_cast<float>(x0) + u * static_cast<float>(nx) - 0.5f;
-        const float y = static_cast<float>(y0) + u * static_cast<float>(ny) - 0.5f;
+        const float x = fx0 + u * fnx - 0.5f;
+        const float y = fy0 + u * fny - 0.5f;
         const float xt = std::floor(x), yt = std::floor(y);
-        const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
-        if (xi < 0 || xi >= max_x || yi < 0 || yi >= max_y) {
-          all_in = false;
-          break;
-        }
-        prof[m] = BilinearAt<float>(im, xi, yi, x - xt, y - yt);
+        xis[m] = static_cast<int>(xt);
+        yis[m] = static_cast<int>(yt);
+        fxs[m] = x - xt;
+        fys[m] = y - yt;
       }
-      if (!all_in) continue;
+      if (xis[0] < 0 || xis[0] >= max_x || yis[0] < 0 || yis[0] >= max_y || xis[taps - 1] < 0 ||
+          xis[taps - 1] >= max_x || yis[taps - 1] < 0 || yis[taps - 1] >= max_y) {
+        continue;
+      }
+      float prof[kMaxTaps];
+      for (int m = 0; m < taps; ++m) prof[m] = BilinearAt<float>(im, xis[m], yis[m], fxs[m], fys[m]);
 
       // Gradient along the normal (outside brighter than inside for a normal border).
       float g[kMaxTaps];
@@ -380,7 +388,7 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
       width_sum += (jr - jl + 1) * kProfileStep;
       ++width_n;
       double cj = gj / gs;  // the edge's position, in taps
-      if (cell > 0 && (ProfileFeatures() & kHalfwayCrossing) != 0 &&
+      if (cell > 0 && halfway &&
           (jr - jl + 1) * kProfileStep > kCrossingCells * cell) {
         const double half = 0.5 * cell;
         for (int iter = 0; iter < 3; ++iter) {
