@@ -2352,6 +2352,45 @@ Decimation 1 is faster because one ranking pass replaces two merge rounds. At de
 cost is the sorting of large background blobs that used to be skipped; with a 2048-point limit and
 run it was 0.2 ms on the Mali-G610 (+10% of a frame), hence 1024 at every decimation.
 
+## 8ac. Ideas from NAPA, tried one branch each
+
+Each idea is a branch `napa/NN-*` behind its own environment variable, scored on a generated corpus
+(`tools/napa_corpus`: 23 scenarios, about 4,000 labelled frames, every pixel the mean of a 4x4 sample
+grid) and timed on the desktop (RX 9060 XT) and the Orange Pi 5 Plus. Accuracy numbers are from the
+desktop; the Pi baselines match them. `napa/combined` merges the winners.
+
+| Item | Switch | Accuracy on the corpus | Time (desktop / Pi, total) | Verdict |
+|---|---|---|---|---|
+| 01 profile fit | `REFINE=profile` | median corner error about 3x lower; worse under blur at decimation 2 | -1 to -18% / -1 to -11% | keep |
+| 02 outlier drop | `PROFILE_FEATURES=1` | halves the error with a cable across the border | within noise | keep |
+| 03 coarse to fine | `PROFILE_FEATURES=2` | almost none | +/-3% | drop |
+| 04 halfway crossing | `PROFILE_FEATURES=4` | blur error 0.146 to 0.122 px | within noise | marginal |
+| 05 clip bias | `PROFILE_FEATURES=8` | overexposed error 0.22 to 0.07 px | -2 to -8% | keep |
+| 06 grey margin | `GREY_MARGIN=1` | grey-margin recall 48 to 98% | +1 to +4% | keep |
+| 07 side one out | `SIDE_ONE_OUT=1` | never triggered on the corpus | 0 | drop |
+| 08 third bit | `THIRD_BIT=1` | obstruction recall 73 to 86%, no new false IDs | +1 to +9% | keep |
+| 09 family limits | `FAMILY_LIMITS=1` | tag16h5 false detections 1739 to 14 (d1), 779 to 3 (d2) | 0 | keep |
+| 10 border pre-check | `BORDER_PRECHECK=1` | false detections halved; range recall -0.5% at d2 | -2 to -12% | keep |
+| 11 noise guard | `NOISE_GUARD=k` | loses recall (small-tags 100 to 51 to 77%) | n/a | drop |
+| 12 box decimation | `BOX_DECIMATE=1` | blur and motion-blur error halved; recall up; tag16h5 false 779 to 189 | d2: -38 to -47% / -45 to -49% | keep, the biggest win |
+| 13 dark reject | `DARK_REJECT=1` | none lost; some false detections gone | -2 to -8% | keep |
+
+Interactions found by merging: item 8's third bit must be exempt from item 9's limit, and items 10 and 13
+must not run with item 6, because they reject the outer quad its retry starts from. With both fixed,
+all winners together (profile fit with all four features, items 6, 8, 9, 10, 13, and box decimation at
+decimation 2) give: median corner error about 0.01 px (from 0.03), tag16h5 false detections 779 to 0,
+recall up on border-occlusion (34 to 43%), obstruction (73 to 86%), grey-margin (48 to 98%), range and
+low-contrast, and no scenario lower.
+
+Box decimation drops candidates on the Pi from 85 to 6 on a 1280x720 frame, so the GPU time falls too
+(1.7 to 1.2 ms) because the unfused min/max and threshold passes are cheaper than the fused ones when
+there is less noise to label.
+
+GPU sparse pass (item 15), stage A: on the Mali at decimation 1 the pixel-scaled passes (union-find,
+run counts, blob diff) take 3.1 of 5.0 ms, so a coarse level would pay. But decimation 4 with box
+averaging, the bound on a stride-3 level, loses recall on small tags and the range sweep (small-tags
+85%, range 77%), which only a second, finer level could recover. Not implemented.
+
 ## 9. Measuring
 
 ```
