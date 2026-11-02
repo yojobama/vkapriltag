@@ -89,6 +89,8 @@ class TagDecoder {
   // APRILTAG_VK_FAMILY_LIMITS=1: reject detections that needed more corrected bits than their
   // family's codes can bear.
   bool family_limits_ = false;
+  // APRILTAG_VK_BORDER_PRECHECK=1: reject a quad whose border cells are not mostly dark before refining.
+  bool border_precheck_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;

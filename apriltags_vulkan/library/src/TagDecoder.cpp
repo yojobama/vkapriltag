@@ -155,6 +155,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] == '1';
+  if (const char *v = std::getenv("APRILTAG_VK_BORDER_PRECHECK")) border_precheck_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -315,6 +316,26 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       if (timing) st.probe_ms += lap();
       if (gate && margin < probe_margin_) {
         if (collect_probe_) slot_probe_[slot].rejected[probe_bin]++;
+        finish(false, 0.0);
+        return;
+      }
+    }
+
+    // A tag's border is black all round: reject a quad where fewer than 22 of 28 border cells (scaled
+    // per family) read dark. Quads that cannot be read through the image are kept.
+    if (border_precheck_ && zarray_size(td_->tag_families) == 1) {
+      apriltag_family_t *family = nullptr;
+      zarray_get(td_->tag_families, 0, &family);
+      struct quad unrefined = quad_original;
+      unrefined.H = nullptr;
+      unrefined.Hinv = nullptr;
+      uint64_t rcode = 0;
+      quad_sample_code(td_, &unrefined, &im, &rcode);
+      BorderLevels border;
+      const bool read = unrefined.H && ReadBorder(unrefined.H, &im, family->width_at_border, &border);
+      if (unrefined.H) matd_destroy(unrefined.H);
+      if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
+      if (read && border.dark * 28 < 22 * border.cells) {
         finish(false, 0.0);
         return;
       }
