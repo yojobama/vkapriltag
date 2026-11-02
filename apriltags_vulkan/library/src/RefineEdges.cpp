@@ -279,6 +279,16 @@ constexpr int kMaxProfilePoints = 96;
 constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient falls below this fraction
 constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
 
+// Optional refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once).
+enum ProfileFeature : unsigned { kDropOutliers = 1u };
+unsigned ProfileFeatures() {
+  static const unsigned features = [] {
+    const char *v = std::getenv("APRILTAG_VK_PROFILE_FEATURES");
+    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+  }();
+  return features;
+}
+
 void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *quad) {
   const float range = static_cast<float>(quad_decimate + 1);
   const int taps = 2 * static_cast<int>(range / kProfileStep) + 3;
@@ -306,7 +316,8 @@ void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *qu
 
     const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
     const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
-    double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    // The refined points of this side, relative to its midpoint, and their weights.
+    double bxs[kMaxProfilePoints], bys[kMaxProfilePoints], ws[kMaxProfilePoints];
     int used = 0;
 
     for (int s = 0; s < np; s++) {
@@ -350,14 +361,9 @@ void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *qu
         gj += static_cast<double>(g[j]) * j;
       }
       const double n0 = -range - kProfileStep + kProfileStep * (gj / gs);
-      const double bx = x0 + n0 * nx - xm, by = y0 + n0 * ny - ym;
-      const double w = best;
-      sw += w;
-      sx += w * bx;
-      sy += w * by;
-      sxx += w * bx * bx;
-      sxy += w * bx * by;
-      syy += w * by * by;
+      bxs[used] = x0 + n0 * nx - xm;
+      bys[used] = y0 + n0 * ny - ym;
+      ws[used] = best;
       used++;
     }
     if (used < 3) {
@@ -368,11 +374,40 @@ void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *qu
       lines[edge][3] = ny;
       continue;
     }
-    const double mx = sx / sw, my = sy / sw;
-    const double Cxx = sxx / sw - mx * mx;
-    const double Cxy = sxy / sw - mx * my;
-    const double Cyy = syy / sw - my * my;
-    const double normal_theta = 0.5 * std::atan2(-2 * Cxy, Cyy - Cxx);
+    // Weighted total-least-squares line through the points: its centre and normal angle.
+    double mx = 0, my = 0, normal_theta = 0;
+    auto fit = [&](int n) {
+      double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+      for (int i = 0; i < n; ++i) {
+        sw += ws[i];
+        sx += ws[i] * bxs[i];
+        sy += ws[i] * bys[i];
+        sxx += ws[i] * bxs[i] * bxs[i];
+        sxy += ws[i] * bxs[i] * bys[i];
+        syy += ws[i] * bys[i] * bys[i];
+      }
+      mx = sx / sw;
+      my = sy / sw;
+      const double Cxx = sxx / sw - mx * mx;
+      const double Cxy = sxy / sw - mx * my;
+      const double Cyy = syy / sw - my * my;
+      normal_theta = 0.5 * std::atan2(-2 * Cxy, Cyy - Cxx);
+    };
+    fit(used);
+    if ((ProfileFeatures() & kDropOutliers) != 0) {
+      // Drop points further than about a pixel from the line and refit, if most of them agree.
+      const double tol = 1.0 + 0.1 * range;
+      const double lx = -std::sin(normal_theta), ly = std::cos(normal_theta);  // the line's direction
+      int kept = 0;
+      for (int i = 0; i < used; ++i) {
+        if (std::fabs((bxs[i] - mx) * -ly + (bys[i] - my) * lx) > tol) continue;
+        bxs[kept] = bxs[i];
+        bys[kept] = bys[i];
+        ws[kept] = ws[i];
+        ++kept;
+      }
+      if (kept < used && kept >= 3 && 2 * kept >= used) fit(kept);
+    }
     lines[edge][0] = xm + mx;
     lines[edge][1] = ym + my;
     lines[edge][2] = std::cos(normal_theta);
