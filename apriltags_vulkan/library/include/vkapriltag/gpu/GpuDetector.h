@@ -41,6 +41,14 @@ struct DetectorConfig {
   // Env override: APRILTAG_VK_MIN_TAG_PX=<n>
   uint32_t min_tag_pixels = 0;
 
+  // Largest tag side in full-resolution pixels; 0 disables. Otherwise max_cluster_pixels is lowered
+  // to twice the boundary-point count of a square tag of that size.
+  uint32_t max_tag_pixels = 0;
+
+  // Averages each decimation block instead of copying its top-left pixel (decimation above 1).
+  // Env override: APRILTAG_VK_BOX_DECIMATE=1
+  bool box_decimate = false;
+
   // Bounding-box aspect ratio cap (max(w,h)/min(w,h)) applied in select_blobs.comp; 0 disables.
   float aspect_max = 8.0f;
 

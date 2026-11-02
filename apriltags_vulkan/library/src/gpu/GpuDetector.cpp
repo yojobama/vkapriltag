@@ -162,6 +162,10 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     const uint32_t derived_min_cluster = 4u * (config_.min_tag_pixels / config_.decimation);
     config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, derived_min_cluster);
   }
+  if (config_.max_tag_pixels > 0) {
+    const uint32_t derived_max_cluster = 8u * std::max(1u, config_.max_tag_pixels / config_.decimation);
+    config_.max_cluster_pixels = std::min(config_.max_cluster_pixels, derived_max_cluster);
+  }
   // Floors min_cluster_pixels at 2, as the ambiguous-pixel paths in uf_final.comp and
   // blob_diff.comp require.
   config_.min_cluster_pixels = std::max(config_.min_cluster_pixels, 2u);
@@ -458,7 +462,7 @@ void GpuDetector::CreatePipelines() {
   // specialization constant 3, after the workgroup size's 0-2.
   // APRILTAG_VK_BOX_DECIMATE=1 averages each block instead of copying its top-left pixel.
   const char *box_env = std::getenv("APRILTAG_VK_BOX_DECIMATE");
-  box_decimate_ = box_env != nullptr && box_env[0] == '1' && config_.decimation > 1;
+  box_decimate_ = (config_.box_decimate || (box_env != nullptr && box_env[0] == '1')) && config_.decimation > 1;
   decimate_pl_ = vk::ComputePipeline(ctx_,
                                      ShaderPath(box_decimate_ ? pick("decimate_box", "decimate_box_u8")
                                                               : pick("decimate", "decimate_u8")),

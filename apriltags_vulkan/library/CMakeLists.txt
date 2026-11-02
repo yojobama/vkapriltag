@@ -124,6 +124,7 @@ add_library(vkapriltag STATIC
   src/vk/QueryPool.cpp
   src/gpu/GpuDetector.cpp
   src/gpu/QuadDecode.cpp
+  src/gpu/MultiLevelDetector.cpp
   src/apriltag_family.cpp
   src/TagDecoder.cpp
   src/RefineEdges.cpp
