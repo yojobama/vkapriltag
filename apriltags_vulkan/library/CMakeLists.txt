@@ -43,6 +43,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
 set(SHADER_SOURCES
   shaders/decimate.comp
   shaders/decimate_u8.comp
+  shaders/decimate_box.comp
+  shaders/decimate_box_u8.comp
   shaders/decimate_yuyv.comp
   shaders/decimate_yuyv_u8.comp
   shaders/block_minmax.comp
