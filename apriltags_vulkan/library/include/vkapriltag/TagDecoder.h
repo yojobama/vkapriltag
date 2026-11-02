@@ -80,6 +80,8 @@ class TagDecoder {
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
+  // APRILTAG_VK_BORDER_PRECHECK=1: reject a quad whose border cells are not mostly dark before refining.
+  bool border_precheck_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;
