@@ -2396,9 +2396,16 @@ blocks, 54 us on the Mali), and the fused threshold reads it from a buffer. With
 recall is unchanged on every scenario at decimation 1 and 2 (k=2.5 loses underexposed recall, 100 to
 92%), tag16h5 false detections fall 1739 to 103, and the output with the switch off is identical to the
 base. Pi total time at decimation 1 falls from 6.3 to 2.3 ms, and at decimation 2 from 2.7 to 1.4 ms
-(1.4 ms also with box decimation). Strided levels and size bands were not built: after the floor the
-pixel-scaled passes are about 1 ms of the 1.7 ms GPU time at decimation 1, and a coarser level loses
-small tags (decimation 4 with box averaging: small-tags 85%, range 77%).
+(1.4 ms also with box decimation). Then built and measured, both losing on the Mali. (1) Predicated skipping (`APRILTAG_VK_SPARSE=1`): the
+labelling passes return at once for a workgroup over flat 64x4 cells. Output is identical, but each
+pass gets 40 to 180 us slower, total 2.2 to 2.4 ms at decimation 1, because a skipped workgroup still
+costs a launch and the flag reads add to it. (2) `MultiLevelDetector`: one pipeline per level, coarsest
+first, each with a band of tag sides, quads merged and de-duplicated. Total time on the Pi is 2.4 ms
+for box decimation 4 plus decimation 1, and 3.4 ms with a decimation 2 level between, against 1.7 to
+2.2 ms for decimation 1 alone, and recall is lower (low-contrast 98 to 84%, grey-margin 88 to 22%,
+range 100 to 95%) because the coarse level misses low-contrast tags and the bands leave gaps. Each level
+repeats the whole frame's fixed cost, so a level only pays if it is restricted to a region, which needs
+compacted indirect dispatch (not built). Use the adaptive floor with decimation 1 or 2 instead.
 
 ## 9. Measuring
 
