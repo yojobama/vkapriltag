@@ -86,6 +86,9 @@ class TagDecoder {
   bool side_one_out_ = false;
   // APRILTAG_VK_THIRD_BIT=1: accept a third corrected bit when the three wrong cells touch.
   bool third_bit_ = false;
+  // APRILTAG_VK_FAMILY_LIMITS=1: reject detections that needed more corrected bits than their
+  // family's codes can bear.
+  bool family_limits_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;

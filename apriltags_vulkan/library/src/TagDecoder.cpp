@@ -97,6 +97,21 @@ bool AllowsThirdBit(const apriltag_detector_t *td) {
   apriltag_family_t *family = nullptr;
   zarray_get(td->tag_families, 0, &family);
   return family->h >= 9;
+// The most wrong bits worth correcting in a family (at most 2, upstream's default): the largest d
+// for which a random bit pattern lands within d bits of one of the family's codes, in any of the four
+// rotations, at most 0.5% of the time. tag16h5 gets 0 (3% at one bit), tag36h11 and tag25h9 get 2.
+int MaxCorrectedBits(const apriltag_family_t *f) {
+  const double patterns = std::ldexp(1.0, static_cast<int>(f->nbits));
+  int best = 0;
+  double ball = 1.0;  // the number of patterns within d bits of a code
+  double choose = 1.0;
+  for (int d = 1; d <= 2; ++d) {
+    choose = choose * (static_cast<double>(f->nbits) - d + 1) / d;
+    ball += choose;
+    if (4.0 * f->ncodes * ball / patterns > 0.005) break;
+    best = d;
+  }
+  return best;
 }
 
 double NsToMs(prof::Ns ns) { return static_cast<double>(ns) / 1.0e6; }
@@ -139,6 +154,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] == '1';
+  if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -440,6 +456,16 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
       if (sampled.H) matd_destroy(sampled.H);
       if (sampled.Hinv) matd_destroy(sampled.Hinv);
+    // Drop corrections beyond what the family can bear before they count as detections.
+    if (family_limits_) {
+      for (int j = zarray_size(per_quad_[i]) - 1; j >= 0; --j) {
+        apriltag_detection_t *det = nullptr;
+        zarray_get(per_quad_[i], j, &det);
+        if (det->hamming > MaxCorrectedBits(det->family)) {
+          apriltag_detection_destroy(det);
+          zarray_remove_index(per_quad_[i], j, 0);
+        }
+      }
     }
 
     // Free the homographies allocated on the stack-local quad.
