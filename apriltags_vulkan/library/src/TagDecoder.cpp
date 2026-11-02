@@ -336,9 +336,10 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
     }
 
+    // (Skipped with grey_margin_, whose retry needs the quads these checks reject.)
     // A tag's border is black all round: reject a quad where fewer than 22 of 28 border cells (scaled
     // per family) read dark. Quads that cannot be read through the image are kept.
-    if (border_precheck_ && zarray_size(td_->tag_families) == 1) {
+    if (border_precheck_ && !grey_margin_ && zarray_size(td_->tag_families) == 1) {
       apriltag_family_t *family = nullptr;
       zarray_get(td_->tag_families, 0, &family);
       struct quad unrefined = quad_original;
@@ -358,7 +359,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
 
     // A quad whose payload shows fewer white cells than the sparsest code has (less the two cells error
     // correction may flip) cannot decode, so skip refining it.
-    if (dark_reject_ && !reversed_border && zarray_size(td_->tag_families) == 1) {
+    if (dark_reject_ && !grey_margin_ && !reversed_border && zarray_size(td_->tag_families) == 1) {
       struct quad unrefined = quad_original;
       unrefined.H = nullptr;
       unrefined.Hinv = nullptr;
@@ -520,7 +521,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       for (int j = zarray_size(per_quad_[i]) - 1; j >= 0; --j) {
         apriltag_detection_t *det = nullptr;
         zarray_get(per_quad_[i], j, &det);
-        if (det->hamming > MaxCorrectedBits(det->family)) {
+        // the third-bit match is the deliberate exception to the family limit
+        if (det->hamming > MaxCorrectedBits(det->family) && !(third_bit_ && det->hamming == 3)) {
           apriltag_detection_destroy(det);
           zarray_remove_index(per_quad_[i], j, 0);
         }
