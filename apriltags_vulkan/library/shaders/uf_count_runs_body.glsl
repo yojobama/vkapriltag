@@ -15,11 +15,12 @@ layout(local_size_x_id = 0, local_size_x = 256) in;
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
 layout(std430, binding = 2) buffer BlobSize { uint blob_size[]; };
 
-// Non-zero: a workgroup over flat cells returns at once (sparse_skip.glsl).
+// Non-zero: workgroups are dispatched over the listed cells, four (one per row) of 16 threads each
+// (cell_list.glsl).
 layout(constant_id = 3) const uint kSparse = 0u;
 
-#define ACTIVE_CELLS_BINDING 3
-#include "sparse_skip.glsl"
+#define CELL_LIST_BINDING 3
+#include "cell_list.glsl"
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -33,11 +34,12 @@ layout(push_constant) uniform PushConstants {
 void main() {
   uint x0 = gl_GlobalInvocationID.x * 4u;
   uint y = gl_GlobalInvocationID.y;
-  if (x0 >= pc.width || y >= pc.height) return;
   if (kSparse != 0u) {
-    uint first = gl_WorkGroupID.x * gl_WorkGroupSize.x * 4u;
-    if (CellsFlat(pc.width, first, min(first + gl_WorkGroupSize.x * 4u, pc.width) - 1u, y, y)) return;
+    uint x_first;
+    CellOfGroup(gl_WorkGroupID.x, pc.width, x_first, y);
+    x0 = x_first + gl_LocalInvocationID.x * 4u;
   }
+  if (x0 >= pc.width || y >= pc.height) return;
   uint row = y * pc.width;
   uint x_end = min(x0 + 4u, pc.width);
 #ifdef THRESHOLDED_WORD

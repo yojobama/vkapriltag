@@ -325,6 +325,7 @@ void GpuDetector::CreateBuffers() {
   minmax_filtered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   contrast_floor_buf_ = ssbo(16);
   active_cells_buf_ = ssbo(VkDeviceSize((block_width_ + 15u) / 16u) * block_height_ * 4);
+  cell_list_buf_ = ssbo(VkDeviceSize(1 + (block_width_ + 15u) / 16u * block_height_) * 4);
   thresholded_buf_ =
       ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
 
@@ -421,6 +422,12 @@ void GpuDetector::CreateBuffers() {
                  vk::MemoryKind::DeviceLocal);
     device_bytes_ += b.size();
     blob_args_buf_ = std::move(b);
+  }
+  {
+    // The labelling passes' arguments over the listed cells (cell_args.comp).
+    vk::Buffer b(ctx_, 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, vk::MemoryKind::DeviceLocal);
+    device_bytes_ += b.size();
+    cell_args_buf_ = std::move(b);
   }
 
   // Readback staging starts at a fixed size and grows on demand.
@@ -519,8 +526,8 @@ void GpuDetector::CreatePipelines() {
   if (const char *v = std::getenv("APRILTAG_VK_COUNT_RUNS")) {
     count_runs_ = uf_init_scan_ && v[0] != '0';
   }
-  // APRILTAG_VK_SPARSE=1 skips workgroups of the labelling passes that lie over flat cells; it needs
-  // the fused threshold, uf_init_scan and uf_count_runs.
+  // APRILTAG_VK_SPARSE=1 dispatches the labelling and boundary passes over only the cells with
+  // contrast; it needs the fused threshold, uf_init_scan and uf_count_runs.
   const char *sparse_env = std::getenv("APRILTAG_VK_SPARSE");
   sparse_ = threshold_block_ && uf_init_scan_ && count_runs_ && sparse_env != nullptr &&
             sparse_env[0] == '1';
@@ -528,8 +535,13 @@ void GpuDetector::CreatePipelines() {
     threshold_block_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath("threshold_block_u8"),
         {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get(),
-         contrast_floor_buf_.get(), active_cells_buf_.get()},
+         contrast_floor_buf_.get(), active_cells_buf_.get(), cell_list_buf_.get()},
         20, wg2d_, {adaptive_floor_ ? 1u : 0u, sparse_ ? 1u : 0u});
+    if (sparse_) {
+      cell_args_pl_ = vk::ComputePipeline(ctx_, ShaderPath("cell_args"),
+                                          {cell_list_buf_.get(), cell_args_buf_.get()}, 0,
+                                          vk::WorkgroupSize{1, 1, 1});
+    }
     if (adaptive_floor_) {
       noise_floor_pl_ = vk::ComputePipeline(
           ctx_, ShaderPath("noise_floor"),
@@ -540,14 +552,14 @@ void GpuDetector::CreatePipelines() {
   if (uf_init_scan_) {
     uf_init_scan_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath(pick("uf_init_scan", "uf_init_scan_u8")),
-        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), active_cells_buf_.get()},
-        12, vk::WorkgroupSize{wg1d_.x, 1, 1}, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
+        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), cell_list_buf_.get()},
+        12, vk::WorkgroupSize{sparse_ ? 16u : wg1d_.x, 1, 1}, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
   }
   if (count_runs_) {
     uf_count_runs_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath(pick("uf_count_runs", "uf_count_runs_u8")),
-        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), active_cells_buf_.get()},
-        16, vk::WorkgroupSize{wg1d_.x, 1, 1}, {sparse_ ? 1u : 0u});
+        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), cell_list_buf_.get()},
+        16, vk::WorkgroupSize{sparse_ ? 16u : wg1d_.x, 1, 1}, {sparse_ ? 1u : 0u});
   }
   // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
   // APRILTAG_VK_FIND_MODE overrides.
@@ -570,11 +582,12 @@ void GpuDetector::CreatePipelines() {
   }
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(merge_x4_ ? "uf_merge_x4_u8" : pick("uf_merge", "uf_merge_u8")),
-      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get(), active_cells_buf_.get()}, 16,
-      vk::WorkgroupSize{wg1d_.x, 1, 1}, {find_mode, merge_flag_mode, sparse_ ? 1u : 0u});
+      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get(), cell_list_buf_.get()}, 16,
+      vk::WorkgroupSize{sparse_ ? (merge_x4_ ? 16u : 64u) : wg1d_.x, 1, 1},
+      {find_mode, merge_flag_mode, sparse_ ? 1u : 0u});
   // Rows merged in bands of this many (a power of two) before the band boundaries, on discrete GPUs;
   // 0 is one pass. APRILTAG_VK_MERGE_BAND overrides.
-  merge_band_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 0u : 8u;
+  merge_band_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || sparse_ ? 0u : 8u;
   if (const char *v = std::getenv("APRILTAG_VK_MERGE_BAND")) {
     const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
     merge_band_ = wanted >= 2u ? PrevPow2(wanted) : 0u;
@@ -599,8 +612,8 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
        qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get(),
-       active_cells_buf_.get()},
-      20, wg2d_, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
+       cell_list_buf_.get()},
+      20, sparse_ ? vk::WorkgroupSize{16, 4, 1} : wg2d_, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
 
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
@@ -760,19 +773,32 @@ struct GpuDetector::FrameStart {
 void GpuDetector::RecordInitScan(VkCommandBuffer cmd) {
   struct { uint32_t dw, dh, min_blob; } pc{decimated_width_, decimated_height_,
                                           config_.min_cluster_pixels};
+  if (sparse_) {
+    uf_init_scan_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc);
+    return;
+  }
   uf_init_scan_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
 }
 
 void GpuDetector::RecordCountRuns(VkCommandBuffer cmd) {
   // The segment is uf_init_scan's: 4 pixels per thread of its workgroup.
   struct { uint32_t dw, dh, min_blob, segment; } pc{decimated_width_, decimated_height_,
-                                                    config_.min_cluster_pixels, 4u * wg1d_.x};
+                                                    config_.min_cluster_pixels,
+                                                    sparse_ ? 64u : 4u * wg1d_.x};
+  if (sparse_) {
+    uf_count_runs_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc);
+    return;
+  }
   uf_count_runs_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
 }
 
 void GpuDetector::RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier) {
   struct { uint32_t dw, dh, band_mask, band_phase; } pc{decimated_width_, decimated_height_, 0u, 0u};
   const uint32_t columns = merge_x4_ ? decimated_width_ / 4u : decimated_width_;
+  if (sparse_) {
+    uf_merge_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc, barrier);
+    return;
+  }
   if (merge_band_ == 0u) {
     uf_merge_pl_.Dispatch2D(cmd, columns, decimated_height_, &pc, barrier);
     return;
@@ -851,6 +877,10 @@ void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *impo
       noise_floor_pl_.DispatchRaw(cmd, 1, 1, 1, &floor_pc);
     }
     threshold_block_pl_.Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
+    if (sparse_) {
+      cell_args_pl_.DispatchRaw(cmd, 1, 1, 1, nullptr);
+      vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+    }
     return;
   }
   struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
@@ -879,7 +909,10 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
-  if (sparse_) active_cells_buf_.FillZero(cmd);
+  if (sparse_) {
+    active_cells_buf_.FillZero(cmd);
+    cell_list_buf_.FillZeroRange(cmd, 0, 4);
+  }
   // uf_init_scan writes every run piece's entry for uf_count_runs, so the fill is needed only without
   // it.
   if (!count_runs_) blob_size_buf_.FillZero(cmd);
@@ -964,8 +997,13 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
       decimated_width_, decimated_height_, qbp_capacity_, speculative && uf_verify_ ? 1u : 0u,
       config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
-  blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
-                           BarrierKind::ComputeAndTransfer);
+  if (sparse_) {
+    blob_diff_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &blobdiff_pc,
+                                   BarrierKind::ComputeAndTransfer);
+  } else {
+    blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
+                             BarrierKind::ComputeAndTransfer);
+  }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
@@ -1487,7 +1525,10 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
-  if (sparse_) active_cells_buf_.FillZero(cmd);
+  if (sparse_) {
+    active_cells_buf_.FillZero(cmd);
+    cell_list_buf_.FillZeroRange(cmd, 0, 4);
+  }
   if (!count_runs_) blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
   blob_cursor_buf_.FillZero(cmd);
@@ -1596,8 +1637,13 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
       decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u,
       config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
-  blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
-                           BarrierKind::ComputeAndTransfer);
+  if (sparse_) {
+    blob_diff_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &blobdiff_pc,
+                                   BarrierKind::ComputeAndTransfer);
+  } else {
+    blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
+                             BarrierKind::ComputeAndTransfer);
+  }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);

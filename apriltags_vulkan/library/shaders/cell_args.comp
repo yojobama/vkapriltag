@@ -1,0 +1,13 @@
+#version 450
+// Writes the dispatch arguments for the labelling passes over the cells threshold_block_u8.comp
+// listed: four workgroups per cell (one per pixel row of its 64 x 4 pixels).
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer CellList { uint cell_count; };
+layout(std430, binding = 1) writeonly buffer IndirectArgs { uint args[]; };
+
+void main() {
+  args[0] = 4u * cell_count;
+  args[1] = 1u;
+  args[2] = 1u;
+}

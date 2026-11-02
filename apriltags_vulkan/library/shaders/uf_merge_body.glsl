@@ -88,11 +88,12 @@ bool doUnion(uint a, uint b) {
 //   1 = read-guarded global atomicOr per pixel, with no shared memory or barriers.
 // Set by GpuDetector::CreatePipelines from ctx_.caps().unified_memory.
 layout(constant_id = 4) const uint kMergeFlagMode = 0u;
-// Non-zero: a workgroup over flat cells returns at once (sparse_skip.glsl).
+// Non-zero: workgroups are dispatched over the listed cells, four (one per row) of 64 pixels each
+// (cell_list.glsl).
 layout(constant_id = 5) const uint kSparse = 0u;
 
-#define ACTIVE_CELLS_BINDING 3
-#include "sparse_skip.glsl"
+#define CELL_LIST_BINDING 3
+#include "cell_list.glsl"
 
 void main() {
   uint x = gl_GlobalInvocationID.x;
@@ -107,16 +108,14 @@ void main() {
   }
 
   if (kSparse != 0u) {
+    uint x_first;
+    CellOfGroup(gl_WorkGroupID.x, pc.width, x_first, y);
+    if (y >= pc.height) return;
 #ifdef THRESHOLDED_WORD
-    uint per_thread = 4u;
+    x = x_first / 4u + gl_LocalInvocationID.x;
 #else
-    uint per_thread = 1u;
+    x = x_first + gl_LocalInvocationID.x;
 #endif
-    uint first = gl_WorkGroupID.x * gl_WorkGroupSize.x * per_thread;
-    if (y >= pc.height || first >= pc.width ||
-        CellsFlat(pc.width, first, min(first + gl_WorkGroupSize.x * per_thread, pc.width) - 1u, y, y)) {
-      return;
-    }
   }
 
   if (kMergeFlagMode == 0u) {

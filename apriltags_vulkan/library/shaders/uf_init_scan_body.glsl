@@ -12,7 +12,8 @@
 
 layout(local_size_x_id = 0, local_size_x = 128) in;
 layout(constant_id = 3) const uint kPieceLengths = 0u;
-// Non-zero: a workgroup over flat cells returns at once (sparse_skip.glsl).
+// Non-zero: workgroups are dispatched over the listed cells, four (one per row) of 16 threads each
+// (cell_list.glsl), so the segment is the cell's 64 pixels.
 layout(constant_id = 4) const uint kSparse = 0u;
 
 layout(std430, binding = 0) writeonly buffer Parent { uint parent[]; };
@@ -20,8 +21,8 @@ layout(std430, binding = 0) writeonly buffer Parent { uint parent[]; };
 layout(std430, binding = 0) writeonly buffer Parent4 { uvec4 parent4[]; };
 layout(std430, binding = 2) writeonly buffer BlobSize { uint blob_size[]; };
 
-#define ACTIVE_CELLS_BINDING 3
-#include "sparse_skip.glsl"
+#define CELL_LIST_BINDING 3
+#include "cell_list.glsl"
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -34,13 +35,13 @@ layout(push_constant) uniform PushConstants {
 shared uint sg_last[64];
 
 void main() {
-  if (kSparse != 0u) {
-    uint first = gl_WorkGroupID.x * gl_WorkGroupSize.x * 4u;
-    uint y_row = gl_GlobalInvocationID.y;
-    if (CellsFlat(pc.width, first, min(first + gl_WorkGroupSize.x * 4u, pc.width) - 1u, y_row, y_row)) return;
-  }
-  uint x0 = gl_GlobalInvocationID.x * 4u;
+  uint seg_first = gl_WorkGroupID.x * gl_WorkGroupSize.x * 4u;
   uint y = gl_GlobalInvocationID.y;
+  if (kSparse != 0u) {
+    CellOfGroup(gl_WorkGroupID.x, pc.width, seg_first, y);
+    if (y >= pc.height) return;
+  }
+  uint x0 = seg_first + gl_LocalInvocationID.x * 4u;
   uint row = y * pc.width;
   bool in_row = x0 < pc.width;
   uint x_end = min(x0 + 4u, pc.width);
@@ -82,7 +83,6 @@ void main() {
   if (!in_row) return;
 
   // Pixel 0 of a row always starts a run, so seg_left is used only for segments after the first.
-  uint seg_first = gl_WorkGroupID.x * gl_WorkGroupSize.x * 4u;
   uint seg_left = row + seg_first - 1u;
   uint seg_end = seg_first + gl_WorkGroupSize.x * 4u;
   for (uint k = 0u; k < 4u && kPieceLengths != 0u; ++k) {

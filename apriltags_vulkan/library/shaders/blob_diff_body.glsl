@@ -11,7 +11,8 @@ layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y
 // Non-zero when parent[] points every pixel at a run start that points at its root
 // (uf_count_runs.comp) rather than at the root itself.
 layout(constant_id = 3) const uint kTwoHop = 0u;
-// Non-zero: a workgroup over flat cells returns at once (sparse_skip.glsl).
+// Non-zero: workgroups of 16 x 4 threads are dispatched over the listed cells, four per cell
+// (cell_list.glsl), each covering 16 pixels of the cell's 4 rows.
 layout(constant_id = 4) const uint kSparse = 0u;
 
 layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
@@ -22,8 +23,8 @@ layout(std430, binding = 3) writeonly buffer Keys { uvec2 keys[]; };
 layout(std430, binding = 4) readonly buffer Changed { uint changed_flag; };
 layout(std430, binding = 5) readonly buffer BlobSize { uint blob_size[]; };
 
-#define ACTIVE_CELLS_BINDING 7
-#include "sparse_skip.glsl"
+#define CELL_LIST_BINDING 7
+#include "cell_list.glsl"
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -58,23 +59,16 @@ void put(uint pos, uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
 
 void main() {
   if (pc.honour_changed_flag != 0u && changed_flag != 0u) return;
-  uint iw = pc.width - 2u;
-  uint ih = pc.height - 2u;
-  uint ox = gl_GlobalInvocationID.x;
-  uint oy = gl_GlobalInvocationID.y;
-  if (ox >= iw || oy >= ih) return;
+  uint x = gl_GlobalInvocationID.x + 1u;
+  uint y = gl_GlobalInvocationID.y + 1u;
   if (kSparse != 0u) {
-    // This workgroup's interior pixels, shifted by one into the image.
-    uint x_first = gl_WorkGroupID.x * gl_WorkGroupSize.x + 1u;
-    uint y_first = gl_WorkGroupID.y * gl_WorkGroupSize.y + 1u;
-    if (CellsFlat(pc.width, x_first, min(x_first + gl_WorkGroupSize.x, pc.width) - 1u, y_first,
-                  min(y_first + gl_WorkGroupSize.y, pc.height) - 1u)) {
-      return;
-    }
+    // Four workgroups per cell, each 16 pixels wide; the cell's four rows are the local y.
+    uint x_first, y_row;
+    CellOfGroup(gl_WorkGroupID.x & ~3u, pc.width, x_first, y_row);
+    x = x_first + (gl_WorkGroupID.x & 3u) * 16u + gl_LocalInvocationID.x;
+    y = y_row + gl_LocalInvocationID.y;
   }
-
-  uint x = ox + 1u;
-  uint y = oy + 1u;
+  if (x < 1u || y < 1u || x + 1u >= pc.width || y + 1u >= pc.height) return;
 
   uint idx = x + y * pc.width;
   uint c0 = CodeAt(idx);
