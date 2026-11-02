@@ -80,6 +80,9 @@ class TagDecoder {
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
+  // APRILTAG_VK_FAMILY_LIMITS=1: reject detections that needed more corrected bits than their
+  // family's codes can bear.
+  bool family_limits_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;
