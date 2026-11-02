@@ -231,6 +231,7 @@ SCENARIOS = {
     "underexposed": {"tags": (1, 3), "bg": "plain", "gain": (0.15, 0.35), "noise": (3, 6)},
     "overexposed": {"tags": (1, 3), "bg": "plain", "gain": (1.3, 1.8)},
     "jpeg": {"tags": (1, 3), "bg": "natural", "jpeg": (25, 70)},
+    "grey-margin": {"tags": (1, 3), "bg": "plain", "grey": True},
     "border-occlusion": {"tags": (1, 2), "bg": "plain", "cross": True},
     "busy-background": {"tags": (1, 3), "bg": "clutter"},
     "frame-edge": {"tags": (1, 2), "bg": "plain", "edge": True},
@@ -251,6 +252,9 @@ def render_frame(fam, cfg, w, h, rng, size_override=None, obstruct=None, light_n
     else:
         bw = (float(rng.uniform(10, 50)), float(rng.uniform(190, 245)))
     base = float(rng.uniform(100, 200))
+    if cfg.get("grey"):  # a grey quiet zone on a bright wall: the margin is darker than its surroundings
+        base = float(rng.uniform(225, 250))
+        bw = (float(rng.uniform(10, 40)), float(rng.uniform(100, 140)))
     if cfg.get("dark"):
         base = float(rng.uniform(15, 90))
     img = background(rng, h, w, cfg.get("bg", "plain"), base)
