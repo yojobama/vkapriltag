@@ -2466,6 +2466,32 @@ alone because the profile fit and the extra checks run on every tag. The desktop
 but add 1.8 us to threshold_block and 8.6 us to blob_diff (the handshake's barriers), net +7 us;
 compaction adds a pass. Neither is a desktop win; both stay opt-in pending the Pi.
 
+Orange Pi 5 Plus (Mali-G610; the board was reflashed, so every tool was reinstalled and the corpus copied),
+`perf/dispatch-fusion`, four 1280x720 frames including the 30-tag one, 150 iterations, four interleaved rounds
+twice, governors pinned and LumenVision stopped, then restored. Total ms against the base (two runs, in
+that order). Decimation 1: base 6.2 and 6.8; adaptive floor 2.12 and 2.22 (-66%); floor plus compaction 1.87
+and 2.00 (-70%); floor plus fused arguments 2.24 and 2.30 (worse than the floor alone); floor with both
+1.95 and 2.01; the tuned set 2.18 and 2.33; tuned with both 1.97 and 2.09; tuned without the floor 6.0 and
+6.4 (so the floor is what matters); box decimation alone no change. Decimation 2: base 4.6 and 5.8; floor
+1.38 and 1.45 (-70 to -75%); floor plus compaction 1.34 and 1.27 (-71 to -78%); floor plus fused
+arguments 1.44 and 1.42; tuned 1.53 and 1.88. Compaction therefore pays on the Mali (the GPU time at
+decimation 1 falls from 1.86-1.93 to 1.60-1.68 ms, about 12%), fused arguments do not (+0.05 to
++0.12 ms), and the CPU tail at decimation 2 varies a lot between runs (the tuned set on the 30-tag frame
+took 2.0 and 3.3 ms), so its totals carry about 0.3 ms of noise. The GPU clock was already at 1 GHz
+under the performance governor and held there (load 56 to 72%, 64 to 70 C, no throttling).
+
+Checks on the Pi: the Khronos validation layer with synchronisation validation over 36 runs on the Mali
+(both decimations, compaction, fused arguments, the unconverged rerun, no subgroups, unfused submits,
+level setups) gave no messages and its best-practices control reported 22; AddressSanitizer with
+UndefinedBehaviourSanitizer (32 runs) and ThreadSanitizer (32 runs) gave none.
+
+Pi profile of the 30-tag frame (perf stat, 400 iterations; instructions at decimation 1 and 2): base
+4.96 G and 6.39 G, floor 1.80 G and 2.01 G, tuned with compaction 2.77 G and 3.86 G, with a 1 to 2%
+cache-miss rate. perf record at decimation 2: the base spends 68% of its time in the exact refine; the
+tuned set spends 57% in the profile fit's ProfilePass (the next thing to optimise), 11% in quad_decode.
+Peak resident memory is 223 MB at decimation 1 and 110 MB at decimation 2 for the base and the tuned set
+alike, and the heap peaks near 5.6 MB.
+
 ## 9. Measuring
 
 ```
