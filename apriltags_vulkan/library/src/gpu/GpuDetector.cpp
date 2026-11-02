@@ -325,7 +325,7 @@ void GpuDetector::CreateBuffers() {
   minmax_filtered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   contrast_floor_buf_ = ssbo(16);
   active_cells_buf_ = ssbo(VkDeviceSize((block_width_ + 15u) / 16u) * block_height_ * 4);
-  cell_list_buf_ = ssbo(VkDeviceSize(2 + (block_width_ + 15u) / 16u * block_height_) * 4);
+  cell_list_buf_ = ssbo(VkDeviceSize(1 + (block_width_ + 15u) / 16u * block_height_) * 4);
   thresholded_buf_ =
       ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
 
@@ -343,7 +343,7 @@ void GpuDetector::CreateBuffers() {
 
   // QBPoint is packed into one uint32 on the GPU (see common.glsl); there is no host mirror.
   qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(uint32_t));
-  qbp_counter_buf_ = ssbo(8);  // the count, then blob_diff's finished-workgroup count
+  qbp_counter_buf_ = ssbo(4);
   // Sized to the point capacity; one interleaved (rep0, rep1) uvec2 key per point.
   qbp_keys_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 8);
 
@@ -397,7 +397,7 @@ void GpuDetector::CreateBuffers() {
   slot_dense_buf_ = ssbo(VkDeviceSize(hash_table_size_) * 4);
   point_slot_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 4);
   blob_cursor_buf_ = ssbo(VkDeviceSize(std::max(config_.max_blobs, 1u)) * 4);
-  raw_blob_counter_buf_ = ssbo(8);  // the count, then hash_group's finished-workgroup count
+  raw_blob_counter_buf_ = ssbo(4);
   hash_drop_counter_buf_ = ssbo(4);
   oversized_sort_counter_buf_ = ssbo(4);
   {
@@ -531,18 +531,12 @@ void GpuDetector::CreatePipelines() {
   const char *sparse_env = std::getenv("APRILTAG_VK_SPARSE");
   sparse_ = threshold_block_ && uf_init_scan_ && count_runs_ && sparse_env != nullptr &&
             sparse_env[0] == '1';
-  // APRILTAG_VK_FUSE_ARGS=1 has the last workgroup of threshold_block, blob_diff and hash_group write
-  // the next pass's dispatch arguments, in place of one-workgroup dispatches.
-  const char *fuse_env = std::getenv("APRILTAG_VK_FUSE_ARGS");
-  fuse_args_ = fuse_env != nullptr && fuse_env[0] == '1';
   if (threshold_block_) {
     threshold_block_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath("threshold_block_u8"),
         {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get(),
-         contrast_floor_buf_.get(), active_cells_buf_.get(), cell_list_buf_.get(),
-         cell_args_buf_.get()},
-        20, wg2d_,
-        {adaptive_floor_ ? 1u : 0u, sparse_ ? 1u : 0u, fuse_args_ && sparse_ ? 1u : 0u});
+         contrast_floor_buf_.get(), active_cells_buf_.get(), cell_list_buf_.get()},
+        20, wg2d_, {adaptive_floor_ ? 1u : 0u, sparse_ ? 1u : 0u});
     if (sparse_) {
       cell_args_pl_ = vk::ComputePipeline(ctx_, ShaderPath("cell_args"),
                                           {cell_list_buf_.get(), cell_args_buf_.get()}, 0,
@@ -618,9 +612,8 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
        qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get(),
-       cell_list_buf_.get(), indirect_args_buf_.get()},
-      20, sparse_ ? vk::WorkgroupSize{16, 4, 1} : wg2d_,
-      {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u, fuse_args_ ? 1u : 0u, wg1d_.x});
+       cell_list_buf_.get()},
+      20, sparse_ ? vk::WorkgroupSize{16, 4, 1} : wg2d_, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
 
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
@@ -659,8 +652,8 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath("hash_group"),
       {qbp_keys_buf_.get(), hash_owner_buf_.get(),
        point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
-       hash_drop_counter_buf_.get(), qbp_counter_buf_.get(), extents_buf_.get(), blob_args_buf_.get()},
-      20, wg1d_, {fuse_args_ ? 1u : 0u});
+       hash_drop_counter_buf_.get(), qbp_counter_buf_.get(), extents_buf_.get()},
+      20, wg1d_);
   // One pipeline per source counter: the counter is binding 0, and
   // ComputePipeline binds its buffers at construction.
   build_indirect_args_pl_ = vk::ComputePipeline(
@@ -885,7 +878,7 @@ void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *impo
     }
     threshold_block_pl_.Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
     if (sparse_) {
-      if (!fuse_args_) cell_args_pl_.DispatchRaw(cmd, 1, 1, 1, nullptr);
+      cell_args_pl_.DispatchRaw(cmd, 1, 1, 1, nullptr);
       vk::ComputePipeline::IndirectDispatchBarrier(cmd);
     }
     return;
@@ -916,14 +909,9 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
-  if (fuse_args_) {
-    blob_args_buf_.FillZero(cmd);
-    indirect_args_buf_.FillZero(cmd);
-    if (sparse_) cell_args_buf_.FillZero(cmd);
-  }
   if (sparse_) {
     active_cells_buf_.FillZero(cmd);
-    cell_list_buf_.FillZeroRange(cmd, 0, 8);
+    cell_list_buf_.FillZeroRange(cmd, 0, 4);
   }
   // uf_init_scan writes every run piece's entry for uf_count_runs, so the fill is needed only without
   // it.
@@ -1024,7 +1012,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   // and scatter_index_points. The counts stay on the device.
   struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{wg1d_.x, 1u, 1u,
                                                                        qbp_capacity_, 2u};
-  if (!fuse_args_) build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
+  build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
@@ -1039,9 +1027,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   // bounds-checks against max_raw_blobs. reduce_extents_hash does not read them.
   struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
       wg1d_.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
-  if (!fuse_args_) {
-    build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
-  }
+  build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
   struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{qbp_capacity_,
@@ -1539,14 +1525,9 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
-  if (fuse_args_) {
-    blob_args_buf_.FillZero(cmd);
-    indirect_args_buf_.FillZero(cmd);
-    if (sparse_) cell_args_buf_.FillZero(cmd);
-  }
   if (sparse_) {
     active_cells_buf_.FillZero(cmd);
-    cell_list_buf_.FillZeroRange(cmd, 0, 8);
+    cell_list_buf_.FillZeroRange(cmd, 0, 4);
   }
   if (!count_runs_) blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
