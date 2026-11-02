@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <bit>
 #include <string>
 
 #include "vkapriltag/common/Profiler.h"
@@ -66,6 +68,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
     probe_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
+  if (const char *v = std::getenv("APRILTAG_VK_DARK_REJECT")) dark_reject_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -137,6 +140,16 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       .stride = static_cast<int32_t>(width),
       .buf = const_cast<uint8_t *>(gray_frame),
   };
+
+  int min_white_cells_ = 0;
+  if (dark_reject_ && zarray_size(td_->tag_families) == 1) {
+    apriltag_family_t *family = nullptr;
+    zarray_get(td_->tag_families, 0, &family);
+    min_white_cells_ = family->nbits;
+    for (uint32_t k = 0; k < family->ncodes; ++k) {
+      min_white_cells_ = std::min(min_white_cells_, std::popcount(family->codes[k]));
+    }
+  }
 
   // One scratch zarray per quad, so tasks share no mutable state beyond td_->mutex.
   while (per_quad_.size() < quads.size()) {
@@ -226,6 +239,24 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       if (timing) st.probe_ms += lap();
       if (gate && margin < probe_margin_) {
         if (collect_probe_) slot_probe_[slot].rejected[probe_bin]++;
+        finish(false, 0.0);
+        return;
+      }
+    }
+
+    // A quad whose payload shows fewer white cells than the sparsest code has (less the two cells error
+    // correction may flip) cannot decode, so skip refining it.
+    if (dark_reject_ && !reversed_border && zarray_size(td_->tag_families) == 1) {
+      apriltag_family_t *family = nullptr;
+      zarray_get(td_->tag_families, 0, &family);
+      struct quad unrefined = quad_original;
+      unrefined.H = nullptr;
+      unrefined.Hinv = nullptr;
+      uint64_t rcode = 0;
+      quad_sample_code(td_, &unrefined, &im, &rcode);
+      if (unrefined.H) matd_destroy(unrefined.H);
+      if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
+      if (std::popcount(rcode) + 2 < min_white_cells_) {
         finish(false, 0.0);
         return;
       }
