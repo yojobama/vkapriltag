@@ -12,11 +12,16 @@
 
 layout(local_size_x_id = 0, local_size_x = 128) in;
 layout(constant_id = 3) const uint kPieceLengths = 0u;
+// Non-zero: a workgroup over flat cells returns at once (sparse_skip.glsl).
+layout(constant_id = 4) const uint kSparse = 0u;
 
 layout(std430, binding = 0) writeonly buffer Parent { uint parent[]; };
 // Binding 0 viewed as 4-pixel groups, for rows whose start is a multiple of 4.
 layout(std430, binding = 0) writeonly buffer Parent4 { uvec4 parent4[]; };
 layout(std430, binding = 2) writeonly buffer BlobSize { uint blob_size[]; };
+
+#define ACTIVE_CELLS_BINDING 3
+#include "sparse_skip.glsl"
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -29,6 +34,11 @@ layout(push_constant) uniform PushConstants {
 shared uint sg_last[64];
 
 void main() {
+  if (kSparse != 0u) {
+    uint first = gl_WorkGroupID.x * gl_WorkGroupSize.x * 4u;
+    uint y_row = gl_GlobalInvocationID.y;
+    if (CellsFlat(pc.width, first, min(first + gl_WorkGroupSize.x * 4u, pc.width) - 1u, y_row, y_row)) return;
+  }
   uint x0 = gl_GlobalInvocationID.x * 4u;
   uint y = gl_GlobalInvocationID.y;
   uint row = y * pc.width;

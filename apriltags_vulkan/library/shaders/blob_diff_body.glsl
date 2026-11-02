@@ -11,6 +11,8 @@ layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y
 // Non-zero when parent[] points every pixel at a run start that points at its root
 // (uf_count_runs.comp) rather than at the root itself.
 layout(constant_id = 3) const uint kTwoHop = 0u;
+// Non-zero: a workgroup over flat cells returns at once (sparse_skip.glsl).
+layout(constant_id = 4) const uint kSparse = 0u;
 
 layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 1) writeonly buffer Compacted { uint compacted[]; };
@@ -19,6 +21,9 @@ layout(std430, binding = 3) writeonly buffer Keys { uvec2 keys[]; };
 // Read only when honour_changed_flag is set.
 layout(std430, binding = 4) readonly buffer Changed { uint changed_flag; };
 layout(std430, binding = 5) readonly buffer BlobSize { uint blob_size[]; };
+
+#define ACTIVE_CELLS_BINDING 7
+#include "sparse_skip.glsl"
 
 layout(push_constant) uniform PushConstants {
   uint width;
@@ -58,6 +63,15 @@ void main() {
   uint ox = gl_GlobalInvocationID.x;
   uint oy = gl_GlobalInvocationID.y;
   if (ox >= iw || oy >= ih) return;
+  if (kSparse != 0u) {
+    // This workgroup's interior pixels, shifted by one into the image.
+    uint x_first = gl_WorkGroupID.x * gl_WorkGroupSize.x + 1u;
+    uint y_first = gl_WorkGroupID.y * gl_WorkGroupSize.y + 1u;
+    if (CellsFlat(pc.width, x_first, min(x_first + gl_WorkGroupSize.x, pc.width) - 1u, y_first,
+                  min(y_first + gl_WorkGroupSize.y, pc.height) - 1u)) {
+      return;
+    }
+  }
 
   uint x = ox + 1u;
   uint y = oy + 1u;

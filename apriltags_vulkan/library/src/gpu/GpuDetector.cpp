@@ -320,6 +320,7 @@ void GpuDetector::CreateBuffers() {
   minmax_unfiltered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   minmax_filtered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   contrast_floor_buf_ = ssbo(16);
+  active_cells_buf_ = ssbo(VkDeviceSize((block_width_ + 15u) / 16u) * block_height_ * 4);
   thresholded_buf_ =
       ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
 
@@ -494,19 +495,6 @@ void GpuDetector::CreatePipelines() {
         {gray_buf_.get(), decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_,
         {config_.decimation});
   }
-  if (threshold_block_) {
-    threshold_block_pl_ = vk::ComputePipeline(
-        ctx_, ShaderPath("threshold_block_u8"),
-        {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get(),
-         contrast_floor_buf_.get()},
-        20, wg2d_, {adaptive_floor_ ? 1u : 0u});
-    if (adaptive_floor_) {
-      noise_floor_pl_ = vk::ComputePipeline(
-          ctx_, ShaderPath("noise_floor"),
-          {minmax_unfiltered_buf_.get(), contrast_floor_buf_.get()}, 12, wg1d_);
-    }
-  }
-
   // uf_init covers this many pixels of a row per thread; APRILTAG_VK_UF_INIT_RUN overrides.
   if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_RUN")) {
     uf_init_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
@@ -527,17 +515,35 @@ void GpuDetector::CreatePipelines() {
   if (const char *v = std::getenv("APRILTAG_VK_COUNT_RUNS")) {
     count_runs_ = uf_init_scan_ && v[0] != '0';
   }
+  // APRILTAG_VK_SPARSE=1 skips workgroups of the labelling passes that lie over flat cells; it needs
+  // the fused threshold, uf_init_scan and uf_count_runs.
+  const char *sparse_env = std::getenv("APRILTAG_VK_SPARSE");
+  sparse_ = threshold_block_ && uf_init_scan_ && count_runs_ && sparse_env != nullptr &&
+            sparse_env[0] == '1';
+  if (threshold_block_) {
+    threshold_block_pl_ = vk::ComputePipeline(
+        ctx_, ShaderPath("threshold_block_u8"),
+        {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get(),
+         contrast_floor_buf_.get(), active_cells_buf_.get()},
+        20, wg2d_, {adaptive_floor_ ? 1u : 0u, sparse_ ? 1u : 0u});
+    if (adaptive_floor_) {
+      noise_floor_pl_ = vk::ComputePipeline(
+          ctx_, ShaderPath("noise_floor"),
+          {minmax_unfiltered_buf_.get(), contrast_floor_buf_.get()}, 12, wg1d_);
+    }
+  }
+
   if (uf_init_scan_) {
     uf_init_scan_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath(pick("uf_init_scan", "uf_init_scan_u8")),
-        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get()}, 12,
-        vk::WorkgroupSize{wg1d_.x, 1, 1}, {count_runs_ ? 1u : 0u});
+        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), active_cells_buf_.get()},
+        12, vk::WorkgroupSize{wg1d_.x, 1, 1}, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
   }
   if (count_runs_) {
     uf_count_runs_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath(pick("uf_count_runs", "uf_count_runs_u8")),
-        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get()}, 16,
-        vk::WorkgroupSize{wg1d_.x, 1, 1});
+        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), active_cells_buf_.get()},
+        16, vk::WorkgroupSize{wg1d_.x, 1, 1}, {sparse_ ? 1u : 0u});
   }
   // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
   // APRILTAG_VK_FIND_MODE overrides.
@@ -560,8 +566,8 @@ void GpuDetector::CreatePipelines() {
   }
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(merge_x4_ ? "uf_merge_x4_u8" : pick("uf_merge", "uf_merge_u8")),
-      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get()}, 16,
-      vk::WorkgroupSize{wg1d_.x, 1, 1}, {find_mode, merge_flag_mode});
+      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get(), active_cells_buf_.get()}, 16,
+      vk::WorkgroupSize{wg1d_.x, 1, 1}, {find_mode, merge_flag_mode, sparse_ ? 1u : 0u});
   // Rows merged in bands of this many (a power of two) before the band boundaries, on discrete GPUs;
   // 0 is one pass. APRILTAG_VK_MERGE_BAND overrides.
   merge_band_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 0u : 8u;
@@ -588,8 +594,9 @@ void GpuDetector::CreatePipelines() {
   blob_diff_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
       {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
-       qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()},
-      20, wg2d_, {count_runs_ ? 1u : 0u});
+       qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get(),
+       active_cells_buf_.get()},
+      20, wg2d_, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
 
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
@@ -868,6 +875,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
+  if (sparse_) active_cells_buf_.FillZero(cmd);
   // uf_init_scan writes every run piece's entry for uf_count_runs, so the fill is needed only without
   // it.
   if (!count_runs_) blob_size_buf_.FillZero(cmd);
@@ -1475,6 +1483,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   uf_changed_buf_.FillZero(cmd);
+  if (sparse_) active_cells_buf_.FillZero(cmd);
   if (!count_runs_) blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
   blob_cursor_buf_.FillZero(cmd);

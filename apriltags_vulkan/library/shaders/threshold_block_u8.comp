@@ -7,11 +7,14 @@
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
 // Non-zero: the contrast floor is the one noise_floor.comp wrote, not the push constant.
 layout(constant_id = 3) const uint kAdaptiveFloor = 0u;
+// Non-zero: marks each 64 x 4 pixel cell that holds a block with contrast (sparse_skip.glsl).
+layout(constant_id = 4) const uint kSparse = 0u;
 
 layout(std430, binding = 0) readonly buffer DecimatedImage { uint8_t decimated[]; };
 layout(std430, binding = 1) readonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
 layout(std430, binding = 2) writeonly buffer Thresholded { uint8_t thresholded[]; };
 layout(std430, binding = 3) readonly buffer Floor { uint contrast_floor[]; };
+layout(std430, binding = 4) buffer ActiveCells { uint active_cells[]; };
 // Bindings 0 and 2 viewed as words of 4 pixels, for blocks whose rows are aligned words.
 layout(std430, binding = 0) readonly buffer DecimatedWords { uint decimated_words[]; };
 layout(std430, binding = 2) writeonly buffer ThresholdedWords { uint thresholded_words[]; };
@@ -45,6 +48,7 @@ void main() {
 
   bool ambiguous = mx - mn < (kAdaptiveFloor != 0u ? contrast_floor[0] : pc.min_white_black_diff);
   uint thresh = mn + (mx - mn) / 2u;
+  if (kSparse != 0u && !ambiguous) active_cells[by * ((pc.block_width + 15u) / 16u) + (bx >> 4u)] = 1u;
   uint x_end = min(bx * 4u + 4u, pc.decimated_width);
   uint y_end = min(by * 4u + 4u, pc.decimated_height);
   if ((pc.decimated_width & 3u) == 0u) {
