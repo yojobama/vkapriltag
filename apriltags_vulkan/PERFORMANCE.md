@@ -2417,6 +2417,17 @@ when it is loaded, with or without these switches. The Mali offline compiler rep
 no stack use and at most 4 more work registers for every new or changed shader; the sparse variants
 add 0.3 to 1.2 arithmetic cycles, consistent with the measured slowdown.
 
+Desktop (RX 9060 XT) timing of the new switches, mean of three 1280x720 corpus frames, interleaved, four
+rounds; total ms against the base: decimation 1: adaptive floor 0.41 (-55%), minimum diff 20 0.39 (-57%),
+box decimation +3%, predicated skipping on top of the floor 0.42 (no gain), two levels 0.70 (-23%),
+three levels 0.90 (-2%); decimation 2: floor 0.39 (-48%), box 0.42 (-44%), floor plus box 0.40 (-47%),
+minimum diff 20 0.34 (-55%), against 0.75. The built-in trace shows why: at decimation 2 the base
+sends 80 quads per frame to the CPU tail (tag.quad plus tag.refine 4.9 ms of thread time per frame) and
+the tuned set sends 3.3 (0.36 ms), peak working set 90 MB in both, GPU memory 44 MB, GPU engine load 25%
+(the loop is CPU-bound); average CPU use falls from 4.4 cores to 0.8 at the same frame count. GPU
+dispatches at decimation 1 with the floor: uf_merge 68.6 to 27.3 us, blob_diff 53 to 12 us, hash_group
+29 to 5 us, sort 74 to 12 us, plus 7 us for the floor pass.
+
 ## 9. Measuring
 
 ```
