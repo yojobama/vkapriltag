@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <algorithm>
 #include <bit>
 #include <string>
 
@@ -73,19 +72,45 @@ bool ErrorsConnected(const apriltag_family_t *f, uint64_t diff) {
   return true;
 }
 
+void BuildThirdBitIndex(const apriltag_family_t *f, ThirdBitIndex *index) {
+  index->family = f;
+  int at = 0;
+  for (int k = 0; k < 4; ++k) {
+    index->shift[k] = at;
+    index->bits[k] = (static_cast<int>(f->nbits) - at) / (4 - k);
+    at += index->bits[k];
+    const uint64_t mask = (uint64_t{1} << index->bits[k]) - 1;
+    index->start[k].assign((size_t{1} << index->bits[k]) + 1, 0);
+    for (uint32_t i = 0; i < f->ncodes; ++i) ++index->start[k][((f->codes[i] >> index->shift[k]) & mask) + 1];
+    for (size_t b = 1; b < index->start[k].size(); ++b) index->start[k][b] += index->start[k][b - 1];
+    index->ids[k].assign(f->ncodes, 0);
+    std::vector<uint32_t> fill(index->start[k].begin(), index->start[k].end() - 1);
+    for (uint32_t i = 0; i < f->ncodes; ++i) index->ids[k][fill[(f->codes[i] >> index->shift[k]) & mask]++] = i;
+  }
+}
+
 // The one code of the family that `rcode` matches, over the four rotations, with exactly three wrong
 // bits that touch (a finger, a cable or glare, not chance); false if there is none or two tie.
-bool MatchThreeTouchingBits(const apriltag_family_t *f, uint64_t rcode, int *id, int *rotation) {
+bool MatchThreeTouchingBits(const ThirdBitIndex &index, uint64_t rcode, int *id, int *rotation) {
+  const apriltag_family_t *f = index.family;
   int found = 0;
   uint64_t r = rcode;
   for (int rot = 0; rot < 4; ++rot, r = Rotate90(r, f->nbits)) {
-    for (uint32_t i = 0; i < f->ncodes; ++i) {
-      const uint64_t diff = r ^ f->codes[i];
-      if (std::popcount(diff) > 3) continue;
-      if (std::popcount(diff) < 3 || !ErrorsConnected(f, diff)) return false;  // decodable, or not touching
-      if (found++ == 0) {
-        *id = static_cast<int>(i);
-        *rotation = rot;
+    uint32_t seen[64];
+    int n_seen = 0;
+    for (int k = 0; k < 4; ++k) {
+      const uint64_t value = (r >> index.shift[k]) & ((uint64_t{1} << index.bits[k]) - 1);
+      for (uint32_t p = index.start[k][value]; p < index.start[k][value + 1]; ++p) {
+        const uint32_t i = index.ids[k][p];
+        if (std::find(seen, seen + n_seen, i) != seen + n_seen) continue;
+        if (n_seen < 64) seen[n_seen++] = i;
+        const uint64_t diff = r ^ f->codes[i];
+        if (std::popcount(diff) > 3) continue;
+        if (std::popcount(diff) < 3 || !ErrorsConnected(f, diff)) return false;  // decodable, or not touching
+        if (found++ == 0) {
+          *id = static_cast<int>(i);
+          *rotation = rot;
+        }
       }
     }
   }
@@ -233,6 +258,11 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       .buf = const_cast<uint8_t *>(gray_frame),
   };
 
+  if (third_bit_ && zarray_size(td_->tag_families) > 0) {
+    apriltag_family_t *family = nullptr;
+    zarray_get(td_->tag_families, 0, &family);
+    if (third_index_.family != family) BuildThirdBitIndex(family, &third_index_);
+  }
   int min_white_cells_ = 0;
   if (dark_reject_ && zarray_size(td_->tag_families) == 1) {
     apriltag_family_t *family = nullptr;
@@ -491,7 +521,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       uint64_t rcode = 0;
       const float margin = quad_sample_code(td_, &sampled, &im, &rcode);
       int id = 0, rotation = 0;
-      if (margin >= 0 && sampled.H && MatchThreeTouchingBits(family, rcode, &id, &rotation)) {
+      if (margin >= 0 && sampled.H && MatchThreeTouchingBits(third_index_, rcode, &id, &rotation)) {
         apriltag_detection_t *det = static_cast<apriltag_detection_t *>(calloc(1, sizeof(apriltag_detection_t)));
         det->family = family;
         det->id = id;

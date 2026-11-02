@@ -22,6 +22,16 @@ namespace apriltag_vulkan {
 // (see RefineEdgesMethod) before decoding. Stops at 2D detection; pose is not computed here.
 // Quads are decoded in parallel over a WorkerPool and merged in quad order, so the output does
 // not depend on thread count.
+// The family's codes bucketed by each of four disjoint bit blocks: a code within three bits of a word
+// equals it exactly in at least one block, so only those buckets need checking.
+struct ThirdBitIndex {
+  const apriltag_family_t *family = nullptr;
+  int shift[4] = {};
+  int bits[4] = {};
+  std::vector<uint32_t> start[4];  // bucket b of block k holds ids[k][start[k][b] .. start[k][b + 1])
+  std::vector<uint32_t> ids[4];
+};
+
 class TagDecoder {
  public:
   // `td` must already have its tag families added; it is not owned.
@@ -86,6 +96,7 @@ class TagDecoder {
   bool side_one_out_ = false;
   // APRILTAG_VK_THIRD_BIT=1: accept a third corrected bit when the three wrong cells touch.
   bool third_bit_ = false;
+  ThirdBitIndex third_index_;
   // APRILTAG_VK_FAMILY_LIMITS=1: reject detections that needed more corrected bits than their
   // family's codes can bear.
   bool family_limits_ = false;
