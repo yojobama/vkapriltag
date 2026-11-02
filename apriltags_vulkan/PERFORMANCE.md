@@ -2407,6 +2407,16 @@ range 100 to 95%) because the coarse level misses low-contrast tags and the band
 repeats the whole frame's fixed cost, so a level only pays if it is restricted to a region, which needs
 compacted indirect dispatch (not built). Use the adaptive floor with decimation 1 or 2 instead.
 
+Checks on the new shaders and code (`napa/15-gpu-sparse`): the validation layer with synchronisation
+validation over 35 runs (decimation 1 and 2, every new switch alone and combined, the unfused paths,
+no subgroups, both merge modes, three level setups) gave no messages, and its best-practices positive
+control reported 10. AddressSanitizer on the desktop (28 runs) and AddressSanitizer with
+UndefinedBehaviourSanitizer on the Pi (28 runs) gave no reports, and ThreadSanitizer on the Pi
+(28 runs, 8 threads) gave none; LeakSanitizer is off on the Pi because the Mali driver leaks 352 bytes
+when it is loaded, with or without these switches. The Mali offline compiler reports 100% occupancy,
+no stack use and at most 4 more work registers for every new or changed shader; the sparse variants
+add 0.3 to 1.2 arithmetic cycles, consistent with the measured slowdown.
+
 ## 9. Measuring
 
 ```
