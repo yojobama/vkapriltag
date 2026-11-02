@@ -80,6 +80,8 @@ class TagDecoder {
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
+  // APRILTAG_VK_GREY_MARGIN=1: retry a quad that did not decode as its inner square.
+  bool grey_margin_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;

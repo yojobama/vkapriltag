@@ -10,6 +10,7 @@
 
 extern "C" {
 #include "common/g2d.h"
+#include "common/homography.h"
 #include "common/matd.h"
 
 // Non-static entry points exposed by cmake/patches/apriltag-expose-decode-steps.patch,
@@ -66,6 +67,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
     probe_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
+  if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -243,6 +245,42 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     {
       VKA_PROF_SCOPE("tag.decode");
       quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, per_quad_[i]);
+    }
+
+    // A grey quiet zone on a bright wall makes the quiet zone's outline the dark blob, so the quad is
+    // the (W + 2) cell square: if it did not decode, try its inner W cells, once that decodes unrefined.
+    if (grey_margin_ && td_->refine_edges && zarray_size(per_quad_[i]) == 0 && quad_original.H &&
+        zarray_size(td_->tag_families) > 0) {
+      VKA_PROF_SCOPE("tag.inner");
+      apriltag_family_t *family = nullptr;
+      zarray_get(td_->tag_families, 0, &family);
+      const double r = static_cast<double>(family->width_at_border) / (family->width_at_border + 2);
+      struct quad inner;
+      const double sx[4] = {-1, 1, 1, -1}, sy[4] = {-1, -1, 1, 1};  // quad_update_homographies' corners
+      for (int k = 0; k < 4; ++k) {
+        double x, y;
+        homography_project(quad_original.H, sx[k] * r, sy[k] * r, &x, &y);
+        inner.p[k][0] = static_cast<float>(x);
+        inner.p[k][1] = static_cast<float>(y);
+      }
+      inner.reversed_border = reversed_border;
+      inner.H = nullptr;
+      inner.Hinv = nullptr;
+      zarray_t *probe = probe_[slot];
+      zarray_truncate(probe, 0);
+      quad_decode_index(td_, &inner, &im, /*im_samples=*/nullptr, probe);
+      const bool decodes = zarray_size(probe) > 0;
+      ClearDetections(probe);
+      if (inner.H) matd_destroy(inner.H);
+      if (inner.Hinv) matd_destroy(inner.Hinv);
+      inner.H = nullptr;
+      inner.Hinv = nullptr;
+      if (decodes) {
+        RefineEdges(refine_method_, td_, &im, &inner);
+        quad_decode_index(td_, &inner, &im, /*im_samples=*/nullptr, per_quad_[i]);
+        if (inner.H) matd_destroy(inner.H);
+        if (inner.Hinv) matd_destroy(inner.Hinv);
+      }
     }
 
     // Free the homographies allocated on the stack-local quad.
