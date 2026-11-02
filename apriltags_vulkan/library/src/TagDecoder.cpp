@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <bit>
 #include <string>
 
 #include "BorderSample.h"
@@ -156,6 +158,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_BORDER_PRECHECK")) border_precheck_ = v[0] == '1';
+  if (const char *v = std::getenv("APRILTAG_VK_DARK_REJECT")) dark_reject_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -227,6 +230,16 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       .stride = static_cast<int32_t>(width),
       .buf = const_cast<uint8_t *>(gray_frame),
   };
+
+  int min_white_cells_ = 0;
+  if (dark_reject_ && zarray_size(td_->tag_families) == 1) {
+    apriltag_family_t *family = nullptr;
+    zarray_get(td_->tag_families, 0, &family);
+    min_white_cells_ = family->nbits;
+    for (uint32_t k = 0; k < family->ncodes; ++k) {
+      min_white_cells_ = std::min(min_white_cells_, std::popcount(family->codes[k]));
+    }
+  }
 
   // One scratch zarray per quad, so tasks share no mutable state beyond td_->mutex.
   while (per_quad_.size() < quads.size()) {
@@ -324,6 +337,9 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     // A tag's border is black all round: reject a quad where fewer than 22 of 28 border cells (scaled
     // per family) read dark. Quads that cannot be read through the image are kept.
     if (border_precheck_ && zarray_size(td_->tag_families) == 1) {
+    // A quad whose payload shows fewer white cells than the sparsest code has (less the two cells error
+    // correction may flip) cannot decode, so skip refining it.
+    if (dark_reject_ && !reversed_border && zarray_size(td_->tag_families) == 1) {
       apriltag_family_t *family = nullptr;
       zarray_get(td_->tag_families, 0, &family);
       struct quad unrefined = quad_original;
@@ -336,6 +352,9 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       if (unrefined.H) matd_destroy(unrefined.H);
       if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
       if (read && border.dark * 28 < 22 * border.cells) {
+      if (unrefined.H) matd_destroy(unrefined.H);
+      if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
+      if (std::popcount(rcode) + 2 < min_white_cells_) {
         finish(false, 0.0);
         return;
       }

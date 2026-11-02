@@ -91,6 +91,8 @@ class TagDecoder {
   bool family_limits_ = false;
   // APRILTAG_VK_BORDER_PRECHECK=1: reject a quad whose border cells are not mostly dark before refining.
   bool border_precheck_ = false;
+  // APRILTAG_VK_DARK_REJECT=1: reject a quad whose payload has fewer white cells than any code.
+  bool dark_reject_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;
