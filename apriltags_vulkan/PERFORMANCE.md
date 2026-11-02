@@ -92,8 +92,6 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_PROBE_STATS=1`, `APRILTAG_VK_PROBE_CSV=<file>` | Per-quad probe histograms and one CSV row per quad (analysis aid). |
 | `APRILTAG_VK_TRACE=<file>` | Write a Chrome-trace JSON of the CPU and GPU spans. See section 9. |
 | `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
-| `APRILTAG_VK_DP_PEAKS_CHECK=1` | Keep a DP-seeded quad only if the peak search also accepts its blob (`DetectorConfig::dp_peaks_check`; off by default). See section 8z. |
-| `APRILTAG_VK_GPU_QUADFIT=1` | Run QuadDecode's DP fit on the GPU (`fit_quad_dp.comp`; needs fp64, so discrete GPUs only; off by default). See section 8z. |
 | `APRILTAG_VK_REFINE=exact\|fast\|ultrafast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
 | `APRILTAG_VK_FORCE_NO_8BIT=1` | Force the 32-bit-per-pixel shader variants even where `VK_KHR_8bit_storage` is available. |
@@ -2213,6 +2211,9 @@ it was not measured on its own.
 
 ## 8z. Four more items: tuned builds, allocation-free decode, a peak check, the quad fit on the GPU
 
+Items 2, 5 and 6 were removed afterwards; only item 3, the allocation-free decode, remains in
+the code.
+
 Four of the suggestions left after section 8y, each behind a switch so one binary covers every
 combination. Benchmarked alone and cumulatively (2, 2+3, 2+3+5, 2+3+5+6) in three refinement states:
 S1 `exact` without the margin gate, S2 `ultrafast` with `APRILTAG_VK_PROBE_MARGIN=4` (the gate has
@@ -2321,9 +2322,9 @@ overflow) in int64, and lets the DP path sum its four segments directly rather t
 sums; `quad_decode` is then back within noise on both machines, and the GCC build of the CPU fit is
 faster than before in a stand-alone benchmark (-12% DP, -37% peak search on synthetic blobs).
 
-With the opt-in GPU quad fit (`APRILTAG_VK_GPU_QUADFIT=1`) the desktop's GPU time is 3.0% higher
-(`pipeline_total` +3.1%): `fit_quad_dp.comp` now sums six int64 moments per segment where it summed
-three int64 and four int32, which the fix needs for the same reason as the CPU path.
+With the opt-in GPU quad fit (`APRILTAG_VK_GPU_QUADFIT=1`, since removed with items 2 and 5 of
+section 8z) the desktop's GPU time was 3.0% higher (`pipeline_total` +3.1%), its shader summing six
+int64 moments per segment where it had summed three int64 and four int32.
 
 Output is unchanged: the dump matrix (331 files, including two odd-sized crops) is identical to the
 base on the desktop with and without the GPU fit, and on the Orange Pi (291 files).

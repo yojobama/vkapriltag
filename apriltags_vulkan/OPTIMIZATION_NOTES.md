@@ -2114,7 +2114,7 @@ Four items, each behind a switch, benchmarked alone and cumulatively in three re
   homography, the quad copy per family, two scratch buffers); identical output, `tag_decode` -1% to
   -6% on the Orange Pi, neutral on the desktop. `ApplyPatches.cmake` now restores the checkout before
   applying the list, since this patch edits lines another adds.
-- **Shipped, opt-in:** `VKAPRILTAG_CPU_TUNE` (identical output; -1.4% to -5.8% `pipeline_total` on the
+- **Shipped opt-in, later removed:** `VKAPRILTAG_CPU_TUNE` (identical output; -1.4% to -5.8% `pipeline_total` on the
   RX 9060 XT with AVX2, nothing measurable on the A76), `dp_peaks_check` (halves the quads; -3% to
   -12% with `exact` refinement at decimation 2, slower under `ultrafast`; loses 1 of 369 tiny tags on
   one synthetic set) and the GPU DP fit (identical output; +4% to +8% serial time, +8% to +9%
