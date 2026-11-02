@@ -84,6 +84,8 @@ class TagDecoder {
   bool grey_margin_ = false;
   // APRILTAG_VK_SIDE_ONE_OUT=1: refit a side whose border cells read white, one cell further in.
   bool side_one_out_ = false;
+  // APRILTAG_VK_THIRD_BIT=1: accept a third corrected bit when the three wrong cells touch.
+  bool third_bit_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;

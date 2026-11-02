@@ -1,6 +1,7 @@
 #include "vkapriltag/TagDecoder.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,73 @@ int apriltag_min_hamming(apriltag_detector_t *td, uint64_t rcode);
 
 namespace apriltag_vulkan {
 namespace {
+
+// libapriltag's rotate90() on an nbits-bit code word.
+uint64_t Rotate90(uint64_t w, int nbits) {
+  int p = nbits;
+  uint64_t l = 0;
+  if (nbits % 4 == 1) {
+    p = nbits - 1;
+    l = 1;
+  }
+  w = ((w >> l) << (p / 4 + l)) | (w >> (3 * p / 4 + l) << l) | (w & l);
+  return w & ((uint64_t{1} << nbits) - 1);
+}
+
+// Whether the set bits of `diff` (bit k from the most significant end is the family's k-th cell)
+// form one 8-connected group of cells.
+bool ErrorsConnected(const apriltag_family_t *f, uint64_t diff) {
+  int cells[8], n = 0;
+  for (int k = 0; k < static_cast<int>(f->nbits) && n < 8; ++k) {
+    if ((diff >> (f->nbits - 1 - k)) & 1) cells[n++] = k;
+  }
+  if (n <= 1) return true;
+  bool reached[8] = {true};
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (int a = 0; a < n; ++a) {
+      if (!reached[a]) continue;
+      for (int b = 0; b < n; ++b) {
+        if (reached[b]) continue;
+        const int dx = static_cast<int>(f->bit_x[cells[a]]) - static_cast<int>(f->bit_x[cells[b]]);
+        const int dy = static_cast<int>(f->bit_y[cells[a]]) - static_cast<int>(f->bit_y[cells[b]]);
+        if (std::abs(dx) <= 1 && std::abs(dy) <= 1) reached[b] = grew = true;
+      }
+    }
+  }
+  for (int a = 0; a < n; ++a) {
+    if (!reached[a]) return false;
+  }
+  return true;
+}
+
+// The one code of the family that `rcode` matches, over the four rotations, with exactly three wrong
+// bits that touch (a finger, a cable or glare, not chance); false if there is none or two tie.
+bool MatchThreeTouchingBits(const apriltag_family_t *f, uint64_t rcode, int *id, int *rotation) {
+  int found = 0;
+  uint64_t r = rcode;
+  for (int rot = 0; rot < 4; ++rot, r = Rotate90(r, f->nbits)) {
+    for (uint32_t i = 0; i < f->ncodes; ++i) {
+      const uint64_t diff = r ^ f->codes[i];
+      if (std::popcount(diff) > 3) continue;
+      if (std::popcount(diff) < 3 || !ErrorsConnected(f, diff)) return false;  // decodable, or not touching
+      if (found++ == 0) {
+        *id = static_cast<int>(i);
+        *rotation = rot;
+      }
+    }
+  }
+  return found == 1;
+}
+
+// Whether the first family's codes are far enough apart (minimum Hamming distance 9 or more) for a
+// third corrected bit to still leave a wide gap to every other code.
+bool AllowsThirdBit(const apriltag_detector_t *td) {
+  if (zarray_size(td->tag_families) == 0) return false;
+  apriltag_family_t *family = nullptr;
+  zarray_get(td->tag_families, 0, &family);
+  return family->h >= 9;
+}
 
 double NsToMs(prof::Ns ns) { return static_cast<double>(ns) / 1.0e6; }
 
@@ -70,6 +138,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   slot_stats_.assign(pool_->threads(), SlotStats{});
   if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] == '1';
+  if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] == '1';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -336,6 +405,41 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         if (moved.H) matd_destroy(moved.H);
         if (moved.Hinv) matd_destroy(moved.Hinv);
       }
+    // A third corrected bit, accepted only when the three wrong cells touch: damage such as a finger
+    // or glare is coherent, a chance match is scattered.
+    if (third_bit_ && td_->refine_edges && zarray_size(per_quad_[i]) == 0 && AllowsThirdBit(td_)) {
+      VKA_PROF_SCOPE("tag.thirdbit");
+      apriltag_family_t *family = nullptr;
+      zarray_get(td_->tag_families, 0, &family);
+      struct quad sampled = quad_original;
+      sampled.H = nullptr;
+      sampled.Hinv = nullptr;
+      uint64_t rcode = 0;
+      const float margin = quad_sample_code(td_, &sampled, &im, &rcode);
+      int id = 0, rotation = 0;
+      if (margin >= 0 && sampled.H && MatchThreeTouchingBits(family, rcode, &id, &rotation)) {
+        apriltag_detection_t *det = static_cast<apriltag_detection_t *>(calloc(1, sizeof(apriltag_detection_t)));
+        det->family = family;
+        det->id = id;
+        det->hamming = 3;
+        det->decision_margin = margin;
+        const double theta = rotation * 1.5707963267948966;
+        matd_t *R = matd_create(3, 3);
+        MATD_EL(R, 0, 0) = std::cos(theta);
+        MATD_EL(R, 0, 1) = -std::sin(theta);
+        MATD_EL(R, 1, 0) = std::sin(theta);
+        MATD_EL(R, 1, 1) = std::cos(theta);
+        MATD_EL(R, 2, 2) = 1;
+        det->H = matd_op("M*M", sampled.H, R);
+        matd_destroy(R);
+        homography_project(det->H, 0, 0, &det->c[0], &det->c[1]);
+        for (int k = 0; k < 4; ++k) {  // counter-clockwise from (-1, -1), as quad_decode_index
+          homography_project(det->H, (k == 1 || k == 2) ? 1 : -1, (k < 2) ? 1 : -1, &det->p[k][0], &det->p[k][1]);
+        }
+        zarray_add(per_quad_[i], &det);
+      }
+      if (sampled.H) matd_destroy(sampled.H);
+      if (sampled.Hinv) matd_destroy(sampled.Hinv);
     }
 
     // Free the homographies allocated on the stack-local quad.
