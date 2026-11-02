@@ -280,7 +280,7 @@ constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient fal
 constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
 
 // Optional refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once).
-enum ProfileFeature : unsigned { kDropOutliers = 1u };
+enum ProfileFeature : unsigned { kDropOutliers = 1u, kCoarseToFine = 2u };
 unsigned ProfileFeatures() {
   static const unsigned features = [] {
     const char *v = std::getenv("APRILTAG_VK_PROFILE_FEATURES");
@@ -289,14 +289,15 @@ unsigned ProfileFeatures() {
   return features;
 }
 
-void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *quad) {
-  const float range = static_cast<float>(quad_decimate + 1);
+// One pass: profiles within `range` pixels either side of each current side, the sides refitted and
+// intersected into new corners. Reports the mean width of the gradient lobes in *edge_width.
+// Returns false, leaving the quad as it was, if a side's fit is degenerate.
+bool ProfilePass(float range, const image_u8_t *im, struct quad *quad, double *edge_width) {
   const int taps = 2 * static_cast<int>(range / kProfileStep) + 3;
   constexpr int kMaxTaps = 96;
-  if (taps > kMaxTaps) {
-    RefineEdgesT<double>(quad_decimate, im, quad);
-    return;
-  }
+  if (taps > kMaxTaps) return false;
+  double width_sum = 0;
+  int width_n = 0;
   const int max_x = im->width - 1;
   const int max_y = im->height - 1;
   double lines[4][4];
@@ -360,6 +361,8 @@ void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *qu
         gs += g[j];
         gj += static_cast<double>(g[j]) * j;
       }
+      width_sum += (jr - jl + 1) * kProfileStep;
+      ++width_n;
       const double n0 = -range - kProfileStep + kProfileStep * (gj / gs);
       bxs[used] = x0 + n0 * nx - xm;
       bys[used] = y0 + n0 * ny - ym;
@@ -414,6 +417,40 @@ void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *qu
     lines[edge][3] = std::sin(normal_theta);
   }
   IntersectLines(lines, quad);
+  *edge_width = width_n > 0 ? width_sum / width_n : 0.0;
+  return true;
+}
+
+void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, struct quad *quad) {
+  const int quad_decimate = static_cast<int>(td->quad_decimate);
+  float reach = static_cast<float>(quad_decimate + 1);
+  double edge_width = 0;
+  if (!ProfilePass(reach, im, quad, &edge_width)) {
+    RefineEdgesT<double>(quad_decimate, im, quad);
+    return;
+  }
+  if ((ProfileFeatures() & kCoarseToFine) == 0 || zarray_size(td->tag_families) == 0) return;
+
+  // Narrow the window to the measured edge width (never above half a cell, so the next payload edge
+  // stays out) and refit around the refined sides, while that still shrinks it.
+  apriltag_family_t *family = nullptr;
+  zarray_get(td->tag_families, 0, &family);
+  const double side = 0.25 * (std::hypot(quad->p[1][0] - quad->p[0][0], quad->p[1][1] - quad->p[0][1]) +
+                              std::hypot(quad->p[2][0] - quad->p[1][0], quad->p[2][1] - quad->p[1][1]) +
+                              std::hypot(quad->p[3][0] - quad->p[2][0], quad->p[3][1] - quad->p[2][1]) +
+                              std::hypot(quad->p[0][0] - quad->p[3][0], quad->p[0][1] - quad->p[3][1]));
+  const double cell = side / family->width_at_border;
+  for (int pass = 0; pass < 3; ++pass) {
+    double next = std::max(1.5, 1.25 * edge_width);
+    if (cell >= 3.0) next = std::min(next, 0.45 * cell);
+    if (next >= 0.9 * reach) break;
+    reach = static_cast<float>(next);
+    struct quad before = *quad;
+    if (!ProfilePass(reach, im, quad, &edge_width)) {
+      *quad = before;
+      break;
+    }
+  }
 }
 
 }  // namespace
@@ -441,7 +478,7 @@ void RefineEdges(RefineEdgesMethod method, apriltag_detector_t *td, image_u8_t *
       RefineEdgesFast(td->quad_decimate, im, quad);
       return;
     case RefineEdgesMethod::kProfile:
-      RefineEdgesProfile(td->quad_decimate, im, quad);
+      RefineEdgesProfile(td, im, quad);
       return;
     case RefineEdgesMethod::kUpstream:
       refine_edges(td, im, quad);
