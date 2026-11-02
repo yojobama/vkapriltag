@@ -2386,10 +2386,19 @@ Box decimation drops candidates on the Pi from 85 to 6 on a 1280x720 frame, so t
 (1.7 to 1.2 ms) because the unfused min/max and threshold passes are cheaper than the fused ones when
 there is less noise to label.
 
-GPU sparse pass (item 15), stage A: on the Mali at decimation 1 the pixel-scaled passes (union-find,
-run counts, blob diff) take 3.1 of 5.0 ms, so a coarse level would pay. But decimation 4 with box
-averaging, the bound on a stride-3 level, loses recall on small tags and the range sweep (small-tags
-85%, range 77%), which only a second, finer level could recover. Not implemented.
+GPU sparse pass (item 15). Measured first: a flat 1280x720 frame costs 1.0 ms of GPU time on the Mali
+at decimation 1, against about 5 ms for the corpus frames, whose 5% active tiles cannot explain the
+gap. The cost is sensor-noise blocks that pass the fixed contrast floor of 5 and are then labelled, so
+flat tiles are already skipped cheaply and tile compaction would add nothing. What helps is a floor that
+follows the frame's noise: `APRILTAG_VK_ADAPTIVE_FLOOR=k` (branch `napa/15-gpu-sparse`) adds a
+one-workgroup pass that sets the floor to k times the median 4x4 block range (about 8,192 sampled
+blocks, 54 us on the Mali), and the fused threshold reads it from a buffer. With k=2 on the corpus,
+recall is unchanged on every scenario at decimation 1 and 2 (k=2.5 loses underexposed recall, 100 to
+92%), tag16h5 false detections fall 1739 to 103, and the output with the switch off is identical to the
+base. Pi total time at decimation 1 falls from 6.3 to 2.3 ms, and at decimation 2 from 2.7 to 1.4 ms
+(1.4 ms also with box decimation). Strided levels and size bands were not built: after the floor the
+pixel-scaled passes are about 1 ms of the 1.7 ms GPU time at decimation 1, and a coarser level loses
+small tags (decimation 4 with box averaging: small-tags 85%, range 77%).
 
 ## 9. Measuring
 
