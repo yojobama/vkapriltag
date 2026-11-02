@@ -137,6 +137,9 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // or launch geometry is derived from the config. ---
 
   // Caps the boundary-point count, and with it device memory.
+  if (const char *v = std::getenv("APRILTAG_VK_MIN_DIFF")) {
+    config_.min_white_black_diff = static_cast<uint32_t>(std::max(0, std::atoi(v)));
+  }
   if (const char *cap = std::getenv("APRILTAG_VK_MAX_POINTS")) {
     const long parsed = std::strtol(cap, nullptr, 10);
     if (parsed > 0) config_.max_boundary_points = static_cast<uint32_t>(parsed);
