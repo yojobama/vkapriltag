@@ -372,6 +372,7 @@ class GpuDetector {
   bool minmax_decimate_ = false;
   bool threshold_block_ = false;
   bool adaptive_floor_ = false;
+  bool fuse_args_ = false;  // APRILTAG_VK_FUSE_ARGS=1: shaders write the next pass's dispatch arguments
   bool sparse_ = false;  // APRILTAG_VK_SPARSE=1: labelling is dispatched over the cells with contrast only
   uint32_t floor_scale_tenths_ = 0;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;

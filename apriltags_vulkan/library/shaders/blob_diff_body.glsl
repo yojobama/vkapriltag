@@ -14,10 +14,19 @@ layout(constant_id = 3) const uint kTwoHop = 0u;
 // Non-zero: workgroups of 16 x 4 threads are dispatched over the listed cells, four per cell
 // (cell_list.glsl), each covering 16 pixels of the cell's 4 rows.
 layout(constant_id = 4) const uint kSparse = 0u;
+// Non-zero: the last workgroup writes the boundary-point passes' dispatch arguments
+// (build_indirect_args.comp's job: one thread per point in slot 1, four per thread in slot 2) for
+// kArgsWorkgroup-wide workgroups; counter_words[1] counts the finished workgroups.
+layout(constant_id = 5) const uint kFuseArgs = 0u;
+layout(constant_id = 6) const uint kArgsWorkgroup = 1u;
+layout(std430, binding = 8) writeonly buffer PointArgs { uint point_args[]; };
 
 layout(std430, binding = 0) readonly buffer Parent { uint parent[]; };
 layout(std430, binding = 1) writeonly buffer Compacted { uint compacted[]; };
-layout(std430, binding = 2) buffer Counter { uint counter; };
+layout(std430, binding = 2) buffer Counter { uint counter_words[]; };
+#define counter counter_words[0]
+#define LAST_GROUP_TICKET counter_words[1]
+#include "last_group.glsl"
 layout(std430, binding = 3) writeonly buffer Keys { uvec2 keys[]; };
 // Read only when honour_changed_flag is set.
 layout(std430, binding = 4) readonly buffer Changed { uint changed_flag; };
@@ -57,7 +66,7 @@ void put(uint pos, uint rep_a, uint rep_b, uint px, uint py, int gx, int gy) {
   keys[pos] = uvec2(min(rep_a, rep_b), max(rep_a, rep_b));
 }
 
-void main() {
+void Body() {
   if (pc.honour_changed_flag != 0u && changed_flag != 0u) return;
   uint x = gl_GlobalInvocationID.x + 1u;
   uint y = gl_GlobalInvocationID.y + 1u;
@@ -152,4 +161,19 @@ void main() {
   if (wantSE) put(pos++, rep0, rSE, x * 2u + 1u, y * 2u + 1u, gSE, gSE);
   if (wantS) put(pos++, rep0, rS, x * 2u, y * 2u + 1u, 0, (cS > c0) ? 1 : -1);
   if (wantSW) put(pos, rep0, rSW, x * 2u - 1u, y * 2u + 1u, gSWx, gSWy);
+}
+
+void main() {
+  Body();
+  if (kFuseArgs != 0u && LastGroupDone()) {
+    if (gl_LocalInvocationIndex == 0u) {
+      uint n = min(atomicAdd(counter, 0u), pc.capacity);
+      point_args[3] = (n + kArgsWorkgroup - 1u) / kArgsWorkgroup;
+      point_args[4] = 1u;
+      point_args[5] = 1u;
+      point_args[6] = (n + 4u * kArgsWorkgroup - 1u) / (4u * kArgsWorkgroup);
+      point_args[7] = 1u;
+      point_args[8] = 1u;
+    }
+  }
 }
