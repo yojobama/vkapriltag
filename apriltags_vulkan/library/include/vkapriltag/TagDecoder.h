@@ -80,6 +80,8 @@ class TagDecoder {
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
+  // APRILTAG_VK_SIDE_ONE_OUT=1: refit a side whose border cells read white, one cell further in.
+  bool side_one_out_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;
