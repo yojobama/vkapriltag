@@ -526,11 +526,10 @@ void GpuDetector::CreatePipelines() {
   if (const char *v = std::getenv("APRILTAG_VK_COUNT_RUNS")) {
     count_runs_ = uf_init_scan_ && v[0] != '0';
   }
-  // APRILTAG_VK_SPARSE=1 dispatches the labelling and boundary passes over only the cells with
-  // contrast; it needs the fused threshold, uf_init_scan and uf_count_runs.
-  const char *sparse_env = std::getenv("APRILTAG_VK_SPARSE");
-  sparse_ = threshold_block_ && uf_init_scan_ && count_runs_ && sparse_env != nullptr &&
-            sparse_env[0] == '1';
+  // DetectorConfig::sparse_labelling needs the fused threshold, uf_init_scan and uf_count_runs.
+  bool want_sparse = config_.sparse_labelling;
+  if (const char *v = std::getenv("APRILTAG_VK_SPARSE")) want_sparse = v[0] != '0';
+  sparse_ = threshold_block_ && uf_init_scan_ && count_runs_ && want_sparse;
   if (threshold_block_) {
     threshold_block_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath("threshold_block_u8"),

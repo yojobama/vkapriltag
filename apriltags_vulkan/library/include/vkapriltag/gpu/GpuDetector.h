@@ -37,6 +37,12 @@ struct DetectorConfig {
   // so a tag whose edge contrast is that low is lost.
   // Env override: APRILTAG_VK_ADAPTIVE_FLOOR=<scale>
   float adaptive_floor_scale = 2.0f;
+
+  // Dispatches the labelling and boundary passes over only the 64 x 4 pixel cells that hold contrast,
+  // so flat regions launch nothing. Used where a launch is costly (integrated GPUs, which also use
+  // uf_count_runs) and with the fused threshold and subgroup arithmetic; elsewhere the dense passes run.
+  // Same detections either way. Env override: APRILTAG_VK_SPARSE=0|1
+  bool sparse_labelling = true;
   uint32_t min_cluster_pixels = 24;
   uint32_t max_cluster_pixels = 100000;
   uint32_t tag_width = 8;  // in "bit squares"; matches quick_decode tag_width usage
