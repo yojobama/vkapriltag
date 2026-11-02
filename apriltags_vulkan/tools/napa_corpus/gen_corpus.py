@@ -220,6 +220,7 @@ SCENARIOS = {
     "decoys": {"tags": (0, 0), "bg": "plain", "decoys": (2, 6)},
     "one-tag": {"tags": (1, 1), "bg": "plain"},
     "many-tags": {"tags": (2, 12), "bg": "plain", "size": (0.35, 0.8)},
+    "dense-tags": {"tags": (20, 40), "bg": "plain", "size_abs": (36, 60)},
     "small-tags": {"tags": (1, 4), "bg": "plain", "size_abs": (32, 53)},
     "large-tags": {"tags": (1, 1), "bg": "plain", "size_frac": (0.45, 0.8)},
     "steep-angle": {"tags": (1, 3), "bg": "plain", "tilt": (40, 65)},
