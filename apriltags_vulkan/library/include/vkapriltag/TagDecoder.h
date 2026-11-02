@@ -80,6 +80,8 @@ class TagDecoder {
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
+  // APRILTAG_VK_THIRD_BIT=1: accept a third corrected bit when the three wrong cells touch.
+  bool third_bit_ = false;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;
