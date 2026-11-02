@@ -319,6 +319,7 @@ void GpuDetector::CreateBuffers() {
       ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
   minmax_unfiltered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   minmax_filtered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
+  contrast_floor_buf_ = ssbo(16);
   thresholded_buf_ =
       ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
 
@@ -481,6 +482,12 @@ void GpuDetector::CreatePipelines() {
   const bool fused_threshold = u8 && !(fused_env != nullptr && fused_env[0] == '0');
   minmax_decimate_ = fused_threshold && !alias_decimated_ && !box_decimate_;
   threshold_block_ = fused_threshold;
+  // APRILTAG_VK_ADAPTIVE_FLOOR=k raises the block contrast floor to k times the frame's median block
+  // range (its noise), per frame on the device; it needs the fused threshold.
+  if (const char *v = std::getenv("APRILTAG_VK_ADAPTIVE_FLOOR")) {
+    floor_scale_tenths_ = static_cast<uint32_t>(std::max(0.0, std::atof(v) * 10.0 + 0.5));
+  }
+  adaptive_floor_ = threshold_block_ && floor_scale_tenths_ > 0;
   if (minmax_decimate_) {
     block_minmax_decimate_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath("block_minmax_decimate_u8"),
@@ -490,7 +497,14 @@ void GpuDetector::CreatePipelines() {
   if (threshold_block_) {
     threshold_block_pl_ = vk::ComputePipeline(
         ctx_, ShaderPath("threshold_block_u8"),
-        {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get()}, 20, wg2d_);
+        {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get(),
+         contrast_floor_buf_.get()},
+        20, wg2d_, {adaptive_floor_ ? 1u : 0u});
+    if (adaptive_floor_) {
+      noise_floor_pl_ = vk::ComputePipeline(
+          ctx_, ShaderPath("noise_floor"),
+          {minmax_unfiltered_buf_.get(), contrast_floor_buf_.get()}, 12, wg1d_);
+    }
   }
 
   // uf_init covers this many pixels of a row per thread; APRILTAG_VK_UF_INIT_RUN overrides.
@@ -820,6 +834,11 @@ void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *impo
     struct { uint32_t dw, dh, min_diff, bw, bh; } thresh_pc{
         decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_,
         block_height_};
+    if (adaptive_floor_) {
+      struct { uint32_t blocks, min_diff, scale_tenths; } floor_pc{
+          block_width_ * block_height_, config_.min_white_black_diff, floor_scale_tenths_};
+      noise_floor_pl_.DispatchRaw(cmd, 1, 1, 1, &floor_pc);
+    }
     threshold_block_pl_.Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
     return;
   }

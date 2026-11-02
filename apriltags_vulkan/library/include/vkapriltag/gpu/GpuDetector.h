@@ -264,6 +264,7 @@ class GpuDetector {
   bool alias_decimated_ = false;
   bool box_decimate_ = false;  // APRILTAG_VK_BOX_DECIMATE=1: decimate by averaging each block
   vk::Buffer minmax_unfiltered_buf_, minmax_filtered_buf_;
+  vk::Buffer contrast_floor_buf_;
   vk::Buffer thresholded_buf_;
   // Reused as the per-pixel label (1 + root, or 0 if too small) once labelling converges.
   vk::Buffer parent_buf_, blob_size_buf_, uf_changed_buf_;
@@ -359,9 +360,11 @@ class GpuDetector {
   vk::ComputePipeline threshold_pl_;
   // With 8-bit storage: decimate and block_minmax in one pass (uploaded frames, decimation above 1),
   // and block_filter and threshold in one pass.
-  vk::ComputePipeline block_minmax_decimate_pl_, threshold_block_pl_;
+  vk::ComputePipeline block_minmax_decimate_pl_, threshold_block_pl_, noise_floor_pl_;
   bool minmax_decimate_ = false;
   bool threshold_block_ = false;
+  bool adaptive_floor_ = false;
+  uint32_t floor_scale_tenths_ = 0;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
   // Run starts from a workgroup max-scan, so no compression precedes the merge (single-merge only).
   vk::ComputePipeline uf_init_scan_pl_;

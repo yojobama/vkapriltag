@@ -51,6 +51,7 @@ set(SHADER_SOURCES
   shaders/block_minmax_u8.comp
   shaders/block_minmax_decimate_u8.comp
   shaders/block_filter.comp
+  shaders/noise_floor.comp
   shaders/threshold.comp
   shaders/threshold_u8.comp
   shaders/threshold_block_u8.comp
