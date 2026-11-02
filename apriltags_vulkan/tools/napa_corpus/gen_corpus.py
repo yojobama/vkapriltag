@@ -119,6 +119,22 @@ def paint_tag(img, fam, grid, project, outline, levels):
     img[y0:y1, x0:x1] = sup.reshape(y1 - y0, SS, x1 - x0, SS).mean(axis=(1, 3))
 
 
+def bar(img, p0, p1, width, level):
+    """Paints a bar of the given width (pixels) between two points."""
+    h, w = img.shape
+    x0, x1 = int(max(0, min(p0[0], p1[0]) - width)), int(min(w, max(p0[0], p1[0]) + width + 1))
+    y0, y1 = int(max(0, min(p0[1], p1[1]) - width)), int(min(h, max(p0[1], p1[1]) + width + 1))
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    gy, gx = np.mgrid[y0:y1, x0:x1]
+    d = np.array(p1) - np.array(p0)
+    t = np.clip(((gx + 0.5 - p0[0]) * d[0] + (gy + 0.5 - p0[1]) * d[1]) / (d @ d), 0, 1)
+    dist = np.hypot(gx + 0.5 - (p0[0] + t * d[0]), gy + 0.5 - (p0[1] + t * d[1]))
+    cover = np.clip(width / 2 + 0.5 - dist, 0, 1)
+    img[y0:y1, x0:x1] = img[y0:y1, x0:x1] * (1 - cover) + level * cover
+    return 1
+
+
 def smooth_noise(rng, h, w, scale):
     small = rng.random((max(2, h // scale + 2), max(2, w // scale + 2))).astype(np.float32)
     ys = np.linspace(0, small.shape[0] - 1.001, h)
@@ -215,6 +231,7 @@ SCENARIOS = {
     "underexposed": {"tags": (1, 3), "bg": "plain", "gain": (0.15, 0.35), "noise": (3, 6)},
     "overexposed": {"tags": (1, 3), "bg": "plain", "gain": (1.3, 1.8)},
     "jpeg": {"tags": (1, 3), "bg": "natural", "jpeg": (25, 70)},
+    "border-occlusion": {"tags": (1, 2), "bg": "plain", "cross": True},
     "busy-background": {"tags": (1, 3), "bg": "clutter"},
     "frame-edge": {"tags": (1, 2), "bg": "plain", "edge": True},
     "noise-free": {"tags": (1, 3), "bg": "plain", "noise": (0, 0)},
@@ -287,6 +304,15 @@ def render_frame(fam, cfg, w, h, rng, size_override=None, obstruct=None, light_n
     for _ in range(ndecoy):
         draw(random_cells(fam, rng), float(rng.uniform(40, 170)) * h / 480, False, None)
 
+    if cfg.get("cross"):
+        # a bar (a cable) across the tag, over its border on two sides: it hides 1/4 to 1/3 of each
+        for t in gt:
+            c = np.array(t["corners"])
+            a, b = c[int(rng.integers(0, 4))], None
+            ctr = c.mean(axis=0)
+            p0 = ctr + (a - ctr) * float(rng.uniform(1.0, 1.15))
+            p1 = ctr + (a - ctr) * float(rng.uniform(-0.6, 0.2))
+            ncross = bar(img, p0, p1, 0.12 * t["size_px"], float(rng.choice([bw[0], bw[1], 0.5 * (bw[0] + bw[1])])))
     if cfg.get("light"):
         gx, gy = np.meshgrid(np.linspace(-1, 1, w), np.linspace(-1, 1, h))
         ang = rng.uniform(0, 2 * math.pi)
