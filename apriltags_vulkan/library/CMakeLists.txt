@@ -124,6 +124,7 @@ add_library(vkapriltag STATIC
   src/apriltag_family.cpp
   src/TagDecoder.cpp
   src/RefineEdges.cpp
+  src/BorderSample.cpp
   src/FramePipeline.cpp
   src/PoseEstimator.cpp
   src/common/pgm_io.cpp
