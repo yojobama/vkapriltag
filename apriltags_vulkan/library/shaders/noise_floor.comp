@@ -1,7 +1,7 @@
 #version 450
 // Sets the frame's block contrast floor from its noise: the median 4x4 block range (most blocks are
 // flat, so it is the sensor noise) times scale_tenths / 10, at least min_white_black_diff. One
-// workgroup, reading about 8,192 evenly spaced blocks.
+// workgroup, reading about 2,048 evenly spaced blocks.
 layout(local_size_x_id = 0, local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
@@ -19,7 +19,7 @@ void main() {
   for (uint b = gl_LocalInvocationID.x; b < 256u; b += gl_WorkGroupSize.x) histogram[b] = 0u;
   memoryBarrierShared();
   barrier();
-  uint step = max(1u, pc.block_count / 8192u);
+  uint step = max(1u, pc.block_count / 2048u);
   uint sampled = (pc.block_count + step - 1u) / step;
   for (uint s = gl_LocalInvocationID.x; s < sampled; s += gl_WorkGroupSize.x) {
     uint v = minmax_unfiltered[s * step];

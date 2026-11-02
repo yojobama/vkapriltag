@@ -494,11 +494,11 @@ void GpuDetector::CreatePipelines() {
   const bool fused_threshold = u8 && !(fused_env != nullptr && fused_env[0] == '0');
   minmax_decimate_ = fused_threshold && !alias_decimated_ && !box_decimate_;
   threshold_block_ = fused_threshold;
-  // APRILTAG_VK_ADAPTIVE_FLOOR=k raises the block contrast floor to k times the frame's median block
-  // range (its noise), per frame on the device; it needs the fused threshold.
-  if (const char *v = std::getenv("APRILTAG_VK_ADAPTIVE_FLOOR")) {
-    floor_scale_tenths_ = static_cast<uint32_t>(std::max(0.0, std::atof(v) * 10.0 + 0.5));
-  }
+  // The adaptive contrast floor (DetectorConfig::adaptive_floor_scale) is set per frame on the device
+  // and needs the fused threshold.
+  double floor_scale = config_.adaptive_floor_scale;
+  if (const char *v = std::getenv("APRILTAG_VK_ADAPTIVE_FLOOR")) floor_scale = std::atof(v);
+  floor_scale_tenths_ = static_cast<uint32_t>(std::max(0.0, floor_scale * 10.0 + 0.5));
   adaptive_floor_ = threshold_block_ && floor_scale_tenths_ > 0;
   if (minmax_decimate_) {
     block_minmax_decimate_pl_ = vk::ComputePipeline(

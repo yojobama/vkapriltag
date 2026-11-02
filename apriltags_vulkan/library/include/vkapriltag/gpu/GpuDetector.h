@@ -30,6 +30,13 @@ struct DetectorConfig {
   uint32_t decimation = 2;
 
   uint32_t min_white_black_diff = 5;
+
+  // Raises the block contrast floor above min_white_black_diff to this many times the frame's median
+  // 4x4 block range (its sensor noise), so noise blocks are not labelled; 0 keeps the fixed floor.
+  // Needs 8-bit storage (the fused threshold). Blocks with a range under twice the noise are dropped,
+  // so a tag whose edge contrast is that low is lost.
+  // Env override: APRILTAG_VK_ADAPTIVE_FLOOR=<scale>
+  float adaptive_floor_scale = 2.0f;
   uint32_t min_cluster_pixels = 24;
   uint32_t max_cluster_pixels = 100000;
   uint32_t tag_width = 8;  // in "bit squares"; matches quick_decode tag_width usage

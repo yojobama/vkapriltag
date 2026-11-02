@@ -100,6 +100,13 @@ This port intentionally does less than the CUDA original and upstream
 - **Single border polarity per run.** `reversed_border` must match across
   every tag family added to the detector in one run — mixing normal- and
   reversed-border families in a single pass is not supported.
+- **The contrast floor follows the frame's noise.** `DetectorConfig::adaptive_floor_scale`
+  (default 2; `APRILTAG_VK_ADAPTIVE_FLOOR=0` or `0` in the config turns it off) raises the
+  4x4-block contrast floor above `min_white_black_diff` to that many times the frame's median block
+  range, so sensor noise is not labelled; on noisy 1280x720 frames this halves the frame time on
+  both test machines. A tag whose edges have less than about twice the noise's block range is
+  lost (1 to 3 of about 700 degraded tags in the harshest synthetic sets, none in the real
+  images). It needs 8-bit storage; without it the fixed floor applies and detections can differ.
 
 ## Requirements
 
