@@ -17,10 +17,13 @@ enum class RefineEdgesMethod {
   kFast,
   // As kFast, and TagDecoder refines only quads that already decode unrefined.
   kUltraFast,
+  // Dense edge profiles (every ~1.5 px along a side) with the gradient lobe's centre of mass and a
+  // strength-weighted line fit; more accurate corners at several times kExact's cost.
+  kProfile,
 };
 
 // Resolves the method: an explicit argument wins, then APRILTAG_VK_REFINE ("upstream", "exact",
-// "fast", "ultrafast"), then `configured`.
+// "fast", "ultrafast", "profile"), then `configured`.
 RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured);
 
 // Refines `quad`'s corners in place against the full-resolution image `im`; `td` is used only for

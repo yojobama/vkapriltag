@@ -269,6 +269,118 @@ void RefineEdgesFast(int quad_decimate, const image_u8_t *im, struct quad *quad)
   IntersectLines(lines, quad);
 }
 
+// Dense-profile refinement. Along each side a profile of bilinear taps across the edge is taken
+// every ~1.5 px; the edge sits at the centre of mass of the positive gradient lobe around the
+// profile's strongest step (unsquared weights are exact for an area-sampled edge at any blur
+// width), and a strength-weighted total-least-squares line is fitted through the points.
+constexpr float kProfileStep = 0.25f;   // pixels between taps
+constexpr double kProfileSpacing = 1.5;  // pixels between profiles along a side
+constexpr int kMaxProfilePoints = 96;
+constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient falls below this fraction
+constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
+
+void RefineEdgesProfile(int quad_decimate, const image_u8_t *im, struct quad *quad) {
+  const float range = static_cast<float>(quad_decimate + 1);
+  const int taps = 2 * static_cast<int>(range / kProfileStep) + 3;
+  constexpr int kMaxTaps = 96;
+  if (taps > kMaxTaps) {
+    RefineEdgesT<double>(quad_decimate, im, quad);
+    return;
+  }
+  const int max_x = im->width - 1;
+  const int max_y = im->height - 1;
+  double lines[4][4];
+
+  for (int edge = 0; edge < 4; edge++) {
+    const int a = edge, b = (edge + 1) & 3;
+    double nx = quad->p[b][1] - quad->p[a][1];
+    double ny = -quad->p[b][0] + quad->p[a][0];
+    const double mag = std::sqrt(nx * nx + ny * ny);
+    nx /= mag;
+    ny /= mag;
+    if (quad->reversed_border) {
+      nx = -nx;
+      ny = -ny;
+    }
+    const int np = std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / kProfileSpacing)));
+
+    const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
+    const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
+    double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    int used = 0;
+
+    for (int s = 0; s < np; s++) {
+      const double alpha = (1.0 + s) / (np + 1);
+      const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
+      const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+      float prof[kMaxTaps];
+      bool all_in = true;
+      for (int m = 0; m < taps; ++m) {
+        const float u = -range - kProfileStep + kProfileStep * m;
+        const float x = static_cast<float>(x0) + u * static_cast<float>(nx) - 0.5f;
+        const float y = static_cast<float>(y0) + u * static_cast<float>(ny) - 0.5f;
+        const float xt = std::floor(x), yt = std::floor(y);
+        const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
+        if (xi < 0 || xi >= max_x || yi < 0 || yi >= max_y) {
+          all_in = false;
+          break;
+        }
+        prof[m] = BilinearAt<float>(im, xi, yi, x - xt, y - yt);
+      }
+      if (!all_in) continue;
+
+      // Gradient along the normal (outside brighter than inside for a normal border).
+      float g[kMaxTaps];
+      float best = 0;
+      int bj = -1;
+      for (int j = 1; j < taps - 1; ++j) {
+        g[j] = prof[j + 1] - prof[j - 1];
+        if (g[j] > best) {
+          best = g[j];
+          bj = j;
+        }
+      }
+      if (bj < 0 || best < kMinStep) continue;
+      int jl = bj, jr = bj;
+      while (jl > 1 && g[jl - 1] > kLobeCut * best) jl--;
+      while (jr < taps - 2 && g[jr + 1] > kLobeCut * best) jr++;
+      double gs = 0, gj = 0;
+      for (int j = jl; j <= jr; ++j) {
+        gs += g[j];
+        gj += static_cast<double>(g[j]) * j;
+      }
+      const double n0 = -range - kProfileStep + kProfileStep * (gj / gs);
+      const double bx = x0 + n0 * nx - xm, by = y0 + n0 * ny - ym;
+      const double w = best;
+      sw += w;
+      sx += w * bx;
+      sy += w * by;
+      sxx += w * bx * bx;
+      sxy += w * bx * by;
+      syy += w * by * by;
+      used++;
+    }
+    if (used < 3) {
+      // Too few usable profiles: keep this side where it was.
+      lines[edge][0] = xm;
+      lines[edge][1] = ym;
+      lines[edge][2] = nx;
+      lines[edge][3] = ny;
+      continue;
+    }
+    const double mx = sx / sw, my = sy / sw;
+    const double Cxx = sxx / sw - mx * mx;
+    const double Cxy = sxy / sw - mx * my;
+    const double Cyy = syy / sw - my * my;
+    const double normal_theta = 0.5 * std::atan2(-2 * Cxy, Cyy - Cxx);
+    lines[edge][0] = xm + mx;
+    lines[edge][1] = ym + my;
+    lines[edge][2] = std::cos(normal_theta);
+    lines[edge][3] = std::sin(normal_theta);
+  }
+  IntersectLines(lines, quad);
+}
+
 }  // namespace
 
 RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured) {
@@ -278,6 +390,7 @@ RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured) {
     if (method == "exact") return RefineEdgesMethod::kExact;
     if (method == "fast") return RefineEdgesMethod::kFast;
     if (method == "ultrafast") return RefineEdgesMethod::kUltraFast;
+    if (method == "profile") return RefineEdgesMethod::kProfile;
   }
   return configured;
 }
@@ -291,6 +404,9 @@ void RefineEdges(RefineEdgesMethod method, apriltag_detector_t *td, image_u8_t *
     case RefineEdgesMethod::kFast:
     case RefineEdgesMethod::kUltraFast:
       RefineEdgesFast(td->quad_decimate, im, quad);
+      return;
+    case RefineEdgesMethod::kProfile:
+      RefineEdgesProfile(td->quad_decimate, im, quad);
       return;
     case RefineEdgesMethod::kUpstream:
       refine_edges(td, im, quad);
