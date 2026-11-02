@@ -1,6 +1,9 @@
 #version 450
 // Blurs the per-block min/max with a 3x3 neighbourhood min/max (InternalBlockFilter).
 layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+// Non-zero: a neighbourhood whose range is under kNoiseGuard times its flattest block's range is
+// treated as flat sensor noise and written with no contrast.
+layout(constant_id = 3) const uint kNoiseGuard = 0u;
 
 layout(std430, binding = 0) readonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
 layout(std430, binding = 1) writeonly buffer FilteredMinMax { uint minmax_filtered[]; };
@@ -17,6 +20,7 @@ void main() {
 
   uint mn = 255u;
   uint mx = 0u;
+  uint floor_range = 255u;
   for (int j = -1; j <= 1; ++j) {
     int ry = int(y) + j;
     if (ry < 0 || ry >= int(pc.block_height)) continue;
@@ -26,7 +30,9 @@ void main() {
       uint v = minmax_unfiltered[uint(ry) * pc.block_width + uint(rx)];
       mn = min(mn, v & 0xffu);
       mx = max(mx, (v >> 8u) & 0xffu);
+      floor_range = min(floor_range, ((v >> 8u) & 0xffu) - (v & 0xffu));
     }
   }
+  if (kNoiseGuard != 0u && mx - mn < kNoiseGuard * floor_range) mx = mn;
   minmax_filtered[y * pc.block_width + x] = mn | (mx << 8u);
 }

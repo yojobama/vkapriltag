@@ -457,9 +457,14 @@ void GpuDetector::CreatePipelines() {
   block_minmax_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("block_minmax", "block_minmax_u8")),
       {decimated_view, minmax_unfiltered_buf_.get()}, 16, wg2d_);
+  // APRILTAG_VK_NOISE_GUARD=k (k >= 2) treats blocks whose range is under k times the flattest nearby
+  // block's as noise; it needs the unfused passes.
+  if (const char *v = std::getenv("APRILTAG_VK_NOISE_GUARD")) {
+    noise_guard_ = static_cast<uint32_t>(std::max(0, std::atoi(v)));
+  }
   block_filter_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
-      8, wg2d_);
+      8, wg2d_, {noise_guard_});
   // threshold covers this many pixels of a row per thread; APRILTAG_VK_THRESH_RUN overrides.
   if (const char *v = std::getenv("APRILTAG_VK_THRESH_RUN")) {
     threshold_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
@@ -470,7 +475,8 @@ void GpuDetector::CreatePipelines() {
       {threshold_run_});
   // One thread per 4x4 block; APRILTAG_VK_FUSED_THRESHOLD=0 keeps the separate passes.
   const char *fused_env = std::getenv("APRILTAG_VK_FUSED_THRESHOLD");
-  const bool fused_threshold = u8 && !(fused_env != nullptr && fused_env[0] == '0');
+  const bool fused_threshold =
+      u8 && noise_guard_ == 0 && !(fused_env != nullptr && fused_env[0] == '0');
   minmax_decimate_ = fused_threshold && !alias_decimated_;
   threshold_block_ = fused_threshold;
   if (minmax_decimate_) {

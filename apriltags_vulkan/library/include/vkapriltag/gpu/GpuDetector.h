@@ -361,6 +361,7 @@ class GpuDetector {
   vk::ComputePipeline block_minmax_decimate_pl_, threshold_block_pl_;
   bool minmax_decimate_ = false;
   bool threshold_block_ = false;
+  uint32_t noise_guard_ = 0;
   vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
   // Run starts from a workgroup max-scan, so no compression precedes the merge (single-merge only).
   vk::ComputePipeline uf_init_scan_pl_;
