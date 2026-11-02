@@ -2492,6 +2492,37 @@ tuned set spends 57% in the profile fit's ProfilePass (the next thing to optimis
 Peak resident memory is 223 MB at decimation 1 and 110 MB at decimation 2 for the base and the tuned set
 alike, and the heap peaks near 5.6 MB.
 
+## 8ae. Fused arguments dropped, a faster profile fit, the adaptive floor on by default
+
+Fused arguments (`APRILTAG_VK_FUSE_ARGS`) are removed: the numbers in 8ad stay as the record of why
+(slower on both machines, 0.05 to 0.12 ms on the Mali, +7 us on the desktop).
+
+Profile fit: the taps of a profile lie on a line, so their positions are computed in a loop the
+compiler can vectorise, then the loads, and the bounds are checked at the first and last tap only.
+The output is unchanged (a decimation-1 run of the old code differs from itself by a line, as from the
+new). With all four features the refine takes 55 us per quad on the desktop before and 40 us after
+(-28%); on the Pi at decimation 2 the CPU tail on the four test frames falls from 0.66 to 0.42 ms
+(-37%) and on the 30-tag frame from 0.84 to 0.72 ms. The coarse-to-fine feature (bit 2) costs a third of
+the refine time for no gain at decimation 1 and only a cable-occlusion gain at decimation 2 (median
+0.20 to 0.42 px on the border-occlusion set when it is dropped, nothing else changes), so features 13
+(outlier drop, halfway crossing, clip bias) are the better setting where that case does not matter; the
+four-features setting stays the opt-in default. Profile spacing of 2 or 3 px instead of 1.5 hurts
+accuracy (range p95 0.098 to 0.107 and 0.129 px) and was not kept.
+
+Adaptive floor on by default (`DetectorConfig::adaptive_floor_scale = 2`, `APRILTAG_VK_ADAPTIVE_FLOOR`,
+0 turns it off): the noise estimate now reads 2,048 blocks instead of 8,192 with the same results, and
+the pass takes 32 us on the Mali instead of 54. On the Pi, total ms for the four test frames, new default
+against the same binary with the floor off: decimation 1 2.29 against 6.89 (-67%), decimation 2 1.42
+against 5.89 (-76%). Detections against the floor off: 1,278 corpus frames identical at decimation 1 and
+three lines different at decimation 2; the ten real images (apriltags, field, field2 and their
+scaled copies) lose and gain nothing at either decimation. The cost is in degraded tags: in the three
+synthetic sets (768 frames each) the default loses 1, 1 and 0 tags at decimation 1 and 2, 3 and 1 at
+decimation 2, of 590 to 750 (all small tags, 20 to 30 px, in frames whose median block range is 10, so
+the floor is 20); k of 1.5 loses the same tags and k of 1 and under none but also saves nothing, so 2 is
+the setting where the gain begins. The compacted labelling (`APRILTAG_VK_SPARSE=1`) now takes the Pi
+from 2.29 to 1.95 ms at decimation 1 and 1.42 to 1.22 ms at decimation 2 on top of it, and is the next
+candidate for a default. Validation layer on the desktop (35 runs): no messages.
+
 ## 9. Measuring
 
 ```
