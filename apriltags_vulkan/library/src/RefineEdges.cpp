@@ -280,7 +280,7 @@ constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient fal
 constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
 
 // Optional refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once).
-enum ProfileFeature : unsigned { kDropOutliers = 1u, kCoarseToFine = 2u, kHalfwayCrossing = 4u };
+enum ProfileFeature : unsigned { kDropOutliers = 1u, kCoarseToFine = 2u, kHalfwayCrossing = 4u, kClipBias = 8u };
 unsigned ProfileFeatures() {
   static const unsigned features = [] {
     const char *v = std::getenv("APRILTAG_VK_PROFILE_FEATURES");
@@ -465,6 +465,162 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
   return true;
 }
 
+// Heckbert's projective map of the unit square onto quad q, applied to (u, v); q's corners 0..3 are
+// the square's (0,0), (1,0), (1,1) and (0,1).
+void SquareToQuad(const struct quad *q, double u, double v, double *x, double *y) {
+  const double dx1 = q->p[1][0] - q->p[2][0], dx2 = q->p[3][0] - q->p[2][0];
+  const double dy1 = q->p[1][1] - q->p[2][1], dy2 = q->p[3][1] - q->p[2][1];
+  const double sx = q->p[0][0] - q->p[1][0] + q->p[2][0] - q->p[3][0];
+  const double sy = q->p[0][1] - q->p[1][1] + q->p[2][1] - q->p[3][1];
+  const double den = dx1 * dy2 - dx2 * dy1;
+  const double g = den != 0 ? (sx * dy2 - dx2 * sy) / den : 0;
+  const double h = den != 0 ? (dx1 * sy - sx * dy1) / den : 0;
+  const double a = q->p[1][0] - q->p[0][0] + g * q->p[1][0], b = q->p[3][0] - q->p[0][0] + h * q->p[3][0];
+  const double d = q->p[1][1] - q->p[0][1] + g * q->p[1][1], e = q->p[3][1] - q->p[0][1] + h * q->p[3][1];
+  const double w = g * u + h * v + 1;
+  *x = (a * u + b * v + q->p[0][0]) / w;
+  *y = (d * u + e * v + q->p[0][1]) / w;
+}
+
+// Centre of mass of the strongest positive gradient lobe of prof[from..to] (falling: the strongest
+// negative one); -1 if there is none.
+double LobeCentroid(const double *prof, int from, int to, bool falling) {
+  double g[64], best = 0;
+  int bj = -1;
+  for (int j = from; j <= to; ++j) {
+    g[j] = falling ? prof[j - 1] - prof[j + 1] : prof[j + 1] - prof[j - 1];
+    if (g[j] > best) {
+      best = g[j];
+      bj = j;
+    }
+  }
+  if (bj < 0) return -1;
+  int jl = bj, jr = bj;
+  while (jl > from && g[jl - 1] > 0.05 * best) jl--;
+  while (jr < to && g[jr + 1] > 0.05 * best) jr++;
+  double sg = 0, sj = 0;
+  for (int j = jl; j <= jr; ++j) {
+    sg += g[j];
+    sj += g[j] * j;
+  }
+  return sj / sg;
+}
+
+// Clipped exposure shrinks every black region by about the same distance delta, so a border that
+// should be one cell wide measures cell - 2 delta while the fitted outline is itself 2 delta small.
+// Measures the border's width across white payload cells and returns delta in pixels (0 when the
+// levels are not clipped, too few cells can be measured, or the sides disagree).
+double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
+  const double cells = width_cells;
+  double black_v[64], white_v[64];
+  int nb = 0, nw = 0;
+  auto at = [&](double u, double v, double *out) {
+    double x, y;
+    SquareToQuad(q, u, v, &x, &y);
+    return SampleAt(im, x, y, out);
+  };
+  for (int i = 0; i < width_cells && nb < 62; ++i) {  // border cells along the top and bottom
+    double v;
+    if (at((i + 0.5) / cells, 0.5 / cells, &v)) black_v[nb++] = v;
+    if (at((i + 0.5) / cells, (cells - 0.5) / cells, &v)) black_v[nb++] = v;
+  }
+  for (int i = 0; i < width_cells && nw < 62; ++i) {  // the quiet ring half a cell outside
+    double v;
+    if (at((i + 0.5) / cells, -0.5 / cells, &v)) white_v[nw++] = v;
+    if (at((i + 0.5) / cells, (cells + 0.5) / cells, &v)) white_v[nw++] = v;
+  }
+  if (nb < 4 || nw < 4) return 0;
+  std::nth_element(black_v, black_v + nb / 2, black_v + nb);
+  std::nth_element(white_v, white_v + nw / 2, white_v + nw);
+  const double black = black_v[nb / 2], white = white_v[nw / 2];
+  if (white < 250 && black > 4) return 0;
+  const double mid = 0.5 * (black + white);
+
+  constexpr int kN = 33;
+  double sum = 0, side_sum[4] = {0, 0, 0, 0};
+  int n = 0, side_n[4] = {0, 0, 0, 0};
+  for (int side = 0; side < 4; ++side) {
+    for (int c = 1; c < width_cells - 1; ++c) {
+      const double a = (c + 0.5) / cells;
+      // (u, v) at depth t (in cells) inward from side `side`, at position a along it
+      auto uv = [&](double t, double *u, double *v) {
+        const double tt = t / cells;
+        *u = side == 0 ? a : side == 1 ? 1 - tt : side == 2 ? a : tt;
+        *v = side == 0 ? tt : side == 1 ? a : side == 2 ? 1 - tt : a;
+      };
+      double u, v, sample;
+      uv(1.5, &u, &v);
+      if (!at(u, v, &sample) || sample < mid) continue;  // a dark payload cell
+      double prof[kN], px[kN], py[kN];
+      bool ok = true;
+      for (int j = 0; j < kN && ok; ++j) {
+        uv(-0.5 + 2.0 * j / (kN - 1), &u, &v);
+        SquareToQuad(q, u, v, &px[j], &py[j]);
+        ok = SampleAt(im, px[j], py[j], &prof[j]);
+      }
+      if (!ok) continue;
+      const double jo = LobeCentroid(prof, 1, kN / 2 - 1, true);
+      const double ji = LobeCentroid(prof, kN / 2 + 1, kN - 2, false);
+      if (jo < 0 || ji < 0) continue;
+      auto along = [&](double j, double *x, double *y) {
+        const int j0 = static_cast<int>(j);
+        const double f = j - j0;
+        *x = px[j0] + (px[j0 + 1] - px[j0]) * f;
+        *y = py[j0] + (py[j0 + 1] - py[j0]) * f;
+      };
+      double ox, oy, ix, iy;
+      along(jo, &ox, &oy);
+      along(ji, &ix, &iy);
+      const double border_px = std::hypot(ix - ox, iy - oy);
+      const double cell_px = std::hypot(px[24] - px[8], py[24] - py[8]);  // depth 0 to depth 1
+      const double d = (cell_px - border_px) / (2.0 * (1.0 - 1.0 / cells));
+      sum += d;
+      side_sum[side] += d;
+      ++n;
+      ++side_n[side];
+    }
+  }
+  if (n < 4) return 0;
+  const double delta = sum / n;
+  for (int side = 0; side < 4; ++side) {
+    if (side_n[side] > 0 && std::fabs(side_sum[side] / side_n[side] - delta) > 0.05 + 0.25 * std::fabs(delta)) {
+      return 0;  // the sides disagree: the border is not one cell wide
+    }
+  }
+  return std::fabs(delta) > 0.02 && std::fabs(delta) < 1.5 ? delta : 0;
+}
+
+// Moves every side of the quad outward by d pixels and re-intersects them.
+void GrowQuad(struct quad *q, double d) {
+  double cx = 0, cy = 0, px[4], py[4], dx[4], dy[4];
+  for (int k = 0; k < 4; ++k) {
+    cx += 0.25 * q->p[k][0];
+    cy += 0.25 * q->p[k][1];
+  }
+  for (int k = 0; k < 4; ++k) {
+    const double ax = q->p[k][0], ay = q->p[k][1];
+    const double ex = q->p[(k + 1) & 3][0] - ax, ey = q->p[(k + 1) & 3][1] - ay;
+    const double len = std::hypot(ex, ey);
+    double nx = ey / len, ny = -ex / len;
+    if ((ax - cx) * nx + (ay - cy) * ny < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    px[k] = ax + nx * d;
+    py[k] = ay + ny * d;
+    dx[k] = ex / len;
+    dy[k] = ey / len;
+  }
+  for (int k = 0; k < 4; ++k) {
+    const int p = (k + 3) & 3;
+    const double cross = dx[p] * dy[k] - dy[p] * dx[k];
+    if (std::fabs(cross) < 1e-9) return;
+    const double t = ((px[k] - px[p]) * dy[k] - (py[k] - py[p]) * dx[k]) / cross;
+    q->p[k][0] = static_cast<float>(px[p] + t * dx[p]);
+    q->p[k][1] = static_cast<float>(py[p] + t * dy[p]);
+  }
+}
+
 void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, struct quad *quad) {
   const int quad_decimate = static_cast<int>(td->quad_decimate);
   float reach = static_cast<float>(quad_decimate + 1);
@@ -484,11 +640,11 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
     RefineEdgesT<double>(quad_decimate, im, quad);
     return;
   }
-  if ((ProfileFeatures() & kCoarseToFine) == 0 || cell <= 0) return;
+  if (cell <= 0) return;
 
   // Narrow the window to the measured edge width (never above half a cell, so the next payload edge
   // stays out) and refit around the refined sides, while that still shrinks it.
-  for (int pass = 0; pass < 3; ++pass) {
+  for (int pass = 0; pass < 3 && (ProfileFeatures() & kCoarseToFine) != 0; ++pass) {
     double next = std::max(1.5, 1.25 * edge_width);
     if (cell >= 3.0) next = std::min(next, 0.45 * cell);
     if (next >= 0.9 * reach) break;
@@ -498,6 +654,12 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
       *quad = before;
       break;
     }
+  }
+  if ((ProfileFeatures() & kClipBias) != 0) {
+    apriltag_family_t *family = nullptr;
+    zarray_get(td->tag_families, 0, &family);
+    const double delta = ClipBias(quad, family->width_at_border, im);
+    if (delta != 0) GrowQuad(quad, delta);
   }
 }
 
