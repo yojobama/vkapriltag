@@ -2523,6 +2523,62 @@ the setting where the gain begins. The compacted labelling (`APRILTAG_VK_SPARSE=
 from 2.29 to 1.95 ms at decimation 1 and 1.42 to 1.22 ms at decimation 2 on top of it, and is the next
 candidate for a default. Validation layer on the desktop (35 runs): no messages.
 
+## 8af. Compaction on by default, and where the time goes now
+
+`DetectorConfig::sparse_labelling` (default on; `APRILTAG_VK_SPARSE=0` turns it off) takes effect where
+its prerequisites hold: the fused threshold, uf_init_scan and uf_count_runs, which means integrated GPUs
+(the Mali); discrete GPUs keep the dense passes, where it was slower. Pi, four 1280x720 frames, total
+ms, floor and compaction against compaction off against both off: decimation 1 1.83, 2.03, 6.04;
+decimation 2 1.20, 1.33, 2.72. Desktop output is unchanged by it (it is off there). Checks on the final
+code: Khronos validation layer with synchronisation validation on the Mali (36 runs) none; AddressSanitizer
+on the desktop (34 runs) none; AddressSanitizer with UndefinedBehaviourSanitizer and ThreadSanitizer on the
+Pi (32 runs each) none.
+
+Mali, per dispatch at decimation 1 with the defaults (us, median; the frame's GPU time is 1.58 ms):
+blob_diff 359, uf_merge 223, uf_init_scan 179, uf_count_runs 172, threshold_block 117, sort (local, two
+large) 74, 106 and 33, block_minmax 45, scatter 46, reduce_extents 41, hash_group 40, clears 33, noise_floor
+31, select_blobs 31, scan_blob_counts 27, cell_args 21, two build_indirect_args 17 and 15. At decimation 2:
+blob_diff 128, uf_merge 76, uf_init 67, uf_count 57, threshold 46, sort 77, 27 and 27. The Mali offline
+compiler reports every kernel bound by the load/store pipe (arithmetic 5 to 15 times below it; load/store
+cycles per invocation: merge 46, count_runs 31, blob_diff 31, noise_floor 260 in its shared-memory
+histogram, scan_blob_counts 34, init_scan 20, threshold 16), all at 100% occupancy except select_blobs
+(64 registers, 50%). The CPU, at decimation 2 with the default exact refine: 51% in the exact refine
+(RefineEdgesT), 15% in memcpy (the frame upload and the readbacks), 6% in FitQuadForBlob, 5% in
+quad_decode; 1.2 instructions per cycle, a 2% cache-miss rate; 48 futex calls per frame (89% of the
+syscall time) and 20 context switches per frame, for 3 candidates; valgrind's callgrind cannot run the Mali
+driver on this board (illegal instruction), so there is no instruction-level profile of the CPU tail.
+Peak memory is unchanged (223 MB at decimation 1, 110 MB at 2).
+
+Ranked candidates, with what each is worth if it works (estimates, not measurements):
+1. Fewer loads in blob_diff (359 us, 23% of the frame, load/store bound): each pixel loads five
+   neighbour codes and a parent; fetch the east and west codes from the next and previous lane with
+   subgroupShuffle (core in Vulkan 1.1 when the device reports shuffle) and keep the global-load path as the
+   fallback; stage the row below through shared memory. Perhaps -100 to -150 us.
+2. Merge the threshold and uf_init_scan passes in one workgroup per 64x4 cell (shared memory holds the
+   thresholded codes the scan needs), which drops a read of the whole thresholded buffer and a dispatch.
+   Perhaps -60 to -100 us.
+3. uf_merge (223 us): test whole words for a top-equals-bottom match before the per-pixel loop, so flat or
+   all-different words skip their loads; perhaps -50 us.
+4. threshold_block: stage the 3x3 block min/max in shared memory (each block loads nine words today);
+   perhaps -40 us.
+5. Clears (33 us): put the per-frame counters in one buffer so one fill replaces about nine; perhaps -20 us.
+6. The sort (213 us at decimation 1): the large-blob runs and merge are 139 us for the largest blobs only;
+   a cheaper path for blobs under about 2,000 points; unmeasured.
+7. CPU: run a frame with few quads on the calling thread instead of waking the pool (about 0.1 ms of 0.29 ms
+   at 3 candidates by the futex count); frames with dozens of quads keep the pool. Zero-copy upload
+   removes the 15% memcpy where the camera path imports the frame (dma-buf import exists; host-pointer
+   import is not offered by the Mali driver).
+8. select_blobs at 64 registers and 50% occupancy: split its two phases or cut live values; small.
+Extensions that exist on the Mali (1.3.276) and could be used behind a Vulkan 1.1 fallback:
+VK_EXT_subgroup_size_control with requiredSubgroupSize (a guaranteed 16-wide subgroup for the scan in
+uf_init_scan), VK_KHR_shader_subgroup_uniform_control_flow (safe subgroup operations inside the divergent
+parts of blob_diff and merge), VK_KHR_shader_integer_dot_product (accelerated 8-bit dot products; no
+current use), VK_KHR_zero_initialize_workgroup_memory, VK_KHR_push_descriptor and VK_KHR_synchronization2
+(barrier precision; the barrier cost per dispatch is already about 15 us, so little to gain),
+VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size and shader-core control;
+unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
+is where the time is.
+
 ## 9. Measuring
 
 ```
