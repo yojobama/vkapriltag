@@ -2579,6 +2579,26 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8al. Candidate 6: small batches on the calling thread (dropped)
+
+`WorkerPool::ParallelFor` runs a batch of at most `APRILTAG_CPU_INLINE` items on the calling thread
+(default 1, as before) instead of waking the pool. Orange Pi 5 Plus, four test frames, CPU tail per
+frame (mean of per-frame medians), default exact refine, interleaved with the base:
+
+| limit | decimation 1 CPU | decimation 2 CPU |
+|---|---|---|
+| base | 0.230 ms | 0.237 ms |
+| 4 | 0.261 ms | 0.257 ms |
+| 8 | 0.242 ms | 0.225 ms |
+| 16 | 0.226 ms | 0.225 ms |
+
+The changes are within run-to-run noise (the base itself moves 0.230 to 0.240 between runs), and the
+low limits are worse: with a few quads the pool's workers still overlap the refine of one quad with
+the decode of the next, which a single thread cannot. The 48 futex calls per frame seen in the
+syscall profile are therefore cheap compared with the work they share out. The separate sort
+fast path for small blobs was not built: `sort_points_local_u8` already handles them in one 74 us
+dispatch, with the large-blob sorts at 33 to 106 us only on frames with large blobs. Not to be merged.
+
 ## 9. Measuring
 
 ```
