@@ -2579,6 +2579,14 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8ai. Candidate 3: word-level skip in `uf_merge` (dropped)
+
+`uf_merge_body.glsl` now finds the bytes whose top and bottom codes match with one word-wide test
+and visits only those, instead of testing four bytes in turn. Output is identical (30 of 30 lines,
+decimation 1 and 2, three switch states). `uf_merge_x4_u8` on the Orange Pi 5 Plus: 223 us before,
+225 us after at decimation 1; 77 us before and after at decimation 2. The kernel is bound by its two
+word loads and the root walks, not by the byte tests, so there is nothing to save. Not to be merged.
+
 ## 9. Measuring
 
 ```
