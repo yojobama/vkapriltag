@@ -2579,6 +2579,16 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8aj. Candidate 4: block min/max tile staged in shared memory in `threshold_block` (dropped)
+
+`threshold_block_u8.comp` loads the workgroup's 16 x 16 block min/max values plus a one-block halo
+into shared memory once and folds each block's 3 x 3 neighbourhood from there, in place of nine global
+loads per block. Output is identical (30 of 30 lines, decimation 1 and 2, three switch states).
+On the Orange Pi 5 Plus the kernel is slower: 116 us before, 193 us after at decimation 1; 46 us before,
+66 us after at decimation 2 (total GPU 1.525 to 1.583 ms and 0.849 to 0.851 ms). The nine loads hit the
+cache (neighbouring threads share them) and the staging adds a barrier and a second pass over shared
+memory. Not to be merged.
+
 ## 9. Measuring
 
 ```
