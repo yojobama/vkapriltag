@@ -2579,6 +2579,33 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8an. Candidate 8: zero-copy upload (already present; summary of the eight candidates)
+
+The library already imports the caller's frame: `GpuDetector::ImportHostFrame` through
+`VK_EXT_external_memory_host` (+26 to +29% on the RX 9060 XT) and `ImportDmaBufFrame` on the Mali,
+which lacks that extension (section 8d). The 15% `memcpy` in the Pi profile belongs to the benchmark
+harness, which hands `Detect()` an ordinary buffer; a camera path that exports its buffers avoids it,
+subject to the cache-coherency caveat in 8d. No code changed for this candidate.
+
+Result of the eight candidates, measured on the Orange Pi 5 Plus (sections 8ag to 8am), none of which
+is to be merged:
+
+| # | Candidate | Verdict |
+|---|---|---|
+| 1 | `blob_diff` neighbour codes by subgroup shuffle | slower (358 to 406 us; 653 us with `subgroupShuffle`) |
+| 2 | threshold and `uf_init_scan` in one pass per cell | slower (296 to 491 us) |
+| 3 | word-level skip in `uf_merge` | no change (223 to 225 us) |
+| 4 | shared-memory min/max tile in `threshold_block` | slower (116 to 193 us) |
+| 5 | one counter buffer and one clear | bound measured at zero (32 to 36 us) |
+| 6 | small batches on the calling thread | no gain (CPU 0.230 to 0.226 to 0.261 ms) |
+| 7 | `select_blobs` register pressure | no change (31.5 us) |
+| 8 | zero-copy upload | already present |
+
+What the results say: at these sizes the Mali kernels are limited by cache-served loads and by the
+~15 us cost of a dispatch, so moving loads into registers or shared memory, or removing small
+operations, does not help. The remaining lever is fewer dispatches or fewer pixels labelled, which
+the adaptive floor and compaction already took.
+
 ## 9. Measuring
 
 ```
