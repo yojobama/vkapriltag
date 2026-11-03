@@ -59,8 +59,8 @@ struct DetectorConfig {
   uint32_t max_tag_pixels = 0;
 
   // Averages each decimation block instead of copying its top-left pixel (decimation above 1).
-  // Env override: APRILTAG_VK_BOX_DECIMATE=1
-  bool box_decimate = false;
+  // Env override: APRILTAG_VK_BOX_DECIMATE=0|1
+  bool box_decimate = true;
 
   // Bounding-box aspect ratio cap (max(w,h)/min(w,h)) applied in select_blobs.comp; 0 disables.
   float aspect_max = 8.0f;
@@ -283,7 +283,7 @@ class GpuDetector {
   vk::Buffer gray_buf_, decimated_buf_;
   // True when the threshold and sort stages read gray_buf_ as the decimated image.
   bool alias_decimated_ = false;
-  bool box_decimate_ = false;  // APRILTAG_VK_BOX_DECIMATE=1: decimate by averaging each block
+  bool box_decimate_ = false;  // APRILTAG_VK_BOX_DECIMATE=0|1: decimate by averaging each block
   vk::Buffer minmax_unfiltered_buf_, minmax_filtered_buf_;
   vk::Buffer contrast_floor_buf_, active_cells_buf_, cell_list_buf_, cell_args_buf_;
   vk::Buffer thresholded_buf_;

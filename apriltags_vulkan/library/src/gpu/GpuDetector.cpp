@@ -469,7 +469,8 @@ void GpuDetector::CreatePipelines() {
   // specialization constant 3, after the workgroup size's 0-2.
   // APRILTAG_VK_BOX_DECIMATE=1 averages each block instead of copying its top-left pixel.
   const char *box_env = std::getenv("APRILTAG_VK_BOX_DECIMATE");
-  box_decimate_ = (config_.box_decimate || (box_env != nullptr && box_env[0] == '1')) && config_.decimation > 1;
+  const bool want_box = box_env != nullptr ? box_env[0] != '0' : config_.box_decimate;
+  box_decimate_ = want_box && config_.decimation > 1;
   // Box sums of whole 2 or 4 byte rows use the integer dot product where the device has it.
   const char *dot_env = std::getenv("APRILTAG_VK_DOT");
   const bool box_dot = box_decimate_ && u8 && ctx_.caps().has_integer_dot_product &&
