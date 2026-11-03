@@ -56,6 +56,7 @@ set(SHADER_SOURCES
   shaders/threshold.comp
   shaders/threshold_u8.comp
   shaders/threshold_block_u8.comp
+  shaders/threshold_init_scan_u8.comp
   shaders/uf_init.comp
   shaders/uf_init_u8.comp
   shaders/uf_init_scan.comp

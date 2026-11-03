@@ -1,0 +1,192 @@
+#version 450
+// threshold_block_u8.comp and uf_init_scan_u8.comp in one pass over a 64 x 4 pixel cell: 16 threads
+// threshold one 4 x 4 block each, keep the codes in shared memory, then scan the cell's four rows.
+// Only for the sparse dispatch; a cell with contrast is listed in cell_list.
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 16) in;
+layout(constant_id = 3) const uint kAdaptiveFloor = 0u;
+layout(constant_id = 4) const uint kPieceLengths = 0u;
+
+layout(std430, binding = 0) readonly buffer DecimatedImage { uint8_t decimated[]; };
+layout(std430, binding = 1) readonly buffer UnfilteredMinMax { uint minmax_unfiltered[]; };
+layout(std430, binding = 2) writeonly buffer Thresholded { uint8_t thresholded[]; };
+layout(std430, binding = 3) readonly buffer Floor { uint contrast_floor[]; };
+layout(std430, binding = 4) buffer CellList { uint cell_list[]; };
+layout(std430, binding = 5) writeonly buffer Parent { uint parent[]; };
+layout(std430, binding = 6) writeonly buffer BlobSize { uint blob_size[]; };
+// Bindings 0, 2 and 5 viewed as words of 4 pixels, for rows whose width is a multiple of 4.
+layout(std430, binding = 0) readonly buffer DecimatedWords { uint decimated_words[]; };
+layout(std430, binding = 2) writeonly buffer ThresholdedWords { uint thresholded_words[]; };
+layout(std430, binding = 5) writeonly buffer Parent4 { uvec4 parent4[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint width;
+  uint height;
+  uint min_white_black_diff;
+  uint block_width;
+  uint block_height;
+  // Must equal blob_diff.comp's min_blob_pixels.
+  uint min_blob_pixels;
+} pc;
+
+shared uint codes[4][64];
+shared uint left_code[4];
+shared uint cell_active;
+// The last run start of each subgroup; sized for the smallest subgroup in a 16-thread workgroup.
+shared uint sg_last[16];
+
+// Threshold of block (bx, by): ambiguous when its 3 x 3 neighbourhood lacks contrast.
+void BlockThreshold(uint bx, uint by, out bool ambiguous, out uint thresh) {
+  uint mn = 255u;
+  uint mx = 0u;
+  for (int j = -1; j <= 1; ++j) {
+    int ry = int(by) + j;
+    if (ry < 0 || ry >= int(pc.block_height)) continue;
+    for (int i = -1; i <= 1; ++i) {
+      int rx = int(bx) + i;
+      if (rx < 0 || rx >= int(pc.block_width)) continue;
+      uint v = minmax_unfiltered[uint(ry) * pc.block_width + uint(rx)];
+      mn = min(mn, v & 0xffu);
+      mx = max(mx, (v >> 8u) & 0xffu);
+    }
+  }
+  ambiguous = mx - mn < (kAdaptiveFloor != 0u ? contrast_floor[0] : pc.min_white_black_diff);
+  thresh = mn + (mx - mn) / 2u;
+}
+
+uint CodeOf(uint pixel, bool ambiguous, uint thresh) {
+  return ambiguous ? 127u : ((pixel > thresh) ? 255u : 0u);
+}
+
+void main() {
+  uint t = gl_LocalInvocationID.x;
+  uint cells_x = (pc.block_width + 15u) / 16u;
+  uint by = gl_WorkGroupID.y;
+  uint x_first = gl_WorkGroupID.x * 64u;
+  uint bx = gl_WorkGroupID.x * 16u + t;
+  bool whole = (pc.width & 3u) == 0u;
+
+  if (t == 0u) cell_active = 0u;
+  barrier();
+
+  // Phase 1: this thread's block, as threshold_block_u8.comp.
+  bool ambiguous = true;
+  uint thresh = 0u;
+  if (bx < pc.block_width) BlockThreshold(bx, by, ambiguous, thresh);
+  if (!ambiguous) atomicOr(cell_active, 1u);
+  uint x_end = min(bx * 4u + 4u, pc.width);
+  uint y_end = min(by * 4u + 4u, pc.height);
+  for (uint r = 0u; r < 4u; ++r) {
+    uint y = by * 4u + r;
+    uint packed_codes = 0x7f7f7f7fu;
+    if (bx < pc.block_width && y < y_end) {
+      if (whole) {
+        uint w = (y * pc.width) / 4u + bx;
+        uint d = decimated_words[w];
+        packed_codes = 0u;
+        for (uint k = 0u; k < 4u; ++k) {
+          packed_codes |= CodeOf((d >> (8u * k)) & 0xFFu, ambiguous, thresh) << (8u * k);
+        }
+        thresholded_words[w] = packed_codes;
+      } else {
+        packed_codes = 0u;
+        for (uint x = bx * 4u; x < x_end; ++x) {
+          uint c = CodeOf(uint(decimated[y * pc.width + x]), ambiguous, thresh);
+          thresholded[y * pc.width + x] = uint8_t(c);
+          packed_codes |= c << (8u * (x - bx * 4u));
+        }
+        // Pixels past the row's end read as ambiguous.
+        for (uint x = x_end; x < bx * 4u + 4u; ++x) packed_codes |= 127u << (8u * (x - bx * 4u));
+      }
+    }
+    codes[r][t * 4u] = packed_codes & 0xFFu;
+    codes[r][t * 4u + 1u] = (packed_codes >> 8u) & 0xFFu;
+    codes[r][t * 4u + 2u] = (packed_codes >> 16u) & 0xFFu;
+    codes[r][t * 4u + 3u] = (packed_codes >> 24u) & 0xFFu;
+  }
+  // The block left of the cell supplies each row's code just before the segment.
+  if (t == 0u) {
+    bool left_ambiguous = true;
+    uint left_thresh = 0u;
+    if (x_first > 0u) BlockThreshold(gl_WorkGroupID.x * 16u - 1u, by, left_ambiguous, left_thresh);
+    for (uint r = 0u; r < 4u; ++r) {
+      uint y = by * 4u + r;
+      left_code[r] = (x_first > 0u && y < pc.height)
+                         ? CodeOf(uint(decimated[y * pc.width + x_first - 1u]), left_ambiguous,
+                                  left_thresh)
+                         : 127u;
+    }
+  }
+  barrier();
+
+  // Appends the cell to the list, as threshold_block_u8.comp does for any block with contrast.
+  if (cell_active == 0u) return;
+  if (t == 0u) cell_list[1u + atomicAdd(cell_list[0], 1u)] = by * cells_x + gl_WorkGroupID.x;
+
+  // Phase 2: uf_init_scan_u8.comp over each of the cell's rows, codes from shared memory.
+  uint x0 = x_first + t * 4u;
+  bool in_row = x0 < pc.width;
+  uint seg_end = x_first + 64u;
+  for (uint r = 0u; r < 4u; ++r) {
+    uint y = by * 4u + r;
+    if (y >= pc.height) break;
+    uint row = y * pc.width;
+    uint xe = min(x0 + 4u, pc.width);
+    uint start[4] = uint[4](0u, 0u, 0u, 0u);
+    uint v[5] = uint[5](127u, 127u, 127u, 127u, 127u);
+    uint last = 0u;
+    if (in_row) {
+      uint prev = (t > 0u) ? codes[r][t * 4u - 1u] : left_code[r];
+      for (uint k = 0u; k < 4u; ++k) {
+        uint x = x0 + k;
+        if (x >= xe) break;
+        v[k] = codes[r][t * 4u + k];
+        bool join_left = (v[k] != 127u) && (x > 0u) && (prev == v[k]);
+        if (!join_left) last = x + 1u;
+        start[k] = last;
+        prev = v[k];
+      }
+      if (t < 15u) v[4] = codes[r][t * 4u + 4u];
+    }
+
+    uint before = subgroupExclusiveMax(last);
+    uint incl = subgroupInclusiveMax(last);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1u) sg_last[gl_SubgroupID] = incl;
+    memoryBarrierShared();
+    barrier();
+    for (uint s = 0u; s < gl_SubgroupID; ++s) before = max(before, sg_last[s]);
+
+    if (in_row) {
+      uint seg_left = row + x_first - 1u;
+      for (uint k = 0u; k < 4u && kPieceLengths != 0u; ++k) {
+        uint x = x0 + k;
+        if (x >= xe) break;
+        bool ends = !(v[k] != 127u && v[k + 1u] == v[k]) || x + 1u == seg_end;
+        if (!ends || v[k] == 127u) continue;
+        uint first = max(start[k], before);
+        first = (first != 0u) ? first - 1u : x_first;
+        blob_size[row + first] = min(x + 1u - first, pc.min_blob_pixels);
+      }
+      if (whole) {
+        uvec4 p;
+        for (uint k = 0u; k < 4u; ++k) {
+          uint s = max(start[k], before);
+          p[k] = (s != 0u) ? row + s - 1u : seg_left;
+        }
+        parent4[(row + x0) >> 2u] = p;
+      } else {
+        for (uint k = 0u; k < 4u; ++k) {
+          uint x = x0 + k;
+          if (x >= xe) break;
+          uint s = max(start[k], before);
+          parent[row + x] = (s != 0u) ? row + s - 1u : seg_left;
+        }
+      }
+    }
+    barrier();
+  }
+}

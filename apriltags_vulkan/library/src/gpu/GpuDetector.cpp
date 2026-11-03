@@ -541,6 +541,15 @@ void GpuDetector::CreatePipelines() {
                                           {cell_list_buf_.get(), cell_args_buf_.get()}, 0,
                                           vk::WorkgroupSize{1, 1, 1});
     }
+    const char *fuse_env = std::getenv("APRILTAG_VK_FUSE_INIT");
+    fuse_init_ = sparse_ && fuse_env != nullptr && fuse_env[0] == '1';
+    if (fuse_init_) {
+      threshold_init_scan_pl_ = vk::ComputePipeline(
+          ctx_, ShaderPath("threshold_init_scan_u8"),
+          {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get(),
+           contrast_floor_buf_.get(), cell_list_buf_.get(), parent_buf_.get(), blob_size_buf_.get()},
+          24, vk::WorkgroupSize{16, 1, 1}, {adaptive_floor_ ? 1u : 0u, count_runs_ ? 1u : 0u});
+    }
     if (adaptive_floor_) {
       noise_floor_pl_ = vk::ComputePipeline(
           ctx_, ShaderPath("noise_floor"),
@@ -770,6 +779,7 @@ struct GpuDetector::FrameStart {
 };
 
 void GpuDetector::RecordInitScan(VkCommandBuffer cmd) {
+  if (fuse_init_) return;
   struct { uint32_t dw, dh, min_blob; } pc{decimated_width_, decimated_height_,
                                           config_.min_cluster_pixels};
   if (sparse_) {
@@ -875,7 +885,15 @@ void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *impo
           block_width_ * block_height_, config_.min_white_black_diff, floor_scale_tenths_};
       noise_floor_pl_.DispatchRaw(cmd, 1, 1, 1, &floor_pc);
     }
-    threshold_block_pl_.Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
+    if (fuse_init_) {
+      struct { uint32_t dw, dh, min_diff, bw, bh, min_blob; } fused_pc{
+          decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_,
+          block_height_, config_.min_cluster_pixels};
+      threshold_init_scan_pl_.DispatchRaw(cmd, (block_width_ + 15u) / 16u, block_height_, 1,
+                                          &fused_pc);
+    } else {
+      threshold_block_pl_.Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
+    }
     if (sparse_) {
       cell_args_pl_.DispatchRaw(cmd, 1, 1, 1, nullptr);
       vk::ComputePipeline::IndirectDispatchBarrier(cmd);
