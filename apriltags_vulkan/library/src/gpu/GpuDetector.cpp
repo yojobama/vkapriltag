@@ -607,12 +607,12 @@ void GpuDetector::CreatePipelines() {
 
   // Binding 4 is uf_changed_buf_, read only by the fused path's speculative attempt. Bindings 5 and 6
   // let the shader test a pixel's blob size and read the threshold codes itself.
-  // Neighbour codes come from adjacent lanes when the subgroup covers whole 16-pixel rows;
-  // APRILTAG_VK_BLOB_SHUFFLE=0 reads them from memory.
+  // Opt-in (APRILTAG_VK_BLOB_SHUFFLE=1): neighbour codes from adjacent lanes, which is slower on
+  // the Mali than reading them. The relative-shuffle feature is assumed, not queried.
   const uint32_t sg = ctx_.caps().subgroup_size;
   const char *shuffle_env = std::getenv("APRILTAG_VK_BLOB_SHUFFLE");
   const bool blob_shuffle = sparse_ && ctx_.caps().has_subgroup_shuffle && sg >= 16u &&
-                            sg <= 64u && !(shuffle_env != nullptr && shuffle_env[0] == '0');
+                            sg <= 64u && shuffle_env != nullptr && shuffle_env[0] == '1';
   blob_diff_pl_ = vk::ComputePipeline(
       ctx_,
       ShaderPath(blob_shuffle ? pick("blob_diff_shuffle", "blob_diff_shuffle_u8")

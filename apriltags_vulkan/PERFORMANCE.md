@@ -2579,6 +2579,23 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8ag. Candidate 1: neighbour codes by subgroup shuffle in `blob_diff` (dropped)
+
+`blob_diff` read five threshold codes per pixel. The shuffle variant (`blob_diff_shuffle*.comp`,
+`APRILTAG_VK_BLOB_SHUFFLE=1`) loads two per lane and takes the east, south-east and south-west codes
+from neighbouring lanes, with only the end lanes of each 16-pixel row reading memory.
+
+| Orange Pi 5 Plus, `blob_diff` | memory loads | `subgroupShuffle` | `subgroupShuffleUp/Down` |
+|---|---|---|---|
+| decimation 1 | 358 us | 653 us | 406 us |
+| decimation 2 | 128 us | 213 us | 141 us |
+
+Output is identical to the memory path (30 of 30 detection lines, decimation 1 and 2, three switch
+states), and the desktop corpus scores match to the digit. The Mali handles the code loads well (the
+frame's codes are one byte per pixel and the lines are shared by the four rows of a cell), while lane
+exchange costs more than the loads it removes. The variant stays off by default and the branch is not
+to be merged.
+
 ## 9. Measuring
 
 ```
