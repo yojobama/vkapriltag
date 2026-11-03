@@ -2579,6 +2579,15 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8am. Candidate 7: `select_blobs` register pressure (dropped)
+
+The copies fold in `select_blobs.comp` is marked not to be unrolled, to drop the kernel's 64
+registers (50% occupancy). Output is identical (30 of 30 lines, decimation 1 and 2, three switch
+states). Orange Pi 5 Plus: 31.5 us before and after at decimation 1; 31.2 us before and after at
+decimation 2. The dispatch covers a few hundred raw blobs, so it is bound by launch latency (a
+one-workgroup dispatch costs about 15 us there, and `scan_blob_counts` takes 25 us), not by occupancy.
+Not to be merged.
+
 ## 9. Measuring
 
 ```
