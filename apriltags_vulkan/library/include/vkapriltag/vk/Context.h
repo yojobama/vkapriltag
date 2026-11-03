@@ -123,6 +123,8 @@ struct DeviceCaps {
   bool has_uniform_control_flow = false;
   // VK_ARM_scheduling_controls, enabled only when APRILTAG_VK_SHADER_CORES is set.
   bool has_scheduling_controls = false;
+  // VK_KHR_shader_integer_dot_product + shaderIntegerDotProduct, enabled when present.
+  bool has_integer_dot_product = false;
 
   // --- Memory topology ---
   // True when device-local memory is also host-visible, so staging copies can be skipped.
@@ -271,6 +273,7 @@ public:
   bool supports_subgroup_size_control_ = false;
   bool supports_uniform_control_flow_ = false;
   bool supports_scheduling_controls_ = false;
+  bool supports_integer_dot_product_ = false;
   PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties_ = nullptr;
   PFN_vkGetMemoryFdPropertiesKHR get_fd_properties_ = nullptr;
   PipelineCache pipeline_cache_;

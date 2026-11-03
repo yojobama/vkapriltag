@@ -545,6 +545,20 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     supports_uniform_control_flow_ =
         supports_uniform_control_flow_ && have_flow.shaderSubgroupUniformControlFlow == VK_TRUE;
   }
+  supports_integer_dot_product_ =
+      DeviceHasExtension(physical_device_, "VK_KHR_shader_integer_dot_product");
+  VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dot_product{};
+  dot_product.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+  if (supports_integer_dot_product_) {
+    VkPhysicalDeviceFeatures2 query{};
+    query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR have{};
+    have.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+    query.pNext = &have;
+    vkGetPhysicalDeviceFeatures2(physical_device_, &query);
+    supports_integer_dot_product_ = have.shaderIntegerDotProduct == VK_TRUE;
+  }
+  dot_product.shaderIntegerDotProduct = VK_TRUE;
   size_control.subgroupSizeControl = VK_TRUE;
   size_control.computeFullSubgroups = VK_TRUE;
   uniform_flow.shaderSubgroupUniformControlFlow = VK_TRUE;
@@ -575,6 +589,10 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     uniform_flow.pNext = features2.pNext;
     features2.pNext = &uniform_flow;
   }
+  if (supports_integer_dot_product_) {
+    dot_product.pNext = features2.pNext;
+    features2.pNext = &dot_product;
+  }
 #ifdef VK_ARM_scheduling_controls
   VkPhysicalDeviceSchedulingControlsFeaturesARM scheduling{};
   scheduling.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCHEDULING_CONTROLS_FEATURES_ARM;
@@ -591,6 +609,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     enabled_extensions.push_back("VK_KHR_shader_subgroup_uniform_control_flow");
   }
   if (supports_scheduling_controls_) enabled_extensions.push_back("VK_ARM_scheduling_controls");
+  if (supports_integer_dot_product_) enabled_extensions.push_back("VK_KHR_shader_integer_dot_product");
   if (supports_8bit_storage_) {
     enabled_extensions.push_back("VK_KHR_8bit_storage");
     // VK_KHR_8bit_storage depends on VK_KHR_storage_buffer_storage_class, which must be named
@@ -704,6 +723,7 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.has_subgroup_size_control = supports_subgroup_size_control_;
   caps_.has_uniform_control_flow = supports_uniform_control_flow_;
   caps_.has_scheduling_controls = supports_scheduling_controls_;
+  caps_.has_integer_dot_product = supports_integer_dot_product_;
   if (supports_subgroup_size_control_) {
     VkPhysicalDeviceSubgroupSizeControlPropertiesEXT size_props{};
     size_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
