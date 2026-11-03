@@ -134,9 +134,14 @@ void main() {
     uint i0 = y * pc.width + x0;
     uint top = THRESHOLDED_WORD(i0 >> 2u);
     uint bottom = THRESHOLDED_WORD((i0 + pc.width) >> 2u);
-    for (uint k = 0u; k < 4u; ++k) {
+    // Bit 7 of each byte is set where the top and bottom codes are equal; only those are visited.
+    uint diff = top ^ bottom;
+    uint equal = ~(((diff & 0x7f7f7f7fu) + 0x7f7f7f7fu) | diff | 0x7f7f7f7fu);
+    while (equal != 0u) {
+      uint k = uint(findLSB(equal)) >> 3u;
+      equal &= ~(0x80u << (8u * k));
       uint v = (top >> (8u * k)) & 0xFFu;
-      if (v == 127u || ((bottom >> (8u * k)) & 0xFFu) != v) continue;
+      if (v == 127u) continue;
       uint i = i0 + k;
       bool overlap_start;
       if (k > 0u) {
