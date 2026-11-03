@@ -467,7 +467,8 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   int shader_cores = 0;
   EnvInt("APRILTAG_VK_SHADER_CORES", &shader_cores);
   supports_scheduling_controls_ = shader_cores > 0 &&
-                                  DeviceHasExtension(physical_device_, "VK_ARM_scheduling_controls");
+                                  DeviceHasExtension(physical_device_, "VK_ARM_scheduling_controls") &&
+                                  DeviceHasExtension(physical_device_, "VK_ARM_shader_core_builtins");
 #ifdef VK_ARM_scheduling_controls
   VkDeviceQueueShaderCoreControlCreateInfoARM core_control{};
   core_control.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_SHADER_CORE_CONTROL_CREATE_INFO_ARM;
@@ -608,7 +609,11 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   if (supports_uniform_control_flow_) {
     enabled_extensions.push_back("VK_KHR_shader_subgroup_uniform_control_flow");
   }
-  if (supports_scheduling_controls_) enabled_extensions.push_back("VK_ARM_scheduling_controls");
+  if (supports_scheduling_controls_) {
+    // VK_ARM_scheduling_controls depends on VK_ARM_shader_core_builtins.
+    enabled_extensions.push_back("VK_ARM_shader_core_builtins");
+    enabled_extensions.push_back("VK_ARM_scheduling_controls");
+  }
   if (supports_integer_dot_product_) enabled_extensions.push_back("VK_KHR_shader_integer_dot_product");
   if (supports_8bit_storage_) {
     enabled_extensions.push_back("VK_KHR_8bit_storage");
