@@ -2579,6 +2579,35 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8ao. Device extensions: subgroup size control, uniform control flow, integer dot product, ARM scheduling controls
+
+`Context` enables each extension when the device has it and falls back silently otherwise (the core
+Vulkan 1.1 paths are unchanged). Orange Pi 5 Plus (Mali-G610, driver g24p0) exposes all four; the RX 9060 XT
+all but the ARM one. Output is identical to the base in every case below.
+
+| Extension | What was tried | Result |
+|---|---|---|
+| `VK_EXT_subgroup_size_control` | `APRILTAG_VK_SUBGROUP_SIZE=n`: whole subgroups of a required size for the two subgroup kernels (`uf_init_scan`, `reduce_extents_hash_subgroup`) | Mali: min = max = 16, so no choice exists; GPU 1.51 vs 1.52 ms. RX 9060 XT: 0.29 ms at 32, 64 and the default, all within noise |
+| `VK_KHR_shader_subgroup_uniform_control_flow` | `uf_init_scan_ucf_u8.comp` (`APRILTAG_VK_UCF=1`), `main` declared to keep invocations converged around the subgroup scans | `uf_init_scan` 178 vs 179 us: no change |
+| `VK_ARM_scheduling_controls` | `APRILTAG_VK_SHADER_CORES=n` (queue shader core count), and workgroup sweeps with `APRILTAG_VK_WG` and `APRILTAG_VK_WG2D` (1D 32 to 512; 2D 8x8, 16x8, 16x16, 32x8, 8x16) | The G610 has 4 cores: 4 is the default speed, 3 gives 1.76 ms, 2 gives 2.30 ms, 1 gives 4.00 ms (decimation 1). Every workgroup shape lies within 1.49 to 1.57 ms, which is noise. Nothing beats the defaults |
+| `VK_KHR_shader_integer_dot_product` | `decimate_box_dot_u8.comp`: the 2 or 4 byte row sums of box decimation by one dot product (`APRILTAG_VK_DOT=0` disables) | **Win on the Mali**, below |
+
+Integer dot product (`decimate_box` at decimation 2 and 4, Mali): the pass takes 93 to about 62 us at
+decimation 2 and 77 to about 41 us at decimation 4, and whole-frame GPU time with `APRILTAG_VK_BOX_DECIMATE=1`
+falls from 0.820 to 0.789 ms at decimation 2 (1.520 to 1.515 ms at decimation 1, where box decimation is
+off the path). The RX 9060 XT's pass is 10 us either way. It is the only byte-summing shader; the other
+kernels move or compare bytes, which a dot product does not shorten. With the dot product box decimation
+at decimation 2 (0.789 ms) is faster than the default top-left decimation (0.846 ms).
+
+The validation layer caught one bug while enabling these: `VK_ARM_scheduling_controls` depends on
+`VK_ARM_shader_core_builtins`, which was not enabled (VUID-vkCreateDevice-ppEnabledExtensionNames-01387);
+both are now enabled together.
+
+Checks on this branch: validation layer with synchronisation validation, 30 runs per machine (decimation
+1, 2 and 4, ten environment sets each), zero messages with the positive control firing; AddressSanitizer
+on the desktop 30 runs, AddressSanitizer plus UBSan and ThreadSanitizer on the Pi 30 runs each, no
+reports.
+
 ## 9. Measuring
 
 ```
