@@ -29,20 +29,33 @@ layout(push_constant) uniform PushConstants {
   uint block_height;
 } pc;
 
+// The workgroup's block min/max with a one-block halo, staged once; out-of-image entries hold the
+// identity for the min/max fold. Sized for workgroups up to 32 x 32.
+shared uint tile[34 * 34];
+
 void main() {
   uint bx = gl_GlobalInvocationID.x;
   uint by = gl_GlobalInvocationID.y;
+  const uint wx = gl_WorkGroupSize.x;
+  const uint wy = gl_WorkGroupSize.y;
+  const uint tw = wx + 2u;
+  const int base_x = int(gl_WorkGroupID.x * wx) - 1;
+  const int base_y = int(gl_WorkGroupID.y * wy) - 1;
+  for (uint i = gl_LocalInvocationIndex; i < tw * (wy + 2u); i += wx * wy) {
+    int rx = base_x + int(i % tw);
+    int ry = base_y + int(i / tw);
+    bool inside = rx >= 0 && ry >= 0 && rx < int(pc.block_width) && ry < int(pc.block_height);
+    tile[i] = inside ? minmax_unfiltered[uint(ry) * pc.block_width + uint(rx)] : 0x00ffu;
+  }
+  memoryBarrierShared();
+  barrier();
   if (bx >= pc.block_width || by >= pc.block_height) return;
 
   uint mn = 255u;
   uint mx = 0u;
-  for (int j = -1; j <= 1; ++j) {
-    int ry = int(by) + j;
-    if (ry < 0 || ry >= int(pc.block_height)) continue;
-    for (int i = -1; i <= 1; ++i) {
-      int rx = int(bx) + i;
-      if (rx < 0 || rx >= int(pc.block_width)) continue;
-      uint v = minmax_unfiltered[uint(ry) * pc.block_width + uint(rx)];
+  for (uint j = 0u; j < 3u; ++j) {
+    for (uint i = 0u; i < 3u; ++i) {
+      uint v = tile[(gl_LocalInvocationID.y + j) * tw + gl_LocalInvocationID.x + i];
       mn = min(mn, v & 0xffu);
       mx = max(mx, (v >> 8u) & 0xffu);
     }
