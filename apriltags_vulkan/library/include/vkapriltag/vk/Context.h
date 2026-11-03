@@ -114,6 +114,15 @@ struct DeviceCaps {
   bool has_subgroup_shuffle = false;
   // Lanes per subgroup (VkPhysicalDeviceSubgroupProperties::subgroupSize).
   uint32_t subgroup_size = 0;
+  // VK_EXT_subgroup_size_control with computeFullSubgroups: a pipeline can require a subgroup size
+  // in [min_subgroup_size, max_subgroup_size] and whole subgroups.
+  bool has_subgroup_size_control = false;
+  uint32_t min_subgroup_size = 0;
+  uint32_t max_subgroup_size = 0;
+  // VK_KHR_shader_subgroup_uniform_control_flow, enabled when present.
+  bool has_uniform_control_flow = false;
+  // VK_ARM_scheduling_controls, enabled only when APRILTAG_VK_SHADER_CORES is set.
+  bool has_scheduling_controls = false;
 
   // --- Memory topology ---
   // True when device-local memory is also host-visible, so staging copies can be skipped.
@@ -259,6 +268,9 @@ public:
   PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering_ = nullptr;
   bool supports_external_memory_host_ = false;
   bool supports_dma_buf_ = false;
+  bool supports_subgroup_size_control_ = false;
+  bool supports_uniform_control_flow_ = false;
+  bool supports_scheduling_controls_ = false;
   PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties_ = nullptr;
   PFN_vkGetMemoryFdPropertiesKHR get_fd_properties_ = nullptr;
   PipelineCache pipeline_cache_;

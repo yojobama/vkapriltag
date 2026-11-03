@@ -211,6 +211,23 @@ ComputePipeline::ComputePipeline(const Context &ctx, const ShaderSource &shader_
   VkPipelineShaderStageCreateInfo stage_info{};
   stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  // The subgroup kernels run whole subgroups of a required size when the device allows it;
+  // APRILTAG_VK_SUBGROUP_SIZE=n picks the size (default: the device's own, with whole subgroups).
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+  required_size.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+  const bool subgroup_kernel = shader_source.label.find("uf_init_scan") != std::string::npos ||
+                               shader_source.label.find("_subgroup") != std::string::npos;
+  if (subgroup_kernel && ctx.caps().has_subgroup_size_control && std::getenv("APRILTAG_VK_SUBGROUP_SIZE")) {
+    const uint32_t wanted =
+        static_cast<uint32_t>(std::max(0L, std::strtol(std::getenv("APRILTAG_VK_SUBGROUP_SIZE"), nullptr, 10)));
+    const uint32_t size = wanted != 0 ? wanted : ctx.caps().subgroup_size;
+    if (size >= ctx.caps().min_subgroup_size && size <= ctx.caps().max_subgroup_size &&
+        workgroup_size_.invocations() % size == 0) {
+      required_size.requiredSubgroupSize = size;
+      stage_info.pNext = &required_size;
+      stage_info.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
+  }
   stage_info.module = shader_.module();
   stage_info.pName = "main";
   stage_info.pSpecializationInfo = &spec_info;

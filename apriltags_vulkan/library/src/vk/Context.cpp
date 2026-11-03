@@ -463,9 +463,24 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     all_counts.push_back(transfer_count);
   }
   queue_families_ = all_families;
+  // Shader core count for the queues (VK_ARM_scheduling_controls); APRILTAG_VK_SHADER_CORES=n.
+  int shader_cores = 0;
+  EnvInt("APRILTAG_VK_SHADER_CORES", &shader_cores);
+  supports_scheduling_controls_ = shader_cores > 0 &&
+                                  DeviceHasExtension(physical_device_, "VK_ARM_scheduling_controls");
+#ifdef VK_ARM_scheduling_controls
+  VkDeviceQueueShaderCoreControlCreateInfoARM core_control{};
+  core_control.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_SHADER_CORE_CONTROL_CREATE_INFO_ARM;
+  core_control.shaderCoreCount = static_cast<uint32_t>(shader_cores);
+#else
+  supports_scheduling_controls_ = false;
+#endif
   std::vector<VkDeviceQueueCreateInfo> queue_infos(all_families.size());
   for (size_t k = 0; k < all_families.size(); ++k) {
     queue_infos[k] = {};
+#ifdef VK_ARM_scheduling_controls
+    if (supports_scheduling_controls_) queue_infos[k].pNext = &core_control;
+#endif
     queue_infos[k].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     queue_infos[k].queueFamilyIndex = all_families[k];
     queue_infos[k].queueCount = all_counts[k];
@@ -500,6 +515,40 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   conditional.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT;
   conditional.conditionalRendering = VK_TRUE;
 
+  // Subgroup size control, with full subgroups, and uniform control flow: enabled when present.
+  supports_subgroup_size_control_ =
+      DeviceHasExtension(physical_device_, "VK_EXT_subgroup_size_control");
+  supports_uniform_control_flow_ =
+      DeviceHasExtension(physical_device_, "VK_KHR_shader_subgroup_uniform_control_flow");
+  VkPhysicalDeviceSubgroupSizeControlFeaturesEXT size_control{};
+  size_control.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+  VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR uniform_flow{};
+  uniform_flow.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
+  {
+    VkPhysicalDeviceFeatures2 query{};
+    query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT have_size{};
+    have_size.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+    VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR have_flow{};
+    have_flow.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
+    if (supports_subgroup_size_control_) {
+      query.pNext = &have_size;
+      if (supports_uniform_control_flow_) have_size.pNext = &have_flow;
+    } else if (supports_uniform_control_flow_) {
+      query.pNext = &have_flow;
+    }
+    vkGetPhysicalDeviceFeatures2(physical_device_, &query);
+    supports_subgroup_size_control_ = supports_subgroup_size_control_ &&
+        have_size.subgroupSizeControl == VK_TRUE && have_size.computeFullSubgroups == VK_TRUE;
+    supports_uniform_control_flow_ =
+        supports_uniform_control_flow_ && have_flow.shaderSubgroupUniformControlFlow == VK_TRUE;
+  }
+  size_control.subgroupSizeControl = VK_TRUE;
+  size_control.computeFullSubgroups = VK_TRUE;
+  uniform_flow.shaderSubgroupUniformControlFlow = VK_TRUE;
+
   VkPhysicalDeviceFeatures2 features2{};
   features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   // features2.features stays zeroed; pEnabledFeatures must be NULL when a
@@ -518,7 +567,30 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     features2.pNext = &conditional;
   }
 
+  if (supports_subgroup_size_control_) {
+    size_control.pNext = features2.pNext;
+    features2.pNext = &size_control;
+  }
+  if (supports_uniform_control_flow_) {
+    uniform_flow.pNext = features2.pNext;
+    features2.pNext = &uniform_flow;
+  }
+#ifdef VK_ARM_scheduling_controls
+  VkPhysicalDeviceSchedulingControlsFeaturesARM scheduling{};
+  scheduling.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCHEDULING_CONTROLS_FEATURES_ARM;
+  scheduling.schedulingControls = VK_TRUE;
+  if (supports_scheduling_controls_) {
+    scheduling.pNext = features2.pNext;
+    features2.pNext = &scheduling;
+  }
+#endif
+
   std::vector<const char *> enabled_extensions;
+  if (supports_subgroup_size_control_) enabled_extensions.push_back("VK_EXT_subgroup_size_control");
+  if (supports_uniform_control_flow_) {
+    enabled_extensions.push_back("VK_KHR_shader_subgroup_uniform_control_flow");
+  }
+  if (supports_scheduling_controls_) enabled_extensions.push_back("VK_ARM_scheduling_controls");
   if (supports_8bit_storage_) {
     enabled_extensions.push_back("VK_KHR_8bit_storage");
     // VK_KHR_8bit_storage depends on VK_KHR_storage_buffer_storage_class, which must be named
@@ -629,6 +701,19 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.has_int64_atomics = supports_int64_atomics_;
   caps_.has_conditional_rendering = supports_conditional_rendering_;
   caps_.has_external_memory_host = supports_external_memory_host_;
+  caps_.has_subgroup_size_control = supports_subgroup_size_control_;
+  caps_.has_uniform_control_flow = supports_uniform_control_flow_;
+  caps_.has_scheduling_controls = supports_scheduling_controls_;
+  if (supports_subgroup_size_control_) {
+    VkPhysicalDeviceSubgroupSizeControlPropertiesEXT size_props{};
+    size_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &size_props;
+    vkGetPhysicalDeviceProperties2(physical_device_, &props2);
+    caps_.min_subgroup_size = size_props.minSubgroupSize;
+    caps_.max_subgroup_size = size_props.maxSubgroupSize;
+  }
   caps_.has_external_memory_dma_buf = supports_dma_buf_;
   if (supports_external_memory_host_) {
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props{};
