@@ -2579,6 +2579,16 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8ak. Candidate 5: one counter buffer and one clear (not implemented; bound measured at zero)
+
+Putting the per-frame counters in one buffer would replace about nine fills with one, but the
+descriptors bind whole buffers, so it needs sub-range binding throughout. Before building that, the
+bound was measured: a build with six of the four-byte counter fills (`qbp_counter`, `selected_counter`,
+`uf_changed`, `raw_blob_counter`, `hash_drop_counter`, `oversized_sort_counter`) removed (so its
+detections are wrong; timing only) took `<clears>` from 32.4 to 36.2 us at decimation 1 and 40.5 to
+37.6 us at decimation 2 on the Orange Pi 5 Plus. The span's cost is the dispatch and barrier, not the
+number of fills, so merging the buffers cannot pay. Nothing was changed on the branch beyond this note.
+
 ## 9. Measuring
 
 ```
