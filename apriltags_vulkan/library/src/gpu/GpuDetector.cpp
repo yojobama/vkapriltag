@@ -550,7 +550,10 @@ void GpuDetector::CreatePipelines() {
 
   if (uf_init_scan_) {
     uf_init_scan_pl_ = vk::ComputePipeline(
-        ctx_, ShaderPath(pick("uf_init_scan", "uf_init_scan_u8")),
+        ctx_,
+        ShaderPath(u8 && ctx_.caps().has_uniform_control_flow && std::getenv("APRILTAG_VK_UCF") != nullptr
+                       ? "uf_init_scan_ucf_u8"
+                       : pick("uf_init_scan", "uf_init_scan_u8")),
         {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), cell_list_buf_.get()},
         12, vk::WorkgroupSize{sparse_ ? 16u : wg1d_.x, 1, 1}, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
   }

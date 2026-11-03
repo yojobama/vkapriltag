@@ -34,6 +34,9 @@ layout(push_constant) uniform PushConstants {
 // The last run start of each subgroup; sized for the smallest subgroup in the largest workgroup.
 shared uint sg_last[64];
 
+#ifdef UF_UNIFORM_CONTROL_FLOW
+[[subgroup_uniform_control_flow]]
+#endif
 void main() {
   uint seg_first = gl_WorkGroupID.x * gl_WorkGroupSize.x * 4u;
   uint y = gl_GlobalInvocationID.y;

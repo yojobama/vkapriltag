@@ -60,6 +60,7 @@ set(SHADER_SOURCES
   shaders/uf_init_u8.comp
   shaders/uf_init_scan.comp
   shaders/uf_init_scan_u8.comp
+  shaders/uf_init_scan_ucf_u8.comp
   shaders/uf_count_runs.comp
   shaders/uf_count_runs_u8.comp
   shaders/uf_merge.comp
