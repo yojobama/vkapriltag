@@ -2600,6 +2600,44 @@ shows no change between 32, 64 and the default), `VK_KHR_shader_subgroup_uniform
 (`uf_init_scan` 178 us against 179 us) and `VK_ARM_scheduling_controls` (4 of 4 cores is the default
 speed, fewer is proportionally slower, and no workgroup shape moves GPU time outside 1.49 to 1.57 ms).
 
+## 8ap. Survey of the available extensions, and what a barrier costs on the Mali
+
+Extensions listed by the two devices (Orange Pi 5 Plus driver g24p0; RX 9060 XT) were read against the
+code. Most are graphics, presentation or ray tracing and do not touch a compute-only pipeline. The ones
+that could bear on it, and why each was kept or set aside:
+
+| Extension (device) | Verdict |
+|---|---|
+| `VK_KHR_shader_integer_dot_product` (both) | in use, section 8ao |
+| `VK_EXT_subgroup_size_control`, `VK_KHR_shader_subgroup_uniform_control_flow`, `VK_ARM_scheduling_controls`, `VK_ARM_shader_core_builtins` (Pi) | measured, no gain (`perf/ext-tuning`) |
+| `VK_KHR_synchronization2` (Pi) | no gain: see below, barriers are already minimal and the cost is the execution dependency |
+| `VK_KHR_push_descriptor`, `VK_EXT_descriptor_buffer` (desktop), `VK_KHR_buffer_device_address` | descriptors are written once at pipeline creation and the command buffers are pre-recorded, so there is no per-frame descriptor work to save |
+| `VK_KHR_16bit_storage`, `VK_KHR_shader_float16_int8` (Pi) | the bytes are not the limit: every kernel is load/store-instruction bound, and the 8-bit storage already in use covers the pixel data |
+| `VK_KHR_vulkan_memory_model` (Pi) | the Mali's caches are coherent; the plain accesses in the union-find are tolerated by design, so relaxed atomics would not shorten any path |
+| `VK_KHR_shader_quad_control` (both) | quad exchange is the same lane-exchange hardware path that made the subgroup shuffle slower than memory loads (section 8ag) |
+| `VK_KHR_timeline_semaphore` | frame completion is one fence wait; a timeline semaphore would not shorten it |
+| `VK_KHR_global_priority`, `VK_EXT_global_priority` | would only matter when other processes load the GPU; not measurable on an idle board |
+| `VK_AMD_shader_trinary_minmax`, `VK_KHR_shader_subgroup_rotate` (desktop) | the desktop's GPU time is 0.29 ms and the CPU tail dominates, so ALU savings in the labelling kernels do not show |
+| `VK_EXT_device_generated_commands`, `VK_KHR_device_address_commands`, `VK_KHR_copy_memory_indirect` (desktop) | the dispatches are already recorded once and replayed |
+| `VK_EXT_external_memory_host`, `VK_EXT_external_memory_dma_buf`, `VK_KHR_external_memory_fd` | already used (section 8d) |
+| `VK_EXT_conditional_rendering` | already used, and predication was measured and dropped (section 8ad) |
+
+Barriers. The labelling and boundary stages are a chain of about 17 dependent dispatches, and the Mali's
+GPU time is mostly the gaps between them. Measured on the Orange Pi (timing only: with the barriers removed
+the results are wrong), GPU time per frame at decimation 1 / 2:
+
+| barrier between dependent dispatches | decimation 1 | decimation 2 |
+|---|---|---|
+| full memory barrier (as built) | 1.536 ms | 0.821 ms |
+| none | 1.318 ms | 0.632 ms |
+| execution dependency only (no access masks) | 1.504 ms vs 1.544 ms | 0.812 ms vs 0.846 ms |
+
+Two readings follow. The access masks (the cache maintenance) cost only about 35 to 40 us per frame, and
+no extension removes them, because the data does pass from one kernel to the next. The remaining 180 to
+190 us is the serialisation itself, which the chain's data dependencies require. The way to reduce it is
+to have fewer, larger dispatches, which the fused-argument, fused-init and predicated-skip experiments
+(sections 8ae, 8ah) each tried without gain, not a different barrier API.
+
 ## 9. Measuring
 
 ```
