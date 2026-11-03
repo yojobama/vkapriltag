@@ -4,6 +4,7 @@
 // maps each raw blob index to its selected index, or 0xFFFFFFFF if rejected. Folds
 // reduce_extents_hash.comp's private accumulator copies into each blob's extents first.
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 #include "common.glsl"
 
 layout(local_size_x_id = 0, local_size_x = 256) in;
@@ -51,7 +52,7 @@ void main() {
 
   MinMaxExtentsGpu e = extents[i];
   if (i < kPrivateExtentsBlobs) {
-    for (uint c = 1u; c < kExtentsCopies; ++c) {
+    [[dont_unroll]] for (uint c = 1u; c < kExtentsCopies; ++c) {
       MinMaxExtentsGpu o = extents[ExtentsSlot(i, c, pc.max_raw_blobs)];
       e.min_x = min(e.min_x, o.min_x);
       e.min_y = min(e.min_y, o.min_y);
