@@ -9,6 +9,9 @@
 namespace apriltag_vulkan {
 
 WorkerPool::WorkerPool(unsigned threads, const char *name) : name_(name) {
+  if (const char *v = std::getenv("APRILTAG_CPU_INLINE")) {
+    inline_limit_ = static_cast<size_t>(std::max(1L, std::strtol(v, nullptr, 10)));
+  }
   const unsigned hardware = std::thread::hardware_concurrency();
   unsigned total = threads;
   if (total == 0) total = hardware;
@@ -89,8 +92,8 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
   if (count == 0) return;
   std::lock_guard<std::mutex> call_lock(call_mutex_);
 
-  // A single item (or a single-threaded pool) runs inline on the calling thread as slot 0.
-  if (workers_.empty() || count == 1) {
+  // Few items (or a single-threaded pool) run inline on the calling thread as slot 0.
+  if (workers_.empty() || count <= inline_limit_) {
     for (size_t i = 0; i < count; ++i) fn(i, 0);
     return;
   }
