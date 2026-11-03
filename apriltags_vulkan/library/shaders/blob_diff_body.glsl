@@ -75,11 +75,10 @@ void main() {
   uint idx = x + y * pc.width;
   uint c0 = in_image ? CodeAt(idx) : 1u;
   uint cS = (x < pc.width && y + 1u < pc.height) ? CodeAt(idx + pc.width) : 1u;
-  uint lane = gl_SubgroupInvocationID;
   uint lx = gl_LocalInvocationID.x;
-  uint cE_n = subgroupShuffle(c0, lane + 1u);
-  uint cSE_n = subgroupShuffle(cS, lane + 1u);
-  uint cSW_n = subgroupShuffle(cS, lane - 1u);
+  uint cE_n = subgroupShuffleDown(c0, 1u);
+  uint cSE_n = subgroupShuffleDown(cS, 1u);
+  uint cSW_n = subgroupShuffleUp(cS, 1u);
   if (x < 1u || y < 1u || x + 1u >= pc.width || y + 1u >= pc.height) return;
   // Ambiguous pixel: contributes nothing.
   if (c0 == 1u) return;
