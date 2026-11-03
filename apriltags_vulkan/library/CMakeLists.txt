@@ -72,6 +72,8 @@ set(SHADER_SOURCES
   shaders/uf_final_u8.comp
   shaders/blob_diff.comp
   shaders/blob_diff_u8.comp
+  shaders/blob_diff_shuffle.comp
+  shaders/blob_diff_shuffle_u8.comp
   shaders/select_blobs.comp
   shaders/scan_blob_counts.comp
   shaders/sort_points_local.comp

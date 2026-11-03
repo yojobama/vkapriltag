@@ -68,6 +68,30 @@ void main() {
     x = x_first + (gl_WorkGroupID.x & 3u) * 16u + gl_LocalInvocationID.x;
     y = y_row + gl_LocalInvocationID.y;
   }
+#ifdef BLOB_DIFF_SHUFFLE
+  // Each lane reads its own code and the one below; the east, south-east and south-west codes come
+  // from the neighbouring lanes, and only the cell's end lanes read them from memory.
+  bool in_image = x < pc.width && y < pc.height;
+  uint idx = x + y * pc.width;
+  uint c0 = in_image ? CodeAt(idx) : 1u;
+  uint cS = (x < pc.width && y + 1u < pc.height) ? CodeAt(idx + pc.width) : 1u;
+  uint lane = gl_SubgroupInvocationID;
+  uint lx = gl_LocalInvocationID.x;
+  uint cE_n = subgroupShuffle(c0, lane + 1u);
+  uint cSE_n = subgroupShuffle(cS, lane + 1u);
+  uint cSW_n = subgroupShuffle(cS, lane - 1u);
+  if (x < 1u || y < 1u || x + 1u >= pc.width || y + 1u >= pc.height) return;
+  // Ambiguous pixel: contributes nothing.
+  if (c0 == 1u) return;
+  uint idxE = idx + 1u;
+  uint idxSE = idx + pc.width + 1u;
+  uint idxS = idx + pc.width;
+  uint idxSW = idx + pc.width - 1u;
+  uint idxW = idx - 1u;
+  uint cE = lx < 15u ? cE_n : CodeAt(idxE);
+  uint cSE = lx < 15u ? cSE_n : CodeAt(idxSE);
+  uint cSW = lx > 0u ? cSW_n : CodeAt(idxSW);
+#else
   if (x < 1u || y < 1u || x + 1u >= pc.width || y + 1u >= pc.height) return;
 
   uint idx = x + y * pc.width;
@@ -86,6 +110,7 @@ void main() {
   uint cSE = CodeAt(idxSE);
   uint cS = CodeAt(idxS);
   uint cSW = CodeAt(idxSW);
+#endif
 
   // Connections E, SE, S, SW: a candidate when the pair straddles black/white. With
   // c0 in {0, 2}, c0 + cN == 2 implies cN == 2 - c0.
