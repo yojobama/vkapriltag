@@ -500,6 +500,19 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   conditional.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT;
   conditional.conditionalRendering = VK_TRUE;
 
+  supports_integer_dot_product_ =
+      DeviceHasExtension(physical_device_, "VK_KHR_shader_integer_dot_product");
+  VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dot_product{};
+  dot_product.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+  if (supports_integer_dot_product_) {
+    VkPhysicalDeviceFeatures2 query{};
+    query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    query.pNext = &dot_product;
+    vkGetPhysicalDeviceFeatures2(physical_device_, &query);
+    supports_integer_dot_product_ = dot_product.shaderIntegerDotProduct == VK_TRUE;
+  }
+  dot_product.shaderIntegerDotProduct = VK_TRUE;
+
   VkPhysicalDeviceFeatures2 features2{};
   features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   // features2.features stays zeroed; pEnabledFeatures must be NULL when a
@@ -518,7 +531,13 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     features2.pNext = &conditional;
   }
 
+  if (supports_integer_dot_product_) {
+    dot_product.pNext = features2.pNext;
+    features2.pNext = &dot_product;
+  }
+
   std::vector<const char *> enabled_extensions;
+  if (supports_integer_dot_product_) enabled_extensions.push_back("VK_KHR_shader_integer_dot_product");
   if (supports_8bit_storage_) {
     enabled_extensions.push_back("VK_KHR_8bit_storage");
     // VK_KHR_8bit_storage depends on VK_KHR_storage_buffer_storage_class, which must be named
@@ -629,6 +648,7 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.has_int64_atomics = supports_int64_atomics_;
   caps_.has_conditional_rendering = supports_conditional_rendering_;
   caps_.has_external_memory_host = supports_external_memory_host_;
+  caps_.has_integer_dot_product = supports_integer_dot_product_;
   caps_.has_external_memory_dma_buf = supports_dma_buf_;
   if (supports_external_memory_host_) {
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props{};

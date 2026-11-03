@@ -45,6 +45,7 @@ set(SHADER_SOURCES
   shaders/decimate_u8.comp
   shaders/decimate_box.comp
   shaders/decimate_box_u8.comp
+  shaders/decimate_box_dot_u8.comp
   shaders/decimate_yuyv.comp
   shaders/decimate_yuyv_u8.comp
   shaders/block_minmax.comp

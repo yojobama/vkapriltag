@@ -106,6 +106,8 @@ struct DeviceCaps {
   // VK_EXT_external_memory_dma_buf + VK_KHR_external_memory_fd: dma-buf file descriptors can back a
   // buffer.
   bool has_external_memory_dma_buf = false;
+  // VK_KHR_shader_integer_dot_product + shaderIntegerDotProduct, enabled when present.
+  bool has_integer_dot_product = false;
   // Subgroup capabilities (VkPhysicalDeviceSubgroupProperties); the subgroup shader variants are
   // used when both ballot and arithmetic are set.
   bool has_subgroup_ballot = false;
@@ -259,6 +261,7 @@ public:
   PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering_ = nullptr;
   bool supports_external_memory_host_ = false;
   bool supports_dma_buf_ = false;
+  bool supports_integer_dot_product_ = false;
   PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties_ = nullptr;
   PFN_vkGetMemoryFdPropertiesKHR get_fd_properties_ = nullptr;
   PipelineCache pipeline_cache_;

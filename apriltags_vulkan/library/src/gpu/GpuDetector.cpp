@@ -470,8 +470,14 @@ void GpuDetector::CreatePipelines() {
   // APRILTAG_VK_BOX_DECIMATE=1 averages each block instead of copying its top-left pixel.
   const char *box_env = std::getenv("APRILTAG_VK_BOX_DECIMATE");
   box_decimate_ = (config_.box_decimate || (box_env != nullptr && box_env[0] == '1')) && config_.decimation > 1;
+  // Box sums of whole 2 or 4 byte rows use the integer dot product where the device has it.
+  const char *dot_env = std::getenv("APRILTAG_VK_DOT");
+  const bool box_dot = box_decimate_ && u8 && ctx_.caps().has_integer_dot_product &&
+                       (config_.decimation == 2 || config_.decimation == 4) &&
+                       !(dot_env != nullptr && dot_env[0] == '0');
   decimate_pl_ = vk::ComputePipeline(ctx_,
-                                     ShaderPath(box_decimate_ ? pick("decimate_box", "decimate_box_u8")
+                                     ShaderPath(box_dot ? "decimate_box_dot_u8"
+                                                : box_decimate_ ? pick("decimate_box", "decimate_box_u8")
                                                               : pick("decimate", "decimate_u8")),
                                      {gray_buf_.get(), decimated_buf_.get()}, 8, wg2d_,
                                      {config_.decimation});

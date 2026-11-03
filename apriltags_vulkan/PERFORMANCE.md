@@ -2579,6 +2579,27 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8ao. Integer dot product in box decimation
+
+`decimate_box_dot_u8.comp` sums each 2 or 4 byte row of a box-decimation block with one dot product
+(`VK_KHR_shader_integer_dot_product`, enabled by `Context` when the device has it; otherwise
+`decimate_box_u8.comp` runs, as before; `APRILTAG_VK_DOT=0` forces that). Output is identical (dumps
+at decimation 2 and 4 on both machines). Box decimation is still opt-in (`APRILTAG_VK_BOX_DECIMATE=1`).
+
+| | without | with |
+|---|---|---|
+| Orange Pi 5 Plus, pass at decimation 2 | 93 us | about 62 us |
+| Orange Pi 5 Plus, pass at decimation 4 | 77 us | about 41 us |
+| Orange Pi 5 Plus, GPU per frame with box decimation, decimation 2 | 0.820 ms | 0.789 ms |
+| RX 9060 XT, pass | 10 us | 10 us |
+
+With the dot product, box decimation at decimation 2 (0.789 ms) is faster than the default top-left
+decimation (0.846 ms). Three other extensions were tried on `perf/ext-tuning` and gave nothing, so they
+are not here: `VK_EXT_subgroup_size_control` (the Mali's subgroup size is fixed at 16; the desktop
+shows no change between 32, 64 and the default), `VK_KHR_shader_subgroup_uniform_control_flow`
+(`uf_init_scan` 178 us against 179 us) and `VK_ARM_scheduling_controls` (4 of 4 cores is the default
+speed, fewer is proportionally slower, and no workgroup shape moves GPU time outside 1.49 to 1.57 ms).
+
 ## 9. Measuring
 
 ```

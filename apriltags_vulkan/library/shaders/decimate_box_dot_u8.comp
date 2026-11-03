@@ -1,0 +1,35 @@
+#version 450
+// decimate_box_u8.comp for decimation 2 and 4, summing each aligned row of 2 or 4 bytes with one
+// integer dot product (VK_KHR_shader_integer_dot_product).
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x_id = 0, local_size_x = 16, local_size_y_id = 1, local_size_y = 16) in;
+layout(constant_id = 3) const uint kDecimation = 2u;
+
+layout(std430, binding = 0) readonly buffer GrayImage { uint gray_packed[]; };
+layout(std430, binding = 1) writeonly buffer DecimatedImage { uint8_t decimated[]; };
+
+layout(push_constant) uniform PushConstants {
+  uint decimated_width;
+  uint decimated_height;
+} pc;
+
+void main() {
+  uint dx = gl_GlobalInvocationID.x;
+  uint dy = gl_GlobalInvocationID.y;
+  if (dx >= pc.decimated_width || dy >= pc.decimated_height) return;
+
+  uint stride = pc.decimated_width * kDecimation;
+  // The weights pick the row's 2 or 4 bytes out of its word: the low or high pair at decimation 2.
+  uint weights = 0x01010101u;
+  if (kDecimation == 2u) weights = ((dx & 1u) == 0u) ? 0x00000101u : 0x01010000u;
+  uint sum = 0u;
+  for (uint y = 0u; y < kDecimation; ++y) {
+    uint linear = (dy * kDecimation + y) * stride + dx * kDecimation;
+    sum += dotPacked4x8EXT(gray_packed[linear >> 2u], weights);
+  }
+  uint mean = (sum + (kDecimation * kDecimation) / 2u) / (kDecimation * kDecimation);
+  decimated[dy * pc.decimated_width + dx] = uint8_t(mean);
+}
