@@ -107,6 +107,13 @@ This port intentionally does less than the CUDA original and upstream
   both test machines. A tag whose edges have less than about twice the noise's block range is
   lost (1 to 3 of about 700 degraded tags in the harshest synthetic sets, none in the real
   images). It needs 8-bit storage; without it the fixed floor applies and detections can differ.
+- **Decimation averages each block.** At decimation 2 and above `DetectorConfig::box_decimate`
+  (default on; `APRILTAG_VK_BOX_DECIMATE=0` or `false` in the config restores the top-left pixel)
+  averages each decimation block instead of copying one pixel. On the corpus it finds as many tags or
+  more in every scenario (small tags at decimation 4: 71.8% to 84.2%) and cuts the corner error under
+  blur, and with the integer dot product it is also faster on the Mali. The cost is more wrong IDs in a
+  tag16h5 scene (97 to 146 at decimation 2 in the corpus set), where `APRILTAG_VK_FAMILY_LIMITS=1` is the
+  remedy; decimation 1 is unchanged.
 
 ## Requirements
 

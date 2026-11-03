@@ -2638,6 +2638,30 @@ no extension removes them, because the data does pass from one kernel to the nex
 to have fewer, larger dispatches, which the fused-argument, fused-init and predicated-skip experiments
 (sections 8ae, 8ah) each tried without gain, not a different barrier API.
 
+## 8aq. Box decimation on by default at decimation 2 and above
+
+`DetectorConfig::box_decimate` now defaults to true; `APRILTAG_VK_BOX_DECIMATE=0` restores the top-left
+pixel (output then equals the previous default exactly at decimation 1, 2 and 4, and the default equals the
+earlier opt-in `BOX_DECIMATE=1`). Corpus, desktop, previous default against box (recall, wrong IDs, median
+corner error in px):
+
+| scenario | decimation 2 | decimation 4 |
+|---|---|---|
+| small-tags | 100% to 100% | 71.8% to 84.2% |
+| dense-tags | 100% to 100% | 86.9% to 92.6% (median 0.049 to 0.039) |
+| range | 91.7% to 92.3% | 73.6% to 76.5% |
+| border-occlusion | 34.3% to 38.3% | 38.7% to 40.0% |
+| steep-angle, underexposed | 99.7% to 100% | 97.0% to 97.4%, 99.3% to 100% |
+| blur, motion-blur (median) | 0.053 to 0.027, 0.132 to 0.052 | 0.025 to 0.022, 0.041 to 0.033 |
+| tag16h5 wrong IDs | 97 to 146 | 111 to 123 |
+
+No scenario loses recall, and the only measured regression is wrong IDs in the tag16h5 set (a family the
+detector already misreads often: 97 wrong IDs at decimation 2 before the change; `APRILTAG_VK_FAMILY_LIMITS=1`
+is the existing remedy). Orange Pi 5 Plus, four frames, GPU / total per frame: decimation 2 0.812 to
+0.781 ms / 1.048 to 1.015 ms; decimation 1 is unchanged (1.559 to 1.531 ms is run-to-run noise, the path is
+the same). The validation layer ran clean on both machines (30 runs each, zero messages); the sanitiser
+runs of section 8ao already cover this path with the switch set.
+
 ## 9. Measuring
 
 ```
