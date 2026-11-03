@@ -2579,6 +2579,24 @@ VK_ARM_scheduling_controls and VK_ARM_shader_core_builtins (dispatch batch size 
 unmeasured and the most speculative). None is a clear win on its own; the load/store pressure in 1 to 4
 is where the time is.
 
+## 8ah. Candidate 2: threshold and `uf_init_scan` in one pass per cell (dropped)
+
+`threshold_init_scan_u8.comp` (`APRILTAG_VK_FUSE_INIT=1`, sparse labelling only) gives one 16-thread
+workgroup each 64 x 4 pixel cell: each thread thresholds a block, the codes go to shared memory, and
+the cell's four rows are then scanned, with the left neighbour block's code recomputed for the segment
+edge. It replaces the `active_cells` dedupe with one list append per cell.
+
+| Orange Pi 5 Plus | separate passes | fused |
+|---|---|---|
+| decimation 1, threshold + init scan | 117 + 179 = 296 us | 491 us |
+| decimation 2 | 46 + 68 = 114 us | 150 us (and `uf_merge` 77 to 94 us) |
+| total GPU, four frames, d1 / d2 | 1.494 / 0.843 ms | 1.728 / 0.904 ms |
+
+Desktop corpus output matches the base at decimation 1 and 2 (all 24 scenarios). The fused pass loses
+because a 16-thread workgroup runs the thresholding and the four scans one after the other, and it is
+launched over every cell (3,600 groups at 1280 x 720) where the separate init scan runs only over the
+listed ones. The branch is not to be merged; the switch stays off.
+
 ## 9. Measuring
 
 ```
