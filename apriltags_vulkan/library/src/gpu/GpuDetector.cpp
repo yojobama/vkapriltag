@@ -66,7 +66,6 @@ constexpr uint32_t kSlotPointCount = 3;
 constexpr uint32_t kSlotRawBlobs = 4;
 constexpr uint32_t kSlotHashDrops = 5;
 constexpr uint32_t kSlotOversizedSortBlobs = 6;
-constexpr uint32_t kSlotLargeBlobs = 7;
 constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 // Largest blob the sort orders (larger ones pass through unsorted); it also bounds mode 2's cost.
@@ -652,7 +651,7 @@ void GpuDetector::CreatePipelines() {
   if (const char *v = std::getenv("APRILTAG_VK_LEAN_TAIL")) {
     lean_tail_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
   }
-  if (!fused_submits_) lean_tail_ &= ~6u;
+  if (!fused_submits_) lean_tail_ &= ~2u;
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
       {extents_buf_.get(), selected_extents_buf_.get(), selected_counter_buf_.get(),
@@ -1024,7 +1023,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
 }
 
-void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative, bool lean_sort) {
+void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
 
@@ -1151,7 +1150,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative, bool le
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
-  RecordSort(cmd, 0u, true, !lean_sort);
+  RecordSort(cmd, 0u, true);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
 
   // Both readbacks are read in place on the fused path, so there is nothing to copy; the span
@@ -1176,31 +1175,17 @@ struct SortPc {
 // Sorts each blob's points by angle (sort_points_local_body.glsl); blobs above local_sort_split_
 // points are sorted in runs by several workgroups, then merged in rounds of one thread per point.
 void GpuDetector::RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs,
-                             bool count_from_buffer, bool with_large) {
+                             bool count_from_buffer) {
   using vk::BarrierKind;
   const SortPc pc{num_selected_blobs, count_from_buffer ? 1u : 0u, config_.max_blobs,
                   static_cast<int32_t>(decimated_width_), static_cast<int32_t>(decimated_height_)};
-  // Without the large sorts this dispatch is the last, so its barrier also covers the counter copy.
-  const BarrierKind after = with_large ? BarrierKind::Compute : BarrierKind::ComputeAndTransfer;
   if (count_from_buffer) {
-    sort_points_local_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 12, &pc, after);
+    sort_points_local_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 12, &pc,
+                                           BarrierKind::Compute);
   } else {
-    sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &pc, after);
+    sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &pc, BarrierKind::Compute);
   }
-  // Blobs above local_sort_split_ points are listed in large_sort_buf_ (count at word 6); the fused
-  // path reads the count to know whether a lean frame still owes their sort.
-  if (with_large) RecordLargeSort(cmd, num_selected_blobs, count_from_buffer);
-  if (count_from_buffer) {
-    large_sort_buf_.RecordCopyTo(cmd, counter_staging_, 4, 24, VkDeviceSize(kSlotLargeBlobs) * 4);
-  }
-}
-
-// Blobs above local_sort_split_ points: their runs, then one pass placing every point.
-void GpuDetector::RecordLargeSort(VkCommandBuffer cmd, uint32_t num_selected_blobs,
-                                  bool count_from_buffer) {
-  using vk::BarrierKind;
-  const SortPc pc{num_selected_blobs, count_from_buffer ? 1u : 0u, config_.max_blobs,
-                  static_cast<int32_t>(decimated_width_), static_cast<int32_t>(decimated_height_)};
+  // Blobs above local_sort_split_ points: their runs, then one pass placing every point.
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   sort_large_runs_pl_.DispatchIndirect(cmd, large_sort_buf_.get(), 0, &pc, BarrierKind::Compute);
   sort_large_merge_pl_.DispatchIndirect(cmd, large_sort_buf_.get(), 12, &pc,
@@ -1273,48 +1258,22 @@ VkCommandBuffer GpuDetector::RecordPersistent(
 
 GpuDetector::Submission GpuDetector::FirstAttempt(const ImportedFrame *imported, uint32_t chunk) {
   const uint8_t *key = imported != nullptr ? imported->key : nullptr;
-  // Leaves the large-blob sorts out while the previous frame had no large blob.
-  lean_sort_frame_ = (lean_tail_ & 4u) != 0 && last_large_blobs_ == 0;
-  const RecordingKind kind =
-      lean_sort_frame_ ? RecordingKind::kFirstAttemptLean : RecordingKind::kFirstAttempt;
   if (prerecord_) {
-    if (VkCommandBuffer cached = FindRecorded(kind, key, chunk)) {
+    if (VkCommandBuffer cached = FindRecorded(RecordingKind::kFirstAttempt, key, chunk)) {
       return {cached, true, completion_flag_ != nullptr};
     }
     recorded_this_frame_ = true;
     VkCommandBuffer cmd = RecordPersistent([&](VkCommandBuffer c) {
       RecordFrameHead(c, imported, chunk);
-      RecordFusedTail(c, /*speculative=*/true, lean_sort_frame_);
+      RecordFusedTail(c, /*speculative=*/true);
     });
-    recorded_frames_.push_back({kind, key, chunk, cmd});
+    recorded_frames_.push_back({RecordingKind::kFirstAttempt, key, chunk, cmd});
     return {cmd, true, completion_flag_ != nullptr};
   }
   recorded_this_frame_ = true;
   VkCommandBuffer cmd = BeginTimedCommands();
   RecordFrameHead(cmd, imported, chunk);
-  RecordFusedTail(cmd, /*speculative=*/true, lean_sort_frame_);
-  return {cmd, false};
-}
-
-// The large-blob sorts a lean first attempt left out; the blobs they need were listed by sort_points_local.
-GpuDetector::Submission GpuDetector::LargeSort() {
-  if (prerecord_) {
-    if (VkCommandBuffer cached = FindRecorded(RecordingKind::kLargeSort, nullptr, 0)) {
-      return {cached, true, completion_flag_ != nullptr};
-    }
-    recorded_this_frame_ = true;
-    VkCommandBuffer cmd = RecordPersistent([&](VkCommandBuffer c) {
-      RecordLargeSort(c, 0u, true);
-      vk::ComputePipeline::HostReadBarrier(c);
-      if (completion_flag_) completion_flag_->RecordSet(c);
-    });
-    recorded_frames_.push_back({RecordingKind::kLargeSort, nullptr, 0, cmd});
-    return {cmd, true, completion_flag_ != nullptr};
-  }
-  recorded_this_frame_ = true;
-  VkCommandBuffer cmd = BeginTimedCommands();
-  RecordLargeSort(cmd, 0u, true);
-  vk::ComputePipeline::HostReadBarrier(cmd);
+  RecordFusedTail(cmd, /*speculative=*/true);
   return {cmd, false};
 }
 
@@ -1463,11 +1422,6 @@ void GpuDetector::DetectFused(const FrameStart &frame, uint32_t chunk) {
     }
     // parent[] is converged (or max_uf_iterations was hit): rerun the tail on it.
     SubmitTimed(timed([&] { return TailRerun(); }));
-  } else if ((lean_tail_ & 4u) != 0) {
-    // A lean first attempt omitted the large-blob sorts; run them now if this frame has such blobs.
-    const uint32_t large_blobs = ReadCounterSlot(kSlotLargeBlobs);
-    if (lean_sort_frame_ && large_blobs != 0) SubmitTimed(timed([&] { return LargeSort(); }));
-    last_large_blobs_ = large_blobs;
   }
   const auto t_submitted = Clock::now();
 
