@@ -2662,6 +2662,65 @@ is the existing remedy). Orange Pi 5 Plus, four frames, GPU / total per frame: d
 the same). The validation layer ran clean on both machines (30 runs each, zero messages); the sanitiser
 runs of section 8ao already cover this path with the switch set.
 
+## 8ar. Against NAPA
+
+NAPA (`napa-vision` 0.5.1 from PyPI, run through `tools/napa_corpus/napa_run.py`, single-threaded CPU)
+and vkapriltag (this branch; GPU plus the CPU tail) ran over the same corpus, 24 scenarios, 7,348 tags,
+scored by `score_corpus.py`. NAPA's corners are converted to the corpus convention (its origin is the first
+pixel's centre and it winds the other way). The corpus is this repository's own renderer in the style NAPA
+describes, not NAPA's benchmark set, so figures differ from NAPA's README. "tuned" is the opt-in set:
+profile-fit refine with all four features, third-bit decode, family limits, border pre-check, dark reject.
+
+**Accuracy** (desktop; recall, wrong IDs outside the tag16h5 set, worst-corner error median / 95th, px):
+
+| detector | tags found | wrong IDs | median / p95 error |
+|---|---|---|---|
+| NAPA, default (`min_tag_px` 32) | 97.3% | 0 | 0.021 / 0.100 |
+| NAPA, `min_tag_px` 16 | 97.7% | 0 | 0.021 / 0.102 |
+| vkapriltag, decimation 1 | 95.9% | 0 | 0.041 / 0.185 |
+| vkapriltag, decimation 2 | 94.2% | 0 | 0.040 / 0.204 |
+| vkapriltag tuned, decimation 1 | 96.5% | 0 | 0.018 / 0.115 |
+| vkapriltag tuned, decimation 2 | 94.9% | 0 | 0.018 / 0.124 |
+
+In the tag16h5 set NAPA made 0 wrong IDs; vkapriltag made 102 at decimation 1 and 146 at 2, and 0 with family
+limits (the tuned rows). NAPA finds more where tags are partly covered or sit in a grey margin
+(border-occlusion 56.5% against 20.0 to 43.0%; grey-margin 98.7% against 87.6% at decimation 1 and 47.9% at
+2; obstruction 85.4% against 73.3% by default, 86.1% tuned; low-contrast 99.3% against 98.3%). vkapriltag
+finds more small and distant tags than NAPA at its default size limit (range 100% against 89.1%,
+small-tags 100% against 98.4%), which `min_tag_px=16` closes (100%, 100%). With the tuned set vkapriltag's
+median corner error is the lower of the two (0.018 against 0.021 px) and NAPA's 95th percentile is the lower
+(0.100 against 0.115 px); by default NAPA's corners are about twice as accurate.
+
+**Time per frame** (median / 95th percentile, ms, one frame at a time, whole corpus):
+
+| | 640x480 | 1280x720 | 1920x1080 | all frames |
+|---|---|---|---|---|
+| Desktop: NAPA | 0.140 / 0.291 | 0.329 / 0.868 | 0.656 / 1.771 | 0.289 / 0.989 |
+| Desktop: NAPA, `min_tag_px` 16 | 0.675 / 1.143 | 1.872 / 3.763 | 4.021 / 8.007 | 1.740 / 5.322 |
+| Desktop: vkapriltag d1 | 0.268 / 0.369 | 0.390 / 0.567 | 0.595 / 0.867 | 0.360 / 0.703 |
+| Desktop: vkapriltag d2 | 0.232 / 0.308 | 0.312 / 0.480 | 0.428 / 0.722 | 0.284 / 0.509 |
+| Desktop: vkapriltag tuned d1 / d2 | | | | 0.379 / 0.690, 0.330 / 0.554 |
+| Pi: NAPA | 0.147 / 0.331 | 0.281 / 0.878 | | 0.174 / 0.422 |
+| Pi: NAPA, `min_tag_px` 16 | 0.381 / 0.904 | 0.969 / 2.924 | | 0.432 / 1.424 |
+| Pi: vkapriltag d1 | 0.998 / 1.433 | 1.624 / 2.670 | | 1.077 / 2.276 |
+| Pi: vkapriltag d2 | 0.802 / 1.112 | 1.101 / 1.719 | | 0.854 / 1.421 |
+| Pi: vkapriltag tuned d1 / d2 | | | | 1.208 / 2.568, 0.825 / 1.466 |
+
+The Pi corpus copy has no 1920x1080 frames. With one CPU thread vkapriltag's medians are about the same
+(desktop 0.343 / 0.278 ms, Pi 1.040 / 0.752 ms at decimation 1 / 2) and its 95th percentile rises
+(1.15 / 1.01 ms desktop). NAPA's time follows the image: on the desktop it is 0.94 ms on the noise
+scenario, 1.08 ms on dense-tags and 0.77 ms on underexposed frames, against 0.31 to 0.38 ms for vkapriltag,
+and 0.21 ms on empty frames against 0.17 to 0.29 ms; on the Pi it is faster than vkapriltag on every
+scenario (noise 0.37 against 0.86 to 0.98 ms; dense-tags 1.31 against 1.55 to 2.45 ms).
+
+Reading: on the Pi NAPA is about 5 to 6 times faster than vkapriltag at its default size limit and about
+2 times faster with `min_tag_px` 16, which is the setting that matches vkapriltag's reach; the Mali's
+dispatch chain (section 8ap) puts a floor of about 0.75 ms under every vkapriltag frame. On the
+desktop the two are within 0.1 ms in the median, NAPA ahead at 640x480 and 1280x720 and vkapriltag ahead at
+1920x1080 and in the noisy, dense and JPEG scenes; with `min_tag_px` 16 NAPA is 3 to 6 times slower there.
+Neither dominates: NAPA is faster and more accurate on quiet scenes with large tags, vkapriltag keeps
+its time flat on busy or noisy frames and finds smaller tags in a single pass.
+
 ## 9. Measuring
 
 ```
