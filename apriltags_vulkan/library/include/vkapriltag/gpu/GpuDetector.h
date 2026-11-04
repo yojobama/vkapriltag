@@ -454,6 +454,8 @@ class GpuDetector {
     kFirstAttempt,   // head + speculative tail; keyed by (input buffer, labelling chunk)
     kContinuation,   // `n` more labelling iterations plus the convergence-flag copy
     kTailRerun,      // zero the tail's counters and rerun the tail non-speculatively
+    kFirstAttemptLean,  // as kFirstAttempt, without the large-blob sorts
+    kLargeSort,         // the large-blob sorts alone, after a lean first attempt
   };
   struct RecordedFrame {
     RecordingKind kind = RecordingKind::kFirstAttempt;
@@ -466,7 +468,11 @@ class GpuDetector {
   // a fixed number of workgroups instead of sizing each from a count on the device.
   // Bit 2 takes the selected blobs' point offsets and the sort's group count in select_blobs.comp,
   // without scan_blob_counts.comp.
+  // Bit 4 records the first attempt without the large-blob sorts while the previous frame had none,
+  // and runs them in a short extra submission if this frame turns out to have some.
   uint32_t lean_tail_ = 0;
+  uint32_t last_large_blobs_ = 0;
+  bool lean_sort_frame_ = false;
   uint32_t lean_point_groups_ = 0;
   uint32_t lean_select_groups_ = 0;
   // Set by the last command of a frame's tail; the host polls it instead of waiting on the fence.
@@ -498,11 +504,13 @@ class GpuDetector {
   void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations, bool trailing_compress = true);
   // The fused tail: blob sizes through line-fit moments; `speculative` stops blob_diff acting on
   // unconverged labels.
-  void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
+  void RecordFusedTail(VkCommandBuffer cmd, bool speculative, bool lean_sort = false);
   void RecordLeanOffsetsClear(VkCommandBuffer cmd);
   void RecordFlatten(VkCommandBuffer cmd);
   // Records the per-blob sort and, when split, the run sort and merge rounds for large blobs.
-  void RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs, bool count_from_buffer);
+  void RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs, bool count_from_buffer,
+                  bool with_large = true);
+  void RecordLargeSort(VkCommandBuffer cmd, uint32_t num_selected_blobs, bool count_from_buffer);
   void RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations);
   void RecordTailRerun(VkCommandBuffer cmd);
 
@@ -512,6 +520,7 @@ class GpuDetector {
   VkCommandBuffer RecordPersistent(const std::function<void(VkCommandBuffer)> &record);
   Submission Continuation(uint32_t iterations);
   Submission TailRerun();
+  Submission LargeSort();
   VkCommandBuffer FindRecorded(RecordingKind kind, const uint8_t *key, uint32_t n) const;
   // Submits and waits; adds the host-side cost to last_profile_.
   void SubmitTimed(const Submission &s);
