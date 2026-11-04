@@ -2834,6 +2834,25 @@ machine with zero messages; AddressSanitizer on the desktop and AddressSanitizer
 ThreadSanitizer on the Pi, 48 runs each, no reports. The Mali path stays opt-in until a longer stress
 (10^5 frames) is run.
 
+## 8av. Sort tie-break (not built) and the calling-thread CPU tail (dropped)
+
+**Order-independent sort ties.** The occasional run-to-run difference in the dumps (2 of 2,982 corpus lines
+in about 1 repeat in 8 on the Orange Pi at decimation 2, a corner moving by 0.0005 px and the margin by 0.001)
+comes from points of one blob with equal `theta_key` being ordered by their position in `src`, which the
+atomic scatter assigns. A canonical tie-break by pixel position does not fit the packed word (20 bits of key
+and 12 of payload index); doing it means a 64-bit key in all three sort variants (rank-all, rank-merge, the
+sorting network) or an extra shared-memory load per comparison in the rank-all fast path, which would slow
+the small-blob sort that dominates on the Mali. The effect is too small to pay for that, so it was not built
+and the persistent-kernel checks that need identity use the numeric-tolerance comparison of the dump matrix
+(`num_cmp.py`) instead of a byte diff.
+
+**CPU tail on the calling thread.** `WorkerPool::ParallelFor` runs batches of at most `APRILTAG_CPU_INLINE`
+items on the calling thread. Orange Pi, one-tag, small-tags and many-tags 640x480 frames, decimation 2, total
+per frame (four runs each, accuracy defaults, profile refine): default 0.640 to 0.644 ms; limit 2: 0.653 to
+0.690 ms; limit 4: 0.626 to 0.646 ms; limit 8: 0.624 to 0.631 ms. The best case saves 15 us against a gate of
+30 us, and with the heavier profile refine each quad's work is long enough that spreading it over the pool
+beats a single thread. Dropped; the branch is not to be merged.
+
 ## 9. Measuring
 
 ```
