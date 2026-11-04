@@ -36,6 +36,14 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
       return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
               0, true};
+    case MemoryKind::DeviceCoherentHost:
+#ifdef VK_AMD_device_coherent_memory
+      return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                  VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD,
+              0, true};
+#else
+      return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, true};
+#endif
     case MemoryKind::DeviceLocalReadback:
       // Shader-written memory the host reads; the caller must check host_cached() and keep a
       // staging path.

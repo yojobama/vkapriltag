@@ -99,6 +99,8 @@ struct DeviceCaps {
   bool has_int64_atomics = false;
   // VK_EXT_conditional_rendering + conditionalRendering; enabled at device creation.
   bool has_conditional_rendering = false;
+  // VK_AMD_device_coherent_memory + deviceCoherentMemory, enabled when present.
+  bool has_device_coherent_memory = false;
   // VK_EXT_external_memory_host: caller memory can back a buffer; imports must be aligned to
   // min_host_pointer_alignment.
   bool has_external_memory_host = false;
@@ -139,6 +141,7 @@ struct DeviceCaps {
 };
 
 class Lane;
+class CompletionFlag;
 
 // Owns the Vulkan instance, device, compute+transfer queues, and a default Lane. Requires only
 // Vulkan 1.1.
@@ -266,6 +269,7 @@ public:
   bool supports_external_memory_host_ = false;
   bool supports_dma_buf_ = false;
   bool supports_integer_dot_product_ = false;
+  bool supports_device_coherent_memory_ = false;
   PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties_ = nullptr;
   PFN_vkGetMemoryFdPropertiesKHR get_fd_properties_ = nullptr;
   PipelineCache pipeline_cache_;
@@ -304,8 +308,11 @@ class Lane {
   void EndCommands(VkCommandBuffer cmd);
   // Returns a persistent buffer to the pool; it must not be in flight.
   void FreePersistentCommands(VkCommandBuffer cmd);
+  // With `flag`, the submission's last command sets it and the call returns as soon as the host sees
+  // it; the fence is then waited on at the next submission, WaitIdle or destruction.
   void SubmitPersistentAndWait(VkCommandBuffer cmd, VkSemaphore wait = VK_NULL_HANDLE,
-                               VkPipelineStageFlags wait_stage = 0);
+                               VkPipelineStageFlags wait_stage = 0,
+                               CompletionFlag *flag = nullptr);
 
   // Queue submissions since construction.
   uint64_t submit_count = 0;
@@ -328,6 +335,7 @@ class Lane {
   VkCommandBuffer cmd_ring_[kCommandRing] = {};
   VkFence fence_ring_[kCommandRing] = {};
   VkFence persistent_fence_ = VK_NULL_HANDLE;  // created on first BeginPersistentCommands()
+  bool persistent_pending_ = false;            // submitted, fence not yet waited on
   size_t ring_next_ = 0;
   size_t ring_active_ = 0;
 };

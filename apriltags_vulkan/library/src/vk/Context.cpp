@@ -1,5 +1,6 @@
 #include "vkapriltag/vk/Context.h"
 
+#include "vkapriltag/vk/CompletionFlag.h"
 #include "vkapriltag/vk/EmbeddedShaders.h"
 
 #include <algorithm>
@@ -486,6 +487,22 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
                                     SupportsConditionalRendering(physical_device_);
 
   supports_external_memory_host_ = DeviceHasExtension(physical_device_, "VK_EXT_external_memory_host");
+#ifdef VK_AMD_device_coherent_memory
+  supports_device_coherent_memory_ =
+      DeviceHasExtension(physical_device_, "VK_AMD_device_coherent_memory");
+  VkPhysicalDeviceCoherentMemoryFeaturesAMD coherent_memory{};
+  coherent_memory.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD;
+  if (supports_device_coherent_memory_) {
+    VkPhysicalDeviceFeatures2 query{};
+    query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    query.pNext = &coherent_memory;
+    vkGetPhysicalDeviceFeatures2(physical_device_, &query);
+    supports_device_coherent_memory_ = coherent_memory.deviceCoherentMemory == VK_TRUE;
+  }
+  coherent_memory.deviceCoherentMemory = VK_TRUE;
+#else
+  supports_device_coherent_memory_ = false;
+#endif
   supports_dma_buf_ = DeviceHasExtension(physical_device_, "VK_EXT_external_memory_dma_buf") &&
                       DeviceHasExtension(physical_device_, "VK_KHR_external_memory_fd");
 
@@ -537,7 +554,17 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
     features2.pNext = &dot_product;
   }
 
+#ifdef VK_AMD_device_coherent_memory
+  if (supports_device_coherent_memory_) {
+    coherent_memory.pNext = features2.pNext;
+    features2.pNext = &coherent_memory;
+  }
+#endif
+
   std::vector<const char *> enabled_extensions;
+  if (supports_device_coherent_memory_) {
+    enabled_extensions.push_back("VK_AMD_device_coherent_memory");
+  }
   if (supports_integer_dot_product_) enabled_extensions.push_back("VK_KHR_shader_integer_dot_product");
   if (supports_8bit_storage_) {
     enabled_extensions.push_back("VK_KHR_8bit_storage");
@@ -648,6 +675,7 @@ void Context::QueryCaps(const ContextOptions &options) {
   caps_.has_8bit_storage = supports_8bit_storage_;
   caps_.has_int64_atomics = supports_int64_atomics_;
   caps_.has_conditional_rendering = supports_conditional_rendering_;
+  caps_.has_device_coherent_memory = supports_device_coherent_memory_;
   caps_.has_external_memory_host = supports_external_memory_host_;
   caps_.has_integer_dot_product = supports_integer_dot_product_;
   caps_.has_external_memory_dma_buf = supports_dma_buf_;
@@ -994,6 +1022,7 @@ Lane::Lane(VkDevice device, VkQueue queue, uint32_t family, std::mutex *submit_m
 Lane::~Lane() { Destroy(); }
 
 void Lane::Destroy() {
+  if (persistent_pending_) vkWaitForFences(device_, 1, &persistent_fence_, VK_TRUE, UINT64_MAX);
   for (size_t i = 0; i < kCommandRing; ++i) {
     if (fence_ring_[i]) vkDestroyFence(device_, fence_ring_[i], nullptr);
   }
@@ -1082,10 +1111,14 @@ void Lane::SubmitSignal(VkCommandBuffer cmd, VkSemaphore signal) {
 
 void Lane::WaitIdle() {
   // Every ring fence is signalled or pending (see SubmitRing); the persistent fence is waited on
-  // at each submit.
+  // at each submit, or here when a flag-polled submission left it pending.
   CheckVk(vkWaitForFences(device_, static_cast<uint32_t>(kCommandRing), fence_ring_, VK_TRUE,
                           UINT64_MAX),
           "vkWaitForFences");
+  if (persistent_pending_) {
+    WaitFence(device_, persistent_fence_);
+    persistent_pending_ = false;
+  }
 }
 
 void Lane::SubmitRing(size_t i, const VkSubmitInfo &submit_info) {
@@ -1155,7 +1188,11 @@ void Lane::EndCommands(VkCommandBuffer cmd) {
 }
 
 void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, VkSemaphore wait,
-                                   VkPipelineStageFlags wait_stage) {
+                                   VkPipelineStageFlags wait_stage, CompletionFlag *flag) {
+  if (persistent_pending_) {
+    WaitFence(device_, persistent_fence_);
+    persistent_pending_ = false;
+  }
   VkSubmitInfo submit_info{};
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.commandBufferCount = 1;
@@ -1167,11 +1204,16 @@ void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, VkSemaphore wait,
   }
 
   CheckVk(vkResetFences(device_, 1, &persistent_fence_), "vkResetFences");
+  if (flag != nullptr) flag->Arm();
   {
     std::lock_guard<std::mutex> lock(*submit_mutex_);
     CheckVk(vkQueueSubmit(queue_, 1, &submit_info, persistent_fence_), "vkQueueSubmit");
   }
   ++submit_count;
+  if (flag != nullptr && flag->Wait(std::chrono::milliseconds(2))) {
+    persistent_pending_ = true;
+    return;
+  }
   WaitFence(device_, persistent_fence_);
 }
 

@@ -14,6 +14,7 @@
 
 #include "vkapriltag/gpu/KeepAlive.h"
 #include "vkapriltag/gpu/Types.h"
+#include "vkapriltag/vk/CompletionFlag.h"
 #include "vkapriltag/vk/Buffer.h"
 #include "vkapriltag/vk/ComputePipeline.h"
 #include "vkapriltag/vk/Context.h"
@@ -461,6 +462,8 @@ class GpuDetector {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
   };
   std::vector<RecordedFrame> recorded_frames_;
+  // Set by the last command of a frame's tail; the host polls it instead of waiting on the fence.
+  std::unique_ptr<vk::CompletionFlag> completion_flag_;
   // Declared last of the members it uses, so it stops before they are destroyed.
   vk::Buffer keepalive_buf_;
   vk::ComputePipeline keepalive_pl_;
@@ -473,6 +476,7 @@ class GpuDetector {
   struct Submission {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     bool persistent = false;
+    bool flagged = false;  // ends by setting completion_flag_
   };
   // Detect() is the shared prologue (upload) followed by one of the two flows below.
   struct FrameStart;

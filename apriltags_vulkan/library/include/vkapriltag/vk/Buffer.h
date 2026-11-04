@@ -29,6 +29,10 @@ enum class MemoryKind {
   // As above, preferring HOST_CACHED, for buffers a shader writes and the host reads; callers
   // must check host_visible() and host_cached().
   DeviceLocalReadback,
+
+  // Host-visible memory the device writes through to (VK_AMD_device_coherent_memory), so the host
+  // sees a write while the submission runs; needs caps().has_device_coherent_memory.
+  DeviceCoherentHost,
 };
 
 // A Vulkan buffer plus its memory allocation; host-visible allocations stay mapped for their

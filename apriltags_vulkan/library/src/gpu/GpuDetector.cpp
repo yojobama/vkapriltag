@@ -274,6 +274,15 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   CreateBuffers();
   CreatePipelines();
 
+  // Completion by polling a flag: on by default only with device-coherent host memory, where the
+  // write is visible to the host while the submission runs; APRILTAG_VK_FLAG_POLL=1 forces it.
+  const char *flag_env = std::getenv("APRILTAG_VK_FLAG_POLL");
+  const bool want_flag =
+      flag_env != nullptr ? flag_env[0] != '0' : ctx_.caps().has_device_coherent_memory;
+  if (want_flag && prerecord_ && fused_submits_) {
+    completion_flag_ = std::make_unique<vk::CompletionFlag>(ctx_);
+  }
+
   int keepalive_ms = config_.keepalive_ms;
   if (const char *v = std::getenv("APRILTAG_VK_KEEPALIVE_MS")) keepalive_ms = std::atoi(v);
   if (keepalive_ms < 0) {
@@ -1110,6 +1119,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   // Counted by sort_points_local, so this is the first submit that can carry it back.
   RecordCounterCopy(cmd, oversized_sort_counter_buf_, kSlotOversizedSortBlobs);
   vk::ComputePipeline::HostReadBarrier(cmd);
+  if (completion_flag_) completion_flag_->RecordSet(cmd);
 }
 
 namespace {
@@ -1199,7 +1209,7 @@ GpuDetector::Submission GpuDetector::FirstAttempt(const ImportedFrame *imported,
   const uint8_t *key = imported != nullptr ? imported->key : nullptr;
   if (prerecord_) {
     if (VkCommandBuffer cached = FindRecorded(RecordingKind::kFirstAttempt, key, chunk)) {
-      return {cached, true};
+      return {cached, true, completion_flag_ != nullptr};
     }
     recorded_this_frame_ = true;
     VkCommandBuffer cmd = RecordPersistent([&](VkCommandBuffer c) {
@@ -1207,7 +1217,7 @@ GpuDetector::Submission GpuDetector::FirstAttempt(const ImportedFrame *imported,
       RecordFusedTail(c, /*speculative=*/true);
     });
     recorded_frames_.push_back({RecordingKind::kFirstAttempt, key, chunk, cmd});
-    return {cmd, true};
+    return {cmd, true, completion_flag_ != nullptr};
   }
   recorded_this_frame_ = true;
   VkCommandBuffer cmd = BeginTimedCommands();
@@ -1236,12 +1246,12 @@ GpuDetector::Submission GpuDetector::Continuation(uint32_t iterations) {
 GpuDetector::Submission GpuDetector::TailRerun() {
   if (prerecord_) {
     if (VkCommandBuffer cached = FindRecorded(RecordingKind::kTailRerun, nullptr, 0)) {
-      return {cached, true};
+      return {cached, true, completion_flag_ != nullptr};
     }
     recorded_this_frame_ = true;
     VkCommandBuffer cmd = RecordPersistent([&](VkCommandBuffer c) { RecordTailRerun(c); });
     recorded_frames_.push_back({RecordingKind::kTailRerun, nullptr, 0, cmd});
-    return {cmd, true};
+    return {cmd, true, completion_flag_ != nullptr};
   }
   recorded_this_frame_ = true;
   VkCommandBuffer cmd = BeginTimedCommands();
@@ -1255,7 +1265,8 @@ void GpuDetector::SubmitTimed(const Submission &s) {
   if (prof::Enabled() && frame_first_submit_ns_ == 0) frame_first_submit_ns_ = ToNs(t0);
   const VkSemaphore wait = std::exchange(pending_wait_, VK_NULL_HANDLE);
   if (s.persistent) {
-    lane_.SubmitPersistentAndWait(s.cmd, wait, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    lane_.SubmitPersistentAndWait(s.cmd, wait, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  s.flagged ? completion_flag_.get() : nullptr);
   } else {
     lane_.SubmitAndWait(s.cmd, wait, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   }
