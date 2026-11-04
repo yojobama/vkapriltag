@@ -14,6 +14,13 @@ layout(std430, binding = 2) buffer Counter { uint counter; };
 layout(std430, binding = 3) writeonly buffer Remap { uint remap[]; };
 // The number of raw blob ids hash_group.comp assigned; only those have initialised extents.
 layout(std430, binding = 4) readonly buffer RawBlobCounter { uint raw_blob_count; };
+// Non-zero: each selected blob also takes its place in the point buffer (an atomic running total)
+// and raises the sort's group count, in place of scan_blob_counts.comp. Bindings 5 to 7 are unused
+// otherwise.
+layout(constant_id = 3) const uint kAtomicOffsets = 0u;
+layout(std430, binding = 5) writeonly buffer BlobPointOffsets { uint blob_point_offsets[]; };
+layout(std430, binding = 6) buffer PointsTotal { uint points_total; };
+layout(std430, binding = 7) buffer BlobArgs { uint blob_args[]; };
 
 layout(push_constant) uniform PushConstants {
   uint max_raw_blobs;
@@ -96,6 +103,11 @@ void SelectBlob(uint i) {
 
   selected[pos] = e;
   remap[i] = pos;
+  if (kAtomicOffsets != 0u) {
+    blob_point_offsets[pos] = atomicAdd(points_total, e.count) + e.count;
+    // The sort's arguments, slot 1: one workgroup per selected blob.
+    atomicMax(blob_args[3], pos + 1u);
+  }
 }
 
 // A grid-stride loop, so an indirect dispatch sized for the count and a direct dispatch of fewer

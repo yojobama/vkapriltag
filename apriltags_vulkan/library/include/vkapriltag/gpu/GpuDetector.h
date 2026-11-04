@@ -307,7 +307,7 @@ class GpuDetector {
            (kExtentsCopies - 1) * std::min(kPrivateExtentsBlobs, max_raw_blobs);
   }
   vk::Buffer extents_buf_;
-  vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_;
+  vk::Buffer selected_extents_buf_, selected_counter_buf_, remap_buf_, points_total_buf_;
   vk::Buffer index_points_buf_;
   // Inclusive scan of per-blob point counts (max_blobs entries): each blob's base offset into index_points_buf_.
   vk::Buffer blob_point_offsets_buf_;
@@ -464,6 +464,8 @@ class GpuDetector {
   std::vector<RecordedFrame> recorded_frames_;
   // APRILTAG_VK_LEAN_TAIL (bit mask, 0 off): bit 1 dispatches the tail's point and blob kernels over
   // a fixed number of workgroups instead of sizing each from a count on the device.
+  // Bit 2 takes the selected blobs' point offsets and the sort's group count in select_blobs.comp,
+  // without scan_blob_counts.comp.
   uint32_t lean_tail_ = 0;
   uint32_t lean_point_groups_ = 0;
   uint32_t lean_select_groups_ = 0;
@@ -497,6 +499,7 @@ class GpuDetector {
   // The fused tail: blob sizes through line-fit moments; `speculative` stops blob_diff acting on
   // unconverged labels.
   void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
+  void RecordLeanOffsetsClear(VkCommandBuffer cmd);
   void RecordFlatten(VkCommandBuffer cmd);
   // Records the per-blob sort and, when split, the run sort and merge rounds for large blobs.
   void RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs, bool count_from_buffer);

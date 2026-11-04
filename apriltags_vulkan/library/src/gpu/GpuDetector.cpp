@@ -385,6 +385,7 @@ void GpuDetector::CreateBuffers() {
   extents_direct_read_ =
       selected_extents_buf_.host_visible() && selected_extents_buf_.host_cached();
   selected_counter_buf_ = ssbo(4);
+  points_total_buf_ = ssbo(4);
   remap_buf_ = ssbo(VkDeviceSize(config_.max_raw_blobs) * 4);
 
   index_points_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * sizeof(IPoint));
@@ -646,11 +647,17 @@ void GpuDetector::CreatePipelines() {
        cell_list_buf_.get()},
       20, sparse_ ? vk::WorkgroupSize{16, 4, 1} : wg2d_, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
 
+  // A leaner tail where a dispatch is costly (bit 1: fixed-grid kernels, bit 2: offsets from select).
+  if (const char *v = std::getenv("APRILTAG_VK_LEAN_TAIL")) {
+    lean_tail_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+  }
+  if (!fused_submits_) lean_tail_ &= ~2u;
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
       {extents_buf_.get(), selected_extents_buf_.get(), selected_counter_buf_.get(),
-       remap_buf_.get(), raw_blob_counter_buf_.get()},
-      44, wg1d_);
+       remap_buf_.get(), raw_blob_counter_buf_.get(), blob_point_offsets_buf_.get(),
+       points_total_buf_.get(), blob_args_buf_.get()},
+      44, wg1d_, {(lean_tail_ & 2u) != 0 ? 1u : 0u});
 
   // Per-blob point base offsets: the inclusive prefix sum of the selected blobs' point counts, in
   // one workgroup; it also writes the sort's indirect arguments (blob_args_buf_ slot 1).
@@ -722,11 +729,8 @@ void GpuDetector::CreatePipelines() {
        index_points_buf_.get(), qbp_counter_buf_.get()},
       16, wg1d_);
 
-  // A leaner tail where a dispatch is costly; opt-in while it is measured. The fixed-grid kernels
-  // need the 4-point reduction and the fused path, not the subgroup reduction.
-  if (const char *v = std::getenv("APRILTAG_VK_LEAN_TAIL")) {
-    lean_tail_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
-  }
+  // The fixed-grid kernels need the 4-point reduction and the fused path, not the subgroup
+  // reduction.
   if (!(fused_submits_ && reduce_x4_ && !subgroup)) lean_tail_ &= ~1u;
   lean_point_groups_ = std::min((qbp_capacity_ + wg1d_.x - 1u) / wg1d_.x, 128u);
   lean_select_groups_ = std::min((config_.max_raw_blobs + wg1d_.x - 1u) / wg1d_.x, 32u);
@@ -948,6 +952,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanClear));
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
+  RecordLeanOffsetsClear(cmd);
   uf_changed_buf_.FillZero(cmd);
   if (sparse_) {
     active_cells_buf_.FillZero(cmd);
@@ -1110,7 +1115,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
 
   struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
-  scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
+  if ((lean_tail_ & 2u) == 0) scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
   struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
@@ -1129,14 +1134,19 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
   RecordCounterCopy(cmd, hash_drop_counter_buf_, kSlotHashDrops);
 
-  // blob_point_offsets_buf_[max_blobs - 1] is the inclusive scan total, the sum of every selected
-  // blob's point count.
-  blob_point_offsets_buf_.RecordCopyTo(
-      cmd, counter_staging_, 4, VkDeviceSize(std::max(config_.max_blobs, 1u) - 1u) * 4,
-      VkDeviceSize(kSlotPointCount) * 4);
+  // The sum of every selected blob's point count: blob_point_offsets_buf_[max_blobs - 1], the
+  // inclusive scan total, or select_blobs' running total.
+  if ((lean_tail_ & 2u) != 0) {
+    RecordCounterCopy(cmd, points_total_buf_, kSlotPointCount);
+  } else {
+    blob_point_offsets_buf_.RecordCopyTo(
+        cmd, counter_staging_, 4, VkDeviceSize(std::max(config_.max_blobs, 1u) - 1u) * 4,
+        VkDeviceSize(kSlotPointCount) * 4);
+  }
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
 
-  // The sort's arguments (one workgroup per selected blob) were written by scan_blob_counts.
+  // The sort's arguments (one workgroup per selected blob) were written by scan_blob_counts or, with
+  // lean offsets, by select_blobs.
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
@@ -1205,6 +1215,7 @@ void GpuDetector::RecordTailRerun(VkCommandBuffer cmd) {
   RecordFlatten(cmd);
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
+  RecordLeanOffsetsClear(cmd);
   blob_size_buf_.FillZero(cmd);
   hash_owner_buf_.FillZero(cmd);
   blob_cursor_buf_.FillZero(cmd);
@@ -1213,6 +1224,15 @@ void GpuDetector::RecordTailRerun(VkCommandBuffer cmd) {
   oversized_sort_counter_buf_.FillZero(cmd);
   vk::ComputePipeline::Barrier(cmd, vk::BarrierKind::ComputeAndTransfer);
   RecordFusedTail(cmd, /*speculative=*/false);
+}
+
+// Zeroes the running point total and the sort's group count and sets its y and z to 1, for
+// select_blobs' offsets (lean tail bit 2).
+void GpuDetector::RecordLeanOffsetsClear(VkCommandBuffer cmd) {
+  if ((lean_tail_ & 2u) == 0) return;
+  points_total_buf_.FillZero(cmd);
+  blob_args_buf_.FillZeroRange(cmd, 12, 4);
+  vkCmdFillBuffer(cmd, blob_args_buf_.get(), 16, 8, 1);
 }
 
 VkCommandBuffer GpuDetector::FindRecorded(RecordingKind kind, const uint8_t *key,
