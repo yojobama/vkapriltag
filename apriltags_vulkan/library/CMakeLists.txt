@@ -55,6 +55,8 @@ set(SHADER_SOURCES
   shaders/noise_floor.comp
   shaders/cell_args.comp
   shaders/keepalive.comp
+  shaders/pf_tail.comp
+  shaders/pf_tail_atomic64.comp
   shaders/threshold.comp
   shaders/threshold_u8.comp
   shaders/threshold_block_u8.comp
