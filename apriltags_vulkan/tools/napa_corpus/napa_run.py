@@ -1,4 +1,4 @@
-"""usage: napa_run.py ROOT OUT_DIR [--min-tag-px N] [--reps N] -- NAPA over the corpus: dumps in vk_eval's format, per-frame timings."""
+"""usage: napa_run.py ROOT OUT_DIR [--min-tag-px N] [--reps N] [--gap-ms MS] -- NAPA over the corpus: dumps in vk_eval's format, per-frame timings."""
 import argparse, json, os, statistics, sys, time
 import numpy as np
 from napa_vision import NapaDetector
@@ -23,6 +23,7 @@ ap.add_argument("root"); ap.add_argument("out")
 ap.add_argument("--min-tag-px", type=int, default=32)
 ap.add_argument("--reps", type=int, default=5)
 ap.add_argument("--only")
+ap.add_argument("--gap-ms", type=float, default=0.0, help="sleep before each frame, to time at a camera rate")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 timings = {}
@@ -35,6 +36,7 @@ for s in sorted(os.listdir(a.root)):
         img = read_pgm(line if os.path.exists(line) else os.path.join(a.root, s, os.path.basename(line)))
         res = None; ts = []
         for r in range(a.reps):
+            if a.gap_ms > 0: time.sleep(a.gap_ms / 1e3)
             t = time.perf_counter(); res = det.detect(img); ts.append(time.perf_counter() - t)
         times.append((img.shape[1], img.shape[0], statistics.median(ts) * 1e3, min(ts) * 1e3))
         out.append(f"F {i} {len(res)}")

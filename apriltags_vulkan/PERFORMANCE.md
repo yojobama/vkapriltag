@@ -2777,9 +2777,9 @@ corpus (4,003 frames, 5 repetitions each) at, median / 95th percentile in ms:
 | vkapriltag decimation 2 | 0.253 / 0.386 | 0.361 / 0.591 | 0.464 / 0.810 | 0.328 / 0.596 |
 
 NAPA is about 3.6 times faster than vkapriltag at decimation 2 over the corpus on the desktop, at every
-resolution. Per scenario the only ones vkapriltag wins are dense-tags (0.535 against 0.639 ms) and, roughly
-level, noise (0.364 against 0.302 ms is NAPA's) and underexposed (0.366 against 0.312): a 0.3 ms floor of
-upload, dispatch chain and CPU decode against NAPA's 0.03 to 0.12 ms on ordinary frames. The Orange Pi
+resolution. Per scenario vkapriltag is ahead only on dense-tags (0.535 against 0.639 ms); noise and
+underexposed frames come closest (NAPA 0.302 and 0.312 ms, vkapriltag 0.364 and 0.366). On ordinary frames
+vkapriltag has a floor of about 0.3 ms (upload, dispatch chain, CPU decode) against NAPA's 0.03 to 0.12 ms. The Orange Pi
 columns of 8ar stand (the aarch64 wheel matches a native gcc build there). The accuracy comparison is
 unaffected.
 
