@@ -1,0 +1,115 @@
+# Changelog
+
+All notable changes to vkapriltag. Per-version detail with measurements for 1.8.0 and 1.9.0 is in the
+"What changed" sections of [README.md](README.md); the measurements behind every change are in
+[apriltags_vulkan/PERFORMANCE.md](apriltags_vulkan/PERFORMANCE.md).
+
+## 1.10.0 (2026-11-04)
+
+Output changes at the defaults: detections, corner positions and the work per frame differ from 1.9.0.
+Every new default has an environment switch (and, where one exists, a `DetectorConfig` field) that
+turns it off; see "Upgrading" below.
+
+### Accuracy
+
+- **Edge refinement uses a profile fit by default.** `RefineEdgesMethod::kProfile` measures each side of a
+  quad every ~1.5 px with a dense edge profile and fits a strength-weighted line, with outlier dropping,
+  coarse-to-fine passes, a halfway-crossing locator for blurred edges and a clipped-exposure bias
+  correction (`APRILTAG_VK_PROFILE_FEATURES`, all four on). Median worst-corner error on the 24-scenario
+  corpus falls from 0.041 to 0.018 px (decimation 1) and from 0.043 to 0.017 px (decimation 2).
+  `APRILTAG_VK_REFINE=exact` (or `fast`, `ultrafast`) restores the 1.9.0 refinement.
+- **The decoder retries more and rejects more.** A quad that fails to decode is retried as its inner
+  square when a grey quiet zone fooled the border (`APRILTAG_VK_GREY_MARGIN`), a side fitted one cell
+  too far out is refitted (`SIDE_ONE_OUT`), a third corrected bit is accepted when the three wrong cells
+  touch (`THIRD_BIT`, with a block-split lookup), correction limits apply per family (`FAMILY_LIMITS`),
+  and quads whose border is not mostly dark (`BORDER_PRECHECK`) or whose payload is darker than any valid
+  code (`DARK_REJECT`) are dropped before refinement. Each switch set to `0` turns one off.
+- **Tags found on the corpus rise** from 94.4% to 97.0% (decimation 1) and from 92.5% to 97.3% (decimation
+  2); wrong IDs in the tag16h5 set fall from 1,739 to 0 and from 779 to 3. Tags with a grey margin
+  (98%+ from 88% / 48%), tags partly covered and low-contrast tags gain most.
+- **Decimation 2 and above averages each block** instead of taking its top-left pixel
+  (`DetectorConfig::box_decimate`, `APRILTAG_VK_BOX_DECIMATE=0` restores it): small tags at decimation 4
+  are found 71.8% -> 84.2% of the time and blur costs less corner error. It adds wrong IDs in a tag16h5
+  scene unless the family limits (now on) are kept.
+- **A noise-adaptive contrast floor** (`DetectorConfig::adaptive_floor_scale = 2`,
+  `APRILTAG_VK_ADAPTIVE_FLOOR=0` off) raises the 4x4-block contrast threshold to twice the frame's median
+  block range, so sensor noise is not labelled. A tag whose edge contrast is under about twice the noise's
+  block range is lost (1 to 3 of about 700 degraded tags in the harshest synthetic sets, none in the real
+  images). It needs 8-bit storage; without it the fixed floor applies.
+- **Fixes found by an edge-case audit** that 1.9.0 does not have: blobs above the shared-memory sort split
+  are sorted at any size up to 65,536 points, line-fit moments are taken relative to the blob's first point
+  in 64 bits, the fused tail bounds its point threads by the buffer capacity, odd frame sizes upload,
+  oversized or zero-iteration configurations are rejected, dispatches stay within
+  `maxComputeWorkGroupCount`, a throw in `Detect` leaks nothing, `FramePipeline` checks the frame size,
+  `PoseEstimator` rejects a non-positive or non-finite tag size or focal length and an SVD of rank below
+  2 gives no pose, `WorkerPool` serialises callers, carries exceptions to the caller and bounds its size,
+  `LoadGrayPgm` checks the header against the file, and the V4L2 capture and dma-buf test no longer busy
+  wait.
+
+### Performance
+
+Median per-frame total over the corpus (4,003 frames on the RX 9060 XT, 1,116 on the Orange Pi 5 Plus), 1.9.0
+-> 1.10.0 at the defaults: desktop 0.923 -> 0.356 ms at decimation 1 and 0.556 -> 0.299 ms at decimation 2;
+Orange Pi 2.549 -> 1.058 ms and 1.230 -> 0.743 ms. At 1,920 x 1,080 the desktop median is 2.014 -> 0.570 ms.
+
+- **Labelling and boundary passes run over compacted active cells** on integrated GPUs
+  (`DetectorConfig::sparse_labelling`, `APRILTAG_VK_SPARSE`): flat regions launch nothing.
+- **A leaner tail on integrated GPUs** (`APRILTAG_VK_LEAN_TAIL`, 3 there, 0 elsewhere): the point and blob
+  kernels are grid-stride loops dispatched over a fixed grid, `select_blobs` places each blob's points and
+  sets the sort's group count, so three dispatches (two argument kernels and the scan) are gone.
+- **A GPU keep-alive on integrated GPUs** (`DetectorConfig::keepalive_ms`, `APRILTAG_VK_KEEPALIVE_MS`): a
+  one-thread dispatch every 6 ms while frames arrive keeps the GPU out of its low-power state between camera
+  frames (Orange Pi at 33 ms gaps: 0.89 to 1.02 -> 0.66 to 0.69 ms); it stops 100 ms after the last frame.
+- **Completion by polling a flag** the last command sets, instead of waiting on the fence
+  (`APRILTAG_VK_FLAG_POLL`): on by default with `VK_AMD_device_coherent_memory` (the RX 9060 XT: 0.194 ->
+  0.145 ms on a one-tag 640x480 frame); `=1` forces it elsewhere (Orange Pi: 68 to 88 us per frame),
+  outside the specification there.
+- **Integer dot product in box decimation** (`VK_KHR_shader_integer_dot_product`, enabled when present,
+  `APRILTAG_VK_DOT=0` disables): the pass takes 93 -> 62 us on the Mali at decimation 2.
+- **Faster decode:** quad refits run in the parallel loop, decode has no per-quad heap allocations, the
+  profile fit's tap positions are computed in one vectorisable loop (28% faster), and the third-bit match
+  looks codes up by bit block.
+- **Known slower case:** candidate-rich frames (JPEG-compressed scenes) at decimation 2 are slower than in
+  1.9.0 at the defaults, by 14% (`fast` + margin gate 4) and 8% (`ultrafast`) on the RX 9060 XT and within
+  5% either way on the Orange Pi, from the profile fit and the extra candidates the contrast floor and box
+  decimation expose. With the old refinement the frames are level with 1.9.0.
+
+### Added
+
+- `RefineEdgesMethod::kProfile`, `MultiLevelDetector` (strided levels with size bands; measured slower
+  than decimation 2, kept as a class), `BorderSample`, `vk::CompletionFlag`,
+  `Context::CreateSiblingLane`, the `has_integer_dot_product` and `has_device_coherent_memory` caps, and
+  `DetectorConfig` fields `adaptive_floor_scale`, `sparse_labelling`, `box_decimate`, `keepalive_ms`,
+  `max_tag_pixels`.
+- Environment switches: `APRILTAG_VK_ADAPTIVE_FLOOR`, `BOX_DECIMATE`, `DOT`, `FLAG_POLL`, `GREY_MARGIN`,
+  `KEEPALIVE_MS`, `LEAN_TAIL`, `PROFILE_FEATURES`, `SIDE_ONE_OUT`, `SPARSE`, `SPIN_WAIT`, `THIRD_BIT`,
+  `FAMILY_LIMITS`, `BORDER_PRECHECK`, `DARK_REJECT`, `MIN_DIFF`.
+- `tools/napa_corpus`: a labelled 24-scenario test corpus generator (`gen_corpus.py`), a scorer
+  (`score_corpus.py`), a runner and a NAPA comparison runner (`napa_run.py`); the benchmark harness takes a
+  frame gap (`--gap-ms` / `VK_EVAL_GAP_MS`) to time at a camera rate.
+
+### Upgrading
+
+To approximate 1.9.0's behaviour set `APRILTAG_VK_REFINE=exact APRILTAG_VK_PROFILE_FEATURES=0
+APRILTAG_VK_THIRD_BIT=0 APRILTAG_VK_FAMILY_LIMITS=0 APRILTAG_VK_BORDER_PRECHECK=0 APRILTAG_VK_DARK_REJECT=0
+APRILTAG_VK_GREY_MARGIN=0 APRILTAG_VK_SIDE_ONE_OUT=0 APRILTAG_VK_BOX_DECIMATE=0 APRILTAG_VK_ADAPTIVE_FLOOR=0
+APRILTAG_VK_SPARSE=0 APRILTAG_VK_LEAN_TAIL=0 APRILTAG_VK_KEEPALIVE_MS=0 APRILTAG_VK_FLAG_POLL=0
+APRILTAG_VK_DOT=0`. The output is not byte-identical to 1.9.0's even then, because the audit fixes above
+change which tags are found (about 3% of dump lines on the corpus, all extra correct detections).
+Library users set the matching `DetectorConfig` fields.
+
+### Tried and not kept
+
+Persistent-kernel tail, calling-thread CPU tail, shuffle and shared-memory variants of the labelling kernels,
+fused threshold and init scan, fused dispatch arguments, multi-level detection as a default, and four device
+extensions (subgroup size control, uniform control flow, scheduling controls, subgroup shuffle) gave no gain
+or a loss on the Mali; the measurements are in PERFORMANCE.md sections 8ac to 8ay.
+
+### Release checks
+
+Both machines (RX 9060 XT, Windows, MSVC; Orange Pi 5 Plus, Linux, GCC): the library, apps and tools build
+in Release; the validation tools against upstream libapriltag, the pose tools and the synthetic ground truth
+pass (21 of 21 checks on each; there are no `ctest` tests); the Khronos validation layer with
+synchronisation validation reports nothing in 75 runs on each; AddressSanitizer on the desktop (75 runs) and
+AddressSanitizer with UBSan and ThreadSanitizer on the Orange Pi (75 runs each) report nothing. Details in
+PERFORMANCE.md section 8bb.

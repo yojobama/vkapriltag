@@ -3035,6 +3035,28 @@ this version profile 97.0% / 97.3%, `fast` + gate 4 96.8% / 96.6%, `ultrafast` 9
 `exact` 95.9% / 94.0%, `fast` + gate 4 95.9% / 94.0%, `ultrafast` 95.8% / 93.7%. Median corner error
 0.041 to 0.043 px for every setting except the profile fit (0.018 and 0.017 px).
 
+## 8bb. Version 1.10.0 against v1.9.0: release checks
+
+The comparisons are in 8az (default refinements) and 8ba (`fast` + margin gate 4 and `ultrafast`); the
+headline numbers are in the README and CHANGELOG.md. Checks on the release tree, on both machines (RX 9060 XT,
+Windows, MSVC, `Release`; Orange Pi 5 Plus, Linux, GCC, `Release`):
+
+- Build: the library, the apps and every tool configure and build; the only warnings are MSVC's unknown-option
+  and unknown-pragma notices (desktop) and four GCC warnings (Orange Pi).
+- Validation tools: `apriltag_vulkan_validate` against upstream libapriltag (the decoded ID set must match) on
+  the five corpus sizes at decimation 1 and 2, the four stress frames, the labelling retry path (`--max-uf 1`)
+  and the pipelined path with depth 2; `apriltag_pose_e2e_validate` at decimation 1 and 2;
+  `apriltag_pose_validate` (synthetic and degenerate cases, and real detections); and
+  `apriltag_synth_ground_truth`: 21 of 21 pass on each machine. There are no `ctest` tests in the project.
+- Khronos validation layer with synchronisation validation and shader-access analysis, 75 runs per machine
+  (decimation 1, 2 and 4; the defaults, the lean tail, flag polling, keep-alive, the subgroup, dot-product and
+  box-decimation switches, and the forced fallbacks): no messages, and the best-practices positive control
+  reports on both.
+- AddressSanitizer on the desktop (75 runs) and AddressSanitizer with UBSan and ThreadSanitizer on the Orange
+  Pi (75 runs each): no reports.
+- Corpus accuracy and timing as in 8az and 8ba. Known regression: JPEG-like candidate-rich frames at
+  decimation 2 on the desktop.
+
 ## 9. Measuring
 
 ```

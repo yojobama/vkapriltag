@@ -376,6 +376,30 @@ Spreading streams over queue families (`ContextOptions::expected_streams`, `Cont
 helps only where the device has two compute families (the desktop: +82% at four streams over one
 queue); on the Mali one queue shared by all streams is faster, and the helper then changes nothing.
 
+### What changed in 1.10.0 (against 1.9.0)
+
+Output changes at the defaults (see [CHANGELOG.md](CHANGELOG.md) for the full list and the environment
+switch that restores each behaviour). On the 24-scenario corpus (`tools/napa_corpus`), at the defaults:
+
+| | 1.9.0 | 1.10.0 |
+| --- | --- | --- |
+| tags found, decimation 1 / 2 | 94.4% / 92.5% | 97.0% / 97.3% |
+| median / 95th percentile corner error, decimation 1 | 0.041 / 0.187 px | 0.018 / 0.115 px |
+| wrong IDs in the tag16h5 set, decimation 1 / 2 | 1,739 / 779 | 0 / 3 |
+| median frame total, RX 9060 XT, decimation 1 / 2 | 0.923 / 0.556 ms | 0.356 / 0.299 ms |
+| median frame total, Orange Pi 5 Plus, decimation 1 / 2 | 2.549 / 1.230 ms | 1.058 / 0.743 ms |
+
+- **Accuracy:** a profile-fit edge refinement, a decoder that retries grey-margin quads and ones fitted a
+  cell too far out and accepts a third corrected bit when the wrong cells touch, per-family correction
+  limits, early rejection of dark or border-less quads, block-averaging decimation and a noise-adaptive
+  contrast floor.
+- **Speed:** compacted labelling, a leaner tail, a keep-alive and flag polling where they help, an integer
+  dot product in decimation, and a faster decode. JPEG-like, candidate-rich frames at decimation 2 are the
+  exception: 8 to 14% slower than 1.9.0 on the RX 9060 XT at equal refinement settings (PERFORMANCE.md
+  section 8ba).
+- **Fixes:** an edge-case audit (large blobs, odd frame sizes, pose input checks, the worker pool,
+  resource release on errors).
+
 ### What changed in 1.9.0 (against 1.8.0)
 
 Same output: the 15 canonical quad dumps match, and quad dumps and detections are byte-identical to
