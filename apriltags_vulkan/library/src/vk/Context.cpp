@@ -1180,6 +1180,11 @@ VkCommandBuffer Lane::BeginPersistentCommands() {
 }
 
 void Lane::FreePersistentCommands(VkCommandBuffer cmd) {
+  // A flag-polled submission leaves its fence pending until the next submission or this wait.
+  if (persistent_pending_) {
+    WaitFence(device_, persistent_fence_);
+    persistent_pending_ = false;
+  }
   vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
 }
 
