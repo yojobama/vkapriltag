@@ -43,10 +43,8 @@ bool hasReversedBorder(MinMaxExtentsGpu e) {
   return two_dot < 0.0;
 }
 
-void main() {
-  uint i = gl_GlobalInvocationID.x;
-  if (i >= min(raw_blob_count, pc.max_raw_blobs)) return;
-
+// Filters raw blob i.
+void SelectBlob(uint i) {
   remap[i] = 0xFFFFFFFFu;
 
   MinMaxExtentsGpu e = extents[i];
@@ -98,4 +96,12 @@ void main() {
 
   selected[pos] = e;
   remap[i] = pos;
+}
+
+// A grid-stride loop, so an indirect dispatch sized for the count and a direct dispatch of fewer
+// workgroups cover the same blobs.
+void main() {
+  const uint n = min(raw_blob_count, pc.max_raw_blobs);
+  const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+  for (uint i = gl_GlobalInvocationID.x; i < n; i += stride) SelectBlob(i);
 }

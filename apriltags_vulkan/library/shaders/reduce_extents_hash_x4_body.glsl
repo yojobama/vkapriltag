@@ -41,12 +41,8 @@ void Flush(uint s, Acc a) {
 #endif
 }
 
-void main() {
-  uint n = pc.count_from_buffer != 0u ? min(count_buf, pc.count) : pc.count;
-  uint first = gl_GlobalInvocationID.x * 4u;
-  if (first >= n) return;
-  uint copy = gl_WorkGroupID.x & (kExtentsCopies - 1u);
-
+// Accumulates the four points from `first` into extents copy `copy`.
+void ReduceFour(uint first, uint n, uint copy) {
   uint cur = 0xFFFFFFFFu;
   Acc a;
   for (uint k = 0u; k < 4u; ++k) {
@@ -79,4 +75,15 @@ void main() {
     }
   }
   if (cur != 0xFFFFFFFFu) Flush(cur, a);
+}
+
+// A grid-stride loop, so an indirect dispatch sized for the count and a direct dispatch of fewer
+// workgroups cover the same points.
+void main() {
+  const uint n = pc.count_from_buffer != 0u ? min(count_buf, pc.count) : pc.count;
+  const uint copy = gl_WorkGroupID.x & (kExtentsCopies - 1u);
+  const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x * 4u;
+  for (uint first = gl_GlobalInvocationID.x * 4u; first < n; first += stride) {
+    ReduceFour(first, n, copy);
+  }
 }

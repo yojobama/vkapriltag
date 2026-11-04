@@ -462,6 +462,11 @@ class GpuDetector {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
   };
   std::vector<RecordedFrame> recorded_frames_;
+  // APRILTAG_VK_LEAN_TAIL (bit mask, 0 off): bit 1 dispatches the tail's point and blob kernels over
+  // a fixed number of workgroups instead of sizing each from a count on the device.
+  uint32_t lean_tail_ = 0;
+  uint32_t lean_point_groups_ = 0;
+  uint32_t lean_select_groups_ = 0;
   // Set by the last command of a frame's tail; the host polls it instead of waiting on the fence.
   std::unique_ptr<vk::CompletionFlag> completion_flag_;
   // Declared last of the members it uses, so it stops before they are destroyed.

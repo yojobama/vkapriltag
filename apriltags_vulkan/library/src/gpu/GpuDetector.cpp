@@ -721,6 +721,15 @@ void GpuDetector::CreatePipelines() {
        selected_extents_buf_.get(), blob_point_offsets_buf_.get(), blob_cursor_buf_.get(),
        index_points_buf_.get(), qbp_counter_buf_.get()},
       16, wg1d_);
+
+  // A leaner tail where a dispatch is costly; opt-in while it is measured. The fixed-grid kernels
+  // need the 4-point reduction and the fused path, not the subgroup reduction.
+  if (const char *v = std::getenv("APRILTAG_VK_LEAN_TAIL")) {
+    lean_tail_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+  }
+  if (!(fused_submits_ && reduce_x4_ && !subgroup)) lean_tail_ &= ~1u;
+  lean_point_groups_ = std::min((qbp_capacity_ + wg1d_.x - 1u) / wg1d_.x, 128u);
+  lean_select_groups_ = std::min((config_.max_raw_blobs + wg1d_.x - 1u) / wg1d_.x, 32u);
 }
 
 void GpuDetector::RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &counter,
@@ -1041,31 +1050,44 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
 
   // Slot 1 of the indirect args: ceil(boundary points / wg1d), for hash_group, reduce_extents_hash
   // and scatter_index_points. The counts stay on the device.
+  const bool lean_grid = (lean_tail_ & 1u) != 0;
   struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{wg1d_.x, 1u, 1u,
                                                                        qbp_capacity_, 2u};
-  build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
-  vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+  if (!lean_grid) {
+    build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
+    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+  }
 
   // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
   // With count_from_buffer, `count` caps the device's counter at the buffer capacity.
   struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
       qbp_capacity_, hash_table_size_ - 1u, 128u, 1u, config_.max_raw_blobs};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
-  hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
+  if (lean_grid) {
+    hash_group_pl_.DispatchRaw(cmd, lean_point_groups_, 1, 1, &hash_pc);
+  } else {
+    hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
+  }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
   // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
   // bounds-checks against max_raw_blobs. reduce_extents_hash does not read them.
   struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
       wg1d_.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
-  build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
+  if (!lean_grid) {
+    build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
+  }
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
   struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{qbp_capacity_,
                                                                          config_.max_raw_blobs, 1u};
-  reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), reduce_x4_ ? 24 : 12,
-                                           &reduce_pc);
-  vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+  if (lean_grid) {
+    reduce_extents_hash_pl_.DispatchRaw(cmd, lean_point_groups_, 1, 1, &reduce_pc);
+  } else {
+    reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), reduce_x4_ ? 24 : 12,
+                                             &reduce_pc);
+    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+  }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
   struct {
@@ -1079,7 +1101,11 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
               config_.aspect_max,         config_.fill_min,
               config_.fill_max};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
-  select_blobs_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
+  if (lean_grid) {
+    select_blobs_pl_.DispatchRaw(cmd, lean_select_groups_, 1, 1, &select_pc);
+  } else {
+    select_blobs_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
+  }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
   struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
@@ -1090,8 +1116,13 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
       qbp_capacity_, ipoint_capacity_, config_.max_raw_blobs, 1u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
-  scatter_index_points_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
-                                            BarrierKind::ComputeAndTransfer);
+  if (lean_grid) {
+    scatter_index_points_pl_.DispatchRaw(cmd, lean_point_groups_, 1, 1, &scatter_pc,
+                                         BarrierKind::ComputeAndTransfer);
+  } else {
+    scatter_index_points_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
+                                              BarrierKind::ComputeAndTransfer);
+  }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
 
   // The number of distinct (rep0, rep1) pairs this frame; profiling only.
