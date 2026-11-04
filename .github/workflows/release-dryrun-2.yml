@@ -1,0 +1,69 @@
+name: Release dry run 2 (temporary)
+
+# Builds the vkapriltag library natively on amd64 and arm64 for tags matching vMAJOR.MINOR.PATCH,
+# packages each as a .deb via CPack and publishes both to a GitHub Release.
+
+on:
+  push:
+    branches:
+      - ci/release-dryrun-2
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package version
+        run: echo "PKG_VERSION=1.10.1" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        # No libopencv-dev: only tools/ need OpenCV and they are built with -DVKAPRILTAG_BUILD_TOOLS=OFF.
+        # No glslang-tools: Ubuntu 24.04's 15.1 cannot compile the integer dot product shader
+        # (GL_EXT_integer_dot_product needs glslang 15.2 or later), so glslang is built below.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential dpkg-dev git python3 \
+            libvulkan-dev
+
+      - name: Build glslang
+        # About half a minute on either architecture.
+        run: |
+          git clone --depth 1 --branch 16.2.0 https://github.com/KhronosGroup/glslang.git
+          cmake -S glslang -B glslang/build -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF \
+            -DENABLE_CTEST=OFF -DBUILD_EXTERNAL=OFF -DCMAKE_INSTALL_PREFIX="$HOME/glslang"
+          cmake --build glslang/build -j --target install
+          echo "$HOME/glslang/bin" >> "$GITHUB_PATH"
+          "$HOME/glslang/bin/glslangValidator" --version | head -1
+
+      - name: Configure
+        run: |
+          cmake -B build -S apriltags_vulkan \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVKAPRILTAG_BUILD_APPS=OFF \
+            -DVKAPRILTAG_BUILD_TOOLS=OFF \
+            -DVKAPRILTAG_DOT_SHADER=ON \
+            -DCPACK_PACKAGE_VERSION="${PKG_VERSION}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Package
+        run: cd build && cpack
+
+      - name: Check the package includes the integer dot product shader
+        run: dpkg-deb -c build/*.deb | grep decimate_box_dot_u8.comp.spv
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkapriltag-deb-${{ matrix.arch }}
+          path: build/*.deb
