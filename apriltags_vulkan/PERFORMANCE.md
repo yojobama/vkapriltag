@@ -2869,6 +2869,34 @@ on the desktop (60 runs) and AddressSanitizer with UBSan and ThreadSanitizer on 
 reports; the matrix includes `APRILTAG_VK_LEAN_TAIL=0`, 1, 2 and 3. Discrete GPUs keep the old tail
 unaided (default 0).
 
+## 8ay. The persistent tail and the calling-thread CPU tail on top of the lean tail
+
+Both earlier experiments (8aw, 8av) were measured against the old tail. Re-measured with them added to the
+lean tail of 8ax (`perf/combined`), Orange Pi 5 Plus, decimation 2, flag polling on, mean total per frame,
+three runs each:
+
+| | 640x480 one-tag, small-tags, many-tags | 1280x720, four test frames | 1280x720 heavy (dense, noise, many-tags, JPEG, large-tags) |
+|---|---|---|---|
+| old tail (`APRILTAG_VK_LEAN_TAIL=0`) | 0.596 to 0.598 ms | 1.033 to 1.040 ms | 1.697 to 1.713 (decimation 1) |
+| lean tail (default) | 0.550 to 0.554 ms | 0.994 to 0.998 ms | 1.449 to 1.465 ms |
+| lean + `APRILTAG_CPU_INLINE=2` | 0.569 ms | 0.989 to 0.995 ms | 1.451 to 1.469 ms |
+| lean + `APRILTAG_CPU_INLINE=3` | 0.540 ms | 1.046 to 1.049 ms | 1.479 to 1.494 ms |
+| lean + `APRILTAG_CPU_INLINE=4` | 0.541 to 0.543 ms | 1.065 to 1.068 ms | 1.475 to 1.508 ms |
+| lean + `APRILTAG_CPU_INLINE=8` | 0.540 to 0.544 ms | 1.060 to 1.067 ms | 1.502 to 1.508 ms |
+| persistent tail (`APRILTAG_VK_PERSISTENT=tail`) | 0.557 to 0.570 ms | 1.033 to 1.051 ms | |
+| persistent tail + inline 8 | 0.542 to 0.545 ms | 1.079 to 1.111 ms | |
+
+Running a small batch on the calling thread helps only frames with one to three candidates (about 10 us) and
+costs 30 to 70 us on frames with four or more, so no limit is better overall. The persistent tail is slower
+than the lean tail on every set (its stages run on a quarter of the GPU and its barriers cost what the
+removed dispatches did), because the lean tail already removed most of the dispatch cost the persistent
+kernel was meant to save. Neither is kept as a default. The combination was checked for correctness and safety
+on both machines: output identical to the lean default on the desktop (30 of 30 lines at decimation 1 and 2);
+validation layer with synchronisation validation 75 runs per machine with zero messages; AddressSanitizer on
+the desktop 75 runs and AddressSanitizer with UBSan and ThreadSanitizer on the Pi 75 runs each, no reports.
+The matrix covered persistent tail with 8 and 4 workgroups, inline limits 3 and 8, and the persistent tail
+with inline 8.
+
 ## 9. Measuring
 
 ```
