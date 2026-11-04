@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -1017,6 +1018,26 @@ uint32_t Context::FindMemoryTypeOrThrow(uint32_t type_bits, VkMemoryPropertyFlag
   return index;
 }
 
+namespace {
+
+// Waits for a fence. APRILTAG_VK_SPIN_WAIT=1 polls it for up to 2 ms before sleeping in the driver,
+// which avoids the thread wake-up latency of a blocking wait.
+void WaitFence(VkDevice device, VkFence fence) {
+  static const bool spin = [] {
+    const char *v = std::getenv("APRILTAG_VK_SPIN_WAIT");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  if (spin) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (vkGetFenceStatus(device, fence) == VK_SUCCESS) return;
+    }
+  }
+  CheckVk(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+}
+
+}  // namespace
+
 VkCommandBuffer Context::BeginCommands() const { return default_lane_->BeginCommands(); }
 
 void Context::SubmitAndWait(VkCommandBuffer cmd) const { default_lane_->SubmitAndWait(cmd); }
@@ -1095,8 +1116,7 @@ void Lane::SubmitAndWait(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageF
     submit_info.pWaitDstStageMask = &wait_stage;
   }
   SubmitRing(i, submit_info);
-  CheckVk(vkWaitForFences(device_, 1, &fence_ring_[i], VK_TRUE, UINT64_MAX),
-          "vkWaitForFences");
+  WaitFence(device_, fence_ring_[i]);
 }
 
 VkCommandBuffer Lane::BeginPersistentCommands() {
@@ -1145,8 +1165,7 @@ void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, VkSemaphore wait,
     CheckVk(vkQueueSubmit(queue_, 1, &submit_info, persistent_fence_), "vkQueueSubmit");
   }
   ++submit_count;
-  CheckVk(vkWaitForFences(device_, 1, &persistent_fence_, VK_TRUE, UINT64_MAX),
-          "vkWaitForFences");
+  WaitFence(device_, persistent_fence_);
 }
 
 std::string Context::DescribeDevice() const {
