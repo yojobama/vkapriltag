@@ -1,0 +1,55 @@
+name: Release dry run (temporary)
+
+# Builds the vkapriltag library natively on amd64 and arm64 for tags matching vMAJOR.MINOR.PATCH,
+# packages each as a .deb via CPack and publishes both to a GitHub Release.
+
+on:
+  push:
+    branches:
+      - ci/release-dryrun
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive package version from tag
+        # Accept strict vMAJOR.MINOR.PATCH tags only.
+        run: |
+          echo "PKG_VERSION=1.10.0" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        # No libopencv-dev: only tools/ need OpenCV and they are built with -DVKAPRILTAG_BUILD_TOOLS=OFF.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential dpkg-dev \
+            libvulkan-dev glslang-tools
+
+      - name: Configure
+        run: |
+          cmake -B build -S apriltags_vulkan \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVKAPRILTAG_BUILD_APPS=OFF \
+            -DVKAPRILTAG_BUILD_TOOLS=OFF \
+            -DCPACK_PACKAGE_VERSION="${PKG_VERSION}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Package
+        run: cd build && cpack
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkapriltag-deb-${{ matrix.arch }}
+          path: build/*.deb
