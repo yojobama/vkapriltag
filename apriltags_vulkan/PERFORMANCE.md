@@ -2834,6 +2834,41 @@ machine with zero messages; AddressSanitizer on the desktop and AddressSanitizer
 ThreadSanitizer on the Pi, 48 runs each, no reports. The Mali path stays opt-in until a longer stress
 (10^5 frames) is run.
 
+## 8ax. A leaner tail on integrated GPUs
+
+The ten dependent dispatches after `blob_diff` do little on a frame with a few tags, so the Mali pays mostly
+for the chain. Three changes that leave every remaining stage a many-workgroup dispatch and change no
+arithmetic were tried (`APRILTAG_VK_LEAN_TAIL`, a bit mask; default 3 on integrated GPUs, 0 elsewhere; each
+bit needs the fused path, bit 1 also the 4-point reduction without the subgroup reduction):
+
+1. **Bit 1, no argument kernels.** `hash_group`, `reduce_extents_hash_x4`, `select_blobs` and
+   `scatter_index_points` are grid-stride loops, so one body serves an indirect dispatch (the loop runs once)
+   and a direct dispatch of at most 128 (point kernels) or 32 (select) workgroups; `build_qbp_args` and
+   `build_indirect_args` and their barriers are gone. Output identical.
+2. **Bit 2, offsets from select.** `select_blobs` takes each blob's place in the point buffer from an atomic
+   running total and raises the sort's group count with `atomicMax`, so `scan_blob_counts` is gone. Every blob
+   is still one contiguous sorted run; only the order of blobs in the buffer (and so of the reported
+   detections, already atomic-order dependent) can change. Output identical on the desktop and the Pi
+   corpus apart from the usual 2-line run-to-run noise.
+3. **Bit 4 (dropped).** Leaving the two large-blob sorts out of frames whose predecessor had no large blob, and
+   running them in a short extra submission when needed, gained 8 us on the Pi against a 15 us gate, so the
+   code was reverted.
+
+Orange Pi 5 Plus, flag polling on in both arms, interleaved: one-tag, small-tags and many-tags 640x480 frames,
+decimation 2, total per frame: 0.595 to 0.599 ms before; 0.564 to 0.571 (bit 1); 0.549 to 0.553 (bits 1 and 2);
+0.541 to 0.546 (all three). The four test frames, GPU per frame, decimation 1 / 2: 1.450 / 0.746 ms before,
+1.417 / 0.713 (bit 1), 1.396 / 0.703 (bits 1 and 2). Heavy frames (dense, noise, many-tags, JPEG and large-tags
+at 1280x720, five frames) do not get slower: GPU 2.425 to 2.440 / 1.071 to 1.085 ms with bits 1 and 2 against
+2.488 to 2.545 / 1.109 to 1.130 ms before, decimation 1 / 2. The default (bits 1 and 2) is therefore
+about 45 us (7.7%) faster on small frames. Output: desktop 30 of 30 lines at decimation 1 and 2 (with
+`APRILTAG_VK_FORCE_NO_SUBGROUP=1` and the bits forced on, which selects the kernels), Pi corpus 2 of 2,982
+lines differ in some repeats, as with the lean tail off.
+
+Checks: validation layer with synchronisation validation, 60 runs per machine, zero messages; AddressSanitizer
+on the desktop (60 runs) and AddressSanitizer with UBSan and ThreadSanitizer on the Pi (60 runs each), no
+reports; the matrix includes `APRILTAG_VK_LEAN_TAIL=0`, 1, 2 and 3. Discrete GPUs keep the old tail
+unaided (default 0).
+
 ## 9. Measuring
 
 ```
