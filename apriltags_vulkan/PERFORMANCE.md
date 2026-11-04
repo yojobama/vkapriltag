@@ -2989,6 +2989,52 @@ Regressions found:
 Everything else is faster at the defaults: the corpus median is 2.6 times lower at decimation 1 on the
 desktop (0.923 to 0.356 ms) and 2.4 times on the Pi.
 
+## 8ba. Against v1.9.0 with `fast` plus margin gate 4 and with `ultrafast`
+
+Section 8az compared the default refinements (v1.9.0 `exact`, this version's profile fit). The same corpus
+run was repeated with the cheaper refinements v1.9.0 recommends, for v1.9.0, for this version at its defaults
+(`APRILTAG_VK_REFINE` set, all else default) and for this version in the compatibility mode of 8az. Median /
+95th percentile of the per-frame total, ms (JPEG: mean total of the 150 JPEG frames):
+
+| | v1.9.0 | this version | compatibility mode |
+|---|---|---|---|
+| Desktop d1, `exact` / profile | 0.923 / 2.313 | 0.356 / 0.690 | 0.791 / 1.944 |
+| Desktop d1, `fast` + gate 4 | 0.857 / 2.043 | 0.315 / 0.637 | 0.730 / 1.603 |
+| Desktop d1, `ultrafast` | 0.854 / 2.018 | 0.316 / 0.623 | 0.728 / 1.594 |
+| Desktop d2, `exact` / profile | 0.556 / 1.315 | 0.299 / 0.560 | 0.551 / 1.258 |
+| Desktop d2, `fast` + gate 4 | 0.424 / 0.844 | 0.250 / 0.480 | 0.403 / 0.789 |
+| Desktop d2, `ultrafast` | 0.419 / 0.836 | 0.247 / 0.453 | 0.402 / 0.776 |
+| Pi d1, `exact` / profile | 2.549 / 6.339 | 1.058 / 2.400 | 2.485 / 6.058 |
+| Pi d1, `fast` + gate 4 | 2.462 / 6.012 | 1.027 / 2.184 | 2.432 / 6.000 |
+| Pi d1, `ultrafast` | 2.804 / 7.264 | 1.016 / 2.106 | 2.399 / 5.782 |
+| Pi d2, `exact` / profile | 1.230 / 2.809 | 0.743 / 1.499 | 1.191 / 2.723 |
+| Pi d2, `fast` + gate 4 | 1.048 / 2.253 | 0.706 / 1.227 | 1.059 / 2.232 |
+| Pi d2, `ultrafast` | 1.074 / 2.353 | 0.683 / 1.156 | 1.017 / 2.162 |
+
+JPEG frames, mean total ms (CPU in brackets), v1.9.0 against this version at the same setting:
+
+| | desktop d1 | desktop d2 | Pi d1 | Pi d2 |
+|---|---|---|---|---|
+| `fast` + gate 4 | 1.135 (0.463) / 1.119 (0.548) | 0.568 (0.247) / 0.647 (0.324) | 3.438 / 3.610 | 1.567 / 1.626 |
+| `ultrafast` | 1.124 (0.452) / 1.097 (0.521) | 0.540 (0.220) / 0.581 (0.261) | 3.788 / 3.580 | 1.524 / 1.494 |
+
+Like for like, the JPEG regression of 8az shrinks but does not vanish: this version is 14% (`fast` + gate 4)
+and 8% (`ultrafast`) slower on desktop decimation 2, level on desktop decimation 1, within 5% either way on the
+Orange Pi (5% slower to 5% faster), and faster everywhere else. A bisect on the desktop JPEG frames at
+decimation 2 with `fast` + gate 4 (0.624 ms; v1.9.0 0.593 ms) puts it in the candidate count: the adaptive floor
+raises it from 81 to 90 candidates per frame (0.608 ms without it) and box decimation adds 2 more (0.664 ms without
+box decimation, because the averaged blocks also cut other work); with every newer default off but the
+refinement the frames take 0.606 to 0.615 ms and 82 candidates. Turning off the side-one-out retry, the third
+bit or the border and dark pre-checks one at a time makes the frames slower (0.653 to 0.663 ms): they cut work
+more than they add; the grey-margin retry costs about 5 us.
+
+Tags found, desktop corpus, decimation 1 / 2 (wrong IDs outside the tag16h5 set were 0 for every cheaper
+refinement; in the tag16h5 set 82 / 85 for v1.9.0 `fast` + gate 4, 400 / 202 for its `ultrafast`, 0 / 0 for
+this version with either): v1.9.0 `exact` 94.4% / 92.5%, `fast` + gate 4 94.4% / 92.5%, `ultrafast` 94.3% / 92.2%;
+this version profile 97.0% / 97.3%, `fast` + gate 4 96.8% / 96.6%, `ultrafast` 95.9% / 94.1%; compatibility mode
+`exact` 95.9% / 94.0%, `fast` + gate 4 95.9% / 94.0%, `ultrafast` 95.8% / 93.7%. Median corner error
+0.041 to 0.043 px for every setting except the profile fit (0.018 and 0.017 px).
+
 ## 9. Measuring
 
 ```
