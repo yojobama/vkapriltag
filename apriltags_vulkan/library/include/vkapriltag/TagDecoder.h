@@ -41,7 +41,7 @@ class TagDecoder {
   // `refine_method` may be overridden by APRILTAG_VK_REFINE; used only if `td->refine_edges` is set.
   // Margin gate in grey levels (0 = off); APRILTAG_VK_PROBE_MARGIN overrides it.
   explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0,
-                      RefineEdgesMethod refine_method = RefineEdgesMethod::kExact,
+                      RefineEdgesMethod refine_method = RefineEdgesMethod::kProfile,
                       float probe_margin = 0.0f);
   ~TagDecoder();
 
@@ -90,20 +90,20 @@ class TagDecoder {
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
-  // APRILTAG_VK_GREY_MARGIN=1: retry a quad that did not decode as its inner square.
-  bool grey_margin_ = false;
-  // APRILTAG_VK_SIDE_ONE_OUT=1: refit a side whose border cells read white, one cell further in.
-  bool side_one_out_ = false;
-  // APRILTAG_VK_THIRD_BIT=1: accept a third corrected bit when the three wrong cells touch.
-  bool third_bit_ = false;
+  // APRILTAG_VK_GREY_MARGIN=0 turns off: retry a quad that did not decode as its inner square.
+  bool grey_margin_ = true;
+  // APRILTAG_VK_SIDE_ONE_OUT=0 turns off: refit a side whose border cells read white, one cell further in.
+  bool side_one_out_ = true;
+  // APRILTAG_VK_THIRD_BIT=0 turns off: accept a third corrected bit when the three wrong cells touch.
+  bool third_bit_ = true;
   ThirdBitIndex third_index_;
-  // APRILTAG_VK_FAMILY_LIMITS=1: reject detections that needed more corrected bits than their
+  // APRILTAG_VK_FAMILY_LIMITS=0 turns off: reject detections that needed more corrected bits than their
   // family's codes can bear.
-  bool family_limits_ = false;
-  // APRILTAG_VK_BORDER_PRECHECK=1: reject a quad whose border cells are not mostly dark before refining.
-  bool border_precheck_ = false;
-  // APRILTAG_VK_DARK_REJECT=1: reject a quad whose payload has fewer white cells than any code.
-  bool dark_reject_ = false;
+  bool family_limits_ = true;
+  // APRILTAG_VK_BORDER_PRECHECK=0 turns off: reject a quad whose border cells are not mostly dark before refining.
+  bool border_precheck_ = true;
+  // APRILTAG_VK_DARK_REJECT=0 turns off: reject a quad whose payload has fewer white cells than any code.
+  bool dark_reject_ = true;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;

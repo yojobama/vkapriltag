@@ -279,12 +279,12 @@ constexpr int kMaxProfilePoints = 96;
 constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient falls below this fraction
 constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
 
-// Optional refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once).
+// Refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once; all four by default).
 enum ProfileFeature : unsigned { kDropOutliers = 1u, kCoarseToFine = 2u, kHalfwayCrossing = 4u, kClipBias = 8u };
 unsigned ProfileFeatures() {
   static const unsigned features = [] {
     const char *v = std::getenv("APRILTAG_VK_PROFILE_FEATURES");
-    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 15u;
   }();
   return features;
 }

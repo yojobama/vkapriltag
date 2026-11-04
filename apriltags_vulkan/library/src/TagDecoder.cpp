@@ -180,12 +180,12 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
     probe_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
-  if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] == '1';
-  if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] == '1';
-  if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] == '1';
-  if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] == '1';
-  if (const char *v = std::getenv("APRILTAG_VK_BORDER_PRECHECK")) border_precheck_ = v[0] == '1';
-  if (const char *v = std::getenv("APRILTAG_VK_DARK_REJECT")) dark_reject_ = v[0] == '1';
+  if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_BORDER_PRECHECK")) border_precheck_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_DARK_REJECT")) dark_reject_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
