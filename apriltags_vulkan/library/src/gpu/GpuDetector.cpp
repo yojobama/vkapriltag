@@ -648,6 +648,7 @@ void GpuDetector::CreatePipelines() {
       20, sparse_ ? vk::WorkgroupSize{16, 4, 1} : wg2d_, {count_runs_ ? 1u : 0u, sparse_ ? 1u : 0u});
 
   // A leaner tail where a dispatch is costly (bit 1: fixed-grid kernels, bit 2: offsets from select).
+  lean_tail_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3u : 0u;
   if (const char *v = std::getenv("APRILTAG_VK_LEAN_TAIL")) {
     lean_tail_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
   }

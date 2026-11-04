@@ -462,7 +462,7 @@ class GpuDetector {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
   };
   std::vector<RecordedFrame> recorded_frames_;
-  // APRILTAG_VK_LEAN_TAIL (bit mask, 0 off): bit 1 dispatches the tail's point and blob kernels over
+  // APRILTAG_VK_LEAN_TAIL (bit mask; 3 on integrated GPUs, 0 elsewhere): bit 1 dispatches the tail's point and blob kernels over
   // a fixed number of workgroups instead of sizing each from a count on the device.
   // Bit 2 takes the selected blobs' point offsets and the sort's group count in select_blobs.comp,
   // without scan_blob_counts.comp.
