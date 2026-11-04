@@ -2721,6 +2721,49 @@ desktop the two are within 0.1 ms in the median, NAPA ahead at 640x480 and 1280x
 Neither dominates: NAPA is faster and more accurate on quiet scenes with large tags, vkapriltag keeps
 its time flat on busy or noisy frames and finds smaller tags in a single pass.
 
+## 8as. Why a CPU detector beats the GPU path on small frames, and the accuracy defaults
+
+Where one frame goes (one-tag 640x480, decimation 1; host trace and dispatch timestamps):
+
+| | RX 9060 XT | Orange Pi 5 Plus (decimation 2) |
+|---|---|---|
+| upload | 25 us | 50 us |
+| wait for the GPU | 157 us | 852 us |
+| of which the 19 dispatches | 126 us (5 to 17 us each) | 620 us (14 to 58 us each) |
+| of which submit and wake-up | about 30 us | about 230 us |
+| CPU decode | about 45 us | about 140 us |
+
+The cost is the dependent chain, not the pixels: each stage waits for the one before it, the stages after
+`blob_diff` (build args, group, extents, select, scan, scatter, sort) are ten dispatches doing almost no
+work on a frame with a few tags (312 of the Pi's 620 us), and an empty `sort_points_large` dispatch still
+costs 27 us there. NAPA touches a ninth of the pixels with no per-frame fixed cost, so on the Pi its
+whole frame (0.13 ms for one tag) is shorter than our CPU decode alone. The GPU pays off only where the
+per-pixel work dominates: 1920x1080 and noisy, dense or JPEG frames (section 8ar). The ways to lower the
+floor are fewer dispatches (a fused tail, a speculative frame without the large-blob sorts, work moved
+into the clear pass), each worth about 5 to 10% on the Mali by the measurements in sections 8ae to 8ap,
+not 3 times; `APRILTAG_VK_SPIN_WAIT=1` (poll the fence for up to 2 ms before sleeping) saves about 30 us
+on the Pi (1.535 to 1.499 ms and 0.807 to 0.780 ms GPU at decimation 1 and 2) and nothing measurable on the
+desktop, so it stays opt-in.
+
+Accuracy. The opt-in set (profile-fit refine with all four features, grey margin, side one out, third
+bit, family limits, border pre-check, dark reject) is now the default (`APRILTAG_VK_REFINE=exact` and each
+switch `=0` restore the previous behaviour exactly; verified on four frames at decimation 1 and 2 and over
+the corpus). Corpus, desktop, previous default against the new default (recall, corner error median / p95):
+
+| | previous default d1 / d2 | new default d1 / d2 | NAPA |
+|---|---|---|---|
+| tags found | 95.9% / 94.2% | 97.0% / 97.3% | 97.3% |
+| median / p95 error, px | 0.041 / 0.185, 0.040 / 0.204 | 0.018 / 0.115, 0.017 / 0.122 | 0.021 / 0.100 |
+| wrong IDs, tag16h5 set | 102 / 146 | 0 / 3 | 0 |
+| grey-margin | 87.6% / 47.9% | 99.0% / 98.1% | 98.7% |
+| low-contrast | 98.3% / 93.8% | 99.7% / 99.3% | 99.3% |
+
+The cost is CPU time per frame (median / p95 ms, whole corpus): desktop 0.360 / 0.703 to 0.393 / 0.731 at
+decimation 1 and 0.284 / 0.509 to 0.328 / 0.596 at 2; Orange Pi 1.077 / 2.276 to 1.169 / 2.480 and 0.854 /
+1.421 to 0.795 / 1.568. The border-occlusion scenario remains behind NAPA (43.0% against 56.5% at decimation
+2). Validation layer with synchronisation validation, 30 runs per machine, zero messages; AddressSanitizer
+on the desktop and AddressSanitizer with UBSan and ThreadSanitizer on the Pi, 30 runs each, no reports.
+
 ## 9. Measuring
 
 ```

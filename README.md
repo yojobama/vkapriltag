@@ -114,6 +114,13 @@ This port intentionally does less than the CUDA original and upstream
   blur, and with the integer dot product it is also faster on the Mali. The cost is more wrong IDs in a
   tag16h5 scene (97 to 146 at decimation 2 in the corpus set), where `APRILTAG_VK_FAMILY_LIMITS=1` is the
   remedy; decimation 1 is unchanged.
+- **Corners and decoding use the accurate set.** The edge refinement fits dense profiles across each
+  side (`APRILTAG_VK_REFINE=exact` restores the previous refinement), and the decoder retries a quad whose
+  border sits in a grey margin or one cell out, accepts a third corrected bit only when the wrong cells
+  touch, and applies per-family correction limits (each `APRILTAG_VK_GREY_MARGIN`, `SIDE_ONE_OUT`,
+  `THIRD_BIT`, `FAMILY_LIMITS`, `BORDER_PRECHECK`, `DARK_REJECT` set to `0` turns one off). On the corpus
+  this raises the tags found at decimation 2 from 94.2% to 97.3% and halves the median corner error, at
+  a cost of 0.04 ms per frame on the desktop and none on the Orange Pi.
 
 ## Requirements
 
