@@ -2834,6 +2834,52 @@ machine with zero messages; AddressSanitizer on the desktop and AddressSanitizer
 ThreadSanitizer on the Pi, 48 runs each, no reports. The Mali path stays opt-in until a longer stress
 (10^5 frames) is run.
 
+## 8av. Sort tie-break (not built) and the calling-thread CPU tail (dropped)
+
+**Order-independent sort ties.** The occasional run-to-run difference in the dumps (2 of 2,982 corpus lines
+in about 1 repeat in 8 on the Orange Pi at decimation 2, a corner moving by 0.0005 px and the margin by 0.001)
+comes from points of one blob with equal `theta_key` being ordered by their position in `src`, which the
+atomic scatter assigns. A canonical tie-break by pixel position does not fit the packed word (20 bits of key
+and 12 of payload index); doing it means a 64-bit key in all three sort variants (rank-all, rank-merge, the
+sorting network) or an extra shared-memory load per comparison in the rank-all fast path, which would slow
+the small-blob sort that dominates on the Mali. The effect is too small to pay for that, so it was not built
+and the persistent-kernel checks that need identity use the numeric-tolerance comparison of the dump matrix
+(`num_cmp.py`) instead of a byte diff.
+
+**CPU tail on the calling thread.** `WorkerPool::ParallelFor` runs batches of at most `APRILTAG_CPU_INLINE`
+items on the calling thread. Orange Pi, one-tag, small-tags and many-tags 640x480 frames, decimation 2, total
+per frame (four runs each, accuracy defaults, profile refine): default 0.640 to 0.644 ms; limit 2: 0.653 to
+0.690 ms; limit 4: 0.626 to 0.646 ms; limit 8: 0.624 to 0.631 ms. The best case saves 15 us against a gate of
+30 us, and with the heavier profile refine each quad's work is long enough that spreading it over the pool
+beats a single thread. Dropped; the code is only on the branch `perf/pf-m5-cpu-inline`.
+
+## 8aw. Persistent tail on the Mali (prototype; dropped at the first go/no-go)
+
+`pf_tail_body.glsl` (`APRILTAG_VK_PERSISTENT=tail`, `APRILTAG_VK_PERSISTENT_WG=<n>`, default 8 workgroups of
+256) runs hash_group, reduce_extents_hash_x4, select_blobs, scan_blob_counts and scatter_index_points as one
+dispatch whose workgroups stay resident and synchronise with software grid barriers, replacing seven
+dispatches (with their argument kernels) by one with four barriers. The stages are the existing kernels'
+bodies over grid-stride loops; a barrier that does not complete sets a `failed` word so every workgroup
+leaves (the host rerun of the tail was not built). Output is identical to the separate-dispatch tail:
+desktop 30 of 30 lines at decimation 1 and 2 (with `APRILTAG_VK_FORCE_NO_SUBGROUP=1`, which selects the
+reduction it covers), Orange Pi corpus 2,982 of 2,982 lines at decimation 2.
+
+Orange Pi 5 Plus, GPU per frame, interleaved, flag polling on in both columns:
+
+| | separate dispatches | persistent tail |
+|---|---|---|
+| four frames, decimation 1 / 2 | 1.449 / 0.739 ms | 1.453 / 0.727 ms (8 workgroups); 1.498 / 0.740 (4); 1.629 / 0.794 (2); 1.925 / 0.905 (1) |
+| one-tag, small-tags, many-tags 640x480, decimation 2, total | 0.595 to 0.599 ms | 0.556 to 0.562 ms (8 workgroups); 0.567 to 0.570 (2) |
+
+The saving is about 40 us on the small frames and nil on the larger ones, against the 80 us the plan set as the
+go/no-go gate for the whole persistent tail and about 100 us predicted from the cost of a dependent dispatch.
+Removing seven dispatches saved about 6 us each in the real chain, not 15 to 17: the stages' own work (hash
+inserts, atomics, the single-workgroup scan, grid-stride loops over a quarter of the GPU) takes most of what the
+boundaries cost, and a grid of 16 workgroups is slower than 8 (0.887 ms). Porting the three sort dispatches
+would add at most about the same again, so the line is stopped here rather than building the abort rerun, the
+start-up probe, the head and the in-kernel convergence loop (M4 depends on this gate). The branch is not to be
+merged; the milestones that were kept are the keep-alive (section 8at) and flag polling (8au).
+
 ## 8ax. A leaner tail on integrated GPUs
 
 The ten dependent dispatches after `blob_diff` do little on a frame with a few tags, so the Mali pays mostly
@@ -2868,6 +2914,34 @@ Checks: validation layer with synchronisation validation, 60 runs per machine, z
 on the desktop (60 runs) and AddressSanitizer with UBSan and ThreadSanitizer on the Pi (60 runs each), no
 reports; the matrix includes `APRILTAG_VK_LEAN_TAIL=0`, 1, 2 and 3. Discrete GPUs keep the old tail
 unaided (default 0).
+
+## 8ay. The persistent tail and the calling-thread CPU tail on top of the lean tail
+
+Both earlier experiments (8aw, 8av) were measured against the old tail. Re-measured with them added to the
+lean tail of 8ax (`perf/combined`), Orange Pi 5 Plus, decimation 2, flag polling on, mean total per frame,
+three runs each:
+
+| | 640x480 one-tag, small-tags, many-tags | 1280x720, four test frames | 1280x720 heavy (dense, noise, many-tags, JPEG, large-tags) |
+|---|---|---|---|
+| old tail (`APRILTAG_VK_LEAN_TAIL=0`) | 0.596 to 0.598 ms | 1.033 to 1.040 ms | 1.697 to 1.713 (decimation 1) |
+| lean tail (default) | 0.550 to 0.554 ms | 0.994 to 0.998 ms | 1.449 to 1.465 ms |
+| lean + `APRILTAG_CPU_INLINE=2` | 0.569 ms | 0.989 to 0.995 ms | 1.451 to 1.469 ms |
+| lean + `APRILTAG_CPU_INLINE=3` | 0.540 ms | 1.046 to 1.049 ms | 1.479 to 1.494 ms |
+| lean + `APRILTAG_CPU_INLINE=4` | 0.541 to 0.543 ms | 1.065 to 1.068 ms | 1.475 to 1.508 ms |
+| lean + `APRILTAG_CPU_INLINE=8` | 0.540 to 0.544 ms | 1.060 to 1.067 ms | 1.502 to 1.508 ms |
+| persistent tail (`APRILTAG_VK_PERSISTENT=tail`) | 0.557 to 0.570 ms | 1.033 to 1.051 ms | |
+| persistent tail + inline 8 | 0.542 to 0.545 ms | 1.079 to 1.111 ms | |
+
+Running a small batch on the calling thread helps only frames with one to three candidates (about 10 us) and
+costs 30 to 70 us on frames with four or more, so no limit is better overall. The persistent tail is slower
+than the lean tail on every set (its stages run on a quarter of the GPU and its barriers cost what the
+removed dispatches did), because the lean tail already removed most of the dispatch cost the persistent
+kernel was meant to save. Both were dropped: neither is in the lean-tail line, and their code is only on `perf/pf-m3-persistent-tail` and `perf/pf-m5-cpu-inline`. The combination was checked for correctness and safety
+on both machines: output identical to the lean default on the desktop (30 of 30 lines at decimation 1 and 2);
+validation layer with synchronisation validation 75 runs per machine with zero messages; AddressSanitizer on
+the desktop 75 runs and AddressSanitizer with UBSan and ThreadSanitizer on the Pi 75 runs each, no reports.
+The matrix covered persistent tail with 8 and 4 workgroups, inline limits 3 and 8, and the persistent tail
+with inline 8.
 
 ## 9. Measuring
 
