@@ -2943,6 +2943,52 @@ the desktop 75 runs and AddressSanitizer with UBSan and ThreadSanitizer on the P
 The matrix covered persistent tail with 8 and 4 workgroups, inline limits 3 and 8, and the persistent tail
 with inline 8.
 
+## 8az. Validation against v1.9.0
+
+`perf/lean-tail` was compared with the v1.9.0 tag on both machines over the whole corpus (4,003 frames on the
+desktop, 1,116 on the Orange Pi, two rounds, best of two per frame), three ways: v1.9.0, this version at its
+defaults, and this version in a compatibility mode with every newer behaviour switched off
+(`APRILTAG_VK_REFINE=exact`, `PROFILE_FEATURES=0`, `GREY_MARGIN`, `SIDE_ONE_OUT`, `THIRD_BIT`,
+`FAMILY_LIMITS`, `BORDER_PRECHECK`, `DARK_REJECT`, `BOX_DECIMATE`, `ADAPTIVE_FLOOR`, `SPARSE`, `LEAN_TAIL`,
+`KEEPALIVE_MS`, `FLAG_POLL`, `DOT` all 0), which separates intended changes from regressions in code whose
+behaviour did not change. v1.9.0 was built from a clean tree with a harness that stubs the multi-level
+detector it lacks.
+
+Median / 95th percentile of the per-frame total, ms:
+
+| | v1.9.0 | compatibility mode | defaults |
+|---|---|---|---|
+| Desktop, decimation 1 | 0.923 / 2.313 | 0.791 / 1.944 | 0.356 / 0.690 |
+| Desktop, decimation 2 | 0.556 / 1.315 | 0.551 / 1.258 | 0.299 / 0.560 |
+| Orange Pi, decimation 1 | 2.549 / 6.339 | 2.485 / 6.058 | 1.058 / 2.400 |
+| Orange Pi, decimation 2 | 1.230 / 2.809 | 1.191 / 2.723 | 0.743 / 1.499 |
+
+Accuracy on the corpus (tags found, wrong IDs outside the tag16h5 set / inside it, median corner error):
+v1.9.0 94.4% (decimation 1) and 92.5% (decimation 2), 3 and 7 wrong, 1,739 and 779 in tag16h5, 0.041 and
+0.043 px; compatibility mode 95.9% and 94.0%, the same wrong IDs, 0.041 and 0.042 px; defaults 97.0% and
+97.3%, 0 wrong, 0 and 3 in tag16h5, 0.018 and 0.017 px. Compatibility mode differs from v1.9.0 in about 3% of
+dump lines on the desktop (21 of 2,963 on the Pi), all extra correct detections from the edge-case fixes
+that v1.9.0 does not have.
+
+Regressions found:
+
+- Candidate-rich frames at the defaults. JPEG frames at decimation 2 are slower than v1.9.0: desktop 0.743 to
+  0.843 ms mean (CPU 0.385 to 0.487 ms; 82 to 90 candidates per frame), Orange Pi 1.728 to 1.923 ms (CPU 0.569
+  to 0.794 ms; 37 to 42 candidates), +13% and +11%. In compatibility mode they are level (0.737 and 1.742
+  ms), so the cost is the accuracy defaults (the profile-fit refine on every candidate, the retry paths) and
+  the extra candidates box decimation exposes in JPEG noise, a trade documented in 8as.
+- Cheap frames on the desktop at the defaults: noise-free at decimation 2 goes from 0.296 to 0.326 ms, all of
+  it CPU (0.078 to 0.113 ms), the same cost.
+- 7.0% of desktop frames (279) and 5.4% of Pi frames (60) at decimation 2 are more than 5% and 20 us slower
+  than v1.9.0 at the defaults (2.4% and 5.2% in compatibility mode); at decimation 1 it is 0.7% and 2.3%.
+- In compatibility mode, noise-free frames at decimation 2 show a small GPU slowdown on the desktop (0.216 to
+  0.231 / 0.234 ms over both rounds) that is absent at the defaults; on the Pi it is within the round-to-round
+  spread (0.603 / 0.610 against 0.707 / 0.632 ms). Not explained; no overall effect (desktop decimation 2
+  median 0.556 against 0.551 ms).
+
+Everything else is faster at the defaults: the corpus median is 2.6 times lower at decimation 1 on the
+desktop (0.923 to 0.356 ms) and 2.4 times on the Pi.
+
 ## 9. Measuring
 
 ```
