@@ -54,6 +54,7 @@ set(SHADER_SOURCES
   shaders/block_filter.comp
   shaders/noise_floor.comp
   shaders/cell_args.comp
+  shaders/keepalive.comp
   shaders/threshold.comp
   shaders/threshold_u8.comp
   shaders/threshold_block_u8.comp
@@ -127,6 +128,7 @@ add_library(vkapriltag STATIC
   src/gpu/GpuDetector.cpp
   src/gpu/QuadDecode.cpp
   src/gpu/MultiLevelDetector.cpp
+  src/gpu/KeepAlive.cpp
   src/apriltag_family.cpp
   src/TagDecoder.cpp
   src/RefineEdges.cpp

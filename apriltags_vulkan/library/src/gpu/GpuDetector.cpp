@@ -81,6 +81,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, const DetectorConfig 
     : GpuDetector(ctx, lane, nullptr, config) {}
 
 GpuDetector::~GpuDetector() {
+  keepalive_.reset();
   vk::DispatchProbe::Report(ctx_.device(), this);
   // Detect() returns only after its submission completes, so nothing recorded is in flight.
   for (const RecordedFrame &r : recorded_frames_) lane_.FreePersistentCommands(r.cmd);
@@ -272,6 +273,21 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
 
   CreateBuffers();
   CreatePipelines();
+
+  int keepalive_ms = config_.keepalive_ms;
+  if (const char *v = std::getenv("APRILTAG_VK_KEEPALIVE_MS")) keepalive_ms = std::atoi(v);
+  if (keepalive_ms < 0) {
+    keepalive_ms = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 6 : 0;
+  }
+  if (keepalive_ms > 0) {
+    if (std::unique_ptr<vk::Lane> keepalive_lane = ctx_.CreateSiblingLane(lane_)) {
+      keepalive_buf_ = vk::Buffer(ctx_, 4, kSsboUsage, vk::MemoryKind::DeviceLocal);
+      keepalive_pl_ = vk::ComputePipeline(ctx_, ShaderPath("keepalive"), {keepalive_buf_.get()}, 0,
+                                          vk::WorkgroupSize{1, 1, 1});
+      keepalive_ = std::make_unique<KeepAlive>(std::move(keepalive_lane), keepalive_pl_,
+                                               std::chrono::milliseconds(keepalive_ms));
+    }
+  }
 
   // Persists newly compiled pipelines immediately rather than only at ~Context().
   ctx_.FlushPipelineCache();
@@ -1247,6 +1263,7 @@ void GpuDetector::SubmitTimed(const Submission &s) {
 }
 
 void GpuDetector::Detect(const uint8_t *gray_frame) {
+  if (keepalive_) keepalive_->Touch();
   try {
     DetectFrame(gray_frame);
   } catch (...) {

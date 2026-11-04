@@ -1,0 +1,9 @@
+#version 450
+// A one-thread dispatch that keeps the GPU out of its low-power state between frames.
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) buffer Scratch { uint scratch; };
+
+void main() {
+  scratch += 1u;
+}

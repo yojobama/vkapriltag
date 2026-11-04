@@ -950,6 +950,13 @@ std::unique_ptr<Lane> Context::CreateLane(size_t slot) const {
   return std::unique_ptr<Lane>(new Lane(device_, q.queue, q.family, q.submit_mutex.get()));
 }
 
+std::unique_ptr<Lane> Context::CreateSiblingLane(const Lane &lane) const {
+  for (size_t slot = 0; slot < queues_.size(); ++slot) {
+    if (queues_[slot].queue == lane.queue()) return CreateLane(slot);
+  }
+  return nullptr;
+}
+
 Lane::Lane(VkDevice device, VkQueue queue, uint32_t family, std::mutex *submit_mutex)
     : device_(device), queue_(queue), family_(family), submit_mutex_(submit_mutex) {
   // Releases whatever was created so far if a later step throws.

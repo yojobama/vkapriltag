@@ -189,6 +189,10 @@ public:
   // A submission lane on queue `slot`. Must be destroyed before the Context.
   std::unique_ptr<Lane> CreateLane(size_t slot) const;
 
+  // A lane of its own on the queue `lane` submits to (the queue's submit mutex is shared), or null
+  // when `lane` is not on a compute queue of this context.
+  std::unique_ptr<Lane> CreateSiblingLane(const Lane &lane) const;
+
   // Queue slot for detector stream `stream`: alternates across families when expected_streams > 1
   // and two compute families exist, otherwise slot 0.
   size_t StreamSlot(size_t stream) const { return spread_streams_ ? stream % queues_.size() : 0; }

@@ -12,6 +12,7 @@
 #include <span>
 #include <vector>
 
+#include "vkapriltag/gpu/KeepAlive.h"
 #include "vkapriltag/gpu/Types.h"
 #include "vkapriltag/vk/Buffer.h"
 #include "vkapriltag/vk/ComputePipeline.h"
@@ -61,6 +62,11 @@ struct DetectorConfig {
   // Averages each decimation block instead of copying its top-left pixel (decimation above 1).
   // Env override: APRILTAG_VK_BOX_DECIMATE=0|1
   bool box_decimate = true;
+
+  // Milliseconds between the one-thread dispatches that keep the GPU awake between frames while
+  // frames are arriving; 0 disables, a negative value picks 6 on integrated GPUs and 0 elsewhere.
+  // Env override: APRILTAG_VK_KEEPALIVE_MS=<ms>
+  int keepalive_ms = -1;
 
   // Bounding-box aspect ratio cap (max(w,h)/min(w,h)) applied in select_blobs.comp; 0 disables.
   float aspect_max = 8.0f;
@@ -455,6 +461,10 @@ class GpuDetector {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
   };
   std::vector<RecordedFrame> recorded_frames_;
+  // Declared last of the members it uses, so it stops before they are destroyed.
+  vk::Buffer keepalive_buf_;
+  vk::ComputePipeline keepalive_pl_;
+  std::unique_ptr<KeepAlive> keepalive_;
   bool prerecord_ = false;
   // Whether this frame recorded anything (false when every submission was a cached replay).
   bool recorded_this_frame_ = false;
