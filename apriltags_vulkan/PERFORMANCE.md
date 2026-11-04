@@ -2764,6 +2764,49 @@ decimation 1 and 0.284 / 0.509 to 0.328 / 0.596 at 2; Orange Pi 1.077 / 2.276 to
 2). Validation layer with synchronisation validation, 30 runs per machine, zero messages; AddressSanitizer
 on the desktop and AddressSanitizer with UBSan and ThreadSanitizer on the Pi, 30 runs each, no reports.
 
+## 8at. Corrections to 8ar, 8af and 8as, camera-rate timing, and the keep-alive
+
+**NAPA on the desktop was mis-measured in 8ar.** The Windows `napa-vision` wheel is built with MSVC; NAPA's
+own source built with gcc -O3 and called through its C API (single thread, same parameters) runs the whole
+corpus (4,003 frames, 5 repetitions each) at, median / 95th percentile in ms:
+
+| | 640x480 | 1280x720 | 1920x1080 | all frames |
+|---|---|---|---|---|
+| NAPA, gcc -O3 | 0.053 / 0.138 | 0.102 / 0.335 | 0.156 / 0.680 | 0.090 / 0.370 |
+| vkapriltag decimation 1 (accuracy defaults) | 0.287 / 0.420 | 0.426 / 0.639 | 0.607 / 0.945 | 0.393 / 0.731 |
+| vkapriltag decimation 2 | 0.253 / 0.386 | 0.361 / 0.591 | 0.464 / 0.810 | 0.328 / 0.596 |
+
+NAPA is about 3.6 times faster than vkapriltag at decimation 2 over the corpus on the desktop, at every
+resolution. Per scenario the only ones vkapriltag wins are dense-tags (0.535 against 0.639 ms) and, roughly
+level, noise (0.364 against 0.302 ms is NAPA's) and underexposed (0.366 against 0.312): a 0.3 ms floor of
+upload, dispatch chain and CPU decode against NAPA's 0.03 to 0.12 ms on ordinary frames. The Orange Pi
+columns of 8ar stand (the aarch64 wheel matches a native gcc build there). The accuracy comparison is
+unaffected.
+
+**Mali per-dispatch timestamps include their own cost.** Two timestamp writes around nothing take about
+26 us of GPU time on the Mali, so the per-dispatch figures from `APRILTAG_VK_DISPATCH_TIMES` in 8af and 8as
+(and the "312 us tail") are inflated by about that much per span; host-timed chains are the reliable measure
+(19 trivial dependent dispatches take 464 to 504 us on the Mali, 82 to 87 us on the RX 9060 XT). Whole-frame
+times, measured without timestamps, are unaffected. The "230 us submit and wake" of 8as is not a fixed floor:
+one dispatch plus a fence wait is 49 to 54 us back to back on the Mali and 57 to 69 us on the desktop.
+
+**Camera rate.** Timed with 33 ms between frames (`VK_EVAL_GAP_MS` in the harness, `--gap-ms` in
+`tools/napa_corpus/napa_run.py`), a GPU that has idled for a few milliseconds is slow to wake. Real
+pipeline, three 640x480 frames, decimation 2, mean per frame:
+
+| | back to back | 33 ms gaps | 33 ms gaps with keep-alive |
+|---|---|---|---|
+| Orange Pi 5 Plus | 0.63 to 0.66 ms | 0.89 to 1.02 ms | 0.66 to 0.69 ms |
+| RX 9060 XT (GPU / CPU / total) | 0.164 / 0.059 / 0.227 ms | 0.400 / 0.107 / 0.511 ms | 0.33 / 0.11 / 0.44 ms (1 ms interval) |
+
+**Keep-alive.** `DetectorConfig::keepalive_ms` (`APRILTAG_VK_KEEPALIVE_MS`; 0 off, negative = automatic) runs a
+thread that submits a one-thread dispatch on a lane of its own every 6 ms on integrated GPUs, only while
+frames arrive (it stops after 100 ms without one, so an idle detector costs nothing). It needs only core
+Vulkan and is off on discrete GPUs. On the Pi it brings the 33 ms-gap frame back to within 0.03 to 0.06 ms of
+back to back, with no change back to back. On the desktop 1 to 6 ms intervals recover only 0.05 to 0.07 ms of
+the 0.28 ms penalty and the CPU decode itself doubles after a gap (0.059 to 0.107 ms), so the cause is not the
+GPU clock alone; it stays off there (setting it to 1 remains possible).
+
 ## 9. Measuring
 
 ```
