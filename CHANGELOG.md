@@ -4,6 +4,20 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
 "What changed" sections of [README.md](README.md); the measurements behind every change are in
 [apriltags_vulkan/PERFORMANCE.md](apriltags_vulkan/PERFORMANCE.md).
 
+## 1.10.1 (2026-11-04)
+
+Release packaging only; the library is unchanged from 1.10.0.
+
+### Fixed
+
+- **The `.deb` packages include the integer dot product decimation shader.** The 1.10.0 packages were
+  built with Ubuntu 24.04's `glslang-tools` 15.1, which cannot compile `GL_EXT_integer_dot_product`, so
+  they ran the plain decimation shader (identical detections, about 30 us slower per frame on the Mali
+  with box decimation at decimation 2 or 4). The release workflow now builds glslang 16.2.0 on both
+  runners (amd64 and arm64, Ubuntu 24.04 so the packages still install on Debian 13 and Ubuntu 24.04 and
+  later), configures with `-DVKAPRILTAG_DOT_SHADER=ON` so a missing shader fails the build, and checks
+  that the package contains `decimate_box_dot_u8.comp.spv`.
+
 ## 1.10.0 (2026-11-04)
 
 Output changes at the defaults: detections, corner positions and the work per frame differ from 1.9.0.

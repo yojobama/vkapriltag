@@ -33,11 +33,23 @@ jobs:
 
       - name: Install build dependencies
         # No libopencv-dev: only tools/ need OpenCV and they are built with -DVKAPRILTAG_BUILD_TOOLS=OFF.
+        # No glslang-tools: Ubuntu 24.04's 15.1 cannot compile the integer dot product shader
+        # (GL_EXT_integer_dot_product needs glslang 15.2 or later), so glslang is built below.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake build-essential dpkg-dev \
-            libvulkan-dev glslang-tools
+            cmake build-essential dpkg-dev git python3 \
+            libvulkan-dev
+
+      - name: Build glslang
+        # About half a minute on either architecture.
+        run: |
+          git clone --depth 1 --branch 16.2.0 https://github.com/KhronosGroup/glslang.git
+          cmake -S glslang -B glslang/build -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF \
+            -DENABLE_CTEST=OFF -DBUILD_EXTERNAL=OFF -DCMAKE_INSTALL_PREFIX="$HOME/glslang"
+          cmake --build glslang/build -j --target install
+          echo "$HOME/glslang/bin" >> "$GITHUB_PATH"
+          "$HOME/glslang/bin/glslangValidator" --version | head -1
 
       - name: Configure
         run: |
@@ -45,6 +57,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DVKAPRILTAG_BUILD_APPS=OFF \
             -DVKAPRILTAG_BUILD_TOOLS=OFF \
+            -DVKAPRILTAG_DOT_SHADER=ON \
             -DCPACK_PACKAGE_VERSION="${PKG_VERSION}"
 
       - name: Build
@@ -52,6 +65,9 @@ jobs:
 
       - name: Package
         run: cd build && cpack
+
+      - name: Check the package includes the integer dot product shader
+        run: dpkg-deb -c build/*.deb | grep decimate_box_dot_u8.comp.spv
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
