@@ -51,6 +51,8 @@ class WorkerPool {
 
   const std::function<void(size_t, unsigned)> *fn_ = nullptr;
   size_t count_ = 0;
+  // Batches of at most this many items run on the calling thread; APRILTAG_CPU_INLINE overrides.
+  size_t inline_limit_ = 1;
   std::atomic<size_t> next_{0};
   size_t outstanding_ = 0;  // workers still inside the current batch
   uint64_t generation_ = 0;
