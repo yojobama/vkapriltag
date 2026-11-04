@@ -735,6 +735,28 @@ void GpuDetector::CreatePipelines() {
   if (!(fused_submits_ && reduce_x4_ && !subgroup)) lean_tail_ &= ~1u;
   lean_point_groups_ = std::min((qbp_capacity_ + wg1d_.x - 1u) / wg1d_.x, 128u);
   lean_select_groups_ = std::min((config_.max_raw_blobs + wg1d_.x - 1u) / wg1d_.x, 32u);
+  // The tail as one dispatch of resident workgroups; needs the 4-point reduction and no subgroup
+  // reduction, and is opt-in while it is measured.
+  const char *persistent_env = std::getenv("APRILTAG_VK_PERSISTENT");
+  persistent_tail_ = persistent_env != nullptr && std::strstr(persistent_env, "tail") != nullptr &&
+                     fused_submits_ && reduce_x4_ && !subgroup;
+  if (persistent_tail_) {
+    if (const char *v = std::getenv("APRILTAG_VK_PERSISTENT_WG")) {
+      pf_tail_groups_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+    }
+    pf_sync_buf_ = vk::Buffer(ctx_, 16, kSsboUsage, vk::MemoryKind::DeviceLocal);
+    pf_tail_pl_ = vk::ComputePipeline(
+        ctx_, ShaderPath(extents_atomic64 ? "pf_tail_atomic64" : "pf_tail"),
+        {qbp_keys_buf_.get(), hash_owner_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(),
+         raw_blob_counter_buf_.get(), hash_drop_counter_buf_.get(), qbp_counter_buf_.get(),
+         extents_buf_.get(), extents_buf_.get(), qbp_compacted_buf_.get(), remap_buf_.get(),
+         selected_extents_buf_.get(), selected_counter_buf_.get(), blob_point_offsets_buf_.get(),
+         blob_cursor_buf_.get(), index_points_buf_.get(), blob_args_buf_.get(),
+         pf_sync_buf_.get()},
+        68, wg1d_);
+    // The persistent kernel does its own selection and scan, so the lean tail's changes do not apply.
+    lean_tail_ = 0;
+  }
 }
 
 void GpuDetector::RecordCounterCopy(VkCommandBuffer cmd, const vk::Buffer &counter,
@@ -955,6 +977,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   selected_counter_buf_.FillZero(cmd);
   RecordLeanOffsetsClear(cmd);
   uf_changed_buf_.FillZero(cmd);
+  if (persistent_tail_) pf_sync_buf_.FillZero(cmd);
   if (sparse_) {
     active_cells_buf_.FillZero(cmd);
     cell_list_buf_.FillZeroRange(cmd, 0, 4);
@@ -1054,6 +1077,33 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
 
+  if (persistent_tail_) {
+    struct {
+      uint32_t count, table_mask, max_probes, max_raw_blobs, max_blobs, min_cluster, max_cluster,
+          reversed, normal, gx_gy_biased;
+      float aspect_max, fill_min, fill_max;
+      uint32_t ipoint_capacity, sort_args_slot, groups, spin_limit;
+    } pf_pc{qbp_capacity_,
+            hash_table_size_ - 1u,
+            128u,
+            config_.max_raw_blobs,
+            config_.max_blobs,
+            config_.min_cluster_pixels,
+            config_.max_cluster_pixels,
+            config_.reversed_border ? 1u : 0u,
+            config_.normal_border ? 1u : 0u,
+            extents_atomic64_ ? 1u : 0u,
+            config_.aspect_max,
+            config_.fill_min,
+            config_.fill_max,
+            ipoint_capacity_,
+            1u,
+            pf_tail_groups_,
+            1u << 20};
+    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
+    pf_tail_pl_.DispatchRaw(cmd, pf_tail_groups_, 1, 1, &pf_pc, BarrierKind::ComputeAndTransfer);
+    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
+  } else {
   // Slot 1 of the indirect args: ceil(boundary points / wg1d), for hash_group, reduce_extents_hash
   // and scatter_index_points. The counts stay on the device.
   const bool lean_grid = (lean_tail_ & 1u) != 0;
@@ -1130,6 +1180,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
                                               BarrierKind::ComputeAndTransfer);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
+  }
 
   // The number of distinct (rep0, rep1) pairs this frame; profiling only.
   RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
@@ -1214,6 +1265,7 @@ void GpuDetector::RecordTailRerun(VkCommandBuffer cmd) {
   timestamp_pool_.Reset(cmd);
   // Also needed when no continuation ran (max_uf_iterations reached by the first attempt).
   RecordFlatten(cmd);
+  if (persistent_tail_) pf_sync_buf_.FillZero(cmd);
   qbp_counter_buf_.FillZero(cmd);
   selected_counter_buf_.FillZero(cmd);
   RecordLeanOffsetsClear(cmd);

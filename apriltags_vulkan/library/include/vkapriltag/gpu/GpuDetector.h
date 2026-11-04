@@ -469,6 +469,12 @@ class GpuDetector {
   uint32_t lean_tail_ = 0;
   uint32_t lean_point_groups_ = 0;
   uint32_t lean_select_groups_ = 0;
+  // APRILTAG_VK_PERSISTENT=tail: hash_group to scatter_index_points as one dispatch of pf_tail_groups_
+  // workgroups that synchronise with software barriers (pf_tail_body.glsl).
+  bool persistent_tail_ = false;
+  uint32_t pf_tail_groups_ = 8;
+  vk::Buffer pf_sync_buf_;
+  vk::ComputePipeline pf_tail_pl_;
   // Set by the last command of a frame's tail; the host polls it instead of waiting on the fence.
   std::unique_ptr<vk::CompletionFlag> completion_flag_;
   // Declared last of the members it uses, so it stops before they are destroyed.

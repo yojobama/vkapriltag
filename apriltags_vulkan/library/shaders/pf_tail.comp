@@ -1,0 +1,6 @@
+#version 450
+// The tail from hash_group to scatter_index_points as one persistent dispatch (plain 32-bit extents
+// atomics); pf_tail_atomic64.comp is the 64-bit atomic variant. The stages are in pf_tail_body.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "pf_tail_body.glsl"
