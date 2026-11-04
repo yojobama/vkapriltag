@@ -2807,6 +2807,33 @@ back to back, with no change back to back. On the desktop 1 to 6 ms intervals re
 the 0.28 ms penalty and the CPU decode itself doubles after a gap (0.059 to 0.107 ms), so the cause is not the
 GPU clock alone; it stays off there (setting it to 1 remains possible).
 
+## 8au. Completion by polling a flag
+
+The last command of a frame's tail submission writes a flag word (`vk::CompletionFlag`); the host polls
+it (up to 2 ms, then falls back to the fence wait) and returns as soon as it sees it, leaving the fence to
+be waited on at the next submission, `WaitIdle` or destruction. It is on by default only where the write
+is visible to the host while the submission runs by specification, that is with
+`VK_AMD_device_coherent_memory` (the flag then lives in device-coherent host memory); elsewhere
+`APRILTAG_VK_FLAG_POLL=1` forces it on plain host-visible memory, which is outside the specification and
+works by observation on the Mali; `APRILTAG_VK_FLAG_POLL=0` turns it off. The extension is enabled at device
+creation only when present.
+
+| | flag polling off | on |
+|---|---|---|
+| RX 9060 XT, one-tag 640x480, decimation 2 | 0.194 ms | 0.145 ms |
+| RX 9060 XT, four test frames, decimation 2 | 0.336 ms | 0.311 ms |
+| Orange Pi, four frames, GPU, decimation 1 / 2 | 1.522 / 0.828 ms | 1.454 / 0.740 ms |
+| Orange Pi, one-tag 640x480 frame, decimation 2, total | 0.673 ms | 0.594 ms |
+
+Output is identical (desktop 30 of 30 lines at decimation 1 and 2; Pi corpus, 2,982 lines: the two lines
+that differ in some repeats differ the same way with polling off, from the append-order nondeterminism
+that the sort tie-break of the next milestone removes). The validation layer found one lifetime bug while
+this was built (persistent command buffers freed while the polled submission's fence was still pending);
+fixed by waiting for it in `Lane::FreePersistentCommands`. After the fix: validation layer 48 runs per
+machine with zero messages; AddressSanitizer on the desktop and AddressSanitizer with UBSan and
+ThreadSanitizer on the Pi, 48 runs each, no reports. The Mali path stays opt-in until a longer stress
+(10^5 frames) is run.
+
 ## 9. Measuring
 
 ```
