@@ -499,9 +499,14 @@ void GpuDetector::CreatePipelines() {
   box_decimate_ = want_box && config_.decimation > 1;
   // Box sums of whole 2 or 4 byte rows use the integer dot product where the device has it.
   const char *dot_env = std::getenv("APRILTAG_VK_DOT");
+#ifdef VKAPRILTAG_HAVE_DOT_SHADER
   const bool box_dot = box_decimate_ && u8 && ctx_.caps().has_integer_dot_product &&
                        (config_.decimation == 2 || config_.decimation == 4) &&
                        !(dot_env != nullptr && dot_env[0] == '0');
+#else
+  (void)dot_env;
+  const bool box_dot = false;
+#endif
   decimate_pl_ = vk::ComputePipeline(ctx_,
                                      ShaderPath(box_dot ? "decimate_box_dot_u8"
                                                 : box_decimate_ ? pick("decimate_box", "decimate_box_u8")

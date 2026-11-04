@@ -88,6 +88,15 @@ Orange Pi 2.549 -> 1.058 ms and 1.230 -> 0.743 ms. At 1,920 x 1,080 the desktop 
   (`score_corpus.py`), a runner and a NAPA comparison runner (`napa_run.py`); the benchmark harness takes a
   frame gap (`--gap-ms` / `VK_EVAL_GAP_MS`) to time at a camera rate.
 
+### Build
+
+- The integer dot product decimation shader is compiled only when `glslangValidator` supports
+  `GL_EXT_integer_dot_product` (glslang 15.2 or later; Ubuntu 24.04's `glslang-tools` 15.1 does not).
+  `VKAPRILTAG_DOT_SHADER=AUTO` (default) probes, `ON` requires it, `OFF` leaves it out; without it the
+  plain decimation shader runs and detections are identical. The `.deb` packages are built on Ubuntu
+  24.04 (glibc 2.39) so they install on Debian 13 and Ubuntu 24.04 and later, and so they use the plain
+  shader.
+
 ### Upgrading
 
 To approximate 1.9.0's behaviour set `APRILTAG_VK_REFINE=exact APRILTAG_VK_PROFILE_FEATURES=0

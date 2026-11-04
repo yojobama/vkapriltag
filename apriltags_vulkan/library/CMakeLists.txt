@@ -45,7 +45,6 @@ set(SHADER_SOURCES
   shaders/decimate_u8.comp
   shaders/decimate_box.comp
   shaders/decimate_box_u8.comp
-  shaders/decimate_box_dot_u8.comp
   shaders/decimate_yuyv.comp
   shaders/decimate_yuyv_u8.comp
   shaders/block_minmax.comp
@@ -89,6 +88,31 @@ set(SHADER_SOURCES
   shaders/reduce_extents_hash_subgroup.comp
   shaders/scatter_index_points.comp
 )
+
+# The integer dot product decimation shader needs a glslang that knows GL_EXT_integer_dot_product (15.2
+# or later). AUTO leaves it out when the compiler lacks the extension, and the plain shader runs instead.
+set(VKAPRILTAG_DOT_SHADER "AUTO" CACHE STRING "Build the integer dot product decimation shader: AUTO, ON or OFF")
+set_property(CACHE VKAPRILTAG_DOT_SHADER PROPERTY STRINGS AUTO ON OFF)
+set(VKAPRILTAG_HAVE_DOT_SHADER OFF)
+if(NOT VKAPRILTAG_DOT_SHADER STREQUAL "OFF")
+  execute_process(
+    COMMAND ${GLSLANG_VALIDATOR_EXECUTABLE} --target-env vulkan1.1
+            -I${CMAKE_CURRENT_SOURCE_DIR}/shaders
+            -o ${CMAKE_CURRENT_BINARY_DIR}/dot_shader_probe.spv
+            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/decimate_box_dot_u8.comp
+    RESULT_VARIABLE DOT_SHADER_PROBE
+    OUTPUT_QUIET ERROR_QUIET)
+  if(DOT_SHADER_PROBE EQUAL 0)
+    set(VKAPRILTAG_HAVE_DOT_SHADER ON)
+  elseif(VKAPRILTAG_DOT_SHADER STREQUAL "ON")
+    message(FATAL_ERROR "VKAPRILTAG_DOT_SHADER=ON, but glslangValidator cannot compile decimate_box_dot_u8.comp (it needs glslang 15.2 or later)")
+  else()
+    message(STATUS "glslangValidator lacks GL_EXT_integer_dot_product: decimate_box_dot_u8 is not built")
+  endif()
+endif()
+if(VKAPRILTAG_HAVE_DOT_SHADER)
+  list(APPEND SHADER_SOURCES shaders/decimate_box_dot_u8.comp)
+endif()
 
 compile_shaders(vkapriltag_shaders "${SHADER_SOURCES}" SHADER_OUTPUT_DIR SHADER_SPIRV_BINARIES)
 
@@ -148,6 +172,10 @@ target_include_directories(vkapriltag PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+
+if(VKAPRILTAG_HAVE_DOT_SHADER)
+  target_compile_definitions(vkapriltag PRIVATE VKAPRILTAG_HAVE_DOT_SHADER=1)
+endif()
 
 # SPIR-V location: the build tree in development, share/vkapriltag/shaders once installed.
 target_compile_definitions(vkapriltag PUBLIC

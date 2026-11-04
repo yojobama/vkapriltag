@@ -133,6 +133,10 @@ This port intentionally does less than the CUDA original and upstream
   an ARM Mali-G610, and earlier revisions on an Intel iGPU and an NVIDIA
   MX230; other vendors are untested at this revision.
 - CMake 3.16+, a C++20 compiler.
+- `glslangValidator` (Vulkan SDK or `glslang-tools`) to compile the shaders. The integer dot product
+  decimation shader needs glslang 15.2 or later; with an older one it is left out of the build (the
+  plain shader runs instead, with identical detections) and CMake says so. `-DVKAPRILTAG_DOT_SHADER=ON`
+  makes that an error, `=OFF` leaves it out.
 - [OpenCV](https://opencv.org/) — optional. `tools/` builds a richer
   validation tool against arbitrary image formats when OpenCV is found, and
   falls back to a PGM-only tool without it.
