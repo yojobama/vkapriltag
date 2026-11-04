@@ -2834,6 +2834,33 @@ machine with zero messages; AddressSanitizer on the desktop and AddressSanitizer
 ThreadSanitizer on the Pi, 48 runs each, no reports. The Mali path stays opt-in until a longer stress
 (10^5 frames) is run.
 
+## 8aw. Persistent tail on the Mali (prototype; dropped at the first go/no-go)
+
+`pf_tail_body.glsl` (`APRILTAG_VK_PERSISTENT=tail`, `APRILTAG_VK_PERSISTENT_WG=<n>`, default 8 workgroups of
+256) runs hash_group, reduce_extents_hash_x4, select_blobs, scan_blob_counts and scatter_index_points as one
+dispatch whose workgroups stay resident and synchronise with software grid barriers, replacing seven
+dispatches (with their argument kernels) by one with four barriers. The stages are the existing kernels'
+bodies over grid-stride loops; a barrier that does not complete sets a `failed` word so every workgroup
+leaves (the host rerun of the tail was not built). Output is identical to the separate-dispatch tail:
+desktop 30 of 30 lines at decimation 1 and 2 (with `APRILTAG_VK_FORCE_NO_SUBGROUP=1`, which selects the
+reduction it covers), Orange Pi corpus 2,982 of 2,982 lines at decimation 2.
+
+Orange Pi 5 Plus, GPU per frame, interleaved, flag polling on in both columns:
+
+| | separate dispatches | persistent tail |
+|---|---|---|
+| four frames, decimation 1 / 2 | 1.449 / 0.739 ms | 1.453 / 0.727 ms (8 workgroups); 1.498 / 0.740 (4); 1.629 / 0.794 (2); 1.925 / 0.905 (1) |
+| one-tag, small-tags, many-tags 640x480, decimation 2, total | 0.595 to 0.599 ms | 0.556 to 0.562 ms (8 workgroups); 0.567 to 0.570 (2) |
+
+The saving is about 40 us on the small frames and nil on the larger ones, against the 80 us the plan set as the
+go/no-go gate for the whole persistent tail and about 100 us predicted from the cost of a dependent dispatch.
+Removing seven dispatches saved about 6 us each in the real chain, not 15 to 17: the stages' own work (hash
+inserts, atomics, the single-workgroup scan, grid-stride loops over a quarter of the GPU) takes most of what the
+boundaries cost, and a grid of 16 workgroups is slower than 8 (0.887 ms). Porting the three sort dispatches
+would add at most about the same again, so the line is stopped here rather than building the abort rerun, the
+start-up probe, the head and the in-kernel convergence loop (M4 depends on this gate). The branch is not to be
+merged; the milestones that were kept are the keep-alive (section 8at) and flag polling (8au).
+
 ## 9. Measuring
 
 ```
