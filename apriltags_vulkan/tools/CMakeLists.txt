@@ -115,3 +115,8 @@ if (VKAPRILTAG_BUILD_MALI_COUNTERS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(hwcnt_timeline mali_counters/hwcnt_timeline.cpp)
   target_link_libraries(hwcnt_timeline PRIVATE hwcpipe)
 endif()
+
+# Runs a frame sequence through TrackingDetector with tracking off and on, interleaved, and reports times and paths.
+add_executable(track_eval track_eval/track_eval.cpp)
+target_link_libraries(track_eval PRIVATE vkapriltag::vkapriltag)
+install(TARGETS track_eval RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
