@@ -9,12 +9,27 @@
 namespace apriltag_vulkan {
 namespace {
 
-constexpr int kMaxCells = 16;     // widest supported grid
-constexpr int kMaxCols = 24;      // columns (or rows) one pixel's blur window may touch
-constexpr int kNL = 8;            // homography parameters
-constexpr int kNP = 13;           // homography, two blur widths, three levels
-constexpr double kReach = 3.5;    // blur window, in standard deviations
-constexpr int kMaxPixels = 6000;  // working set cap
+constexpr int kMaxCells = 16;   // widest supported grid
+constexpr int kMaxCols = 24;    // columns (or rows) one pixel's blur window may touch
+constexpr int kNP = 16;         // homography, three blur/motion terms, three levels, two illumination slopes
+constexpr double kReach = 3.5;  // blur window, in standard deviations
+constexpr int kMaxTaps = 25;    // samples along the motion blur segment
+
+unsigned DevFlags() {
+  static const unsigned v = [] {
+    const char *e = std::getenv("APRILTAG_VK_POLISH_DEV");
+    return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 0u;
+  }();
+  return v;
+}
+
+int MaxPixels() {
+  static const int v = [] {
+    const char *e = std::getenv("APRILTAG_VK_POLISH_N");
+    return e ? std::atoi(e) : 1500;
+  }();
+  return v;
+}
 
 // Standard normal CDF and density, tabulated over [-4, 4].
 struct NormalTable {
@@ -96,7 +111,7 @@ void ComputeAxis(double u, double s, int width, bool derivatives, Axis *ax) {
 
 struct Fit {
   int width;
-  uint8_t cls[kMaxCells][kMaxCells];  // [row][column]: 0 black, 1 white
+  uint8_t cls[kMaxCells][kMaxCells];  // [row][column]: 0 black, 1 white, 3 unknown
   double cx, cy, scale;               // pixel -> normalised coordinates
   std::vector<float> nx, ny, obs;     // working set: normalised position and observed value
 };
@@ -152,9 +167,95 @@ void CellCorners(const Mapping &m, int width, double xy[4][2]) {
 
 struct Params {
   Mapping map;
-  double su, sv;  // blur standard deviation along the cell axes, in pixels (pixel footprint included)
-  double lev[3];  // black, white, outside
+  bool motion = false;
+  // Without motion: blur standard deviations along the cell axes. With it: su = sv is the blur
+  // standard deviation and (mx, my) the straight motion blur segment, all in pixels.
+  double su = 1, sv = 1, mx = 0, my = 0;
+  double lev[3] = {20, 235, 235};  // black, white, outside
+  double lx = 0, ly = 0;           // relative illumination slope per normalised pixel
 };
+
+// The model at one pixel: the cell classes' blurred coverage and, with `normal`, the derivatives of
+// the predicted value with respect to the parameters (columns as in the normal equations).
+struct PixelEval {
+  double S[4];
+  double dbase[kNP];  // derivative of the prediction; the three level columns are set by the caller
+};
+
+// Level weights of the four classes: unknown cells read as the mid-level.
+inline void ClassLevels(const Params &p, double l[4]) {
+  l[0] = p.lev[0];
+  l[1] = p.lev[1];
+  l[2] = p.lev[2];
+  l[3] = 0.5 * (p.lev[0] + p.lev[1]);
+}
+
+void ModelPixel(const Fit &f, const Params &p, const double lv[4], double x, double y, bool normal, PixelEval *e) {
+  int taps = 1;
+  double length = 0;
+  if (p.motion) {
+    length = std::hypot(p.mx, p.my);
+    if (length > 0.05) taps = std::clamp(static_cast<int>(2.0 * length) + 2, 3, kMaxTaps);
+  }
+  for (int c = 0; c < 4; ++c) e->S[c] = 0;
+  if (normal) std::fill(std::begin(e->dbase), std::end(e->dbase), 0.0);
+  const double inv_taps = 1.0 / taps;
+  Axis ax_u, ax_v;
+  for (int t = 0; t < taps; ++t) {
+    const double frac = taps == 1 ? 0.0 : (t + 0.5) / taps - 0.5;
+    const double xt = x + frac * p.mx / f.scale, yt = y + frac * p.my / f.scale;
+    double u, v, w;
+    Project(p.map, xt, yt, &u, &v, &w);
+    const double iw = 1.0 / w;
+    const double gux = (p.map.g[0] - u * p.map.g[6]) * iw, guy = (p.map.g[1] - u * p.map.g[7]) * iw;
+    const double gvx = (p.map.g[3] - v * p.map.g[6]) * iw, gvy = (p.map.g[4] - v * p.map.g[7]) * iw;
+    const double gu = std::sqrt(gux * gux + guy * guy) / f.scale;  // cells per pixel
+    const double gv = std::sqrt(gvx * gvx + gvy * gvy) / f.scale;
+    ComputeAxis(u, p.su * gu, f.width, normal, &ax_u);
+    ComputeAxis(v, p.sv * gv, f.width, normal, &ax_v);
+    double S[4] = {0, 0, 0, 0}, Su[4] = {0, 0, 0, 0}, Sv[4] = {0, 0, 0, 0}, Ssu[4] = {0, 0, 0, 0}, Ssv[4] = {0, 0, 0, 0};
+    for (int j = ax_v.lo; j <= ax_v.hi; ++j) {
+      const double cv = ax_v.a[j - ax_v.lo];
+      const double dcv = normal ? ax_v.da_du[j - ax_v.lo] : 0.0;
+      const double dcs = normal ? ax_v.da_ds[j - ax_v.lo] : 0.0;
+      for (int i = ax_u.lo; i <= ax_u.hi; ++i) {
+        const int c = ClassOf(f, j, i);
+        const double au = ax_u.a[i - ax_u.lo];
+        S[c] += au * cv;
+        if (normal) {
+          Su[c] += ax_u.da_du[i - ax_u.lo] * cv;
+          Sv[c] += au * dcv;
+          Ssu[c] += ax_u.da_ds[i - ax_u.lo] * cv;
+          Ssv[c] += au * dcs;
+        }
+      }
+    }
+    for (int c = 0; c < 4; ++c) e->S[c] += S[c] * inv_taps;
+    if (!normal) continue;
+    double pu = 0, pv = 0, psu = 0, psv = 0;
+    for (int c = 0; c < 4; ++c) {
+      pu += lv[c] * Su[c];
+      pv += lv[c] * Sv[c];
+      psu += lv[c] * Ssu[c];
+      psv += lv[c] * Ssv[c];
+    }
+    pu *= inv_taps;
+    pv *= inv_taps;
+    const double dg_u[8] = {xt * iw, yt * iw, iw, 0, 0, 0, -u * xt * iw, -u * yt * iw};
+    const double dg_v[8] = {0, 0, 0, xt * iw, yt * iw, iw, -v * xt * iw, -v * yt * iw};
+    for (int k = 0; k < 8; ++k) e->dbase[k] += pu * dg_u[k] + pv * dg_v[k];
+    if (p.motion) {
+      e->dbase[8] += (psu * gu + psv * gv) * inv_taps;
+      // a shift of the sample position by frac * (mx, my) / scale
+      const double along_x = pu * gux + pv * gvx, along_y = pu * guy + pv * gvy;
+      e->dbase[9] += frac * along_x / f.scale;
+      e->dbase[13] += frac * along_y / f.scale;
+    } else {
+      e->dbase[8] += psu * gu * inv_taps;
+      e->dbase[9] += psv * gv * inv_taps;
+    }
+  }
+}
 
 struct Accum {
   double cost = 0;
@@ -172,40 +273,15 @@ void Evaluate(const Fit &f, const Params &p, double kcut, bool normal, Accum *ac
     for (auto &r : acc->jtj) std::fill(std::begin(r), std::end(r), 0.0);
     std::fill(std::begin(acc->jtr), std::end(acc->jtr), 0.0);
   }
-  const int W = f.width;
+  double lv[4];
+  ClassLevels(p, lv);
   const size_t count = f.obs.size();
-  Axis ax_u, ax_v;
+  PixelEval e;
   for (size_t idx = 0; idx < count; ++idx) {
-    const double x = f.nx[idx], y = f.ny[idx];
-    double u, v, w;
-    Project(p.map, x, y, &u, &v, &w);
-    const double iw = 1.0 / w;
-    const double gux = (p.map.g[0] - u * p.map.g[6]) * iw, guy = (p.map.g[1] - u * p.map.g[7]) * iw;
-    const double gvx = (p.map.g[3] - v * p.map.g[6]) * iw, gvy = (p.map.g[4] - v * p.map.g[7]) * iw;
-    const double gu = std::sqrt(gux * gux + guy * guy) / f.scale;  // cells per pixel
-    const double gv = std::sqrt(gvx * gvx + gvy * gvy) / f.scale;
-    const double s_u = p.su * gu, s_v = p.sv * gv;
-    ComputeAxis(u, s_u, W, normal, &ax_u);
-    ComputeAxis(v, s_v, W, normal, &ax_v);
-
-    double S[3] = {0, 0, 0}, Su[3] = {0, 0, 0}, Sv[3] = {0, 0, 0}, Ssu[3] = {0, 0, 0}, Ssv[3] = {0, 0, 0};
-    for (int j = ax_v.lo; j <= ax_v.hi; ++j) {
-      const double cv = ax_v.a[j - ax_v.lo];
-      const double dcv = normal ? ax_v.da_du[j - ax_v.lo] : 0.0;
-      const double dcs = normal ? ax_v.da_ds[j - ax_v.lo] : 0.0;
-      for (int i = ax_u.lo; i <= ax_u.hi; ++i) {
-        const int c = ClassOf(f, j, i);
-        const double au = ax_u.a[i - ax_u.lo];
-        S[c] += au * cv;
-        if (normal) {
-          Su[c] += ax_u.da_du[i - ax_u.lo] * cv;
-          Sv[c] += au * dcv;
-          Ssu[c] += ax_u.da_ds[i - ax_u.lo] * cv;
-          Ssv[c] += au * dcs;
-        }
-      }
-    }
-    double pred = p.lev[0] * S[0] + p.lev[1] * S[1] + p.lev[2] * S[2];
+    ModelPixel(f, p, lv, f.nx[idx], f.ny[idx], normal, &e);
+    const double base = lv[0] * e.S[0] + lv[1] * e.S[1] + lv[2] * e.S[2] + lv[3] * e.S[3];
+    const double gain = 1.0 + p.lx * f.nx[idx] + p.ly * f.ny[idx];
+    const double pred = gain * base;
     const double ob = f.obs[idx];
     // Saturated pixels the model also puts at or beyond the range carry no information.
     if ((ob >= 255.0 && pred >= 255.0) || (ob <= 0.0 && pred <= 0.0)) continue;
@@ -215,27 +291,21 @@ void Evaluate(const Fit &f, const Params &p, double kcut, bool normal, Accum *ac
     acc->cost += ar <= kcut ? r * r : kcut * (2.0 * ar - kcut);
     ++acc->n;
     if (!normal) continue;
-
-    double jr[kNP];
-    const double pu = p.lev[0] * Su[0] + p.lev[1] * Su[1] + p.lev[2] * Su[2];
-    const double pv = p.lev[0] * Sv[0] + p.lev[1] * Sv[1] + p.lev[2] * Sv[2];
-    const double dg_u[8] = {x * iw, y * iw, iw, 0, 0, 0, -u * x * iw, -u * y * iw};
-    const double dg_v[8] = {0, 0, 0, x * iw, y * iw, iw, -v * x * iw, -v * y * iw};
-    for (int k = 0; k < 8; ++k) jr[k] = pu * dg_u[k] + pv * dg_v[k];
-    jr[8] = (p.lev[0] * Ssu[0] + p.lev[1] * Ssu[1] + p.lev[2] * Ssu[2]) * gu;
-    jr[9] = (p.lev[0] * Ssv[0] + p.lev[1] * Ssv[1] + p.lev[2] * Ssv[2]) * gv;
-    jr[10] = S[0];
-    jr[11] = S[1];
-    jr[12] = S[2];
+    e.dbase[10] = e.S[0] + 0.5 * e.S[3];
+    e.dbase[11] = e.S[1] + 0.5 * e.S[3];
+    e.dbase[12] = e.S[2];
+    for (int a = 0; a < 14; ++a) e.dbase[a] *= gain;
+    e.dbase[14] = base * f.nx[idx];
+    e.dbase[15] = base * f.ny[idx];
     for (int a = 0; a < kNP; ++a) {
-      const double ja = wt * jr[a];
+      const double ja = wt * e.dbase[a];
       acc->jtr[a] += ja * r;
-      for (int b = a; b < kNP; ++b) acc->jtj[a][b] += ja * jr[b];
+      for (int c = a; c < kNP; ++c) acc->jtj[a][c] += ja * e.dbase[c];
     }
   }
   if (normal) {
     for (int a = 0; a < kNP; ++a) {
-      for (int b = 0; b < a; ++b) acc->jtj[a][b] = acc->jtj[b][a];
+      for (int c = 0; c < a; ++c) acc->jtj[a][c] = acc->jtj[c][a];
     }
   }
 }
@@ -267,8 +337,9 @@ bool Solve(double a[kNP][kNP], double b[kNP], double x[kNP]) {
   return true;
 }
 
-// Builds the working set: the pixels whose blur window touches cells of more than one class.
-void BuildSet(Fit *f, const Mapping &map, double half_window_px, int image_w, int image_h, const image_u8_t *im) {
+// Builds the working set: the pixels whose blur window touches cells of more than one class, on a
+// lattice thinned so that about `limit` of them remain.
+void BuildSet(Fit *f, const Mapping &map, double half_window_px, int limit, const image_u8_t *im) {
   const int W = f->width;
   double inv[9];
   CellToNormalised(map, inv);
@@ -284,13 +355,19 @@ void BuildSet(Fit *f, const Mapping &map, double half_window_px, int image_w, in
     miny = std::min(miny, y);
     maxy = std::max(maxy, y);
   }
-  const int x0 = std::max(0, static_cast<int>(std::floor(minx))), x1 = std::min(image_w - 1, static_cast<int>(std::ceil(maxx)));
-  const int y0 = std::max(0, static_cast<int>(std::floor(miny))), y1 = std::min(image_h - 1, static_cast<int>(std::ceil(maxy)));
+  const int x0 = std::max(0, static_cast<int>(std::floor(minx))), x1 = std::min(im->width - 1, static_cast<int>(std::ceil(maxx)));
+  const int y0 = std::max(0, static_cast<int>(std::floor(miny))), y1 = std::min(im->height - 1, static_cast<int>(std::ceil(maxy)));
   f->nx.clear();
   f->ny.clear();
   f->obs.clear();
+  // About half the tag's area lies within reach of an edge.
+  const double area = static_cast<double>(x1 - x0 + 1) * (y1 - y0 + 1);
+  const int k = std::max(1, static_cast<int>(0.45 * area / std::max(limit, 1)));
+  const int r = std::max(1, static_cast<int>(std::lround(k * 0.382)));
   for (int py = y0; py <= y1; ++py) {
-    for (int px = x0; px <= x1; ++px) {
+    const int off = ((-(py * r)) % k + k) % k;
+    int px = x0 + (((off - x0) % k) + k) % k;
+    for (; px <= x1; px += k) {
       const double x = (px + 0.5 - f->cx) / f->scale, y = (py + 0.5 - f->cy) / f->scale;
       double u, v, w;
       Project(map, x, y, &u, &v, &w);
@@ -303,57 +380,35 @@ void BuildSet(Fit *f, const Mapping &map, double half_window_px, int image_w, in
       const int i0 = std::clamp(static_cast<int>(std::floor(u - ru)), -1, W), i1 = std::clamp(static_cast<int>(std::floor(u + ru)), -1, W);
       const int j0 = std::clamp(static_cast<int>(std::floor(v - rv)), -1, W), j1 = std::clamp(static_cast<int>(std::floor(v + rv)), -1, W);
       const int first = ClassOf(*f, j0, i0);
-      bool varies = false;
-      for (int j = j0; j <= j1 && !varies; ++j) {
+      bool varies = false, unknown = false;
+      for (int j = j0; j <= j1; ++j) {
         for (int i = i0; i <= i1; ++i) {
-          if (ClassOf(*f, j, i) != first) {
-            varies = true;
-            break;
-          }
+          const int c = ClassOf(*f, j, i);
+          varies |= c != first;
+          unknown |= c == 3;
         }
       }
-      if (!varies) continue;
+      if (!varies || unknown) continue;
       f->nx.push_back(static_cast<float>(x));
       f->ny.push_back(static_cast<float>(y));
       f->obs.push_back(static_cast<float>(im->buf[py * im->stride + px]));
     }
   }
-  const size_t n = f->obs.size();
-  if (n > static_cast<size_t>(kMaxPixels)) {
-    const size_t stride = (n + kMaxPixels - 1) / kMaxPixels;
-    size_t k = 0;
-    for (size_t i = 0; i < n; i += stride, ++k) {
-      f->nx[k] = f->nx[i];
-      f->ny[k] = f->ny[i];
-      f->obs[k] = f->obs[i];
-    }
-    f->nx.resize(k);
-    f->ny.resize(k);
-    f->obs.resize(k);
-  }
 }
 
 // Linear least squares for the three levels at fixed mapping and blur.
 bool FitLevels(const Fit &f, Params *p) {
-  Params q = *p;
-  Axis ax_u, ax_v;
   double ata[3][3] = {}, atb[3] = {};
-  const int W = f.width;
+  const double unit[4] = {1, 1, 1, 1};
+  PixelEval e;
   for (size_t idx = 0; idx < f.obs.size(); ++idx) {
-    double u, v, w;
-    Project(q.map, f.nx[idx], f.ny[idx], &u, &v, &w);
-    const double iw = 1.0 / w;
-    const double gux = (q.map.g[0] - u * q.map.g[6]) * iw, guy = (q.map.g[1] - u * q.map.g[7]) * iw;
-    const double gvx = (q.map.g[3] - v * q.map.g[6]) * iw, gvy = (q.map.g[4] - v * q.map.g[7]) * iw;
-    ComputeAxis(u, q.su * std::sqrt(gux * gux + guy * guy) / f.scale, W, false, &ax_u);
-    ComputeAxis(v, q.sv * std::sqrt(gvx * gvx + gvy * gvy) / f.scale, W, false, &ax_v);
-    double S[3] = {0, 0, 0};
-    for (int j = ax_v.lo; j <= ax_v.hi; ++j) {
-      for (int i = ax_u.lo; i <= ax_u.hi; ++i) S[ClassOf(f, j, i)] += ax_u.a[i - ax_u.lo] * ax_v.a[j - ax_v.lo];
-    }
+    ModelPixel(f, *p, unit, f.nx[idx], f.ny[idx], false, &e);
+    // The unknown class reads as the mid-level of black and white.
+    const double gain = 1.0 + p->lx * f.nx[idx] + p->ly * f.ny[idx];
+    const double sw[3] = {gain * (e.S[0] + 0.5 * e.S[3]), gain * (e.S[1] + 0.5 * e.S[3]), gain * e.S[2]};
     for (int a = 0; a < 3; ++a) {
-      atb[a] += S[a] * f.obs[idx];
-      for (int b = 0; b < 3; ++b) ata[a][b] += S[a] * S[b];
+      atb[a] += sw[a] * f.obs[idx];
+      for (int c = 0; c < 3; ++c) ata[a][c] += sw[a] * sw[c];
     }
   }
   for (int a = 0; a < 3; ++a) ata[a][a] += 1e-6 * (ata[0][0] + ata[1][1] + ata[2][2]) + 1e-9;
@@ -364,29 +419,86 @@ bool FitLevels(const Fit &f, Params *p) {
   return true;
 }
 
+// A cheap robust scale: the median absolute residual of the current model.
 double MedianAbsResidual(const Fit &f, const Params &p) {
-  // A cheap robust scale: the median absolute residual of the current model.
   thread_local std::vector<float> res;
   res.clear();
-  Axis ax_u, ax_v;
-  const int W = f.width;
+  double lv[4];
+  ClassLevels(p, lv);
+  PixelEval e;
   for (size_t idx = 0; idx < f.obs.size(); ++idx) {
-    double u, v, w;
-    Project(p.map, f.nx[idx], f.ny[idx], &u, &v, &w);
-    const double iw = 1.0 / w;
-    const double gux = (p.map.g[0] - u * p.map.g[6]) * iw, guy = (p.map.g[1] - u * p.map.g[7]) * iw;
-    const double gvx = (p.map.g[3] - v * p.map.g[6]) * iw, gvy = (p.map.g[4] - v * p.map.g[7]) * iw;
-    ComputeAxis(u, p.su * std::sqrt(gux * gux + guy * guy) / f.scale, W, false, &ax_u);
-    ComputeAxis(v, p.sv * std::sqrt(gvx * gvx + gvy * gvy) / f.scale, W, false, &ax_v);
-    double S[3] = {0, 0, 0};
-    for (int j = ax_v.lo; j <= ax_v.hi; ++j) {
-      for (int i = ax_u.lo; i <= ax_u.hi; ++i) S[ClassOf(f, j, i)] += ax_u.a[i - ax_u.lo] * ax_v.a[j - ax_v.lo];
-    }
-    res.push_back(static_cast<float>(std::fabs(f.obs[idx] - (p.lev[0] * S[0] + p.lev[1] * S[1] + p.lev[2] * S[2]))));
+    ModelPixel(f, p, lv, f.nx[idx], f.ny[idx], false, &e);
+    const double gain = 1.0 + p.lx * f.nx[idx] + p.ly * f.ny[idx];
+    res.push_back(static_cast<float>(std::fabs(f.obs[idx] - gain * (lv[0] * e.S[0] + lv[1] * e.S[1] + lv[2] * e.S[2] + lv[3] * e.S[3]))));
   }
   if (res.empty()) return 0;
   std::nth_element(res.begin(), res.begin() + res.size() / 2, res.end());
   return res[res.size() / 2];
+}
+
+// Levenberg-Marquardt on the normal equations; returns the final cost and leaves the best
+// parameters in *p. Stops when the corners move less than `tol` pixels.
+double Optimise(const Fit &f, Params *p, double kcut, int max_iter, double tol, int width) {
+  Accum cur, trial;
+  Evaluate(f, *p, kcut, true, &cur);
+  double lambda = 1e-3;
+  double prev[4][2];
+  CellCorners(p->map, width, prev);
+  for (int iter = 0; iter < max_iter; ++iter) {
+    double diag[kNP];
+    for (int k = 0; k < kNP; ++k) diag[k] = std::max(cur.jtj[k][k], 1e-9);
+    bool accepted = false;
+    for (int attempt = 0; attempt < 6 && !accepted; ++attempt) {
+      double a[kNP][kNP], b[kNP], delta[kNP];
+      for (int r = 0; r < kNP; ++r) {
+        for (int c = 0; c < kNP; ++c) a[r][c] = cur.jtj[r][c];
+        a[r][r] += lambda * diag[r];
+        b[r] = cur.jtr[r];
+      }
+      if (!Solve(a, b, delta)) {
+        lambda *= 10;
+        continue;
+      }
+      Params q = *p;
+      for (int k = 0; k < 8; ++k) q.map.g[k] += delta[k];
+      if (q.motion) {
+        q.su = q.sv = std::clamp(q.su + delta[8], 0.35, 6.0);
+        q.mx += delta[9];
+        q.my += delta[13];
+        const double len = std::hypot(q.mx, q.my);
+        if (len > 24.0) {
+          q.mx *= 24.0 / len;
+          q.my *= 24.0 / len;
+        }
+      } else {
+        q.su = std::clamp(q.su + delta[8], 0.35, 8.0);
+        q.sv = std::clamp(q.sv + delta[9], 0.35, 8.0);
+      }
+      for (int k = 0; k < 3; ++k) q.lev[k] += delta[10 + k];
+      q.lx += delta[14];
+      q.ly += delta[15];
+      Evaluate(f, q, kcut, true, &trial);
+      if (trial.n > 0 && trial.cost < cur.cost) {
+        *p = q;
+        std::swap(cur, trial);
+        lambda = std::max(lambda / 4, 1e-7);
+        accepted = true;
+      } else {
+        lambda *= 5;
+      }
+    }
+    if (!accepted) break;
+    double corners[4][2];
+    CellCorners(p->map, width, corners);
+    double move = 0;
+    for (int k = 0; k < 4; ++k) {
+      move = std::max(move, std::hypot((corners[k][0] - prev[k][0]) * f.scale, (corners[k][1] - prev[k][1]) * f.scale));
+      prev[k][0] = corners[k][0];
+      prev[k][1] = corners[k][1];
+    }
+    if (move < tol) break;
+  }
+  return cur.cost;
 }
 
 }  // namespace
@@ -447,15 +559,13 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   double start_corners[4][2];
   CellCorners(start, W, start_corners);
 
+  const int limit = MaxPixels();
   // Blur: try a few widths on a narrow working set first.
-  const double candidates[] = {0.6, 1.0, 1.6, 2.5, 4.0};
-  BuildSet(&fit, p.map, std::min(3.0, 0.5 * cell_px + 0.5), im->width, im->height, im);
+  const double candidates[] = {0.7, 1.2, 2.0, 3.5};
+  BuildSet(&fit, p.map, std::min(3.0, 0.5 * cell_px + 0.5), limit, im);
   if (fit.obs.size() < 40) return false;
   double best_cost = 1e300, best_s = 1.0;
   Accum acc;
-  p.lev[0] = 20;
-  p.lev[1] = 235;
-  p.lev[2] = 235;
   for (double s : candidates) {
     p.su = p.sv = s;
     if (!FitLevels(fit, &p)) continue;
@@ -467,71 +577,79 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   }
   p.su = p.sv = best_s;
   if (!FitLevels(fit, &p)) return false;
-  double window = std::min(kReach * best_s, 0.75 * cell_px + 0.5);
-  window = std::max(window, 2.0);
-  BuildSet(&fit, p.map, window, im->width, im->height, im);
+  if (det->hamming > 0) {
+    // A cell whose centre reads far from the level its code bit implies (covered, or a corrected bit) is left out.
+    const double range = std::fabs(p.lev[1] - p.lev[0]);
+    double inv_map[9];
+    if (range > 8.0 && CellToNormalised(p.map, inv_map)) {
+      uint8_t marked[kMaxCells][kMaxCells] = {};
+      for (int j = 0; j < W; ++j) {
+        for (int i = 0; i < W; ++i) {
+          const double cu = i + 0.5, cv = j + 0.5;
+          const double w = inv_map[6] * cu + inv_map[7] * cv + inv_map[8];
+          const double px = (inv_map[0] * cu + inv_map[1] * cv + inv_map[2]) / w * fit.scale + fit.cx;
+          const double py = (inv_map[3] * cu + inv_map[4] * cv + inv_map[5]) / w * fit.scale + fit.cy;
+          const int ix = static_cast<int>(px), iy = static_cast<int>(py);
+          if (ix < 0 || iy < 0 || ix >= im->width || iy >= im->height) continue;
+          const double expected = fit.cls[j][i] ? p.lev[1] : p.lev[0];
+          if (std::fabs(im->buf[iy * im->stride + ix] - expected) > 0.3 * range) marked[j][i] = 1;
+        }
+      }
+      for (int j = 0; j < W; ++j) {
+        for (int i = 0; i < W; ++i) {
+          if (marked[j][i]) fit.cls[j][i] = 3;
+        }
+      }
+    }
+  }
+  double window = std::min(2.5 * best_s + 0.3, 0.75 * cell_px + 0.5);
+  window = std::max(window, 1.8);
+  BuildSet(&fit, p.map, window, limit, im);
   if (fit.obs.size() < 40) return false;
   FitLevels(fit, &p);
 
   const double kcut = std::max(6.0, 4.0 * 1.4826 * MedianAbsResidual(fit, p));
   Evaluate(fit, p, kcut, false, &acc);
   const double start_cost = acc.cost;
-  double lambda = 1e-3;
-  double cost = start_cost;
-  double prev_corners[4][2];
-  CellCorners(p.map, W, prev_corners);
-  for (int iter = 0; iter < 12; ++iter) {
-    Evaluate(fit, p, kcut, true, &acc);
-    cost = acc.cost;
-    double diag[kNP];
-    for (int k = 0; k < kNP; ++k) diag[k] = std::max(acc.jtj[k][k], 1e-12);
-    bool accepted = false;
-    for (int attempt = 0; attempt < 8 && !accepted; ++attempt) {
-      double a[kNP][kNP], b[kNP], delta[kNP];
-      for (int r = 0; r < kNP; ++r) {
-        for (int c = 0; c < kNP; ++c) a[r][c] = acc.jtj[r][c];
-        a[r][r] += lambda * diag[r];
-        b[r] = acc.jtr[r];
-      }
-      if (!Solve(a, b, delta)) {
-        lambda *= 10;
-        continue;
-      }
-      Params q = p;
-      for (int k = 0; k < 8; ++k) q.map.g[k] += delta[k];
-      q.su = std::clamp(q.su + delta[8], 0.35, 8.0);
-      q.sv = std::clamp(q.sv + delta[9], 0.35, 8.0);
-      for (int k = 0; k < 3; ++k) q.lev[k] += delta[10 + k];
-      Accum trial;
-      Evaluate(fit, q, kcut, false, &trial);
-      if (trial.n > 0 && trial.cost < cost) {
-        p = q;
-        cost = trial.cost;
-        lambda = std::max(lambda / 4, 1e-7);
-        accepted = true;
-      } else {
-        lambda *= 5;
+  double cost = Optimise(fit, &p, kcut, 8, 0.01, W);
+
+  if (std::max(p.su, p.sv) > 1.4 && (DevFlags() & 8) == 0) {
+    // A wide blur may be motion: refit with a straight blur segment, from the best of eight directions.
+    const double sigma0 = 0.7;
+    const double smax = std::max(p.su, p.sv);
+    const double length0 = std::sqrt(12.0 * std::max(smax * smax - sigma0 * sigma0, 1.0));
+    Params moving = p;
+    moving.motion = true;
+    moving.su = moving.sv = sigma0;
+    double best_move = 1e300;
+    Params best = moving;
+    for (int d = 0; d < 8; ++d) {
+      const double ang = d * 3.14159265358979323846 / 8.0;
+      moving.mx = length0 * std::cos(ang);
+      moving.my = length0 * std::sin(ang);
+      if (!FitLevels(fit, &moving)) continue;
+      Evaluate(fit, moving, kcut, false, &acc);
+      if (acc.n > 0 && acc.cost < best_move) {
+        best_move = acc.cost;
+        best = moving;
       }
     }
-    if (!accepted) break;
-    double corners[4][2];
-    CellCorners(p.map, W, corners);
-    double move = 0;
-    for (int k = 0; k < 4; ++k) {
-      move = std::max(move, std::hypot((corners[k][0] - prev_corners[k][0]) * fit.scale, (corners[k][1] - prev_corners[k][1]) * fit.scale));
-      prev_corners[k][0] = corners[k][0];
-      prev_corners[k][1] = corners[k][1];
+    if (best_move < 1e300) {
+      const double cost_moving = Optimise(fit, &best, kcut, 10, 0.01, W);
+      if (cost_moving < 0.97 * cost) {
+        p = best;
+        cost = cost_moving;
+      }
     }
-    if (move < 0.002) break;
   }
 
   if (!(cost < start_cost)) return false;
   double corners[4][2];
   CellCorners(p.map, W, corners);
-  double limit = std::max(0.5, std::min(2.0, 0.3 * cell_px));
+  const double limit_px = std::max(0.5, std::min(2.0, 0.3 * cell_px));
   for (int k = 0; k < 4; ++k) {
     if (!std::isfinite(corners[k][0]) || !std::isfinite(corners[k][1])) return false;
-    if (std::hypot((corners[k][0] - start_corners[k][0]) * fit.scale, (corners[k][1] - start_corners[k][1]) * fit.scale) > limit) return false;
+    if (std::hypot((corners[k][0] - start_corners[k][0]) * fit.scale, (corners[k][1] - start_corners[k][1]) * fit.scale) > limit_px) return false;
   }
 
   // New tag -> pixel homography: cell -> normalised pixel -> pixel, composed with tag -> cell.
