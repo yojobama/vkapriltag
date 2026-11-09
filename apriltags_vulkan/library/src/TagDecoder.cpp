@@ -592,6 +592,29 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     r.clear();
   }
 
+  if (const char *dn = std::getenv("APRILTAG_VK_DIAG")) {  // DIAG-TEMP
+    if (FILE *f = std::fopen(dn, "a")) {
+      for (size_t i = 0; i < quads.size(); ++i) {
+        struct quad un;
+        for (int k = 0; k < 4; ++k) { un.p[k][0] = (float)quads[i].p[k][0]; un.p[k][1] = (float)quads[i].p[k][1]; }
+        un.reversed_border = reversed_border; un.H = nullptr; un.Hinv = nullptr;
+        uint64_t rcode = 0;
+        const float margin = quad_sample_code(td_, &un, &im, &rcode);
+        const int ham = margin < 0 ? -1 : apriltag_min_hamming(td_, rcode);
+        if (un.H) matd_destroy(un.H);
+        if (un.Hinv) matd_destroy(un.Hinv);
+        int id = -1, hh = -1;
+        if (zarray_size(per_quad_[i]) > 0) {
+          apriltag_detection_t *det; zarray_get(per_quad_[i], 0, &det); id = det->id; hh = det->hamming;
+        }
+        std::fprintf(f, "Q %zu %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f ham0 %d marg %.1f dec %d %d\n", i,
+                     quads[i].p[0][0], quads[i].p[0][1], quads[i].p[1][0], quads[i].p[1][1], quads[i].p[2][0],
+                     quads[i].p[2][1], quads[i].p[3][0], quads[i].p[3][1], ham, margin, id, hh);
+      }
+      std::fclose(f);
+    }
+  }
+
   // Merge in quad order over [0, quads.size()), as in the reset loop above.
   for (size_t i = 0; i < quads.size(); ++i) {
     zarray_t *z = per_quad_[i];

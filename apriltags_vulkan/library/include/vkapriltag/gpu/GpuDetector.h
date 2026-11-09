@@ -86,6 +86,10 @@ struct DetectorConfig {
   enum class QuadFitMethod { kPeaks, kDp };
   QuadFitMethod quad_fit_method = QuadFitMethod::kDp;
 
+  // Retries a blob whose quad fit failed on the convex hull of its boundary points, for a tag whose
+  // border is partly covered. Env override: APRILTAG_VK_HULL_QUAD=0|1
+  bool hull_quad = false;
+
   // Caps on the raw (pre-selection) blob count.
   uint32_t max_raw_blobs = 65536;
   // Ceiling on blobs surviving selection. 0 sizes it from the frame (scaled with
