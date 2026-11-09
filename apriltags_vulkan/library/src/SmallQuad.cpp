@@ -65,12 +65,16 @@ struct Roi {
   int x0, y0, w, h;
 };
 
-bool FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, double out[4][2]) {
+// kFit: a quad was written; kEdge: every dark component touched the region's edge; kNone: no tag-like blob.
+enum class Fit { kFit, kEdge, kNone };
+
+Fit FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, double out[4][2]) {
   const int rx0 = roi.x0, ry0 = roi.y0, rw = roi.w, rh = roi.h;
   // Dark pixels (<= thr) in 8-connected components; keep the largest that stays clear of the edge.
   std::vector<int16_t> label(static_cast<size_t>(rw) * rh, 0);
   std::vector<int> stack, cur, best_pixels;
   int next = 0;
+  bool any_touch = false;
   auto dark = [&](int x, int y) { return grey[static_cast<size_t>(ry0 + y) * width + rx0 + x] <= thr; };
   for (int y = 0; y < rh; ++y) {
     for (int x = 0; x < rw; ++x) {
@@ -97,10 +101,11 @@ bool FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, dou
           stack.push_back(q);
         }
       }
+      any_touch |= touches;
       if (!touches && cur.size() > best_pixels.size()) best_pixels = cur;
     }
   }
-  if (best_pixels.size() < 12) return false;
+  if (best_pixels.size() < 12) return any_touch ? Fit::kEdge : Fit::kNone;
 
   std::vector<Pt> pts;
   pts.reserve(best_pixels.size() * 4);
@@ -112,7 +117,7 @@ bool FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, dou
     pts.push_back({px - 0.5, py + 0.5});
   }
   const std::vector<Pt> hull = ConvexHull(pts);
-  if (hull.size() < 3) return false;
+  if (hull.size() < 3) return Fit::kNone;
 
   double best_area = 1e30, best_c[4][2] = {}, best_w = 0, best_h = 0;
   for (size_t i = 0; i < hull.size(); ++i) {
@@ -140,25 +145,26 @@ bool FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, dou
       }
     }
   }
-  if (best_area > 1e29) return false;
+  if (best_area > 1e29) return Fit::kNone;
   const double lo = std::min(best_w, best_h), hi = std::max(best_w, best_h);
-  if (lo < 5.0 || hi > 1.7 * lo) return false;
-  if (static_cast<double>(best_pixels.size()) < 0.4 * best_area) return false;
+  if (lo < 5.0 || hi > 1.4 * lo) return Fit::kNone;
+  const double fill = static_cast<double>(best_pixels.size()) / best_area;
+  if (fill < 0.4 || fill > 0.92) return Fit::kNone;
   for (int k = 0; k < 4; ++k) {
     out[k][0] = best_c[k][0];
     out[k][1] = best_c[k][1];
   }
-  return true;
+  return Fit::kFit;
 }
 
-bool FitInRegion(const uint8_t *grey, int width, int height, double cx, double cy, double half,
-                 double out[4][2]) {
+Fit FitInRegion(const uint8_t *grey, int width, int height, double cx, double cy, double half,
+                double out[4][2]) {
   const int rx0 = std::max(0, static_cast<int>(std::floor(cx - half)));
   const int ry0 = std::max(0, static_cast<int>(std::floor(cy - half)));
   const int rx1 = std::min(width - 1, static_cast<int>(std::ceil(cx + half)));
   const int ry1 = std::min(height - 1, static_cast<int>(std::ceil(cy + half)));
   const int rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
-  if (rw < 8 || rh < 8) return false;
+  if (rw < 8 || rh < 8) return Fit::kNone;
 
   int hist[256] = {};
   for (int y = ry0; y <= ry1; ++y) {
@@ -167,12 +173,13 @@ bool FitInRegion(const uint8_t *grey, int width, int height, double cx, double c
   }
   double gap;
   const int thr = OtsuThreshold(hist, rw * rh, &gap);
-  if (gap < 20.0) return false;
+  if (gap < 20.0) return Fit::kNone;
   int below = 0, p5 = 0;
   for (; p5 < 255 && below < rw * rh / 20; ++p5) below += hist[p5];
-  if (FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, thr, out)) return true;
+  const Fit first = FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, thr, out);
   const int low = (p5 + thr) / 2;
-  return low < thr && FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, low, out);
+  if (first != Fit::kEdge || low >= thr) return first;
+  return FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, low, out);
 }
 
 }  // namespace
@@ -181,8 +188,9 @@ bool FitSmallQuad(const uint8_t *grey, int width, int height, double x0, double 
                   double y1, double out[4][2]) {
   const double cx = 0.5 * (x0 + x1), cy = 0.5 * (y0 + y1);
   const double half = std::max(0.75 * std::max(x1 - x0, y1 - y0), 10.0) + 4.0;
-  return FitInRegion(grey, width, height, cx, cy, std::min(28.0, half), out) ||
-         FitInRegion(grey, width, height, cx, cy, std::min(44.0, 1.8 * half), out);
+  const Fit small = FitInRegion(grey, width, height, cx, cy, std::min(28.0, half), out);
+  if (small != Fit::kEdge) return small == Fit::kFit;
+  return FitInRegion(grey, width, height, cx, cy, std::min(44.0, 1.8 * half), out) == Fit::kFit;
 }
 
 }  // namespace apriltag_vulkan

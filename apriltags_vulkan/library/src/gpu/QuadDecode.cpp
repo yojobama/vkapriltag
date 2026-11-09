@@ -719,7 +719,23 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
   }
   if (boxes.size() > kMaxRescueBoxes) boxes.resize(kMaxRescueBoxes);
+  // A box whose centre lies inside a fitted quad is a data cell of a larger tag, not a small tag.
+  const size_t n_quads = output.size();
+  auto inside_quad = [&](double x, double y) {
+    for (size_t i = 0; i < n_quads; ++i) {
+      const DetectedQuad &q = output[i];
+      bool pos = false, neg = false;
+      for (int k = 0; k < 4; ++k) {
+        const double *a = q.p[k], *b = q.p[(k + 1) & 3];
+        const double c = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+        (c >= 0 ? pos : neg) = true;
+      }
+      if (!(pos && neg)) return true;
+    }
+    return false;
+  };
   for (const std::array<double, 4> &bx : boxes) {
+    if (inside_quad(0.5 * (bx[0] + bx[2]), 0.5 * (bx[1] + bx[3]))) continue;
     DetectedQuad box;
     box.coarse = true;
     const double xs[4] = {bx[0], bx[2], bx[2], bx[0]}, ys[4] = {bx[1], bx[1], bx[3], bx[3]};
