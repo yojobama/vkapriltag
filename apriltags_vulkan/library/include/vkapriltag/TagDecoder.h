@@ -92,6 +92,8 @@ class TagDecoder {
   RefineEdgesMethod refine_method_;
   // APRILTAG_VK_GREY_MARGIN=0 turns off: retry a quad that did not decode as its inner square.
   bool grey_margin_ = true;
+  // APRILTAG_VK_SMALL_RESCUE=1 turns on: refit boxes and small undecoded quads from the full-resolution image.
+  bool small_rescue_ = false;
   // APRILTAG_VK_SIDE_ONE_OUT=0 turns off: refit a side whose border cells read white, one cell further in.
   bool side_one_out_ = true;
   // APRILTAG_VK_THIRD_BIT=0 turns off: accept a third corrected bit when the three wrong cells touch.

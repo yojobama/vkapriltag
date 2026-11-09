@@ -156,6 +156,7 @@ add_library(vkapriltag STATIC
   src/vk/CompletionFlag.cpp
   src/apriltag_family.cpp
   src/TagDecoder.cpp
+  src/SmallQuad.cpp
   src/RefineEdges.cpp
   src/BorderSample.cpp
   src/FramePipeline.cpp

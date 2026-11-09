@@ -23,6 +23,9 @@ constexpr std::array<double, 7> kFilterCoefficients = {
 
 constexpr int kNMaxima = 10;
 
+// Largest bounding box, in full-resolution pixels, of a blob handed on for the small-tag rescue.
+constexpr double kMaxRescueBox = 40.0;
+
 // Hypotenuse of two floats, evaluated in double and rounded once to float.
 inline float Hypot(float x, float y) {
   const double dx = x, dy = y;
@@ -582,6 +585,7 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
       reject = true;
     }
   }
+
   if (reject) return false;
 
   // Decimated grid to full-resolution pixels: a plain scale. decimate.comp point-samples the
@@ -601,6 +605,7 @@ QuadDecode::QuadDecode(const DetectorConfig &config)
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker")),
       scratch_(pool_->threads()) {
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
+  if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) config_.small_tag_rescue = v[0] != '0';
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
@@ -629,6 +634,8 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   struct SpanResult {
     bool dp_attempted = false, dp_used = false, has_quad = false;
     DetectedQuad quad;
+    bool has_box = false;
+    DetectedQuad box;
   };
   std::vector<SpanResult> per_span(spans.size());
   pool_->ParallelFor(spans.size(), [&](size_t s, unsigned slot) {
@@ -640,6 +647,22 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     r.dp_attempted = fq.dp_attempted;
     r.dp_used = fq.dp_used;
     r.has_quad = fq.valid && UpdateFitQuad(config_, fq, &r.quad);
+    if (config_.small_tag_rescue && config_.decimation > 1 && !r.has_quad) {
+      int32_t xlo = INT32_MAX, ylo = INT32_MAX, xhi = 0, yhi = 0;
+      for (size_t k = spans[s].begin; k < spans[s].end; ++k) {
+        xlo = std::min(xlo, line_fit_points[k].x2());
+        xhi = std::max(xhi, line_fit_points[k].x2());
+        ylo = std::min(ylo, line_fit_points[k].y2());
+        yhi = std::max(yhi, line_fit_points[k].y2());
+      }
+      const double d = 0.5 * config_.decimation;
+      if ((xhi - xlo) * d <= kMaxRescueBox && (yhi - ylo) * d <= kMaxRescueBox) {
+        r.has_box = true;
+        r.box.coarse = true;
+        const double xs[4] = {xlo * d, xhi * d, xhi * d, xlo * d}, ys[4] = {ylo * d, ylo * d, yhi * d, yhi * d};
+        for (int k = 0; k < 4; ++k) r.box.p[k][0] = xs[k], r.box.p[k][1] = ys[k];
+      }
+    }
   });
 
   last_dp_stats_ = DpStats{};
@@ -653,6 +676,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   // Collect survivors in span order so the output is independent of thread scheduling.
   for (const SpanResult &r : per_span) {
     if (r.has_quad) output.push_back(r.quad);
+    else if (r.has_box) output.push_back(r.box);
   }
 
   return output;
