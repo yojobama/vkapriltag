@@ -44,3 +44,13 @@ Conclusion: the decimated blob is too coarse; the fit has to be redone at full r
 the set). All other scenarios unchanged at decimation 1 and 2 (recall, false detections incl. family16h5 = 3,
 error), apart from run-to-run noise (2 dump lines). Switch off: identical to base.
 Commands: `APRILTAG_VK_SMALL_RESCUE=1 bash run_corpus.sh vk_eval.exe corpus out --decimation 2`, score_corpus.py.
+
+## Final state (commit after 613b550 adds this log update)
+Later changes: boxes whose centre is inside a fitted quad are dropped (data cells of large tags; dense-tags cost
+gone), FitSmallQuad gates tightened (aspect <= 1.4, fill 0.4-0.92), the larger ROI / lower threshold retries only
+run when every dark component touched the ROI edge. The unrefined probe distance cannot separate rescued tags
+from clutter (accepted at 8-9, rejected at 8-10), so no probe gate.
+Interleaved ABBA medians, decimation 2, off -> on (ms): range 0.167 -> 0.199, one-tag 0.269 -> 0.317,
+noise 0.353 -> 0.409, jpeg 0.77 -> 0.77, dense-tags 0.60 -> 0.61, clutter-only 0.50 -> 1.02 (28 small
+high-contrast boxes per frame go through the full-resolution refit; no detections result).
+Left: cut the clutter-only cost (cheaper pre-filter of boxes before FitSmallQuad), rescue at decimation 4.
