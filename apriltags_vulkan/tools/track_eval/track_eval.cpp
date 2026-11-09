@@ -136,7 +136,10 @@ int main(int argc, char **argv) {
             samples[mode].push_back({std::chrono::duration<double, std::milli>(t1 - t0).count(),
                                      static_cast<int>(det.last_path())});
           }
-          if (dump) WriteDets(out, int(n), dets);
+          if (dump) {
+            WriteDets(out, int(n), dets);
+            out << "# path " << static_cast<int>(det.last_path()) << '\n';
+          }
         }
       }
     }

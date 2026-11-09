@@ -23,6 +23,10 @@ void ApplyEnv(TrackingConfig *c) {
   if (const char *v = std::getenv("APRILTAG_VK_TRACKING_MIN_MARGIN")) {
     c->min_margin = static_cast<float>(std::atof(v));
   }
+  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_CONVERGE")) c->converge_px = static_cast<float>(std::atof(v));
+  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ITERATIONS")) {
+    c->max_iterations = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  }
   if (const char *v = std::getenv("APRILTAG_VK_TRACKING_SEARCH")) c->roi_search = v[0] != '0';
 }
 
@@ -35,7 +39,6 @@ TrackingDetector::TrackingDetector(vk::Context &ctx, apriltag_detector_t *td,
   gpu_ = std::make_unique<GpuDetector>(ctx, config_);
   quad_decode_ = std::make_unique<QuadDecode>(config_);
   full_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, config_.cpu_threads);
-  track_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, 1);
   search_td_ = apriltag_detector_create();
   for (int i = 0; i < zarray_size(td_->tag_families); ++i) {
     apriltag_family_t *family = nullptr;
@@ -49,7 +52,6 @@ TrackingDetector::TrackingDetector(vk::Context &ctx, apriltag_detector_t *td,
 }
 
 TrackingDetector::~TrackingDetector() {
-  track_decoder_.reset();
   full_decoder_.reset();
   apriltag_detector_destroy(search_td_);
 }
@@ -57,6 +59,8 @@ TrackingDetector::~TrackingDetector() {
 void TrackingDetector::Reset() {
   tracks_.clear();
   tracked_run_ = 0;
+  skip_ = 0;
+  backoff_ = 1;
 }
 
 void TrackingDetector::SetEnabled(bool enabled) {
@@ -65,15 +69,19 @@ void TrackingDetector::SetEnabled(bool enabled) {
 }
 
 zarray_t *TrackingDetector::Detect(const uint8_t *gray_frame) {
-  if (tracking_.enabled && !tracks_.empty() && tracked_run_ + 1 < tracking_.keyframe_interval) {
+  if (skip_ > 0) --skip_;
+  if (tracking_.enabled && !tracks_.empty() && skip_ == 0 && tracked_run_ + 1 < tracking_.keyframe_interval) {
     bool searched = false;
     if (zarray_t *dets = TryTrack(gray_frame, &searched)) {
       ++tracked_run_;
+      backoff_ = 1;
       last_path_ = searched ? Path::kSearch : Path::kTracked;
       ++(searched ? stats_.frames_search : stats_.frames_tracked);
       return dets;
     }
     ++stats_.tracked_attempts_failed;
+    skip_ = backoff_ + 1;
+    backoff_ = std::min(backoff_ * 2, tracking_.keyframe_interval);
   }
   zarray_t *dets = DetectFull(gray_frame);
   last_path_ = Path::kFull;
@@ -180,6 +188,7 @@ bool TrackingDetector::SearchQuad(const uint8_t *gray_frame, const Track &t, Det
     std::copy_n(gray_frame + static_cast<size_t>(ry0 + y) * config_.width + rx0, rw,
                 crop_.begin() + static_cast<size_t>(y) * rw);
   }
+  search_td_->quad_decimate = std::clamp(std::floor(static_cast<float>(Side(t.p)) / tracking_.search_tag_px), 1.0f, 4.0f);
   image_u8_t sub{rw, rh, rw, crop_.data()};
   zarray_t *found = apriltag_detector_detect(search_td_, &sub);
   bool ok = false;
@@ -211,7 +220,7 @@ zarray_t *TrackingDetector::TryTrack(const uint8_t *gray_frame, bool *searched) 
     }
   }
   auto decode = [&](const std::vector<DetectedQuad> &q) {
-    return track_decoder_->Decode(q, gray_frame, config_.width, config_.height,
+    return full_decoder_->Decode(q, gray_frame, config_.width, config_.height,
                                   config_.reversed_border);
   };
   // The detection for track i among `dets`, or nullptr if it is missing or ambiguous.
@@ -227,11 +236,47 @@ zarray_t *TrackingDetector::TryTrack(const uint8_t *gray_frame, bool *searched) 
     return hit;
   };
 
-  zarray_t *dets = decode(quads);
+  // Decodes from `start`, feeding each tag's refined corners back in until they stop moving; ok[i] is
+  // set when track i decodes as itself and has settled.
+  auto solve = [&](const std::vector<DetectedQuad> &start, const std::vector<char> &strict,
+                   std::vector<char> *ok) {
+    std::vector<DetectedQuad> cur = start;
+    zarray_t *dets = nullptr;
+    for (uint32_t iter = 0; iter < tracking_.max_iterations; ++iter) {
+      dets = decode(cur);
+      ok->assign(n, 1);
+      bool moving = false, lost = false;
+      for (size_t i = 0; i < n; ++i) {
+        const apriltag_detection_t *det = find(dets, i);
+        if (!det || !Accept(det, tracks_[i], start[i], strict[i] != 0)) {
+          (*ok)[i] = 0;
+          lost = true;
+          continue;
+        }
+        double shift = 0.0;
+        for (int k = 0; k < 4; ++k) {
+          shift = std::max(shift, std::hypot(det->p[k][0] - cur[i].p[3 - k][0],
+                                             det->p[k][1] - cur[i].p[3 - k][1]));
+          cur[i].p[3 - k][0] = det->p[k][0];
+          cur[i].p[3 - k][1] = det->p[k][1];
+        }
+        if (shift > tracking_.converge_px) {
+          moving = true;
+          (*ok)[i] = 0;
+          if (iter == 0 && shift > tracking_.max_first_shift_px) lost = true;
+        }
+      }
+      if (lost || !moving) break;
+    }
+    return dets;
+  };
+
+  std::vector<char> ok;
+  const std::vector<DetectedQuad> predicted = quads;
+  zarray_t *dets = solve(predicted, std::vector<char>(n, 1), &ok);
   std::vector<size_t> failed;
   for (size_t i = 0; i < n; ++i) {
-    const apriltag_detection_t *det = find(dets, i);
-    if (!det || !Accept(det, tracks_[i], quads[i], true)) failed.push_back(i);
+    if (!ok[i]) failed.push_back(i);
   }
   if (failed.empty() && static_cast<size_t>(zarray_size(dets)) == n) {
     UpdateTracks(dets);
@@ -239,17 +284,17 @@ zarray_t *TrackingDetector::TryTrack(const uint8_t *gray_frame, bool *searched) 
   }
   if (!tracking_.roi_search || failed.empty()) return nullptr;
 
-  // Failed tracks go back through the decoder from their searched corners; the others from the same
-  // predicted corners as before, which gives the same detections.
+  // Failed tracks restart from their searched corners; the others from the same predicted corners as
+  // before, which gives the same detections.
+  std::vector<char> strict(n, 1);
   for (size_t i : failed) {
     if (!SearchQuad(gray_frame, tracks_[i], &quads[i])) return nullptr;
+    strict[i] = 0;
   }
-  dets = decode(quads);
+  dets = solve(quads, strict, &ok);
   if (static_cast<size_t>(zarray_size(dets)) != n) return nullptr;
   for (size_t i = 0; i < n; ++i) {
-    const apriltag_detection_t *det = find(dets, i);
-    const bool was_failed = std::find(failed.begin(), failed.end(), i) != failed.end();
-    if (!det || !Accept(det, tracks_[i], quads[i], !was_failed)) return nullptr;
+    if (!ok[i]) return nullptr;
   }
   *searched = true;
   UpdateTracks(dets);

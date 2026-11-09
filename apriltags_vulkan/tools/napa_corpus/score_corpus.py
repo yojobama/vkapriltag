@@ -18,7 +18,7 @@ def load_dump(path):
     frames, cur = {}, None
     for line in open(path):
         f = line.split()
-        if not f:
+        if not f or f[0] == "#":
             continue
         if f[0] == "F":
             cur = int(f[1])

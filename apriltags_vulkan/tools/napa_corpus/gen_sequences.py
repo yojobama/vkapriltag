@@ -34,22 +34,25 @@ SEQUENCES = {
 
 
 def tag_paths(cfg, rng, n_frames, w, h):
-    """Per tag: (size, id slot, function frame -> (centre, theta, tilt, axis))."""
+    """Per tag: (size, function frame -> (centre, theta, tilt, axis)); each tag keeps to its own grid cell."""
     tags = []
+    n = cfg["tags"]
+    cols, rows = {1: (1, 1), 2: (2, 1), 3: (3, 1), 4: (2, 2)}[n]
+    cw, ch = w / cols, h / rows
     side = 0.22 * h if w == 640 else 0.2 * h
-    for i in range(cfg["tags"]):
-        size = side * float(rng.uniform(0.8, 1.2))
+    for i in range(n):
+        size = min(side * float(rng.uniform(0.8, 1.2)), 0.55 * min(cw, ch))
         extent = 0.85 * size
         th0 = float(rng.uniform(0, 2 * math.pi))
         spin = float(rng.uniform(-0.012, 0.012))
         tilt0 = math.radians(float(rng.uniform(10, 30)))
         axis = float(rng.uniform(0, 2 * math.pi))
         if cfg.get("cross"):
-            # a straight crossing starting off-frame at a staggered time; the tag is fully visible mid-way
-            start = i * n_frames // (cfg["tags"] + 1) * 0.5
+            # a straight crossing in its own horizontal band, starting off-frame at a staggered time
+            start = i * n_frames // (n + 1) * 0.5
             vx = cfg["speed"] * float(rng.choice([-1, 1]))
-            vy = float(rng.uniform(-0.3, 0.3)) * cfg["speed"]
-            y0 = float(rng.uniform(0.25, 0.75)) * h
+            vy = float(rng.uniform(-0.1, 0.1)) * cfg["speed"]
+            y0 = (i + 0.5) * h / n
             x_start = -1.2 * extent if vx > 0 else w + 1.2 * extent
 
             def path(f, x_start=x_start, vx=vx, vy=vy, y0=y0, start=start, th0=th0, spin=spin, tilt0=tilt0, axis=axis):
@@ -58,21 +61,15 @@ def tag_paths(cfg, rng, n_frames, w, h):
 
             tags.append((size, path))
             continue
-        ax, ay = (w - 2 * extent) / 2, (h - 2 * extent) / 2
-        cx, cy = w / 2, h / 2
+        ax, ay = max(8.0, cw / 2 - extent), max(8.0, ch / 2 - extent)
+        cx, cy = (i % cols + 0.5) * cw, (i // cols + 0.5) * ch
         # peak speed = amplitude * omega, split between the axes
-        phi = float(rng.uniform(0, 2 * math.pi))
         sx, sy = float(rng.uniform(0.5, 1.0)), float(rng.uniform(0.5, 1.0))
         norm = math.hypot(sx, sy)
-        sc = 1.0 if cfg["tags"] == 1 else 0.55
-        wx, wy = cfg["speed"] * sx / norm / (ax * sc), cfg["speed"] * sy / norm / (ay * sc)
-        # keep tags apart: each lives in its own horizontal band slice of the Lissajous box
+        wx, wy = cfg["speed"] * sx / norm / ax, cfg["speed"] * sy / norm / ay
         px, py = float(rng.uniform(0, 2 * math.pi)), float(rng.uniform(0, 2 * math.pi))
-        ox = (i % 2 - 0.5) * 0.9 * ax if cfg["tags"] > 1 else 0.0
-        oy = ((i // 2) % 2 - 0.5) * 0.9 * ay if cfg["tags"] > 2 else 0.0
 
-        def path(f, ax=ax * sc, ay=ay * sc, cx=cx + ox, cy=cy + oy, wx=wx, wy=wy, px=px, py=py, th0=th0, spin=spin,
-                 tilt0=tilt0, axis=axis):
+        def path(f, ax=ax, ay=ay, cx=cx, cy=cy, wx=wx, wy=wy, px=px, py=py, th0=th0, spin=spin, tilt0=tilt0, axis=axis):
             return ((cx + ax * math.sin(wx * f + px), cy + ay * math.sin(wy * f + py)), th0 + spin * f,
                     tilt0 * (1 + 0.3 * math.sin(0.03 * f + px)), axis)
 

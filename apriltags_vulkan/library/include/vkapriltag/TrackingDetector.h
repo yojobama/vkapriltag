@@ -28,12 +28,22 @@ struct TrackingConfig {
   // change by up to this ratio.
   float max_jump_frac = 0.5f;
   float max_scale_change = 1.4f;
+  // The refined corners are fed back through refine and decode until they move less than converge_px
+  // (at most max_iterations decodes); a tag that has not settled counts as lost.
+  // Env overrides: APRILTAG_VK_TRACKING_CONVERGE=<px>, APRILTAG_VK_TRACKING_ITERATIONS=<n>
+  // A first pass that moves a tag's corners more than max_first_shift_px gives up at once (the refine
+  // is too slow to settle from there); the next 1, 2, 4... frames, up to keyframe_interval, then run full.
+  float max_first_shift_px = 3.0f;
+  float converge_px = 0.05f;
+  uint32_t max_iterations = 8;
   // When the predicted corners do not decode, search a region around the tag with libapriltag's quad
   // detector before giving up. Env override: APRILTAG_VK_TRACKING_SEARCH=0|1
-  bool roi_search = true;
+  bool roi_search = false;
   // The search region's padding: at least roi_pad_min pixels and roi_pad_frac of the tag's side.
   float roi_pad_frac = 0.75f;
   float roi_pad_min = 16.0f;
+  // The region is decimated until the tag's side is about this many pixels, at most 4 times.
+  float search_tag_px = 24.0f;
 };
 
 // Runs the full detector on keyframes and, between them, re-detects the tags of the previous frame on
@@ -97,10 +107,11 @@ class TrackingDetector {
   std::unique_ptr<GpuDetector> gpu_;
   std::unique_ptr<QuadDecode> quad_decode_;
   std::unique_ptr<TagDecoder> full_decoder_;
-  std::unique_ptr<TagDecoder> track_decoder_;
   std::vector<Track> tracks_;
   std::vector<uint8_t> crop_;
   uint32_t tracked_run_ = 0;
+  uint32_t skip_ = 0;
+  uint32_t backoff_ = 1;
   Path last_path_ = Path::kFull;
   Stats stats_;
 };
