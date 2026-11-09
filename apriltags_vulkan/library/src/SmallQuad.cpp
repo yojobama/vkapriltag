@@ -100,7 +100,7 @@ bool FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, dou
       if (!touches && cur.size() > best_pixels.size()) best_pixels = cur;
     }
   }
-  if (best_pixels.size() < 12) { std::fprintf(stderr, "SQ fail 45\n"); return false; }
+  if (best_pixels.size() < 12) return false;
 
   std::vector<Pt> pts;
   pts.reserve(best_pixels.size() * 4);
@@ -112,7 +112,7 @@ bool FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, dou
     pts.push_back({px - 0.5, py + 0.5});
   }
   const std::vector<Pt> hull = ConvexHull(pts);
-  if (hull.size() < 3) { std::fprintf(stderr, "SQ fail 37\n"); return false; }
+  if (hull.size() < 3) return false;
 
   double best_area = 1e30, best_c[4][2] = {}, best_w = 0, best_h = 0;
   for (size_t i = 0; i < hull.size(); ++i) {
@@ -140,10 +140,10 @@ bool FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, dou
       }
     }
   }
-  if (best_area > 1e29) { std::fprintf(stderr, "SQ fail 38\n"); return false; }
+  if (best_area > 1e29) return false;
   const double lo = std::min(best_w, best_h), hi = std::max(best_w, best_h);
-  if (lo < 5.0 || hi > 1.7 * lo) { std::fprintf(stderr, "SQ fail 47\n"); return false; }
-  if (static_cast<double>(best_pixels.size()) < 0.4 * best_area) { std::fprintf(stderr, "SQ fail 79\n"); return false; }
+  if (lo < 5.0 || hi > 1.7 * lo) return false;
+  if (static_cast<double>(best_pixels.size()) < 0.4 * best_area) return false;
   for (int k = 0; k < 4; ++k) {
     out[k][0] = best_c[k][0];
     out[k][1] = best_c[k][1];

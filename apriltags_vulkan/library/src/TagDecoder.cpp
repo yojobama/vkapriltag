@@ -563,7 +563,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     }
 
     // A small quad that did not decode: refit it from the full-resolution image and try again.
-    if (small_rescue_ && td_->quad_decimate > 1 && !q.coarse && td_->refine_edges && zarray_size(per_quad_[i]) == 0) {
+    if (small_rescue_ && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f && td_->refine_edges && zarray_size(per_quad_[i]) == 0) {
       double xlo = 1e30, ylo = 1e30, xhi = -1e30, yhi = -1e30;
       for (int k = 0; k < 4; ++k) {
         xlo = std::min(xlo, q.p[k][0]);

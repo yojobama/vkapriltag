@@ -119,6 +119,8 @@ struct DetectedQuad {
   double p[4][2];
   // Only the bounding box of a small blob that did not fit a quad; TagDecoder refits it at full resolution.
   bool coarse = false;
+  // Mean edge gradient of the blob; set only with small_tag_rescue.
+  float gradient = 0.0f;
 };
 
 // Vulkan compute pipeline for decimation, thresholding, connected-component labelling,
