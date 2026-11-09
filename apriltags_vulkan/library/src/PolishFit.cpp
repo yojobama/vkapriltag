@@ -26,7 +26,7 @@ unsigned DevFlags() {
 int MaxPixels() {
   static const int v = [] {
     const char *e = std::getenv("APRILTAG_VK_POLISH_N");
-    return e ? std::atoi(e) : 1500;
+    return e ? std::atoi(e) : 8000;
   }();
   return v;
 }
@@ -114,6 +114,7 @@ struct Fit {
   uint8_t cls[kMaxCells][kMaxCells];  // [row][column]: 0 black, 1 white, 3 unknown
   double cx, cy, scale;               // pixel -> normalised coordinates
   std::vector<float> nx, ny, obs;     // working set: normalised position and observed value
+  int thin = 1;                       // lattice step the working set was thinned by
 };
 
 inline int ClassOf(const Fit &f, int row, int col) {
@@ -364,6 +365,7 @@ void BuildSet(Fit *f, const Mapping &map, double half_window_px, int limit, cons
   const double area = static_cast<double>(x1 - x0 + 1) * (y1 - y0 + 1);
   const int k = std::max(1, static_cast<int>(0.45 * area / std::max(limit, 1)));
   const int r = std::max(1, static_cast<int>(std::lround(k * 0.382)));
+  f->thin = k;
   for (int py = y0; py <= y1; ++py) {
     const int off = ((-(py * r)) % k + k) % k;
     int px = x0 + (((off - x0) % k) + k) % k;
@@ -397,8 +399,8 @@ void BuildSet(Fit *f, const Mapping &map, double half_window_px, int limit, cons
 }
 
 // Linear least squares for the three levels at fixed mapping and blur.
-bool FitLevels(const Fit &f, Params *p) {
-  double ata[3][3] = {}, atb[3] = {};
+bool FitLevels(const Fit &f, Params *p, double *sse = nullptr) {
+  double ata[3][3] = {}, atb[3] = {}, yy = 0;
   const double unit[4] = {1, 1, 1, 1};
   PixelEval e;
   for (size_t idx = 0; idx < f.obs.size(); ++idx) {
@@ -408,6 +410,7 @@ bool FitLevels(const Fit &f, Params *p) {
     const double sw[3] = {gain * (e.S[0] + 0.5 * e.S[3]), gain * (e.S[1] + 0.5 * e.S[3]), gain * e.S[2]};
     for (int a = 0; a < 3; ++a) {
       atb[a] += sw[a] * f.obs[idx];
+      yy += a == 0 ? static_cast<double>(f.obs[idx]) * f.obs[idx] : 0.0;
       for (int c = 0; c < 3; ++c) ata[a][c] += sw[a] * sw[c];
     }
   }
@@ -416,6 +419,7 @@ bool FitLevels(const Fit &f, Params *p) {
   double inv[9];
   if (!Invert3(m, inv)) return false;
   for (int a = 0; a < 3; ++a) p->lev[a] = inv[3 * a] * atb[0] + inv[3 * a + 1] * atb[1] + inv[3 * a + 2] * atb[2];
+  if (sse != nullptr) *sse = yy - (p->lev[0] * atb[0] + p->lev[1] * atb[1] + p->lev[2] * atb[2]);
   return true;
 }
 
@@ -438,9 +442,10 @@ double MedianAbsResidual(const Fit &f, const Params &p) {
 
 // Levenberg-Marquardt on the normal equations; returns the final cost and leaves the best
 // parameters in *p. Stops when the corners move less than `tol` pixels.
-double Optimise(const Fit &f, Params *p, double kcut, int max_iter, double tol, int width) {
+double Optimise(const Fit &f, Params *p, double kcut, int max_iter, double tol, int width, double *initial_cost = nullptr) {
   Accum cur, trial;
   Evaluate(f, *p, kcut, true, &cur);
+  if (initial_cost != nullptr) *initial_cost = cur.cost;
   double lambda = 1e-3;
   double prev[4][2];
   CellCorners(p->map, width, prev);
@@ -568,15 +573,21 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   Accum acc;
   for (double s : candidates) {
     p.su = p.sv = s;
-    if (!FitLevels(fit, &p)) continue;
-    Evaluate(fit, p, 1e9, false, &acc);
-    if (acc.n > 0 && acc.cost < best_cost) {
-      best_cost = acc.cost;
+    double sse = 0;
+    if (!FitLevels(fit, &p, &sse)) continue;
+    if (sse < best_cost) {
+      best_cost = sse;
       best_s = s;
     }
   }
   p.su = p.sv = best_s;
   if (!FitLevels(fit, &p)) return false;
+  if (fit.thin > 1 && (DevFlags() & 16) == 0) {
+    // A tag too large for the working set keeps its profile fit unless it is blurred or clipped.
+    size_t saturated = 0;
+    for (float v : fit.obs) saturated += v >= 255.0f;
+    if (best_s < 1.6 && saturated * 20 < fit.obs.size()) return false;
+  }
   if (det->hamming > 0) {
     // A cell whose centre reads far from the level its code bit implies (covered, or a corrected bit) is left out.
     const double range = std::fabs(p.lev[1] - p.lev[0]);
@@ -609,9 +620,8 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   FitLevels(fit, &p);
 
   const double kcut = std::max(6.0, 4.0 * 1.4826 * MedianAbsResidual(fit, p));
-  Evaluate(fit, p, kcut, false, &acc);
-  const double start_cost = acc.cost;
-  double cost = Optimise(fit, &p, kcut, 8, 0.01, W);
+  double start_cost = 0;
+  double cost = Optimise(fit, &p, kcut, 8, 0.01, W, &start_cost);
 
   if (std::max(p.su, p.sv) > 1.4 && (DevFlags() & 8) == 0) {
     // A wide blur may be motion: refit with a straight blur segment, from the best of eight directions.
