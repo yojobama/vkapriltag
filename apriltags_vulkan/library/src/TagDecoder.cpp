@@ -9,6 +9,7 @@
 #include <string>
 
 #include "BorderSample.h"
+#include "vkapriltag/PolishFit.h"
 #include "vkapriltag/common/Profiler.h"
 
 extern "C" {
@@ -181,6 +182,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
   if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_POLISH")) polish_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] != '0';
@@ -557,6 +559,16 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
           zarray_remove_index(per_quad_[i], j, 0);
         }
       }
+    }
+
+    if (polish_) {
+      VKA_PROF_SCOPE("tag.polish");
+      for (int j = 0; j < zarray_size(per_quad_[i]); ++j) {
+        apriltag_detection_t *det = nullptr;
+        zarray_get(per_quad_[i], j, &det);
+        PolishDetection(&im, det);
+      }
+      if (timing) refine_ms += lap();
     }
 
     // Free the homographies allocated on the stack-local quad.
