@@ -3057,6 +3057,82 @@ Windows, MSVC, `Release`; Orange Pi 5 Plus, Linux, GCC, `Release`):
 - Corpus accuracy and timing as in 8az and 8ba. Known regression: JPEG-like candidate-rich frames at
   decimation 2 on the desktop.
 
+## 8bc. Camera rate: the idle GPU, the keep-alive timer and the pre-warm burst
+
+Frames that arrive with a pause between them cost far more than frames back to back on the RX 9060 XT.
+`vk_eval` (decimation 2, mean ms per frame as GPU / CPU / total, 640x480 one tag | 1280x720 many tags),
+median of three interleaved runs:
+
+| | 640x480 | 1280x720 |
+|---|---|---|
+| back to back | 0.173 / 0.041 / 0.214 | 0.278 / 0.091 / 0.369 |
+| 16 ms gaps, before | 0.745 / 0.086 / 0.833 | 0.887 / 0.165 / 1.053 |
+| 33 ms gaps, before | 0.755 / 0.087 / 0.841 | 0.899 / 0.169 / 1.068 |
+| 16 ms gaps, pre-warm | 0.323 / 0.090 / 0.415 | 0.398 / 0.178 / 0.575 |
+| 33 ms gaps, pre-warm | 0.269 / 0.094 / 0.363 | 0.398 / 0.182 / 0.580 |
+| back to back, pre-warm | 0.173 / 0.041 / 0.215 | 0.243 / 0.090 / 0.333 |
+
+**Where the time goes.** At 640x480 the GPU phase is upload 0.027 -> 0.104 ms and submit-and-wait 0.125 ->
+0.642 ms after a gap. With `APRILTAG_VK_TIMESTAMPS=1` the summed GPU stage time is 0.067 -> 0.115 ms and the
+gaps between stages 0.006 -> 0.011 ms, so the dispatches run about 0.05 ms slower and the other 0.5 ms is the
+latency between the submission and the GPU starting. Sleeping the calling thread is not what costs: a
+busy-waiting gap gives 0.68 ms for the GPU phase at 16 ms (0.75 asleep), 0.34 at 4 ms and 0.26 at 1 ms, so
+the cost follows the time the GPU has been idle, and any idle of 0.2 ms or more already costs. A spinning
+helper thread, `timeBeginPeriod(1)`, CPU load in other processes and a heavier keep-alive dispatch (64 to
+16384 workgroups) change nothing.
+
+**The existing keep-alive failed on Windows because of its timer.** Its `wait_for` rounds up to the 15.6 ms
+timer tick, so a 1 to 4 ms interval gave a 15.6 ms one. `KeepAlive` now waits on a high-resolution waitable
+timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`); with intervals of 1, 2 and 4 ms the GPU phase at 16 ms gaps is
+0.29, 0.28 and 0.31 ms (before: 0.75). It stays off by default on discrete GPUs because it costs
+a submission every interval (process CPU about 0.2 to 0.4 ms per 16 ms frame more than the pre-warm).
+
+**Predictive pre-warm.** `DetectorConfig::prewarm_lead_us` (`APRILTAG_VK_PREWARM_LEAD_US`; 0 off, negative
+selects 3000, the default), `prewarm_burst` (`APRILTAG_VK_PREWARM_BURST`, 2) and `prewarm_gap_us`
+(`APRILTAG_VK_PREWARM_GAP_US`, 1000). `Detect()` records its call times; when the last four or more
+inter-frame intervals are within 25 % of their median and the median is 2 to 200 ms, the keep-alive thread
+submits `prewarm_burst` one-thread dispatches `prewarm_lead_us` before the next frame is due, then sleeps
+again. Back-to-back frames and irregular cadences never arm it (one uncontended lock per `Detect()`).
+`GpuDetector::Prewarm()` submits the burst at once, for an application that knows a frame is about to arrive
+(measured with 3 ms before the frame: 0.269 / 0.072 / 0.341 ms against 0.337 for the predictive burst and 0.757
+with neither, timer at 1 ms). Sweep at 16 ms gaps, GPU phase in ms (lead us x burst x gap us): 400x2x100 0.66,
+600x4x100 0.54, 1000x8x100 0.41, 1500x3x300 0.30, 2000x3x500 0.32, 2000x2x800 0.31, 3000x2x1000 0.30; the
+GPU needs more than 1 ms after the first submission to be awake, and stays awake for 2 ms or more after the
+last one. A burst that fills the whole 3 ms (28 dispatches) gives 0.28 against 0.33, not worth its
+submissions. `TrackingDetector` calls `NoteFrame()` for tracked frames and `ExpectGpuFrame()` before a
+keyframe, because tracked frames never reach `GpuDetector::Detect()`.
+
+**Tracking, full pipeline (`track_eval`, mean ms per frame; slow-3tag-640 | medium-4tag-1280).** Full mode:
+back to back 0.273 | 0.508, 16 ms gaps 0.937 | 1.254 before and 0.503 | 0.774 after, 33 ms gaps 0.949 | 1.264
+before and 0.467 | 0.780 after. Key mode (keyframe every 8): 0.181 | 0.265 back to back, 0.403 | 0.520 at 16 ms
+before and 0.353 | 0.468 after; the keyframes themselves 1.00 | 1.31 ms before and 0.48 | 0.80 after.
+
+**Orange Pi 5 Plus** (all runs with the service stopped and the governors on `performance`). The full detector
+was already within 6 % of back to back at camera rate (3 tags 640x480: 0.797 gap 0, 0.830 at 16 ms, 0.849 at 33
+ms; 4 tags 1280x720: 1.91 at every gap) and the pre-warm does not change that. In key mode the tracked frames
+(0.258 ms) are unchanged by gaps, but the keyframe that follows seven tracked frames finds the GPU cold, since
+the 6 ms keep-alive stops after 100 ms without a `Detect()`: keyframe median 0.775 ms back to back, 1.106 at
+16 ms, 1.278 at 33 ms (4 tags 1280x720: 1.90, 2.28, 2.26). With the pre-warm 0.867 and 0.853 (1.97, 1.94); key
+mode mean 0.367 -> 0.339 at 16 ms (back to back 0.326). Lead 1000 to 8000 us and bursts of 1 to 4 are all within
+the noise of 25 keyframes. The tracked-frame penalty reported earlier (0.258 -> 0.776 ms at 16 ms) is not seen
+with the governors pinned. Worker wake-up on the Pi: a worker on a little core starts its first item 77 to 85 us
+after a 16 ms sleep (9 us on a big core), but the effect on a whole frame is 3 % or less at 1, 2, 4 and 8
+threads, so the worker pool is unchanged (no spinning, pinning or run-inline-when-cold).
+
+**Not explained.** The CPU phase after a gap (0.042 -> 0.085 ms at 640x480) is not core frequency or the worker
+pool (`--threads 1` is the same); a 2 ms busy spin right before the frame brings it only to 0.060, and it is
+better (0.072) when the system timer is at 1 ms. What remains between the pre-warm and back to back on the
+desktop (about +0.1 ms GPU, +0.025 upload, +0.04 CPU at 640x480) is partly the harness: back to back the same
+image stays in the CPU caches, a camera frame does not.
+
+**Idle cost.** Pre-warm: two trivial submissions per frame (120 per second at 60 Hz) and no thread activity
+without frames; process CPU time per frame (noisy, two runs each at 16 ms gaps) was 0.31 and 0.54 ms with it and 0.50 and 0.73
+without, so it adds none that shows; the keep-alive at 2 ms 0.89 ms. Back to back is unchanged (0.214 against 0.215 ms; 1280x720 0.333 against 0.369, noise). Detections
+are identical (corpus at decimation 2 with the pre-warm, without it and with a 2 ms keep-alive: one line of
+`noise.txt` differs in the last digits, the known run-to-run difference; `track_eval` dumps of
+slow-3tag-640 identical). ThreadSanitizer on the Pi (vk_eval with 16 and 5 ms gaps and bursts of 3, track_eval
+with full, key and async modes at 8 ms gaps): no reports.
+
 ## 9. Measuring
 
 ```

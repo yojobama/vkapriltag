@@ -4,6 +4,23 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
 "What changed" sections of [README.md](README.md); the measurements behind every change are in
 [apriltags_vulkan/PERFORMANCE.md](apriltags_vulkan/PERFORMANCE.md).
 
+## Unreleased
+
+### Added
+
+- **Pre-warm for frames that arrive at camera rate.** A GPU idle for a few milliseconds takes about 0.5 ms
+  longer to start the next frame (640x480 one tag at 16 ms gaps: 0.83 ms per frame against 0.21 back to
+  back). `Detect()` now learns the frame period and a helper thread submits two trivial dispatches 3 ms before
+  the next frame is due, giving 0.36 to 0.42 ms; back-to-back frames and irregular cadences are unaffected.
+  `DetectorConfig::prewarm_lead_us`, `prewarm_burst`, `prewarm_gap_us` (`APRILTAG_VK_PREWARM_LEAD_US=0` turns it
+  off), and `GpuDetector::Prewarm()` for an application that knows a frame is about to arrive.
+  `TrackingDetector` pre-warms before each keyframe (Orange Pi, keyframe 1.11 -> 0.87 ms at 16 ms gaps).
+
+### Fixed
+
+- **The keep-alive works on Windows.** Its wait rounded up to the 15.6 ms timer tick; it now uses a
+  high-resolution waitable timer, so `APRILTAG_VK_KEEPALIVE_MS=1` to `4` keeps a discrete GPU awake.
+
 ## 1.10.1 (2026-11-04)
 
 Release packaging only; the library is unchanged from 1.10.0.

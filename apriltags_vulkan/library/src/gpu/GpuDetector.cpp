@@ -294,13 +294,25 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   if (keepalive_ms < 0) {
     keepalive_ms = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 6 : 0;
   }
-  if (keepalive_ms > 0) {
+  int prewarm_lead_us = config_.prewarm_lead_us;
+  if (const char *v = std::getenv("APRILTAG_VK_PREWARM_LEAD_US")) prewarm_lead_us = std::atoi(v);
+  if (prewarm_lead_us < 0) prewarm_lead_us = 3000;
+  uint32_t prewarm_burst = config_.prewarm_burst;
+  if (const char *v = std::getenv("APRILTAG_VK_PREWARM_BURST")) prewarm_burst = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  uint32_t prewarm_gap_us = config_.prewarm_gap_us;
+  if (const char *v = std::getenv("APRILTAG_VK_PREWARM_GAP_US")) prewarm_gap_us = static_cast<uint32_t>(std::max(0, std::atoi(v)));
+  if (keepalive_ms > 0 || prewarm_lead_us > 0) {
     if (std::unique_ptr<vk::Lane> keepalive_lane = ctx_.CreateSiblingLane(lane_)) {
       keepalive_buf_ = vk::Buffer(ctx_, 4, kSsboUsage, vk::MemoryKind::DeviceLocal);
       keepalive_pl_ = vk::ComputePipeline(ctx_, ShaderPath("keepalive"), {keepalive_buf_.get()}, 0,
                                           vk::WorkgroupSize{1, 1, 1});
-      keepalive_ = std::make_unique<KeepAlive>(std::move(keepalive_lane), keepalive_pl_,
-                                               std::chrono::milliseconds(keepalive_ms));
+      KeepAlive::Options options;
+      options.interval = std::chrono::milliseconds(std::max(keepalive_ms, 0));
+      options.lead = std::chrono::microseconds(prewarm_lead_us);
+      options.burst = prewarm_burst;
+      if (const char *v = std::getenv("APRILTAG_VK_PREWARM_GROUPS")) options.groups = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+      options.burst_gap = std::chrono::microseconds(prewarm_gap_us);
+      keepalive_ = std::make_unique<KeepAlive>(std::move(keepalive_lane), keepalive_pl_, options);
     }
   }
 
@@ -1337,13 +1349,25 @@ void GpuDetector::SubmitTimed(const Submission &s) {
 }
 
 void GpuDetector::Detect(const uint8_t *gray_frame) {
-  if (keepalive_) keepalive_->Touch();
+  if (keepalive_) keepalive_->Touch(auto_prewarm_.load(std::memory_order_relaxed));
   try {
     DetectFrame(gray_frame);
   } catch (...) {
     DropPendingWait();
     throw;
   }
+}
+
+void GpuDetector::Prewarm() {
+  if (keepalive_) keepalive_->Prewarm();
+}
+
+void GpuDetector::NoteFrame() {
+  if (keepalive_) keepalive_->NoteFrame();
+}
+
+void GpuDetector::ExpectGpuFrame() {
+  if (keepalive_) keepalive_->ExpectGpuFrame();
 }
 
 void GpuDetector::DropPendingWait() noexcept {

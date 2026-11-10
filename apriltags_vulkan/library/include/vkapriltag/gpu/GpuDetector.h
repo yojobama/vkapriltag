@@ -74,6 +74,17 @@ struct DetectorConfig {
   // Env override: APRILTAG_VK_KEEPALIVE_MS=<ms>
   int keepalive_ms = -1;
 
+  // Predictive pre-warm: learns the frame period from Detect() calls and submits a short burst of
+  // trivial dispatches this many microseconds before the next frame is due, only while the cadence
+  // is regular. 0 disables; a negative value picks 3000. Prewarm()
+  // works whenever this is non-zero or keepalive_ms is positive.
+  // Env override: APRILTAG_VK_PREWARM_LEAD_US=<us>
+  int prewarm_lead_us = -1;
+  // Dispatches per pre-warm burst and the pause between them in microseconds.
+  // Env override: APRILTAG_VK_PREWARM_BURST=<n>, APRILTAG_VK_PREWARM_GAP_US=<us>
+  uint32_t prewarm_burst = 2;
+  uint32_t prewarm_gap_us = 1000;
+
   // Bounding-box aspect ratio cap (max(w,h)/min(w,h)) applied in select_blobs.comp; 0 disables.
   float aspect_max = 8.0f;
 
@@ -235,6 +246,17 @@ class GpuDetector {
   // Runs the GPU pipeline on one grayscale frame; results land in last_selected_extents and
   // last_line_fit_points.
   void Detect(const uint8_t *gray_frame);
+
+  // Submits a short burst of trivial dispatches now, so the GPU is awake for a frame about to
+  // arrive. Safe to call from any thread; does nothing unless the pre-warm helper exists (see
+  // prewarm_lead_us and keepalive_ms).
+  void Prewarm();
+  // For callers that skip Detect() on some frames (see TrackingDetector): NoteFrame() records the
+  // arrival of a frame that does not use the GPU, ExpectGpuFrame() arms the predictive burst for the
+  // next frame, and SetAutoPrewarm(false) stops Detect() arming it.
+  void NoteFrame();
+  void ExpectGpuFrame();
+  void SetAutoPrewarm(bool enabled) { auto_prewarm_.store(enabled, std::memory_order_relaxed); }
 
   // Registers an external frame buffer so Detect(key) reads it in place, without the upload copy.
   // The buffer holds the packed 8-bit frame, `bytes` >= width * height, and must outlive the
@@ -488,6 +510,7 @@ class GpuDetector {
   vk::Buffer keepalive_buf_;
   vk::ComputePipeline keepalive_pl_;
   std::unique_ptr<KeepAlive> keepalive_;
+  std::atomic<bool> auto_prewarm_{true};
   bool prerecord_ = false;
   // Whether this frame recorded anything (false when every submission was a cached replay).
   bool recorded_this_frame_ = false;
