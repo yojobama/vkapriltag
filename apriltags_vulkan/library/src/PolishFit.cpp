@@ -22,7 +22,7 @@ struct ProfCounters {
   long tags = 0, pixels = 0, evals = 0;
   long hist[10][10] = {};
   ~ProfCounters() {
-    if (tags == 0) return;
+    if (tags == 0 || std::getenv("APRILTAG_VK_POLISH_PROF") == nullptr) return;
     static const char *names[12] = {"setup", "cand", "scan", "select", "freeze+lev", "opt-model", "opt-accum", "motion", "final", "total", "gather", "dots"};
     for (int i = 0; i < 12; ++i) std::fprintf(stderr, "PROF %-10s %8.1f us/tag\n", names[i], t[i] * 1e6 / tags);
     for (int a = 1; a < 10; ++a) {
@@ -63,10 +63,12 @@ int MaxPixels() {
 }
 
 struct Knobs {
-  double blur_extra, hstride, base_window, win_mult, min_win, smax_mult, tol, iters, full, scan_n, reach, fast;
+  double blur_extra, hstride, base_window, win_mult, min_win, smax_mult, tol, iters, full, scan_n, reach, fast, slopes, slope_t;
   Knobs() {
     hstride = Get("APRILTAG_VK_POLISH_HSTRIDE", 1);
     fast = Get("APRILTAG_VK_POLISH_FAST", 0);
+    slopes = Get("APRILTAG_VK_POLISH_SLOPES", 1);
+    slope_t = Get("APRILTAG_VK_POLISH_SLOPE_T", 0.9);
     blur_extra = Get("APRILTAG_VK_POLISH_BLUREXTRA", 2.0);
     base_window = Get("APRILTAG_VK_POLISH_BASEWIN", 3.0);
     win_mult = Get("APRILTAG_VK_POLISH_WINMULT", 0.8);
@@ -285,6 +287,7 @@ struct Params {
   double s[3] = {1, 1, 0};
   double lev[3] = {20, 235, 235};  // black, white, outside
   double lx = 0, ly = 0;           // relative illumination slope per normalised pixel
+  bool slope_fit = false;          // fast path: the slope is refitted linearly at every evaluation
   double smax = 8;                 // upper bound of the Gaussian blur widths
 };
 
@@ -531,7 +534,6 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
 // unknown cell, on the lattice of `box.thin`, with the cell window of each pixel frozen for reach_px.
 void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px, const BoxInfo &box, const image_u8_t *im) {
   const int W = f->width;
-  f->Clear();
   f->n = 0;
   if (box.x1 < box.x0 || box.y1 < box.y0) return;
   const float g0 = static_cast<float>(map.g[0]), g1 = static_cast<float>(map.g[1]), g2 = static_cast<float>(map.g[2]);
@@ -548,23 +550,28 @@ void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px
   const int lr = std::max(1, static_cast<int>(std::lround(k * 0.382)));
   const int x0 = box.x0, x1 = box.x1;
   const int width = (x1 - x0) / k + 2;
-  thread_local std::vector<float> row_u, row_v, row_gu, row_gv;
+  thread_local std::vector<float> row_u, row_v, row_gu;
   row_u.resize(width);
   row_v.resize(width);
   row_gu.resize(width);
-  row_gv.resize(width);
-  const size_t cap = static_cast<size_t>((box.y1 - box.y0) / k + 2) * static_cast<size_t>(width);
-  f->x.resize(cap);
-  f->y.resize(cap);
-  f->obs.resize(cap);
-  f->u0.resize(cap);
-  f->v0.resize(cap);
-  f->gu.resize(cap);
-  f->gv.resize(cap);
-  f->i0.resize(cap);
-  f->j0.resize(cap);
-  f->nu.resize(cap);
-  f->nv.resize(cap);
+  const size_t cap = static_cast<size_t>(box.y1 - box.y0 + 1) * static_cast<size_t>(width);
+  const auto grow = [cap](auto &v) {
+    if (v.size() < cap) v.resize(cap);
+  };
+  grow(f->x);
+  grow(f->y);
+  grow(f->obs);
+  grow(f->u0);
+  grow(f->v0);
+  grow(f->gu);
+  grow(f->gv);
+  grow(f->i0);
+  grow(f->j0);
+  grow(f->nu);
+  grow(f->nv);
+  grow(f->A);
+  grow(f->B);
+  grow(f->C);
   size_t out = 0;
   for (int py = box.y0; py <= box.y1; ++py) {
     const uint8_t *row = im->buf + static_cast<size_t>(py) * im->stride;
@@ -582,16 +589,17 @@ void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px
       const float u = (g0 * x + a0) * iw, v = (g3 * x + b0) * iw;
       row_u[i] = u;
       row_v[i] = v;
-      const float gux = (g0 - u * g6) * iw, guy = (g1 - u * g7) * iw;
-      const float gvx = (g3 - v * g6) * iw, gvy = (g4 - v * g7) * iw;
-      row_gu[i] = std::sqrt(gux * gux + guy * guy) * inv_scale;
-      row_gv[i] = std::sqrt(gvx * gvx + gvy * gvy) * inv_scale;
+      row_gu[i] = iw;
     }
     for (int i = 0; i < count; ++i) {
       const float u = row_u[i], v = row_v[i];
       if (u < -ext || u > lim || v < -ext || v > lim) continue;
       if (FloorI(u - rmax) == FloorI(u + rmax) && FloorI(v - rmax) == FloorI(v + rmax)) continue;
-      const float gu = row_gu[i], gv = row_gv[i];
+      const float iw = row_gu[i];
+      const float gux = (g0 - u * g6) * iw, guy = (g1 - u * g7) * iw;
+      const float gvx = (g3 - v * g6) * iw, gvy = (g4 - v * g7) * iw;
+      const float gu = std::sqrt(gux * gux + guy * guy) * inv_scale;
+      const float gv = std::sqrt(gvx * gvx + gvy * gvy) * inv_scale;
       const float ru = hw * gu, rv = hw * gv;
       const int i0 = std::clamp(FloorI(u - ru), -1, W), i1 = std::clamp(FloorI(u + ru), -1, W);
       const int j0 = std::clamp(FloorI(v - rv), -1, W), j1 = std::clamp(FloorI(v + rv), -1, W);
@@ -635,20 +643,6 @@ void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px
     }
   }
   f->n = static_cast<int>(out);
-  f->x.resize(out);
-  f->y.resize(out);
-  f->obs.resize(out);
-  f->u0.resize(out);
-  f->v0.resize(out);
-  f->gu.resize(out);
-  f->gv.resize(out);
-  f->i0.resize(out);
-  f->j0.resize(out);
-  f->nu.resize(out);
-  f->nv.resize(out);
-  f->A.resize(out);
-  f->B.resize(out);
-  f->C.resize(out);
 }
 
 // Fixes each pixel's column and row window for blur widths up to sigma_px.
@@ -696,7 +690,7 @@ void ModelPass(Fit *f, const Params &p) {
   const float s0 = static_cast<float>(p.s[0]), s1 = static_cast<float>(p.s[1]), s2 = static_cast<float>(p.s[2]);
   const int W = f->width;
   const float inv_scale = static_cast<float>(1.0 / f->scale);
-  if (Deriv) f->J.resize(static_cast<size_t>(f->n) * kStrideJ);
+  if (Deriv && f->J.size() < static_cast<size_t>(f->n) * kStrideJ) f->J.resize(static_cast<size_t>(f->n) * kStrideJ);
   Axis au, av;
   if (Deriv && !Box && f->n > 300) {
     for (int idx = 0; idx < f->n; ++idx) ++g_prof_local.hist[std::min(9, static_cast<int>(f->nu[idx]))][std::min(9, static_cast<int>(f->nv[idx]))];
@@ -949,6 +943,29 @@ bool FitLevels(const Fit &f, Params *p, double *sse = nullptr) {
   return true;
 }
 
+// Fits the relative illumination slope by linear least squares at fixed levels and geometry; returns the
+// ratio of the squared residual after to before.
+double FitSlopes(const Fit &f, Params *p) {
+  double sxx = 0, sxy = 0, syy = 0, sxr = 0, syr = 0, sse = 0;
+  const float L0 = static_cast<float>(p->lev[0]), L1 = static_cast<float>(p->lev[1]), L2 = static_cast<float>(p->lev[2]);
+  for (int idx = 0; idx < f.n; ++idx) {
+    const float base = L0 * f.A[idx] + L1 * f.B[idx] + L2 * f.C[idx];
+    const float r = f.obs[idx] - base;
+    const float cx = base * f.x[idx], cy = base * f.y[idx];
+    sxx += cx * cx;
+    sxy += cx * cy;
+    syy += cy * cy;
+    sxr += cx * r;
+    syr += cy * r;
+    sse += static_cast<double>(r) * r;
+  }
+  const double det = sxx * syy - sxy * sxy;
+  if (!(det > 1e-12 * (sxx * syy + 1e-30)) || sse <= 0) return 1.0;
+  p->lx = (syy * sxr - sxy * syr) / det;
+  p->ly = (sxx * syr - sxy * sxr) / det;
+  return (sse - (p->lx * sxr + p->ly * syr)) / sse;
+}
+
 // The median absolute residual of the current model over every third pixel (a cheap robust scale).
 double MedianAbsResidual(const Fit &f, const Params &p) {
   thread_local std::vector<float> res;
@@ -1111,17 +1128,20 @@ inline void Dot4(const float *a, const float *b0, const float *b1, const float *
 void EvaluateFast(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_model = true) {
   const bool normal = mode >= 1;
   const double tp0 = NowS();
-  if (run_model) RunModel(f, *p, normal);
+  if (run_model) {
+    RunModel(f, *p, normal);
+    if (p->slope_fit) FitSlopes(*f, p);
+  }
   const double tp1 = NowS();
   g_prof_local.t[5] += tp1 - tp0;
   ++g_prof_local.evals;
   const int n = f->n;
   const float kc = static_cast<float>(kcut);
   const int ng = p->box ? 11 : 10;
-  const int nt = ng + 5;
+  const int nt = ng + (kKnobs.slopes != 0 ? 5 : 3);
   const int stride = (n + 7) & ~7;
   thread_local std::vector<float> buf;
-  if (normal) buf.resize(static_cast<size_t>(nt + 1) * stride);
+  if (normal && buf.size() < static_cast<size_t>(nt + 1) * stride) buf.resize(static_cast<size_t>(nt + 1) * stride);
   float *base_col = buf.data();
   const float L0 = static_cast<float>(p->lev[0]), L1 = static_cast<float>(p->lev[1]), L2 = static_cast<float>(p->lev[2]);
   const float lx = static_cast<float>(p->lx), ly = static_cast<float>(p->ly);
@@ -1146,9 +1166,11 @@ void EvaluateFast(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run
       dst[static_cast<size_t>(ng) * stride] = g * a;
       dst[static_cast<size_t>(ng + 1) * stride] = g * bb;
       dst[static_cast<size_t>(ng + 2) * stride] = g * c;
-      const float sb = sw * base;
-      dst[static_cast<size_t>(ng + 3) * stride] = sb * f->x[idx];
-      dst[static_cast<size_t>(ng + 4) * stride] = sb * f->y[idx];
+      if (kKnobs.slopes != 0) {
+        const float sb = sw * base;
+        dst[static_cast<size_t>(ng + 3) * stride] = sb * f->x[idx];
+        dst[static_cast<size_t>(ng + 4) * stride] = sb * f->y[idx];
+      }
       dst[static_cast<size_t>(nt) * stride] = sw * r;
     }
     ++count;
@@ -1205,12 +1227,14 @@ void ApplyStep(const double *delta, Params *q) {
     q->s[1] = std::clamp(q->s[1] + delta[9], 0.35, q->smax);
   }
   for (int k = 0; k < 3; ++k) q->lev[k] += delta[ng + k];
-  q->lx += delta[ng + 3];
-  q->ly += delta[ng + 4];
+  if (!(kKnobs.fast != 0 && kKnobs.slopes == 0)) {
+    q->lx += delta[ng + 3];
+    q->ly += delta[ng + 4];
+  }
 }
 
 bool SolveStep(const Accum &cur, bool box, double lambda, double *delta) {
-  const int nt = (box ? 11 : 10) + 5;
+  const int nt = (box ? 11 : 10) + (kKnobs.fast != 0 && kKnobs.slopes == 0 ? 3 : 5);
   double a[kMaxT][kMaxT], b[kMaxT];
   for (int r = 0; r < nt; ++r) {
     const double diag = std::max(cur.jtj[r][r], 1e-9);
@@ -1450,6 +1474,16 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   if (fast) ModelPass<false, true>(&fit, p);
   else ModelPass<false, false>(&fit, p);
   FitLevels(fit, &p);
+  if (fast && kKnobs.slopes == 0) {
+    const double ratio = FitSlopes(fit, &p);
+    if (std::getenv("APRILTAG_VK_POLISH_PROF") != nullptr) std::fprintf(stderr, "SLOPE %.5f %.4f %.4f\n", ratio, p.lx, p.ly);
+    if (ratio > kKnobs.slope_t) {
+      p.lx = p.ly = 0;
+    } else {
+      p.slope_fit = true;
+      FitLevels(fit, &p);
+    }
+  }
 
   const double kcut = std::max(6.0, 4.0 * 1.4826 * MedianAbsResidual(fit, p));
   g_prof_local.t[4] += NowS() - tq;
