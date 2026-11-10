@@ -296,9 +296,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   }
   int prewarm_lead_us = config_.prewarm_lead_us;
   if (const char *v = std::getenv("APRILTAG_VK_PREWARM_LEAD_US")) prewarm_lead_us = std::atoi(v);
-  if (prewarm_lead_us < 0) {
-    prewarm_lead_us = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3000 : 0;
-  }
+  if (prewarm_lead_us < 0) prewarm_lead_us = 3000;
   uint32_t prewarm_burst = config_.prewarm_burst;
   if (const char *v = std::getenv("APRILTAG_VK_PREWARM_BURST")) prewarm_burst = static_cast<uint32_t>(std::max(1, std::atoi(v)));
   uint32_t prewarm_gap_us = config_.prewarm_gap_us;

@@ -76,7 +76,7 @@ struct DetectorConfig {
 
   // Predictive pre-warm: learns the frame period from Detect() calls and submits a short burst of
   // trivial dispatches this many microseconds before the next frame is due, only while the cadence
-  // is regular. 0 disables; a negative value picks 3000 on discrete GPUs and 0 elsewhere. Prewarm()
+  // is regular. 0 disables; a negative value picks 3000. Prewarm()
   // works whenever this is non-zero or keepalive_ms is positive.
   // Env override: APRILTAG_VK_PREWARM_LEAD_US=<us>
   int prewarm_lead_us = -1;
