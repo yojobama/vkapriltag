@@ -9,33 +9,10 @@
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
-#include <chrono>
-#include <cstdio>
 #include <vector>
 
 namespace apriltag_vulkan {
 namespace {
-
-struct ProfCounters {
-  double t[12] = {};
-  long n[12] = {};
-  long tags = 0, pixels = 0, evals = 0;
-  long hist[10][10] = {};
-  ~ProfCounters() {
-    if (tags == 0 || std::getenv("APRILTAG_VK_POLISH_PROF") == nullptr) return;
-    static const char *names[12] = {"setup", "cand", "scan", "select", "freeze+lev", "opt-model", "opt-accum", "motion", "final", "total", "gather", "dots"};
-    for (int i = 0; i < 12; ++i) std::fprintf(stderr, "PROF %-10s %8.1f us/tag\n", names[i], t[i] * 1e6 / tags);
-    for (int a = 1; a < 10; ++a) {
-      for (int b = 1; b < 10; ++b) {
-        if (hist[a][b] > 0) std::fprintf(stderr, "HIST nu=%d nv=%d %.1f%%\n", a, b, 100.0 * hist[a][b] / (pixels > 0 ? pixels : 1));
-      }
-    }
-    std::fprintf(stderr, "PROF box area/tag %.0f\n", static_cast<double>(n[0]) / tags);
-    std::fprintf(stderr, "PROF tags %ld px/tag %.0f evals/tag %.2f\n", tags, static_cast<double>(pixels) / tags, static_cast<double>(evals) / tags);
-  }
-};
-thread_local ProfCounters g_prof_local;
-inline double NowS() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 constexpr int kMaxCells = 16;        // widest supported grid
 constexpr int kPad = kMaxCells + 2;  // class grid with one outside row and column on each side
@@ -43,7 +20,6 @@ constexpr int kMaxC = 8;             // columns (or rows) one pixel's frozen win
 constexpr int kMaxJ = 11;            // homography plus up to three blur parameters
 constexpr int kMotionPixels = 800;  // working-set size of the motion-blur search
 constexpr int kMaxT = 16;           // all parameters: geometry, blur, three levels, two slopes
-
 
 unsigned DevFlags() {
   static const unsigned v = [] {
@@ -386,7 +362,6 @@ void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px
   const float ext = 0.8f, lim = static_cast<float>(W) + ext;
   const float cxf = static_cast<float>(f->cx), cyf = static_cast<float>(f->cy);
   const int k = box.thin;
-  g_prof_local.n[0] += static_cast<long>(box.area);
   const int lr = std::max(1, static_cast<int>(std::lround(k * 0.382)));
   const int x0 = box.x0, x1 = box.x1;
   const int width = (x1 - x0) / k + 2;
@@ -534,9 +509,6 @@ void ModelPass(Fit *f, const Params &p) {
   if (Deriv && f->J.size() < (kMaxT + 1) * js) f->J.resize((kMaxT + 1) * js);
   float *const Jb = f->J.data();
   Axis au, av;
-  if (Deriv && !Box && f->n > 300) {
-    for (int idx = 0; idx < f->n; ++idx) ++g_prof_local.hist[std::min(9, static_cast<int>(f->nu[idx]))][std::min(9, static_cast<int>(f->nv[idx]))];
-  }
   for (int idx = 0; idx < f->n; ++idx) {
     const float x = f->x[idx], y = f->y[idx];
     const float iw = 1.0f / (g6 * x + g7 * y + 1.0f);
@@ -855,11 +827,7 @@ inline void Dot4(const float *a, const float *b0, const float *b1, const float *
 // blur, level and illumination slope parameters over the Huber-weighted residuals.
 void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_model = true) {
   const bool normal = mode >= 1;
-  const double tp0 = NowS();
   if (run_model) RunModel(f, *p, normal);
-  const double tp1 = NowS();
-  g_prof_local.t[5] += tp1 - tp0;
-  ++g_prof_local.evals;
   const int n = f->n;
   const float kc = static_cast<float>(kcut);
   const int ng = p->box ? 11 : 10;
@@ -898,8 +866,6 @@ void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_mod
   }
   acc->cost = cost;
   acc->n = count;
-  const double tp2 = NowS();
-  g_prof_local.t[10] += tp2 - tp1;
   if (normal) {
     for (int k = 0; k < ng; ++k) {
       float *col = cols + static_cast<size_t>(k) * stride;
@@ -928,8 +894,6 @@ void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_mod
       }
     }
   }
-  g_prof_local.t[11] += NowS() - tp2;
-  g_prof_local.t[6] += NowS() - tp1;
 }
 
 // Applies a solved step to the parameters.
@@ -1013,18 +977,9 @@ double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int wi
   return cur.cost;
 }
 
-
 }  // namespace
 
 bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
-  const double tt0 = NowS();
-  struct Done {
-    double t0;
-    ~Done() {
-      g_prof_local.t[9] += NowS() - t0;
-      ++g_prof_local.tags;
-    }
-  } done{tt0};
   const apriltag_family_t *fam = det->family;
   if (fam == nullptr || fam->reversed_border) return false;
   const int W = static_cast<int>(fam->width_at_border);
@@ -1085,14 +1040,10 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   CellCorners(start, W, start_corners);
 
   const int limit = MaxPixels();
-  double tq = NowS();
-  g_prof_local.t[0] += tq - tt0;
   BoxInfo box;
   ComputeBox(fit, p.map, limit, im, &box);
   const int thin = box.thin;
   BuildScan(&scan, fit, p.map, cell_px, im);
-  g_prof_local.t[1] += NowS() - tq;
-  tq = NowS();
   if (scan.n < 40) return false;
   const double candidates[] = {0.7, 1.2, 2.0, 3.5};
   double best_cost = 1e300, best_s = 1.0;
@@ -1113,7 +1064,6 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   }
   p.s[0] = p.s[1] = best_s;
   std::copy(best_lev, best_lev + 3, p.lev);
-  g_prof_local.t[2] += NowS() - tq;
   if (thin > 1 && (DevFlags() & 16) == 0) {
     // A tag too large for the working set keeps its profile fit unless it is blurred or clipped.
     size_t saturated = 0;
@@ -1148,29 +1098,20 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   const double window_mult = kKnobs.win_mult;
   double window = std::min(window_mult * best_s + 0.3 + kKnobs.blur_extra * std::max(0.0, best_s - 1.2), 0.75 * cell_px + 0.5);
   window = std::max(window, kKnobs.min_win);
-  tq = NowS();
   const double reach_s = std::min(kKnobs.smax_mult * best_s, 8.0);
   if (best_s >= 1.2) box.thin = std::max(box.thin, 2);
   BuildFit(&fit, p.map, window, kKnobs.reach * reach_s, box, im);
-  g_prof_local.t[3] += NowS() - tq;
-  tq = NowS();
   if (fit.n < 40) return false;
-  g_prof_local.pixels += fit.n;
   p.smax = reach_s;
   ModelPass<false, true>(&fit, p);
   FitLevels(fit, &p);
 
   const double kcut = std::max(6.0, 4.0 * 1.4826 * MedianAbsResidual(fit, p));
-  g_prof_local.t[4] += NowS() - tq;
-  tq = NowS();
   double start_cost = 0;
   const double tol = kKnobs.tol;
   const int iters = static_cast<int>(kKnobs.iters);
   double cost = Optimise(&fit, &p, kcut, iters, tol, W, &start_cost, true);
 
-  const double topt = NowS() - tq;
-  (void)topt;
-  tq = NowS();
   bool moving_accepted = false;
   if (std::max(p.s[0], p.s[1]) > 1.4 && (DevFlags() & 8) == 0) {
     // A wide blur may be motion: refit with a Gaussian blur plus a straight blur segment.
@@ -1252,7 +1193,6 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
     }
   }
 
-  g_prof_local.t[7] += NowS() - tq;
   if (!moving_accepted && cost > start_cost) return false;
   double corners[4][2];
   CellCorners(p.map, W, corners);
