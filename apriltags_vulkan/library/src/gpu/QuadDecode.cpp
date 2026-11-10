@@ -32,6 +32,10 @@ constexpr double kMinRescueGradient = 60.0;
 constexpr size_t kRescueFlatPoints = 64;
 constexpr double kRescueFlatGradient = 25.0;
 constexpr size_t kMaxRescueBoxes = 64;
+// Most full-resolution refits per frame, taken from the candidates scored nearest a small tag.
+constexpr size_t kMaxRescueRefits = 4;
+constexpr double kRescueIdealSide = 14.0;
+constexpr double kRescueGradientWeight = 0.05;
 
 // Hypotenuse of two floats, evaluated in double and rounded once to float.
 inline float Hypot(float x, float y) {
@@ -950,6 +954,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
         (yhi - ylo) * d <= kMaxRescueBox) {
       r.has_box = true;
       r.box.coarse = true;
+      r.box.gradient = static_cast<float>(mean_w);
       const double xs[4] = {xlo * d, xhi * d, xhi * d, xlo * d}, ys[4] = {ylo * d, ylo * d, yhi * d, yhi * d};
       for (int k = 0; k < 4; ++k) r.box.p[k][0] = xs[k], r.box.p[k][1] = ys[k];
     }
@@ -1001,21 +1006,21 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   }
 
   // Boxes of fragments of one small tag are merged, so each tag is refitted once.
-  std::vector<std::array<double, 4>> boxes;
+  std::vector<std::array<double, 5>> boxes;
   for (const SpanResult &r : per_span) {
-    if (r.has_box && !r.has_quad) boxes.push_back({r.box.p[0][0], r.box.p[0][1], r.box.p[2][0], r.box.p[2][1]});
+    if (r.has_box && !r.has_quad) boxes.push_back({r.box.p[0][0], r.box.p[0][1], r.box.p[2][0], r.box.p[2][1], r.box.gradient});
   }
   for (bool merged = !boxes.empty() && boxes.size() <= kMaxRescueBoxes; merged;) {
     merged = false;
     for (size_t a = 0; a < boxes.size() && !merged; ++a) {
       for (size_t b = a + 1; b < boxes.size() && !merged; ++b) {
-        const std::array<double, 4> &u = boxes[a], &v = boxes[b];
+        const std::array<double, 5> &u = boxes[a], &v = boxes[b];
         const double x0 = std::min(u[0], v[0]), y0 = std::min(u[1], v[1]);
         const double x1 = std::max(u[2], v[2]), y1 = std::max(u[3], v[3]);
         const bool near = v[0] <= u[2] + kRescueMergeGap && u[0] <= v[2] + kRescueMergeGap &&
                           v[1] <= u[3] + kRescueMergeGap && u[1] <= v[3] + kRescueMergeGap;
         if (near && x1 - x0 <= kMaxRescueBox && y1 - y0 <= kMaxRescueBox) {
-          boxes[a] = {x0, y0, x1, y1};
+          boxes[a] = {x0, y0, x1, y1, std::max(u[4], v[4])};
           boxes.erase(boxes.begin() + static_cast<std::ptrdiff_t>(b));
           merged = true;
         }
@@ -1025,6 +1030,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   if (boxes.size() > kMaxRescueBoxes) boxes.resize(kMaxRescueBoxes);
   // A box whose centre lies inside a fitted quad is a data cell of a larger tag, not a small tag.
   const size_t n_quads = output.size();
+  const bool rescue_enabled = config_.small_tag_rescue && config_.decimation > 1;
   auto inside_quad = [&](double x, double y) {
     for (size_t i = 0; i < n_quads; ++i) {
       const DetectedQuad &q = output[i];
@@ -1038,13 +1044,49 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
     return false;
   };
-  for (const std::array<double, 4> &bx : boxes) {
+  struct Candidate {
+    double score;
+    size_t index;
+    bool is_box;
+  };
+  std::vector<Candidate> candidates;
+  std::vector<DetectedQuad> box_quads;
+  auto score = [](double side, double gradient) { return -std::abs(side - kRescueIdealSide) - gradient * kRescueGradientWeight; };
+  if (rescue_enabled) {
+    for (size_t i = 0; i < n_quads; ++i) {
+      const DetectedQuad &q = output[i];
+      if (q.coarse || q.gradient < kMinRescueGradient) continue;
+      double lo_x = 1e30, hi_x = -1e30, lo_y = 1e30, hi_y = -1e30;
+      for (int k = 0; k < 4; ++k) {
+        lo_x = std::min(lo_x, q.p[k][0]), hi_x = std::max(hi_x, q.p[k][0]);
+        lo_y = std::min(lo_y, q.p[k][1]), hi_y = std::max(hi_y, q.p[k][1]);
+      }
+      if (hi_x - lo_x <= kMaxRescueBox && hi_y - lo_y <= kMaxRescueBox) {
+        candidates.push_back({score(std::max(hi_x - lo_x, hi_y - lo_y), q.gradient), i, false});
+      }
+    }
+  }
+  for (const std::array<double, 5> &bx : boxes) {
     if (inside_quad(0.5 * (bx[0] + bx[2]), 0.5 * (bx[1] + bx[3]))) continue;
     DetectedQuad box;
     box.coarse = true;
     const double xs[4] = {bx[0], bx[2], bx[2], bx[0]}, ys[4] = {bx[1], bx[1], bx[3], bx[3]};
     for (int k = 0; k < 4; ++k) box.p[k][0] = xs[k], box.p[k][1] = ys[k];
-    output.push_back(box);
+    candidates.push_back({score(std::max(bx[2] - bx[0], bx[3] - bx[1]), bx[4]), box_quads.size(), true});
+    box_quads.push_back(box);
+  }
+  // Only the most tag-like candidates are refitted from the full-resolution image.
+  if (candidates.size() > kMaxRescueRefits) {
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+      return a.score != b.score ? a.score > b.score : (a.is_box != b.is_box ? !a.is_box : a.index < b.index);
+    });
+    for (size_t c = kMaxRescueRefits; c < candidates.size(); ++c) {
+      if (!candidates[c].is_box) output[candidates[c].index].gradient = 0.0f;
+    }
+    candidates.resize(kMaxRescueRefits);
+  }
+  for (const Candidate &c : candidates) {
+    if (c.is_box) output.push_back(box_quads[c.index]);
   }
 
   return output;

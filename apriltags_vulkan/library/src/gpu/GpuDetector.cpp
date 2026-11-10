@@ -161,6 +161,8 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) config_.small_tag_rescue = v[0] != '0';
   if (config_.small_tag_rescue && config_.decimation > 1) {
     config_.min_cluster_pixels = std::min<uint32_t>(config_.min_cluster_pixels, 8u);
+    // Raises the contrast floor so noise specks of 8 to 24 pixels are not labelled.
+    config_.min_white_black_diff = std::max<uint32_t>(config_.min_white_black_diff, 8u);
   }
   if (config_.min_tag_pixels > 0) {
     // Perimeter, in decimated pixels, of a square tag whose side is min_tag_pixels.
