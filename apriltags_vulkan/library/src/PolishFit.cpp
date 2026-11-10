@@ -41,7 +41,6 @@ constexpr int kMaxCells = 16;        // widest supported grid
 constexpr int kPad = kMaxCells + 2;  // class grid with one outside row and column on each side
 constexpr int kMaxC = 8;             // columns (or rows) one pixel's frozen window may hold
 constexpr int kMaxJ = 11;            // homography plus up to three blur parameters
-constexpr int kStrideJ = 12;
 constexpr int kMaxT = 16;           // all parameters: geometry, blur, three levels, two slopes
 
 
@@ -193,7 +192,7 @@ struct Fit {
   std::vector<int8_t> i0, j0;
   std::vector<uint8_t> nu, nv;
   std::vector<float> A, B, C;  // black (plus half the unknown), white (plus half the unknown), outside coverage
-  std::vector<float> J;        // kStrideJ columns per pixel: derivative of the base prediction
+  std::vector<float> J;        // columns of the Jacobian and weighted system, each padded to a multiple of 8 pixels
   void Clear() {
     n = 0;
     x.clear();
@@ -530,7 +529,9 @@ void ModelPass(Fit *f, const Params &p) {
   const float s0 = static_cast<float>(p.s[0]), s1 = static_cast<float>(p.s[1]), s2 = static_cast<float>(p.s[2]);
   const int W = f->width;
   const float inv_scale = static_cast<float>(1.0 / f->scale);
-  if (Deriv && f->J.size() < static_cast<size_t>(f->n) * kStrideJ) f->J.resize(static_cast<size_t>(f->n) * kStrideJ);
+  const size_t js = static_cast<size_t>((f->n + 7) & ~7);
+  if (Deriv && f->J.size() < (kMaxT + 1) * js) f->J.resize((kMaxT + 1) * js);
+  float *const Jb = f->J.data();
   Axis au, av;
   if (Deriv && !Box && f->n > 300) {
     for (int idx = 0; idx < f->n; ++idx) ++g_prof_local.hist[std::min(9, static_cast<int>(f->nu[idx]))][std::min(9, static_cast<int>(f->nv[idx]))];
@@ -563,19 +564,18 @@ void ModelPass(Fit *f, const Params &p) {
         const float d = (lv[cl_hi] - lv[cl_lo]) * pp * inv_s;
         const float pu = ua ? d : 0.0f, pv = ua ? 0.0f : d;
         const float pb = d * z;
-        float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
         const float xi = x * iw, yi = y * iw;
         const float q = pu * u + pv * v;
-        J[0] = pu * xi;
-        J[1] = pu * yi;
-        J[2] = pu * iw;
-        J[3] = pv * xi;
-        J[4] = pv * yi;
-        J[5] = pv * iw;
-        J[6] = -q * xi;
-        J[7] = -q * yi;
-        J[8] = ua ? pb * gu : 0.0f;
-        J[9] = ua ? 0.0f : pb * gv;
+        Jb[0 * js + idx] = pu * xi;
+        Jb[1 * js + idx] = pu * yi;
+        Jb[2 * js + idx] = pu * iw;
+        Jb[3 * js + idx] = pv * xi;
+        Jb[4 * js + idx] = pv * yi;
+        Jb[5 * js + idx] = pv * iw;
+        Jb[6 * js + idx] = -q * xi;
+        Jb[7 * js + idx] = -q * yi;
+        Jb[8 * js + idx] = ua ? pb * gu : 0.0f;
+        Jb[9 * js + idx] = ua ? 0.0f : pb * gv;
       }
       continue;
     }
@@ -600,19 +600,18 @@ void ModelPass(Fit *f, const Params &p) {
         const float l00 = lv[c00], l10 = lv[c10], l01 = lv[c01], l11 = lv[c11];
         const float pu = pdu * inv_su * (b0 * (l10 - l00) + b1 * (l11 - l01));
         const float pv = pdv * inv_sv * (a0 * (l01 - l00) + a1 * (l11 - l10));
-        float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
         const float xi = x * iw, yi = y * iw;
         const float q = pu * u + pv * v;
-        J[0] = pu * xi;
-        J[1] = pu * yi;
-        J[2] = pu * iw;
-        J[3] = pv * xi;
-        J[4] = pv * yi;
-        J[5] = pv * iw;
-        J[6] = -q * xi;
-        J[7] = -q * yi;
-        J[8] = zu * pu * gu;
-        J[9] = zv * pv * gv;
+        Jb[0 * js + idx] = pu * xi;
+        Jb[1 * js + idx] = pu * yi;
+        Jb[2 * js + idx] = pu * iw;
+        Jb[3 * js + idx] = pv * xi;
+        Jb[4 * js + idx] = pv * yi;
+        Jb[5 * js + idx] = pv * iw;
+        Jb[6 * js + idx] = -q * xi;
+        Jb[7 * js + idx] = -q * yi;
+        Jb[8 * js + idx] = zu * pu * gu;
+        Jb[9 * js + idx] = zv * pv * gv;
       }
       continue;
     }
@@ -670,8 +669,7 @@ void ModelPass(Fit *f, const Params &p) {
       f->B[idx] = S[1] + 0.5f * S[3];
       f->C[idx] = S[2];
       if (Deriv) {
-        float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
-        for (int k = 0; k < kMaxJ; ++k) J[k] = Jt[k];
+        for (int k = 0; k < kMaxJ; ++k) Jb[k * js + idx] = Jt[k];
       }
       continue;
     }
@@ -699,19 +697,18 @@ void ModelPass(Fit *f, const Params &p) {
     f->B[idx] = S[1] + 0.5f * S[3];
     f->C[idx] = S[2];
     if (Deriv) {
-      float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
       const float xi = x * iw, yi = y * iw;
       const float q = pu * u + pv * v;
-      J[0] = pu * xi;
-      J[1] = pu * yi;
-      J[2] = pu * iw;
-      J[3] = pv * xi;
-      J[4] = pv * yi;
-      J[5] = pv * iw;
-      J[6] = -q * xi;
-      J[7] = -q * yi;
-      J[8] = pbu * gu;
-      J[9] = pbv * gv;
+      Jb[0 * js + idx] = pu * xi;
+      Jb[1 * js + idx] = pu * yi;
+      Jb[2 * js + idx] = pu * iw;
+      Jb[3 * js + idx] = pv * xi;
+      Jb[4 * js + idx] = pv * yi;
+      Jb[5 * js + idx] = pv * iw;
+      Jb[6 * js + idx] = -q * xi;
+      Jb[7 * js + idx] = -q * yi;
+      Jb[8 * js + idx] = pbu * gu;
+      Jb[9 * js + idx] = pbv * gv;
     }
   }
 }
@@ -853,13 +850,12 @@ inline void Dot4(const float *a, const float *b0, const float *b1, const float *
   out[3] = VSum(s3) + VSum(t3);
 }
 
-// As Evaluate, but the weighted columns are gathered first and the normal equations formed as dot products.
+// Evaluates the model at p and accumulates the cost and, with mode 2, the normal equations of the geometry,
+// blur, level and illumination slope parameters over the Huber-weighted residuals.
 void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_model = true) {
   const bool normal = mode >= 1;
   const double tp0 = NowS();
-  if (run_model) {
-    RunModel(f, *p, normal);
-  }
+  if (run_model) RunModel(f, *p, normal);
   const double tp1 = NowS();
   g_prof_local.t[5] += tp1 - tp0;
   ++g_prof_local.evals;
@@ -868,9 +864,9 @@ void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_mod
   const int ng = p->box ? 11 : 10;
   const int nt = ng + 5;
   const int stride = (n + 7) & ~7;
-  thread_local std::vector<float> buf;
-  if (normal && buf.size() < static_cast<size_t>(nt + 1) * stride) buf.resize(static_cast<size_t>(nt + 1) * stride);
-  float *base_col = buf.data();
+  float *const cols = f->J.data();
+  thread_local std::vector<float> gw;
+  if (normal && gw.size() < static_cast<size_t>(stride)) gw.resize(stride);
   const float L0 = static_cast<float>(p->lev[0]), L1 = static_cast<float>(p->lev[1]), L2 = static_cast<float>(p->lev[2]);
   const float lx = static_cast<float>(p->lx), ly = static_cast<float>(p->ly);
   double cost = 0;
@@ -881,44 +877,45 @@ void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_mod
     const float gain = 1.0f + lx * f->x[idx] + ly * f->y[idx];
     const float pred = gain * base;
     const float ob = f->obs[idx];
-    if ((ob >= 255.0f && pred >= 255.0f) || (ob <= 0.0f && pred <= 0.0f)) continue;
-    const float r = ob - pred;
+    const bool skip = (ob >= 255.0f && pred >= 255.0f) || (ob <= 0.0f && pred <= 0.0f);
+    const float r = skip ? 0.0f : ob - pred;
     const float ar = std::fabs(r);
-    const float sw = ar <= kc ? 1.0f : std::sqrt(kc / ar);
+    const float sw = skip ? 0.0f : (ar <= kc ? 1.0f : std::sqrt(kc / ar));
     cost += ar <= kc ? r * r : kc * (2.0f * ar - kc);
+    count += skip ? 0 : 1;
     if (normal) {
-      const float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
       const float g = gain * sw;
-      float *dst = base_col + count;
-      for (int k = 0; k < ng; ++k) dst[static_cast<size_t>(k) * stride] = g * J[k];
-      dst[static_cast<size_t>(ng) * stride] = g * a;
-      dst[static_cast<size_t>(ng + 1) * stride] = g * bb;
-      dst[static_cast<size_t>(ng + 2) * stride] = g * c;
       const float sb = sw * base;
-      dst[static_cast<size_t>(ng + 3) * stride] = sb * f->x[idx];
-      dst[static_cast<size_t>(ng + 4) * stride] = sb * f->y[idx];
-      dst[static_cast<size_t>(nt) * stride] = sw * r;
+      gw[idx] = g;
+      cols[static_cast<size_t>(ng) * stride + idx] = g * a;
+      cols[static_cast<size_t>(ng + 1) * stride + idx] = g * bb;
+      cols[static_cast<size_t>(ng + 2) * stride + idx] = g * c;
+      cols[static_cast<size_t>(ng + 3) * stride + idx] = sb * f->x[idx];
+      cols[static_cast<size_t>(ng + 4) * stride + idx] = sb * f->y[idx];
+      cols[static_cast<size_t>(nt) * stride + idx] = sw * r;
     }
-    ++count;
   }
   acc->cost = cost;
   acc->n = count;
   const double tp2 = NowS();
   g_prof_local.t[10] += tp2 - tp1;
   if (normal) {
-    const int n8 = (count + 7) & ~7;
+    for (int k = 0; k < ng; ++k) {
+      float *col = cols + static_cast<size_t>(k) * stride;
+      for (int i = 0; i < n; ++i) col[i] *= gw[i];
+    }
     for (int k = 0; k <= nt; ++k) {
-      float *col = base_col + static_cast<size_t>(k) * stride;
-      for (int i = count; i < n8; ++i) col[i] = 0.0f;
+      float *col = cols + static_cast<size_t>(k) * stride;
+      for (int i = n; i < stride; ++i) col[i] = 0.0f;
     }
     // Columns i..nt (the residual is column nt) in groups of four; the last group repeats a column.
     for (int i = 0; i < nt; ++i) {
-      const float *ci = base_col + static_cast<size_t>(i) * stride;
+      const float *ci = cols + static_cast<size_t>(i) * stride;
       for (int k = i; k <= nt; k += 4) {
         const float *b[4];
-        for (int l = 0; l < 4; ++l) b[l] = base_col + static_cast<size_t>(std::min(k + l, nt)) * stride;
+        for (int l = 0; l < 4; ++l) b[l] = cols + static_cast<size_t>(std::min(k + l, nt)) * stride;
         double v[4];
-        Dot4(ci, b[0], b[1], b[2], b[3], n8, v);
+        Dot4(ci, b[0], b[1], b[2], b[3], stride, v);
         for (int l = 0; l < 4 && k + l <= nt; ++l) {
           if (k + l == nt) {
             acc->jtr[i] = v[l];
