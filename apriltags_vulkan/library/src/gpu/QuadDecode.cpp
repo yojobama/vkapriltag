@@ -521,6 +521,228 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   return result;
 }
 
+// Smallest bounding-box side, in half-pixel units, of a blob worth a hull fit.
+constexpr int32_t kMinHullExtent = 40;
+
+// Distance from point (x, y) to the line through a and b.
+double LineDistance(double ax, double ay, double bx, double by, double x, double y) {
+  const double dx = bx - ax, dy = by - ay;
+  const double len = std::sqrt(dx * dx + dy * dy);
+  if (len < 1e-9) return std::hypot(x - ax, y - ay);
+  return std::fabs(dx * (y - ay) - dy * (x - ax)) / len;
+}
+
+// Douglas-Peucker over the closed polygon `hull`, between vertices i and j (unwrapped): marks the
+// vertices of the simplification in `keep`.
+void SimplifyChain(const std::vector<std::pair<int32_t, int32_t>> &hull, size_t i, size_t j, double eps,
+                   std::vector<char> &keep) {
+  const size_t m = hull.size();
+  if (j <= i + 1) return;
+  double best = -1;
+  size_t best_k = i;
+  for (size_t k = i + 1; k < j; ++k) {
+    const double d = LineDistance(hull[i % m].first, hull[i % m].second, hull[j % m].first,
+                                  hull[j % m].second, hull[k % m].first, hull[k % m].second);
+    if (d > best) {
+      best = d;
+      best_k = k;
+    }
+  }
+  if (best <= eps) return;
+  keep[best_k % m] = 1;
+  SimplifyChain(hull, i, best_k, eps, keep);
+  SimplifyChain(hull, best_k, j, eps, keep);
+}
+
+// Quad fit on the convex hull of a blob's boundary points: the four sides are the hull's long edges,
+// which skips a corner an occluder has covered, and each side is refitted on the points near its edge.
+FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineFitPoint> points,
+                          size_t begin, size_t end, QuadFitScratch &scratch) {
+  FitQuadResult result;
+  const size_t n = end - begin;
+  if (n < 600 / config.decimation || n > INT32_MAX / 1023) return result;
+  auto &pts = scratch.hull_points;
+  auto &hull = scratch.hull;
+  pts.clear();
+  auto &keys = scratch.hull_keys;
+  keys.clear();
+  {
+    int32_t lo_x = INT32_MAX, lo_y = INT32_MAX, hi_x = 0, hi_y = 0;
+    for (size_t k = begin; k < end; ++k) {
+      const int32_t x = points[k].x2(), y = points[k].y2();
+      lo_x = std::min(lo_x, x);
+      hi_x = std::max(hi_x, x);
+      lo_y = std::min(lo_y, y);
+      hi_y = std::max(hi_y, y);
+      keys.push_back(static_cast<uint32_t>(x) << 14 | static_cast<uint32_t>(y));
+    }
+    if (std::max(hi_x - lo_x, hi_y - lo_y) < kMinHullExtent) return result;
+  }
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+  for (const uint32_t key : keys) pts.emplace_back(static_cast<int32_t>(key >> 14), static_cast<int32_t>(key & 0x3FFF));
+  if (pts.size() < 8) return result;
+
+  // Andrew's monotone chain.
+  auto cross = [](const std::pair<int32_t, int32_t> &o, const std::pair<int32_t, int32_t> &a,
+                  const std::pair<int32_t, int32_t> &b) {
+    return static_cast<int64_t>(a.first - o.first) * (b.second - o.second) -
+           static_cast<int64_t>(a.second - o.second) * (b.first - o.first);
+  };
+  hull.assign(2 * pts.size(), {0, 0});
+  size_t h = 0;
+  for (size_t i = 0; i < pts.size(); ++i) {
+    while (h >= 2 && cross(hull[h - 2], hull[h - 1], pts[i]) <= 0) --h;
+    hull[h++] = pts[i];
+  }
+  for (size_t i = pts.size() - 1, lower = h + 1; i-- > 0;) {
+    while (h >= lower && cross(hull[h - 2], hull[h - 1], pts[i]) <= 0) --h;
+    hull[h++] = pts[i];
+  }
+  hull.resize(h - 1);
+  const size_t m = hull.size();
+  if (m < 4) return result;
+
+  // Simplify to a few vertices, anchored at the vertex farthest from the first.
+  size_t far = 0;
+  double far_d = -1;
+  for (size_t i = 1; i < m; ++i) {
+    const double d = std::hypot(static_cast<double>(hull[i].first - hull[0].first),
+                                static_cast<double>(hull[i].second - hull[0].second));
+    if (d > far_d) {
+      far_d = d;
+      far = i;
+    }
+  }
+  const double min_side_x2 = std::max(3.0, config.tag_width / static_cast<double>(config.decimation));
+  if (far_d < min_side_x2) return result;
+  std::vector<char> keep(m, 0);
+  keep[0] = 1;
+  keep[far] = 1;
+  constexpr double kEps = 2.4;  // 1.2 pixels, in the points' half-pixel units
+  SimplifyChain(hull, 0, far, kEps, keep);
+  SimplifyChain(hull, far, m, kEps, keep);
+  std::array<std::pair<double, double>, 16> v;
+  size_t k = 0;
+  for (size_t i = 0; i < m; ++i) {
+    if (!keep[i]) continue;
+    if (k == 10) return result;
+    v[k++] = {static_cast<double>(hull[i].first), static_cast<double>(hull[i].second)};
+  }
+  if (k < 4) return result;
+
+  std::array<double, 16> len, ux, uy;
+  double perimeter = 0;
+  for (size_t i = 0; i < k; ++i) {
+    const auto &a = v[i], &b = v[(i + 1) % k];
+    len[i] = std::hypot(b.first - a.first, b.second - a.second);
+    ux[i] = len[i] > 0 ? (b.first - a.first) / len[i] : 0;
+    uy[i] = len[i] > 0 ? (b.second - a.second) / len[i] : 0;
+    perimeter += len[i];
+  }
+
+  // The four edges, in order, of greatest total length whose neighbours are near-perpendicular and
+  // whose intersections lie close to the edges' ends.
+  constexpr double kMaxCos = 0.8, kReach = 0.4;
+  double best_len = 0;
+  size_t best[4] = {};
+  auto corner_ok = [&](size_t a, size_t b) {
+    if (std::fabs(ux[a] * ux[b] + uy[a] * uy[b]) > kMaxCos) return false;
+    const double det = ux[a] * uy[b] - uy[a] * ux[b];
+    if (std::fabs(det) < 1e-9) return false;
+    const auto &pa = v[a], &pb = v[b];
+    const double t = ((pb.first - pa.first) * uy[b] - (pb.second - pa.second) * ux[b]) / det;
+    const double cx = pa.first + t * ux[a], cy = pa.second + t * uy[a];
+    const auto &ea = v[(a + 1) % k];
+    return std::hypot(cx - ea.first, cy - ea.second) <= kReach * len[a] &&
+           std::hypot(cx - pb.first, cy - pb.second) <= kReach * len[b];
+  };
+  for (size_t a = 0; a < k; ++a)
+    for (size_t b = a + 1; b < k; ++b) {
+      if (!corner_ok(a, b)) continue;
+      for (size_t c = b + 1; c < k; ++c) {
+        if (!corner_ok(b, c)) continue;
+        for (size_t d = c + 1; d < k; ++d) {
+          if (!corner_ok(c, d) || !corner_ok(d, a)) continue;
+          const double total = len[a] + len[b] + len[c] + len[d];
+          if (total > best_len) {
+            best_len = total;
+            best[0] = a, best[1] = b, best[2] = c, best[3] = d;
+          }
+        }
+      }
+    }
+  if (best_len < 0.6 * perimeter) return result;
+
+  result.x0 = points[begin].x2();
+  result.y0 = points[begin].y2();
+  constexpr double kBand = 3.0;  // 1.5 pixels
+  std::vector<std::array<double, 2>> near;
+  std::vector<int> hist;
+  for (int s = 0; s < 4; ++s) {
+    const size_t e = best[s];
+    const auto &p0 = v[e];
+    const double window = std::max(10.0, 0.25 * len[e]);
+    near.clear();
+    for (size_t i = begin; i < end; ++i) {
+      const double dx = points[i].x2() - p0.first, dy = points[i].y2() - p0.second;
+      const double along = dx * ux[e] + dy * uy[e], across = dx * uy[e] - dy * ux[e];
+      if (std::fabs(across) > window || along < -kBand || along > len[e] + kBand) continue;
+      near.push_back({dx, dy});
+    }
+    // The line of greatest support within 10 degrees of the edge: a hull edge can be a chord that
+    // bridges a protrusion.
+    const size_t bins = static_cast<size_t>(window) + 2;
+    double best_support = -1, best_cos = 1, best_sin = 0, best_offset = 0;
+    for (int step = 0; step < 21; ++step) {
+      const int deg = (step + 1) / 2 * ((step & 1) ? 1 : -1);
+      const double a = deg * 0.017453292519943295, ca = std::cos(a), sa = std::sin(a);
+      const double nx = uy[e] * ca + ux[e] * sa, ny = -(ux[e] * ca - uy[e] * sa);
+      hist.assign(bins, 0);
+      for (const auto &q : near) {
+        const double across = q[0] * nx + q[1] * ny;
+        const int b = static_cast<int>((across + window) * 0.5);
+        if (b >= 0 && b < static_cast<int>(bins)) ++hist[b];
+      }
+      for (size_t b = 0; b + 1 < bins; ++b) {
+        const double support = hist[b] + hist[b + 1];
+        if (support > best_support) {
+          best_support = support;
+          best_cos = ca;
+          best_sin = sa;
+          best_offset = static_cast<double>(b) * 2.0 - window + 2.0;
+        }
+      }
+    }
+    const double nx = uy[e] * best_cos + ux[e] * best_sin, ny = -(ux[e] * best_cos - uy[e] * best_sin);
+    int64_t mx = 0, my = 0, w_sum = 0, mxx = 0, mxy = 0, myy = 0;
+    int32_t count = 0;
+    for (size_t i = begin; i < end; ++i) {
+      const double dx = points[i].x2() - p0.first, dy = points[i].y2() - p0.second;
+      const double along = dx * ux[e] + dy * uy[e];
+      if (std::fabs(dx * nx + dy * ny - best_offset) > kBand || along < -kBand || along > len[e] + kBand) continue;
+      const int32_t x2 = points[i].x2() - result.x0, y2 = points[i].y2() - result.y0, w = points[i].W();
+      const int64_t wx = static_cast<int64_t>(w) * x2, wy = static_cast<int64_t>(w) * y2;
+      mx += wx;
+      my += wy;
+      w_sum += w;
+      mxx += wx * x2;
+      mxy += wx * y2;
+      myy += wy * y2;
+      ++count;
+    }
+    if (count < 6) return result;
+    LineFitMoments &fit = result.moments[s];
+    fit.Mx = mx, fit.My = my, fit.W = static_cast<int32_t>(w_sum), fit.Mxx = mxx, fit.Myy = myy, fit.Mxy = mxy;
+    fit.N = count;
+    double err, mse;
+    FitLine(fit, 0, 0, nullptr, nullptr, &err, &mse);
+    if (mse > config.max_line_fit_mse) return result;
+  }
+  result.valid = true;
+  return result;
+}
+
 // Resolves quad_fit_method: explicit config wins, then APRILTAG_VK_QUADFIT.
 DetectorConfig::QuadFitMethod ResolveQuadFitMethod(DetectorConfig::QuadFitMethod configured) {
   if (const char *m = std::getenv("APRILTAG_VK_QUADFIT")) {
@@ -605,6 +827,50 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
   return true;
 }
 
+constexpr double kSuspectFraction = 0.02;
+
+// Whether every corner of `a` is within `tolerance` pixels of a corner of `b`.
+bool SameCorners(const DetectedQuad &a, const DetectedQuad &b, double tolerance) {
+  for (int i = 0; i < 4; ++i) {
+    double nearest = 1e30;
+    for (int j = 0; j < 4; ++j) nearest = std::min(nearest, std::hypot(a.p[i][0] - b.p[j][0], a.p[i][1] - b.p[j][1]));
+    if (nearest > tolerance) return false;
+  }
+  return true;
+}
+
+// Whether more than `fraction` of the boundary points are farther than `tolerance` (half-pixel
+// units) from every side of the quad, whose corners are in full-resolution pixels.
+bool HasOutliers(std::span<const RawLineFitPoint> points, size_t begin, size_t end, const DetectedQuad &quad,
+                 double decimation, double tolerance, double fraction) {
+  double c[4][2], d[4][2], inv_l2[4];
+  for (int i = 0; i < 4; ++i) {
+    c[i][0] = quad.p[i][0] * 2.0 / decimation;
+    c[i][1] = quad.p[i][1] * 2.0 / decimation;
+  }
+  for (int i = 0; i < 4; ++i) {
+    d[i][0] = c[(i + 1) & 3][0] - c[i][0];
+    d[i][1] = c[(i + 1) & 3][1] - c[i][1];
+    const double l2 = d[i][0] * d[i][0] + d[i][1] * d[i][1];
+    inv_l2[i] = l2 > 0 ? 1.0 / l2 : 0.0;
+  }
+  const double limit = tolerance * tolerance;
+  const size_t allowed = static_cast<size_t>(fraction * static_cast<double>(end - begin));
+  size_t out = 0;
+  for (size_t k = begin; k < end; ++k) {
+    const double x = points[k].x2(), y = points[k].y2();
+    bool near_side = false;
+    for (int i = 0; i < 4 && !near_side; ++i) {
+      const double ex = x - c[i][0], ey = y - c[i][1];
+      const double t = std::min(1.0, std::max(0.0, (ex * d[i][0] + ey * d[i][1]) * inv_l2[i]));
+      const double rx = ex - t * d[i][0], ry = ey - t * d[i][1];
+      near_side = rx * rx + ry * ry <= limit;
+    }
+    if (!near_side && ++out > allowed) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 QuadDecode::QuadDecode(const DetectorConfig &config)
@@ -613,6 +879,7 @@ QuadDecode::QuadDecode(const DetectorConfig &config)
       scratch_(pool_->threads()) {
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
   if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) config_.small_tag_rescue = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_HULL_QUAD")) config_.hull_quad = v[0] != '0';
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
@@ -639,8 +906,8 @@ std::vector<DetectedQuad> QuadDecode::Decode(
 
   // Fit and refit every blob independently; each entry is written by exactly one task.
   struct SpanResult {
-    bool dp_attempted = false, dp_used = false, has_quad = false;
-    DetectedQuad quad;
+    bool dp_attempted = false, dp_used = false, has_quad = false, has_hull = false;
+    DetectedQuad quad, hull_quad;
     bool has_box = false;
     DetectedQuad box;
   };
@@ -681,6 +948,18 @@ std::vector<DetectedQuad> QuadDecode::Decode(
       const double xs[4] = {xlo * d, xhi * d, xhi * d, xlo * d}, ys[4] = {ylo * d, ylo * d, yhi * d, yhi * d};
       for (int k = 0; k < 4; ++k) r.box.p[k][0] = xs[k], r.box.p[k][1] = ys[k];
     }
+    if (config_.hull_quad) {
+      const bool large = !r.has_quad || std::hypot(r.quad.p[0][0] - r.quad.p[2][0], r.quad.p[0][1] - r.quad.p[2][1]) >=
+                                            kMinHullExtent * config_.decimation * 0.5;
+      const bool suspect = large && (!r.has_quad || HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
+                                               config_.decimation, 4.0, kSuspectFraction));
+      if (suspect) {
+        const FitQuadResult hq =
+            FitQuadHull(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
+        r.has_hull = hq.valid && UpdateFitQuad(config_, hq, &r.hull_quad);
+        if (r.has_hull && r.has_quad && SameCorners(r.quad, r.hull_quad, 2.0)) r.has_hull = false;
+      }
+    }
   });
 
   last_dp_stats_ = DpStats{};
@@ -694,6 +973,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   // Collect survivors in span order so the output is independent of thread scheduling.
   for (const SpanResult &r : per_span) {
     if (r.has_quad) output.push_back(r.quad);
+    if (r.has_hull) output.push_back(r.hull_quad);
   }
 
   // Boxes of fragments of one small tag are merged, so each tag is refitted once.

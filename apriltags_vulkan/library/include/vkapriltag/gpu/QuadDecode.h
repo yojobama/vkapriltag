@@ -18,6 +18,9 @@ struct QuadFitScratch {
   std::vector<double> error;
   std::vector<double> filtered;
   std::vector<std::pair<double, uint32_t>> peaks;
+  std::vector<std::pair<int32_t, int32_t>> hull_points;
+  std::vector<std::pair<int32_t, int32_t>> hull;
+  std::vector<uint32_t> hull_keys;
 };
 
 // CPU tail of the detector pipeline: cumulative sums, peak finding and the
