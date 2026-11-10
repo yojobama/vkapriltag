@@ -47,3 +47,6 @@ model 45, accumulate 51 (gather 28, dots 23), scan 11, cand 6. 729 pixels per ta
 - Band rasterisation in BuildFit (per row intervals from the monotone u(x), v(x)): slower (select 58 -> 80 us)
   because the bands still cover about 60 % of the box and the cost is the per-candidate exact test; reverted.
 - Double precision dot products: no change in motion-blur p95, so float accumulation is not the problem.
+- Fast path is now the only path (`APRILTAG_VK_POLISH=1` alone): slow Evaluate, BuildCand, Select, Cand, the
+  slope experiment and its knobs removed. Output equals the previous fast+offsets run to float rounding (a few
+  dump lines differ in the last digit).
