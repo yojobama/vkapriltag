@@ -576,7 +576,8 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
       hi_y = std::max(hi_y, y);
       keys.push_back(static_cast<uint32_t>(x) << 14 | static_cast<uint32_t>(y));
     }
-    if (std::max(hi_x - lo_x, hi_y - lo_y) < kMinHullExtent) return result;
+    const int32_t long_side = std::max(hi_x - lo_x, hi_y - lo_y), short_side = std::min(hi_x - lo_x, hi_y - lo_y);
+    if (long_side < kMinHullExtent || short_side * 5 < long_side * 3) return result;
   }
   std::sort(keys.begin(), keys.end());
   keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -677,7 +678,7 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   result.x0 = points[begin].x2();
   result.y0 = points[begin].y2();
   constexpr double kBand = 3.0;  // 1.5 pixels
-  std::vector<std::array<double, 2>> near;
+  std::vector<std::array<float, 2>> near;
   std::vector<int> hist;
   for (int s = 0; s < 4; ++s) {
     const size_t e = best[s];
@@ -688,7 +689,7 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
       const double dx = points[i].x2() - p0.first, dy = points[i].y2() - p0.second;
       const double along = dx * ux[e] + dy * uy[e], across = dx * uy[e] - dy * ux[e];
       if (std::fabs(across) > window || along < -kBand || along > len[e] + kBand) continue;
-      near.push_back({dx, dy});
+      near.push_back({static_cast<float>(dx), static_cast<float>(dy)});
     }
     // The line of greatest support within 10 degrees of the edge: a hull edge can be a chord that
     // bridges a protrusion.
@@ -699,10 +700,11 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
       const double a = deg * 0.017453292519943295, ca = std::cos(a), sa = std::sin(a);
       const double nx = uy[e] * ca + ux[e] * sa, ny = -(ux[e] * ca - uy[e] * sa);
       hist.assign(bins, 0);
+      const float fnx = static_cast<float>(nx * 0.5), fny = static_cast<float>(ny * 0.5);
+      const float shift = static_cast<float>(window * 0.5);
       for (const auto &q : near) {
-        const double across = q[0] * nx + q[1] * ny;
-        const int b = static_cast<int>((across + window) * 0.5);
-        if (b >= 0 && b < static_cast<int>(bins)) ++hist[b];
+        const int b = static_cast<int>(q[0] * fnx + q[1] * fny + shift);
+        if (static_cast<unsigned>(b) < bins) ++hist[b];
       }
       for (size_t b = 0; b + 1 < bins; ++b) {
         const double support = hist[b] + hist[b + 1];
@@ -829,6 +831,9 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
 
 constexpr double kSuspectFraction = 0.02;
 
+// Most hull fits attempted in one frame.
+constexpr size_t kMaxHullAttempts = 6;
+
 // Whether every corner of `a` is within `tolerance` pixels of a corner of `b`.
 bool SameCorners(const DetectedQuad &a, const DetectedQuad &b, double tolerance) {
   for (int i = 0; i < 4; ++i) {
@@ -906,7 +911,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
 
   // Fit and refit every blob independently; each entry is written by exactly one task.
   struct SpanResult {
-    bool dp_attempted = false, dp_used = false, has_quad = false, has_hull = false;
+    bool dp_attempted = false, dp_used = false, has_quad = false, has_hull = false, hull_candidate = false;
     DetectedQuad quad, hull_quad;
     bool has_box = false;
     DetectedQuad box;
@@ -951,16 +956,35 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     if (config_.hull_quad) {
       const bool large = !r.has_quad || std::hypot(r.quad.p[0][0] - r.quad.p[2][0], r.quad.p[0][1] - r.quad.p[2][1]) >=
                                             kMinHullExtent * config_.decimation * 0.5;
-      const bool suspect = large && (!r.has_quad || HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
+      r.hull_candidate = large && (!r.has_quad || HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
                                                config_.decimation, 4.0, kSuspectFraction));
-      if (suspect) {
-        const FitQuadResult hq =
-            FitQuadHull(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
-        r.has_hull = hq.valid && UpdateFitQuad(config_, hq, &r.hull_quad);
-        if (r.has_hull && r.has_quad && SameCorners(r.quad, r.hull_quad, 2.0)) r.has_hull = false;
-      }
     }
   });
+
+  // The hull fit runs on the largest candidates only, so a frame full of failing blobs stays cheap.
+  if (config_.hull_quad) {
+    std::vector<size_t> candidates;
+    for (size_t s = 0; s < spans.size(); ++s) {
+      if (per_span[s].hull_candidate) candidates.push_back(s);
+    }
+    if (candidates.size() > kMaxHullAttempts) {
+      std::nth_element(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(kMaxHullAttempts),
+                       candidates.end(),
+                       [&](size_t a, size_t b) {
+                         const size_t na = spans[a].end - spans[a].begin, nb = spans[b].end - spans[b].begin;
+                         return na != nb ? na > nb : a < b;
+                       });
+      candidates.resize(kMaxHullAttempts);
+    }
+    pool_->ParallelFor(candidates.size(), [&](size_t c, unsigned slot) {
+      const size_t s = candidates[c];
+      SpanResult &r = per_span[s];
+      const FitQuadResult hq =
+          FitQuadHull(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
+      r.has_hull = hq.valid && UpdateFitQuad(config_, hq, &r.hull_quad);
+      if (r.has_hull && r.has_quad && SameCorners(r.quad, r.hull_quad, 2.0)) r.has_hull = false;
+    });
+  }
 
   last_dp_stats_ = DpStats{};
   for (const SpanResult &r : per_span) {

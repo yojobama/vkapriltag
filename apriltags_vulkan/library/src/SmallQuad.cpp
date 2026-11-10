@@ -61,6 +61,9 @@ int OtsuThreshold(const int hist[256], int total, double *gap) {
   return best_t;
 }
 
+// Largest fraction of a region's edge pixels that may be dark for a retry to be worth flooding.
+constexpr double kRetryRingMax = 0.05;
+
 struct Roi {
   int x0, y0, w, h;
 };
@@ -68,41 +71,62 @@ struct Roi {
 // kFit: a quad was written; kEdge: every dark component touched the region's edge; kNone: no tag-like blob.
 enum class Fit { kFit, kEdge, kNone };
 
-Fit FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, double out[4][2]) {
+Fit FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, double max_ring_dark, double out[4][2]) {
   const int rx0 = roi.x0, ry0 = roi.y0, rw = roi.w, rh = roi.h;
   // Dark pixels (<= thr) in 8-connected components; keep the largest that stays clear of the edge.
-  std::vector<int16_t> label(static_cast<size_t>(rw) * rh, 0);
-  std::vector<int> stack, cur, best_pixels;
-  int next = 0;
-  bool any_touch = false;
-  auto dark = [&](int x, int y) { return grey[static_cast<size_t>(ry0 + y) * width + rx0 + x] <= thr; };
+  const int pw = rw + 2;
+  static thread_local std::vector<uint8_t> blocked;
+  static thread_local std::vector<int> stack, cur, best_pixels;
+  blocked.assign(static_cast<size_t>(pw) * (rh + 2), 1);
   for (int y = 0; y < rh; ++y) {
-    for (int x = 0; x < rw; ++x) {
-      const int idx = y * rw + x;
-      if (label[idx] != 0 || !dark(x, y)) continue;
-      ++next;
-      cur.clear();
-      stack.assign(1, idx);
-      label[idx] = static_cast<int16_t>(next);
-      bool touches = false;
-      while (!stack.empty()) {
-        const int p = stack.back();
-        stack.pop_back();
-        cur.push_back(p);
-        const int px = p % rw, py = p / rw;
-        if (px == 0 || py == 0 || px == rw - 1 || py == rh - 1) touches = true;
-        const int nx[8] = {px - 1, px + 1, px, px, px - 1, px + 1, px - 1, px + 1};
-        const int ny[8] = {py, py, py - 1, py + 1, py - 1, py - 1, py + 1, py + 1};
-        for (int k = 0; k < 8; ++k) {
-          if (nx[k] < 0 || ny[k] < 0 || nx[k] >= rw || ny[k] >= rh) continue;
-          const int q = ny[k] * rw + nx[k];
-          if (label[q] != 0 || !dark(nx[k], ny[k])) continue;
-          label[q] = static_cast<int16_t>(next);
-          stack.push_back(q);
-        }
+    const uint8_t *row = grey + static_cast<size_t>(ry0 + y) * width + rx0;
+    uint8_t *out_row = blocked.data() + static_cast<size_t>(y + 1) * pw + 1;
+    for (int x = 0; x < rw; ++x) out_row[x] = row[x] > thr;
+  }
+  if (max_ring_dark < 1.0) {
+    int ring = 0;
+    for (int x = 0; x < rw; ++x) ring += !blocked[pw + 1 + x] + !blocked[rh * pw + 1 + x];
+    for (int y = 0; y < rh; ++y) ring += !blocked[(y + 1) * pw + 1] + !blocked[(y + 1) * pw + rw];
+    if (ring > max_ring_dark * (2 * (rw + rh))) return Fit::kEdge;
+  }
+  const int step[8] = {-1, 1, -pw, pw, -pw - 1, -pw + 1, pw - 1, pw + 1};
+  auto flood = [&](int start, bool keep) {
+    cur.clear();
+    stack.assign(1, start);
+    blocked[start] = 1;
+    while (!stack.empty()) {
+      const int p = stack.back();
+      stack.pop_back();
+      if (keep) cur.push_back(p);
+      for (int k = 0; k < 8; ++k) {
+        const int q = p + step[k];
+        if (blocked[q]) continue;
+        blocked[q] = 1;
+        stack.push_back(q);
       }
-      any_touch |= touches;
-      if (!touches && cur.size() > best_pixels.size()) best_pixels = cur;
+    }
+  };
+  bool any_touch = false;
+  best_pixels.clear();
+  auto edge_pixel = [&](int idx) {
+    if (blocked[idx]) return;
+    any_touch = true;
+    flood(idx, false);
+  };
+  for (int x = 0; x < rw; ++x) {
+    edge_pixel(pw + 1 + x);
+    edge_pixel(rh * pw + 1 + x);
+  }
+  for (int y = 0; y < rh; ++y) {
+    edge_pixel((y + 1) * pw + 1);
+    edge_pixel((y + 1) * pw + rw);
+  }
+  for (int y = 1; y <= rh; ++y) {
+    for (int x = 1; x <= rw; ++x) {
+      const int idx = y * pw + x;
+      if (blocked[idx]) continue;
+      flood(idx, true);
+      if (cur.size() > best_pixels.size()) best_pixels.swap(cur);
     }
   }
   if (best_pixels.size() < 12) return any_touch ? Fit::kEdge : Fit::kNone;
@@ -110,7 +134,7 @@ Fit FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, doub
   std::vector<Pt> pts;
   pts.reserve(best_pixels.size() * 4);
   for (int p : best_pixels) {
-    const double px = rx0 + p % rw, py = ry0 + p / rw;
+    const double px = rx0 + p % pw - 1, py = ry0 + p / pw - 1;
     pts.push_back({px - 0.5, py - 0.5});
     pts.push_back({px + 0.5, py - 0.5});
     pts.push_back({px + 0.5, py + 0.5});
@@ -158,7 +182,7 @@ Fit FitAtThreshold(const uint8_t *grey, int width, const Roi &roi, int thr, doub
 }
 
 Fit FitInRegion(const uint8_t *grey, int width, int height, double cx, double cy, double half,
-                double out[4][2]) {
+                double first_limit, double low_limit, double out[4][2]) {
   const int rx0 = std::max(0, static_cast<int>(std::floor(cx - half)));
   const int ry0 = std::max(0, static_cast<int>(std::floor(cy - half)));
   const int rx1 = std::min(width - 1, static_cast<int>(std::ceil(cx + half)));
@@ -176,10 +200,10 @@ Fit FitInRegion(const uint8_t *grey, int width, int height, double cx, double cy
   if (gap < 20.0) return Fit::kNone;
   int below = 0, p5 = 0;
   for (; p5 < 255 && below < rw * rh / 20; ++p5) below += hist[p5];
-  const Fit first = FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, thr, out);
+  const Fit first = FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, thr, first_limit, out);
   const int low = (p5 + thr) / 2;
   if (first != Fit::kEdge || low >= thr) return first;
-  return FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, low, out);
+  return FitAtThreshold(grey, width, {rx0, ry0, rw, rh}, low, low_limit, out);
 }
 
 }  // namespace
@@ -188,9 +212,9 @@ bool FitSmallQuad(const uint8_t *grey, int width, int height, double x0, double 
                   double y1, double out[4][2]) {
   const double cx = 0.5 * (x0 + x1), cy = 0.5 * (y0 + y1);
   const double half = std::max(0.75 * std::max(x1 - x0, y1 - y0), 10.0) + 4.0;
-  const Fit small = FitInRegion(grey, width, height, cx, cy, std::min(28.0, half), out);
+  const Fit small = FitInRegion(grey, width, height, cx, cy, std::min(28.0, half), 1.0, kRetryRingMax, out);
   if (small != Fit::kEdge) return small == Fit::kFit;
-  return FitInRegion(grey, width, height, cx, cy, std::min(44.0, 1.8 * half), out) == Fit::kFit;
+  return FitInRegion(grey, width, height, cx, cy, std::min(44.0, 1.8 * half), kRetryRingMax, kRetryRingMax, out) == Fit::kFit;
 }
 
 }  // namespace apriltag_vulkan
