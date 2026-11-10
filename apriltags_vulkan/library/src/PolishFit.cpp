@@ -9,11 +9,14 @@
 namespace apriltag_vulkan {
 namespace {
 
-constexpr int kMaxCells = 16;   // widest supported grid
-constexpr int kMaxCols = 24;    // columns (or rows) one pixel's blur window may touch
-constexpr int kNP = 16;         // homography, three blur/motion terms, three levels, two illumination slopes
-constexpr double kReach = 3.5;  // blur window, in standard deviations
-constexpr int kMaxTaps = 13;    // samples along the motion blur segment
+constexpr int kMaxCells = 16;        // widest supported grid
+constexpr int kPad = kMaxCells + 2;  // class grid with one outside row and column on each side
+constexpr int kMaxC = 8;             // columns (or rows) one pixel's frozen window may hold
+constexpr int kMaxJ = 11;            // homography plus up to three blur parameters
+constexpr int kStrideJ = 12;
+constexpr int kMaxT = 16;           // all parameters: geometry, blur, three levels, two slopes
+constexpr double kReach = 3.0;       // evaluation window, in blur standard deviations
+
 
 unsigned DevFlags() {
   static const unsigned v = [] {
@@ -31,95 +34,173 @@ int MaxPixels() {
   return v;
 }
 
-// Standard normal CDF and density, tabulated over [-4, 4].
+struct Knobs {
+  double blur_extra, hstride, base_window, win_mult, min_win, smax_mult, tol, iters, full, scan_n, reach;
+  Knobs() {
+    hstride = Get("APRILTAG_VK_POLISH_HSTRIDE", 1);
+    blur_extra = Get("APRILTAG_VK_POLISH_BLUREXTRA", 2.0);
+    base_window = Get("APRILTAG_VK_POLISH_BASEWIN", 3.0);
+    win_mult = Get("APRILTAG_VK_POLISH_WINMULT", 0.8);
+    min_win = Get("APRILTAG_VK_POLISH_MINWIN", 0.5);
+    smax_mult = Get("APRILTAG_VK_POLISH_SMAXM", 1.3);
+    tol = Get("APRILTAG_VK_POLISH_TOL", 0.004);
+    iters = Get("APRILTAG_VK_POLISH_ITERS", 6);
+    full = Get("APRILTAG_VK_POLISH_FULL", 9);
+    scan_n = Get("APRILTAG_VK_POLISH_SCANN", 160);
+    reach = Get("APRILTAG_VK_POLISH_REACH", 3.0);
+  }
+  static double Get(const char *name, double fallback) {
+    const char *e = std::getenv(name);
+    return e ? std::atof(e) : fallback;
+  }
+};
+const Knobs kKnobs;
+
+// Standard normal CDF, density and CDF integral (z Phi(z) + phi(z)), tabulated over [-4, 4].
 struct NormalTable {
-  static constexpr int kSteps = 128;
+  static constexpr int kSteps = 32;
   static constexpr int kN = 8 * kSteps + 2;
-  double cdf[kN], pdf[kN];
+  float cdf[kN], pdf[kN], gint[kN];
   NormalTable() {
     for (int i = 0; i < kN; ++i) {
       const double z = -4.0 + static_cast<double>(i) / kSteps;
-      cdf[i] = 0.5 * std::erfc(-z / std::sqrt(2.0));
-      pdf[i] = std::exp(-0.5 * z * z) / std::sqrt(2.0 * 3.14159265358979323846);
+      const double c = 0.5 * std::erfc(-z / std::sqrt(2.0));
+      const double p = std::exp(-0.5 * z * z) / std::sqrt(2.0 * 3.14159265358979323846);
+      cdf[i] = static_cast<float>(c);
+      pdf[i] = static_cast<float>(p);
+      gint[i] = static_cast<float>(z * c + p);
     }
   }
 };
 const NormalTable kNormal;
 
-inline void NormalAt(double z, double *cdf, double *pdf) {
-  if (z <= -4.0) {
-    *cdf = 0.0;
-    *pdf = 0.0;
-    return;
-  }
-  if (z >= 4.0) {
-    *cdf = 1.0;
-    *pdf = 0.0;
-    return;
-  }
-  const double t = (z + 4.0) * NormalTable::kSteps;
+inline void Lut(float z, float *cdf, float *pdf) {
+  float t = (z + 4.0f) * NormalTable::kSteps;
+  t = std::min(std::max(t, 0.0f), 8.0f * NormalTable::kSteps - 0.001f);
   const int i = static_cast<int>(t);
-  const double f = t - i;
+  const float f = t - static_cast<float>(i);
   *cdf = kNormal.cdf[i] + f * (kNormal.cdf[i + 1] - kNormal.cdf[i]);
   *pdf = kNormal.pdf[i] + f * (kNormal.pdf[i + 1] - kNormal.pdf[i]);
 }
 
-// A blurred indicator of each cell column (index -1 is everything left of the grid, W everything
-// right of it) at one position, with derivatives with respect to the position and the blur width.
+inline void LutG(float z, float *cdf, float *gint) {
+  if (z >= 4.0f) {
+    *cdf = 1.0f;
+    *gint = z;
+    return;
+  }
+  float t = (z + 4.0f) * NormalTable::kSteps;
+  t = std::max(t, 0.0f);
+  const int i = static_cast<int>(t);
+  const float f = t - static_cast<float>(i);
+  *cdf = kNormal.cdf[i] + f * (kNormal.cdf[i + 1] - kNormal.cdf[i]);
+  *gint = kNormal.gint[i] + f * (kNormal.gint[i + 1] - kNormal.gint[i]);
+}
+
+// Blurred cell-column coverage along one axis at position u: a[t] for column lo + t, and its
+// derivatives with respect to u, the blur width s and (box model) the box length l.
 struct Axis {
-  int lo, hi;
-  double a[kMaxCols], da_du[kMaxCols], da_ds[kMaxCols];
+  float a[kMaxC], du[kMaxC], ds[kMaxC], dl[kMaxC];
 };
 
-void ComputeAxis(double u, double s, int width, bool derivatives, Axis *ax) {
-  const double reach = kReach * s;
-  int lo = std::clamp(static_cast<int>(std::floor(u - reach)), -1, width);
-  int hi = std::clamp(static_cast<int>(std::floor(u + reach)), -1, width);
-  if (hi - lo > kMaxCols - 3) {
-    const int mid = std::clamp(static_cast<int>(std::floor(u)), -1, width);
-    lo = std::max(lo, mid - (kMaxCols - 3) / 2);
-    hi = std::min(hi, lo + kMaxCols - 3);
+template <bool Box, bool Deriv>
+inline void AxisEval(float u, float s, float l, int lo, int n, int width, Axis *ax) {
+  if (n == 1) {
+    ax->a[0] = 1.0f;
+    if (Deriv) ax->du[0] = ax->ds[0] = ax->dl[0] = 0.0f;
+    return;
   }
-  ax->lo = lo;
-  ax->hi = hi;
-  double cdf[kMaxCols + 1], pdf[kMaxCols + 1], zs[kMaxCols + 1];
-  const double inv_s = 1.0 / s;
-  for (int k = lo; k <= hi + 1; ++k) {
-    const int idx = k - lo;
+  float c[kMaxC + 1], dt[kMaxC + 1], dsb[kMaxC + 1], dlb[kMaxC + 1];
+  const float inv_s = 1.0f / s;
+  const float inv_l = Box ? 1.0f / l : 0.0f;
+  c[0] = 0.0f;
+  dt[0] = dsb[0] = dlb[0] = 0.0f;
+  c[n] = 1.0f;
+  dt[n] = dsb[n] = dlb[n] = 0.0f;
+  for (int t = 1; t < n; ++t) {
+    const int k = lo + t;
     if (k < 0) {
-      cdf[idx] = 0.0;
-      pdf[idx] = 0.0;
-      zs[idx] = 0.0;
+      c[t] = 0.0f;
+      dt[t] = dsb[t] = dlb[t] = 0.0f;
     } else if (k > width) {
-      cdf[idx] = 1.0;
-      pdf[idx] = 0.0;
-      zs[idx] = 0.0;
+      c[t] = 1.0f;
+      dt[t] = dsb[t] = dlb[t] = 0.0f;
+    } else if (Box) {
+      const float d = static_cast<float>(k) - u;
+      const float zp = (d + 0.5f * l) * inv_s, zm = (d - 0.5f * l) * inv_s;
+      float cp, gp, cm, gm;
+      LutG(zp, &cp, &gp);
+      LutG(zm, &cm, &gm);
+      const float cc = s * inv_l * (gp - gm);
+      c[t] = cc;
+      if (Deriv) {
+        dt[t] = (cp - cm) * inv_l;
+        dsb[t] = cc * inv_s - (zp * cp - zm * cm) * inv_l;
+        dlb[t] = (0.5f * (cp + cm) - cc) * inv_l;
+      }
     } else {
-      zs[idx] = (k - u) * inv_s;
-      NormalAt(zs[idx], &cdf[idx], &pdf[idx]);
+      const float z = (static_cast<float>(k) - u) * inv_s;
+      float cc, pp;
+      Lut(z, &cc, &pp);
+      c[t] = cc;
+      if (Deriv) {
+        dt[t] = pp * inv_s;
+        dsb[t] = -pp * z * inv_s;
+      }
     }
   }
-  for (int i = lo; i <= hi; ++i) {
-    const int idx = i - lo;
-    ax->a[idx] = cdf[idx + 1] - cdf[idx];
-    if (derivatives) {
-      ax->da_du[idx] = (pdf[idx] - pdf[idx + 1]) * inv_s;
-      ax->da_ds[idx] = (pdf[idx] * zs[idx] - pdf[idx + 1] * zs[idx + 1]) * inv_s;
+  for (int t = 0; t < n; ++t) {
+    ax->a[t] = c[t + 1] - c[t];
+    if (Deriv) {
+      ax->du[t] = dt[t] - dt[t + 1];
+      ax->ds[t] = dsb[t + 1] - dsb[t];
+      if (Box) ax->dl[t] = dlb[t + 1] - dlb[t];
     }
   }
 }
+
+inline int FloorI(float x) { return static_cast<int>(std::max(x, -60.0f) + 64.0f) - 64; }
+
+// A pixel whose window touches more than one cell class, with its position at the starting mapping.
+struct CandPixel {
+  float x, y, obs, u, v, gu, gv;
+  int16_t px, py;
+};
+
+struct Cand {
+  std::vector<CandPixel> pix;
+  double area = 0;
+  double window = 0;
+  int thin = 1;
+};
 
 struct Fit {
-  int width;
-  uint8_t cls[kMaxCells][kMaxCells];  // [row][column]: 0 black, 1 white, 3 unknown
-  double cx, cy, scale;               // pixel -> normalised coordinates
-  std::vector<float> nx, ny, obs;     // working set: normalised position and observed value
-  int thin = 1;                       // lattice step the working set was thinned by
+  int width = 0;
+  uint8_t cls[kPad][kPad];  // [row + 1][column + 1]: 0 black, 1 white, 2 outside, 3 unknown
+  double cx = 0, cy = 0, scale = 1;
+  int n = 0;
+  std::vector<float> x, y, obs, u0, v0, gu, gv;
+  std::vector<int8_t> i0, j0;
+  std::vector<uint8_t> nu, nv;
+  std::vector<float> A, B, C;  // black (plus half the unknown), white (plus half the unknown), outside coverage
+  std::vector<float> J;        // kStrideJ columns per pixel: derivative of the base prediction
+  void Clear() {
+    n = 0;
+    x.clear();
+    y.clear();
+    obs.clear();
+    u0.clear();
+    v0.clear();
+    gu.clear();
+    gv.clear();
+    i0.clear();
+    j0.clear();
+    nu.clear();
+    nv.clear();
+  }
 };
 
-inline int ClassOf(const Fit &f, int row, int col) {
-  return (row < 0 || row >= f.width || col < 0 || col >= f.width) ? 2 : f.cls[row][col];
-}
+inline int ClassOf(const Fit &f, int row, int col) { return f.cls[row + 1][col + 1]; }
 
 struct Mapping {
   double g[8];  // normalised pixel -> cell: u = (g0 x + g1 y + g2) / w, v = (g3 x + g4 y + g5) / w, w = g6 x + g7 y + 1
@@ -168,252 +249,414 @@ void CellCorners(const Mapping &m, int width, double xy[4][2]) {
 
 struct Params {
   Mapping map;
-  bool motion = false;
-  // Without motion: blur standard deviations along the cell axes. With it: su = sv is the blur
-  // standard deviation and (mx, my) the straight motion blur segment, all in pixels.
-  double su = 1, sv = 1, mx = 0, my = 0;
+  bool box = false;  // motion model: s[0] blur, (s[1], s[2]) blur segment in pixels
+  int taps = 5;
+  // Gaussian model: s[0], s[1] are the blur standard deviations along the cell axes. Box model:
+  // s[0] is the blur standard deviation and s[1], s[2] the motion blur extent along each axis.
+  double s[3] = {1, 1, 0};
   double lev[3] = {20, 235, 235};  // black, white, outside
   double lx = 0, ly = 0;           // relative illumination slope per normalised pixel
+  double smax = 8;                 // upper bound of the Gaussian blur widths
 };
 
-// The model at one pixel: the cell classes' blurred coverage and, with `normal`, the derivatives of
-// the predicted value with respect to the parameters (columns as in the normal equations).
-struct PixelEval {
-  double S[4];
-  double dbase[kNP];  // derivative of the prediction; the three level columns are set by the caller
-};
-
-// Level weights of the four classes: unknown cells read as the mid-level.
-inline void ClassLevels(const Params &p, double l[4]) {
-  l[0] = p.lev[0];
-  l[1] = p.lev[1];
-  l[2] = p.lev[2];
-  l[3] = 0.5 * (p.lev[0] + p.lev[1]);
+// Local scale of the mapping at a normalised pixel: cells per pixel along u and v.
+inline void LocalScale(const Mapping &m, double x, double y, double scale, double *u, double *v, double *gu, double *gv) {
+  double w;
+  Project(m, x, y, u, v, &w);
+  const double iw = 1.0 / w;
+  const double gux = (m.g[0] - *u * m.g[6]) * iw, guy = (m.g[1] - *u * m.g[7]) * iw;
+  const double gvx = (m.g[3] - *v * m.g[6]) * iw, gvy = (m.g[4] - *v * m.g[7]) * iw;
+  *gu = std::sqrt(gux * gux + guy * guy) / scale;
+  *gv = std::sqrt(gvx * gvx + gvy * gvy) / scale;
 }
 
-void ModelPixel(const Fit &f, const Params &p, const double lv[4], double x, double y, bool normal, PixelEval *e) {
-  int taps = 1;
-  double length = 0;
-  if (p.motion) {
-    length = std::hypot(p.mx, p.my);
-    if (length > 0.05) taps = std::clamp(static_cast<int>(length) + 2, 3, kMaxTaps);
-  }
-  for (int c = 0; c < 4; ++c) e->S[c] = 0;
-  if (normal) std::fill(std::begin(e->dbase), std::end(e->dbase), 0.0);
-  const double inv_taps = 1.0 / taps;
-  Axis ax_u, ax_v;
-  for (int t = 0; t < taps; ++t) {
-    const double frac = taps == 1 ? 0.0 : (t + 0.5) / taps - 0.5;
-    const double xt = x + frac * p.mx / f.scale, yt = y + frac * p.my / f.scale;
-    double u, v, w;
-    Project(p.map, xt, yt, &u, &v, &w);
-    const double iw = 1.0 / w;
-    const double gux = (p.map.g[0] - u * p.map.g[6]) * iw, guy = (p.map.g[1] - u * p.map.g[7]) * iw;
-    const double gvx = (p.map.g[3] - v * p.map.g[6]) * iw, gvy = (p.map.g[4] - v * p.map.g[7]) * iw;
-    const double gu = std::sqrt(gux * gux + guy * guy) / f.scale;  // cells per pixel
-    const double gv = std::sqrt(gvx * gvx + gvy * gvy) / f.scale;
-    ComputeAxis(u, p.su * gu, f.width, normal, &ax_u);
-    ComputeAxis(v, p.sv * gv, f.width, normal, &ax_v);
-    double S[4] = {0, 0, 0, 0}, Su[4] = {0, 0, 0, 0}, Sv[4] = {0, 0, 0, 0}, Ssu[4] = {0, 0, 0, 0}, Ssv[4] = {0, 0, 0, 0};
-    for (int j = ax_v.lo; j <= ax_v.hi; ++j) {
-      const double cv = ax_v.a[j - ax_v.lo];
-      const double dcv = normal ? ax_v.da_du[j - ax_v.lo] : 0.0;
-      const double dcs = normal ? ax_v.da_ds[j - ax_v.lo] : 0.0;
-      for (int i = ax_u.lo; i <= ax_u.hi; ++i) {
-        const int c = ClassOf(f, j, i);
-        const double au = ax_u.a[i - ax_u.lo];
-        S[c] += au * cv;
-        if (normal) {
-          Su[c] += ax_u.da_du[i - ax_u.lo] * cv;
-          Sv[c] += au * dcv;
-          Ssu[c] += ax_u.da_ds[i - ax_u.lo] * cv;
-          Ssv[c] += au * dcs;
-        }
-      }
-    }
-    for (int c = 0; c < 4; ++c) e->S[c] += S[c] * inv_taps;
-    if (!normal) continue;
-    double pu = 0, pv = 0, psu = 0, psv = 0;
-    for (int c = 0; c < 4; ++c) {
-      pu += lv[c] * Su[c];
-      pv += lv[c] * Sv[c];
-      psu += lv[c] * Ssu[c];
-      psv += lv[c] * Ssv[c];
-    }
-    pu *= inv_taps;
-    pv *= inv_taps;
-    const double dg_u[8] = {xt * iw, yt * iw, iw, 0, 0, 0, -u * xt * iw, -u * yt * iw};
-    const double dg_v[8] = {0, 0, 0, xt * iw, yt * iw, iw, -v * xt * iw, -v * yt * iw};
-    for (int k = 0; k < 8; ++k) e->dbase[k] += pu * dg_u[k] + pv * dg_v[k];
-    if (p.motion) {
-      e->dbase[8] += (psu * gu + psv * gv) * inv_taps;
-      // a shift of the sample position by frac * (mx, my) / scale
-      const double along_x = pu * gux + pv * gvx, along_y = pu * guy + pv * gvy;
-      e->dbase[9] += frac * along_x / f.scale;
-      e->dbase[13] += frac * along_y / f.scale;
-    } else {
-      e->dbase[8] += psu * gu * inv_taps;
-      e->dbase[9] += psv * gv * inv_taps;
-    }
-  }
-}
-
-struct Accum {
-  double cost = 0;
-  double jtj[kNP][kNP];
-  double jtr[kNP];
-  int n = 0;
-};
-
-// Evaluates the model over the working set. With `normal` set, accumulates the normal equations;
-// `kcut` is the Huber threshold.
-void Evaluate(const Fit &f, const Params &p, double kcut, bool normal, Accum *acc) {
-  acc->cost = 0;
-  acc->n = 0;
-  if (normal) {
-    for (auto &r : acc->jtj) std::fill(std::begin(r), std::end(r), 0.0);
-    std::fill(std::begin(acc->jtr), std::end(acc->jtr), 0.0);
-  }
-  double lv[4];
-  ClassLevels(p, lv);
-  const size_t count = f.obs.size();
-  PixelEval e;
-  for (size_t idx = 0; idx < count; ++idx) {
-    ModelPixel(f, p, lv, f.nx[idx], f.ny[idx], normal, &e);
-    const double base = lv[0] * e.S[0] + lv[1] * e.S[1] + lv[2] * e.S[2] + lv[3] * e.S[3];
-    const double gain = 1.0 + p.lx * f.nx[idx] + p.ly * f.ny[idx];
-    const double pred = gain * base;
-    const double ob = f.obs[idx];
-    // Saturated pixels the model also puts at or beyond the range carry no information.
-    if ((ob >= 255.0 && pred >= 255.0) || (ob <= 0.0 && pred <= 0.0)) continue;
-    const double r = ob - pred;
-    const double ar = std::fabs(r);
-    const double wt = ar <= kcut ? 1.0 : kcut / ar;
-    acc->cost += ar <= kcut ? r * r : kcut * (2.0 * ar - kcut);
-    ++acc->n;
-    if (!normal) continue;
-    e.dbase[10] = e.S[0] + 0.5 * e.S[3];
-    e.dbase[11] = e.S[1] + 0.5 * e.S[3];
-    e.dbase[12] = e.S[2];
-    for (int a = 0; a < 14; ++a) e.dbase[a] *= gain;
-    e.dbase[14] = base * f.nx[idx];
-    e.dbase[15] = base * f.ny[idx];
-    for (int a = 0; a < kNP; ++a) {
-      const double ja = wt * e.dbase[a];
-      acc->jtr[a] += ja * r;
-      for (int c = a; c < kNP; ++c) acc->jtj[a][c] += ja * e.dbase[c];
-    }
-  }
-  if (normal) {
-    for (int a = 0; a < kNP; ++a) {
-      for (int c = 0; c < a; ++c) acc->jtj[a][c] = acc->jtj[c][a];
-    }
-  }
-}
-
-// Solves (A) x = b by Gaussian elimination with partial pivoting; false if singular.
-bool Solve(double a[kNP][kNP], double b[kNP], double x[kNP]) {
-  for (int c = 0; c < kNP; ++c) {
-    int piv = c;
-    for (int r = c + 1; r < kNP; ++r) {
-      if (std::fabs(a[r][c]) > std::fabs(a[piv][c])) piv = r;
-    }
-    if (std::fabs(a[piv][c]) < 1e-18) return false;
-    if (piv != c) {
-      for (int k = 0; k < kNP; ++k) std::swap(a[c][k], a[piv][k]);
-      std::swap(b[c], b[piv]);
-    }
-    for (int r = c + 1; r < kNP; ++r) {
-      const double m = a[r][c] / a[c][c];
-      if (m == 0.0) continue;
-      for (int k = c; k < kNP; ++k) a[r][k] -= m * a[c][k];
-      b[r] -= m * b[c];
-    }
-  }
-  for (int r = kNP - 1; r >= 0; --r) {
-    double s = b[r];
-    for (int k = r + 1; k < kNP; ++k) s -= a[r][k] * x[k];
-    x[r] = s / a[r][r];
-  }
-  return true;
-}
-
-// Builds the working set: the pixels whose blur window touches cells of more than one class, on a
-// lattice thinned so that about `limit` of them remain.
-void BuildSet(Fit *f, const Mapping &map, double half_window_px, int limit, const image_u8_t *im) {
-  const int W = f->width;
+// Collects the pixels whose blur window (half_window_px) touches cells of more than one class.
+void BuildCand(Cand *c, const Fit &f, const Mapping &map, double half_window_px, int limit, const image_u8_t *im) {
+  const int W = f.width;
   double inv[9];
   CellToNormalised(map, inv);
   double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
   const double ext = 0.8;
   const double cu[4] = {-ext, W + ext, W + ext, -ext}, cv[4] = {-ext, -ext, W + ext, W + ext};
+  double gmax = 0;
   for (int k = 0; k < 4; ++k) {
     const double w = inv[6] * cu[k] + inv[7] * cv[k] + inv[8];
-    const double x = (inv[0] * cu[k] + inv[1] * cv[k] + inv[2]) / w * f->scale + f->cx;
-    const double y = (inv[3] * cu[k] + inv[4] * cv[k] + inv[5]) / w * f->scale + f->cy;
+    const double nx = (inv[0] * cu[k] + inv[1] * cv[k] + inv[2]) / w;
+    const double ny = (inv[3] * cu[k] + inv[4] * cv[k] + inv[5]) / w;
+    const double x = nx * f.scale + f.cx;
+    const double y = ny * f.scale + f.cy;
     minx = std::min(minx, x);
     maxx = std::max(maxx, x);
     miny = std::min(miny, y);
     maxy = std::max(maxy, y);
+    double u, v, gu, gv;
+    LocalScale(map, nx, ny, f.scale, &u, &v, &gu, &gv);
+    gmax = std::max(gmax, std::max(gu, gv));
   }
   const int x0 = std::max(0, static_cast<int>(std::floor(minx))), x1 = std::min(im->width - 1, static_cast<int>(std::ceil(maxx)));
   const int y0 = std::max(0, static_cast<int>(std::floor(miny))), y1 = std::min(im->height - 1, static_cast<int>(std::ceil(maxy)));
-  f->nx.clear();
-  f->ny.clear();
-  f->obs.clear();
-  // About half the tag's area lies within reach of an edge.
-  const double area = static_cast<double>(x1 - x0 + 1) * (y1 - y0 + 1);
-  const int k = std::max(1, static_cast<int>(0.45 * area / std::max(limit, 1)));
-  const int r = std::max(1, static_cast<int>(std::lround(k * 0.382)));
-  f->thin = k;
+  c->pix.clear();
+  c->window = half_window_px;
+  c->area = static_cast<double>(std::max(0, x1 - x0 + 1)) * std::max(0, y1 - y0 + 1);
+  if (x1 < x0 || y1 < y0) return;
+  const float g0 = static_cast<float>(map.g[0]), g1 = static_cast<float>(map.g[1]), g2 = static_cast<float>(map.g[2]);
+  const float g3 = static_cast<float>(map.g[3]), g4 = static_cast<float>(map.g[4]), g5 = static_cast<float>(map.g[5]);
+  const float g6 = static_cast<float>(map.g[6]), g7 = static_cast<float>(map.g[7]);
+  const float inv_scale = static_cast<float>(1.0 / f.scale);
+  const float hw = static_cast<float>(half_window_px);
+  const float rmax = hw * static_cast<float>(gmax) * 1.02f;
+  const float lim = static_cast<float>(W) + static_cast<float>(ext);
+  const float cxf = static_cast<float>(f.cx), cyf = static_cast<float>(f.cy);
+  const int k = std::max(1, static_cast<int>(0.45 * c->area / std::max(limit, 1)));
+  c->thin = k;
+  const int lr = std::max(1, static_cast<int>(std::lround(k * 0.382)));
+  const int width = (x1 - x0) / k + 2;
+  thread_local std::vector<float> row_u, row_v, row_iw;
+  row_u.resize(width);
+  row_v.resize(width);
+  row_iw.resize(width);
+  c->pix.reserve(static_cast<size_t>(c->area * 0.4 / k) + 16);
   for (int py = y0; py <= y1; ++py) {
-    const int off = ((-(py * r)) % k + k) % k;
-    int px = x0 + (((off - x0) % k) + k) % k;
-    for (; px <= x1; px += k) {
-      const double x = (px + 0.5 - f->cx) / f->scale, y = (py + 0.5 - f->cy) / f->scale;
-      double u, v, w;
-      Project(map, x, y, &u, &v, &w);
-      if (u < -ext || u > W + ext || v < -ext || v > W + ext) continue;
-      const double iw = 1.0 / w;
-      const double gux = (map.g[0] - u * map.g[6]) * iw, guy = (map.g[1] - u * map.g[7]) * iw;
-      const double gvx = (map.g[3] - v * map.g[6]) * iw, gvy = (map.g[4] - v * map.g[7]) * iw;
-      const double ru = half_window_px * std::sqrt(gux * gux + guy * guy) / f->scale;
-      const double rv = half_window_px * std::sqrt(gvx * gvx + gvy * gvy) / f->scale;
-      const int i0 = std::clamp(static_cast<int>(std::floor(u - ru)), -1, W), i1 = std::clamp(static_cast<int>(std::floor(u + ru)), -1, W);
-      const int j0 = std::clamp(static_cast<int>(std::floor(v - rv)), -1, W), j1 = std::clamp(static_cast<int>(std::floor(v + rv)), -1, W);
-      const int first = ClassOf(*f, j0, i0);
-      bool varies = false, unknown = false;
+    const uint8_t *row = im->buf + static_cast<size_t>(py) * im->stride;
+    const float y = (static_cast<float>(py) + 0.5f - cyf) * inv_scale;
+    const float a0 = g1 * y + g2, b0 = g4 * y + g5, c0 = g7 * y + 1.0f;
+    const int off = ((-(py * lr)) % k + k) % k;
+    const int xfirst = x0 + (((off - x0) % k) + k) % k;
+    if (xfirst > x1) continue;
+    const int count = (x1 - xfirst) / k + 1;
+    const float xs = (static_cast<float>(xfirst) + 0.5f - cxf) * inv_scale;
+    const float xstep = static_cast<float>(k) * inv_scale;
+    for (int i = 0; i < count; ++i) {
+      const float x = xs + static_cast<float>(i) * xstep;
+      const float iw = 1.0f / (g6 * x + c0);
+      row_iw[i] = iw;
+      row_u[i] = (g0 * x + a0) * iw;
+      row_v[i] = (g3 * x + b0) * iw;
+    }
+    for (int i = 0; i < count; ++i) {
+      const float u = row_u[i], v = row_v[i];
+      if (u < -ext || u > lim || v < -ext || v > lim) continue;
+      if (FloorI(u - rmax) == FloorI(u + rmax) && FloorI(v - rmax) == FloorI(v + rmax)) continue;
+      const float x = xs + static_cast<float>(i) * xstep;
+      const float iw = row_iw[i];
+      const float gux = (g0 - u * g6) * iw, guy = (g1 - u * g7) * iw;
+      const float gvx = (g3 - v * g6) * iw, gvy = (g4 - v * g7) * iw;
+      const float gu = std::sqrt(gux * gux + guy * guy) * inv_scale;
+      const float gv = std::sqrt(gvx * gvx + gvy * gvy) * inv_scale;
+      const float ru = hw * gu, rv = hw * gv;
+      const int i0 = std::clamp(FloorI(u - ru), -1, W), i1 = std::clamp(FloorI(u + ru), -1, W);
+      const int j0 = std::clamp(FloorI(v - rv), -1, W), j1 = std::clamp(FloorI(v + rv), -1, W);
+      if (i0 == i1 && j0 == j1) continue;
+      const int first = ClassOf(f, j0, i0);
+      bool varies = false;
       for (int j = j0; j <= j1; ++j) {
-        for (int i = i0; i <= i1; ++i) {
-          const int c = ClassOf(*f, j, i);
-          varies |= c != first;
-          unknown |= c == 3;
-        }
+        for (int ii = i0; ii <= i1; ++ii) varies |= ClassOf(f, j, ii) != first;
       }
-      if (!varies || unknown) continue;
-      f->nx.push_back(static_cast<float>(x));
-      f->ny.push_back(static_cast<float>(y));
-      f->obs.push_back(static_cast<float>(im->buf[py * im->stride + px]));
+      if (!varies) continue;
+      c->pix.push_back({x, y, static_cast<float>(row[xfirst + i * k]), u, v, gu, gv, static_cast<int16_t>(xfirst + i * k), static_cast<int16_t>(py)});
     }
   }
 }
 
-// Linear least squares for the three levels at fixed mapping and blur.
-bool FitLevels(const Fit &f, Params *p, double *sse = nullptr) {
-  double ata[3][3] = {}, atb[3] = {}, yy = 0;
-  const double unit[4] = {1, 1, 1, 1};
-  PixelEval e;
-  for (size_t idx = 0; idx < f.obs.size(); ++idx) {
-    ModelPixel(f, *p, unit, f.nx[idx], f.ny[idx], false, &e);
-    // The unknown class reads as the mid-level of black and white.
-    const double gain = 1.0 + p->lx * f.nx[idx] + p->ly * f.ny[idx];
-    const double sw[3] = {gain * (e.S[0] + 0.5 * e.S[3]), gain * (e.S[1] + 0.5 * e.S[3]), gain * e.S[2]};
-    for (int a = 0; a < 3; ++a) {
-      atb[a] += sw[a] * f.obs[idx];
-      yy += a == 0 ? static_cast<double>(f.obs[idx]) * f.obs[idx] : 0.0;
-      for (int c = 0; c < 3; ++c) ata[a][c] += sw[a] * sw[c];
+// Chooses the working set from the candidates: a window of half_window_px, dropping pixels that touch
+// unknown cells, on a lattice thinned by `thin` or every `stride`-th candidate.
+void Select(Fit *f, const Cand &c, double half_window_px, int stride) {
+  const int W = f->width;
+  const float hw = static_cast<float>(half_window_px);
+  const size_t count = c.pix.size();
+  f->x.resize(count);
+  f->y.resize(count);
+  f->obs.resize(count);
+  f->u0.resize(count);
+  f->v0.resize(count);
+  f->gu.resize(count);
+  f->gv.resize(count);
+  size_t out = 0;
+  int counter = 0;
+  for (size_t idx = 0; idx < count; ++idx) {
+    const CandPixel &q = c.pix[idx];
+    if (stride > 1 && (counter++ % stride) != 0) continue;
+    const float ru = hw * q.gu, rv = hw * q.gv;
+    const int i0 = std::clamp(FloorI(q.u - ru), -1, W), i1 = std::clamp(FloorI(q.u + ru), -1, W);
+    const int j0 = std::clamp(FloorI(q.v - rv), -1, W), j1 = std::clamp(FloorI(q.v + rv), -1, W);
+    const int first = ClassOf(*f, j0, i0);
+    bool varies = false, unknown = false;
+    for (int j = j0; j <= j1; ++j) {
+      for (int i = i0; i <= i1; ++i) {
+        const int cl = ClassOf(*f, j, i);
+        varies |= cl != first;
+        unknown |= cl == 3;
+      }
+    }
+    if (!varies || unknown) continue;
+    f->x[out] = q.x;
+    f->y[out] = q.y;
+    f->obs[out] = q.obs;
+    f->u0[out] = q.u;
+    f->v0[out] = q.v;
+    f->gu[out] = q.gu;
+    f->gv[out] = q.gv;
+    ++out;
+  }
+  f->n = static_cast<int>(out);
+  f->x.resize(out);
+  f->y.resize(out);
+  f->obs.resize(out);
+  f->u0.resize(out);
+  f->v0.resize(out);
+  f->gu.resize(out);
+  f->gv.resize(out);
+}
+
+// Fixes each pixel's column and row window for blur widths up to sigma_px.
+void Freeze(Fit *f, double sigma_px, double extra_px = 0) {
+  const int W = f->width;
+  const float reach = static_cast<float>(kReach * sigma_px + extra_px);
+  f->i0.resize(f->n);
+  f->j0.resize(f->n);
+  f->nu.resize(f->n);
+  f->nv.resize(f->n);
+  for (int idx = 0; idx < f->n; ++idx) {
+    for (int axis = 0; axis < 2; ++axis) {
+      const float pos = axis == 0 ? f->u0[idx] : f->v0[idx];
+      const float rr = reach * (axis == 0 ? f->gu[idx] : f->gv[idx]);
+      int lo = std::clamp(FloorI(pos - rr), -1, W);
+      int hi = std::clamp(FloorI(pos + rr), -1, W);
+      if (hi - lo + 1 > kMaxC) {
+        const int mid = std::clamp(FloorI(pos), -1, W);
+        lo = std::max(lo, mid - (kMaxC - 1) / 2);
+        hi = std::min(hi, lo + kMaxC - 1);
+      }
+      if (axis == 0) {
+        f->i0[idx] = static_cast<int8_t>(lo);
+        f->nu[idx] = static_cast<uint8_t>(hi - lo + 1);
+      } else {
+        f->j0[idx] = static_cast<int8_t>(lo);
+        f->nv[idx] = static_cast<uint8_t>(hi - lo + 1);
+      }
     }
   }
+  f->A.resize(f->n);
+  f->B.resize(f->n);
+  f->C.resize(f->n);
+}
+
+// The model at every pixel of the working set: class coverages and, with Deriv, the derivatives of the
+// base prediction (levels p.lev, unknown cells at the mid-level) with respect to the parameters.
+template <bool Box, bool Deriv>
+void ModelPass(Fit *f, const Params &p) {
+  const float g0 = static_cast<float>(p.map.g[0]), g1 = static_cast<float>(p.map.g[1]), g2 = static_cast<float>(p.map.g[2]);
+  const float g3 = static_cast<float>(p.map.g[3]), g4 = static_cast<float>(p.map.g[4]), g5 = static_cast<float>(p.map.g[5]);
+  const float g6 = static_cast<float>(p.map.g[6]), g7 = static_cast<float>(p.map.g[7]);
+  const float lv[4] = {static_cast<float>(p.lev[0]), static_cast<float>(p.lev[1]), static_cast<float>(p.lev[2]),
+                       static_cast<float>(0.5 * (p.lev[0] + p.lev[1]))};
+  const float s0 = static_cast<float>(p.s[0]), s1 = static_cast<float>(p.s[1]), s2 = static_cast<float>(p.s[2]);
+  const int W = f->width;
+  const float inv_scale = static_cast<float>(1.0 / f->scale);
+  if (Deriv) f->J.resize(static_cast<size_t>(f->n) * kStrideJ);
+  Axis au, av;
+  for (int idx = 0; idx < f->n; ++idx) {
+    const float x = f->x[idx], y = f->y[idx];
+    const float iw = 1.0f / (g6 * x + g7 * y + 1.0f);
+    const float u = (g0 * x + g1 * y + g2) * iw, v = (g3 * x + g4 * y + g5) * iw;
+    const float gu = f->gu[idx], gv = f->gv[idx];
+    const int i0 = f->i0[idx], j0 = f->j0[idx], nu = f->nu[idx], nv = f->nv[idx];
+    if (!Box && nu * nv == 2) {
+      // A single cell edge: one boundary along one axis.
+      const bool ua = nu == 2;
+      const float pos = ua ? u : v;
+      const float sp = ua ? s0 : s1;
+      const int lo = ua ? i0 : j0;
+      const int cl_lo = f->cls[j0 + 1][i0 + 1];
+      const int cl_hi = ua ? f->cls[j0 + 1][i0 + 2] : f->cls[j0 + 2][i0 + 1];
+      const float inv_s = 1.0f / (sp * (ua ? gu : gv));
+      const float z = (static_cast<float>(lo + 1) - pos) * inv_s;
+      float cc, pp;
+      Lut(z, &cc, &pp);
+      float S[4] = {0, 0, 0, 0};
+      S[cl_lo] += cc;
+      S[cl_hi] += 1.0f - cc;
+      f->A[idx] = S[0] + 0.5f * S[3];
+      f->B[idx] = S[1] + 0.5f * S[3];
+      f->C[idx] = S[2];
+      if (Deriv) {
+        const float d = (lv[cl_hi] - lv[cl_lo]) * pp * inv_s;
+        const float pu = ua ? d : 0.0f, pv = ua ? 0.0f : d;
+        const float pb = d * z;
+        float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
+        const float xi = x * iw, yi = y * iw;
+        const float q = pu * u + pv * v;
+        J[0] = pu * xi;
+        J[1] = pu * yi;
+        J[2] = pu * iw;
+        J[3] = pv * xi;
+        J[4] = pv * yi;
+        J[5] = pv * iw;
+        J[6] = -q * xi;
+        J[7] = -q * yi;
+        J[8] = ua ? pb * gu : 0.0f;
+        J[9] = ua ? 0.0f : pb * gv;
+      }
+      continue;
+    }
+    if (Box) {
+      // Motion blur: a straight segment of taps, each a Gaussian that also covers the tap spacing.
+      const float len = std::sqrt(s1 * s1 + s2 * s2);
+      const int taps = p.taps;
+      const float inv_t = 1.0f / static_cast<float>(taps);
+      const float st = std::sqrt(s0 * s0 + len * len * inv_t * inv_t / 12.0f);
+      const float dst = s0 / st;
+      float S[4] = {0, 0, 0, 0};
+      float Jt[kMaxJ] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+      for (int t = 0; t < taps; ++t) {
+        const float frac = (static_cast<float>(t) + 0.5f) * inv_t - 0.5f;
+        const float xt = x + frac * s1 * inv_scale, yt = y + frac * s2 * inv_scale;
+        const float iwt = 1.0f / (g6 * xt + g7 * yt + 1.0f);
+        const float ut = (g0 * xt + g1 * yt + g2) * iwt, vt = (g3 * xt + g4 * yt + g5) * iwt;
+        AxisEval<false, Deriv>(ut, st * gu, 0.0f, i0, nu, W, &au);
+        AxisEval<false, Deriv>(vt, st * gv, 0.0f, j0, nv, W, &av);
+        float pu = 0, pv = 0, pbu = 0, pbv = 0;
+        for (int j = 0; j < nv; ++j) {
+          const float cv = av.a[j];
+          const uint8_t *crow = &f->cls[j0 + j + 1][i0 + 1];
+          for (int i = 0; i < nu; ++i) {
+            const int c = crow[i];
+            S[c] += au.a[i] * cv * inv_t;
+            if (Deriv) {
+              const float l = lv[c] * inv_t;
+              pu += l * au.du[i] * cv;
+              pv += l * au.a[i] * av.du[j];
+              pbu += l * au.ds[i] * cv;
+              pbv += l * au.a[i] * av.ds[j];
+            }
+          }
+        }
+        if (Deriv) {
+          const float xi = xt * iwt, yi = yt * iwt;
+          const float q = pu * ut + pv * vt;
+          Jt[0] += pu * xi;
+          Jt[1] += pu * yi;
+          Jt[2] += pu * iwt;
+          Jt[3] += pv * xi;
+          Jt[4] += pv * yi;
+          Jt[5] += pv * iwt;
+          Jt[6] -= q * xi;
+          Jt[7] -= q * yi;
+          Jt[8] += (pbu * gu + pbv * gv) * dst;
+          const float gux = (g0 - ut * g6) * iwt, guy = (g1 - ut * g7) * iwt;
+          const float gvx = (g3 - vt * g6) * iwt, gvy = (g4 - vt * g7) * iwt;
+          Jt[9] += frac * inv_scale * (pu * gux + pv * gvx);
+          Jt[10] += frac * inv_scale * (pu * guy + pv * gvy);
+        }
+      }
+      f->A[idx] = S[0] + 0.5f * S[3];
+      f->B[idx] = S[1] + 0.5f * S[3];
+      f->C[idx] = S[2];
+      if (Deriv) {
+        float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
+        for (int k = 0; k < kMaxJ; ++k) J[k] = Jt[k];
+      }
+      continue;
+    }
+    AxisEval<false, Deriv>(u, s0 * gu, 0.0f, i0, nu, W, &au);
+    AxisEval<false, Deriv>(v, s1 * gv, 0.0f, j0, nv, W, &av);
+    float S[4] = {0, 0, 0, 0};
+    float pu = 0, pv = 0, pbu = 0, pbv = 0;
+    for (int j = 0; j < nv; ++j) {
+      const float cv = av.a[j];
+      const uint8_t *crow = &f->cls[j0 + j + 1][i0 + 1];
+      for (int i = 0; i < nu; ++i) {
+        const int c = crow[i];
+        const float wgt = au.a[i] * cv;
+        S[c] += wgt;
+        if (Deriv) {
+          const float l = lv[c];
+          pu += l * au.du[i] * cv;
+          pv += l * au.a[i] * av.du[j];
+          pbu += l * au.ds[i] * cv;
+          pbv += l * au.a[i] * av.ds[j];
+        }
+      }
+    }
+    f->A[idx] = S[0] + 0.5f * S[3];
+    f->B[idx] = S[1] + 0.5f * S[3];
+    f->C[idx] = S[2];
+    if (Deriv) {
+      float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
+      const float xi = x * iw, yi = y * iw;
+      const float q = pu * u + pv * v;
+      J[0] = pu * xi;
+      J[1] = pu * yi;
+      J[2] = pu * iw;
+      J[3] = pv * xi;
+      J[4] = pv * yi;
+      J[5] = pv * iw;
+      J[6] = -q * xi;
+      J[7] = -q * yi;
+      J[8] = pbu * gu;
+      J[9] = pbv * gv;
+    }
+  }
+}
+
+inline void RunModel(Fit *f, const Params &p, bool deriv) {
+  if (p.box) {
+    if (deriv) ModelPass<true, true>(f, p);
+    else ModelPass<true, false>(f, p);
+  } else {
+    if (deriv) ModelPass<false, true>(f, p);
+    else ModelPass<false, false>(f, p);
+  }
+}
+
+// Solves (A) x = b by Gaussian elimination with partial pivoting; false if singular.
+bool Solve(int N, double a[kMaxT][kMaxT], double b[kMaxT], double x[kMaxT]) {
+  for (int c = 0; c < N; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < N; ++r) {
+      if (std::fabs(a[r][c]) > std::fabs(a[piv][c])) piv = r;
+    }
+    if (std::fabs(a[piv][c]) < 1e-18) return false;
+    if (piv != c) {
+      for (int k = 0; k < N; ++k) std::swap(a[c][k], a[piv][k]);
+      std::swap(b[c], b[piv]);
+    }
+    for (int r = c + 1; r < N; ++r) {
+      const double m = a[r][c] / a[c][c];
+      if (m == 0.0) continue;
+      for (int k = c; k < N; ++k) a[r][k] -= m * a[c][k];
+      b[r] -= m * b[c];
+    }
+  }
+  for (int r = N - 1; r >= 0; --r) {
+    double s = b[r];
+    for (int k = r + 1; k < N; ++k) s -= a[r][k] * x[k];
+    x[r] = s / a[r][r];
+  }
+  return true;
+}
+
+// Linear least squares for the three levels at fixed mapping and blur, from the model pass. Returns the SSE.
+bool FitLevels(const Fit &f, Params *p, double *sse = nullptr) {
+  double ata[3][3] = {}, atb[3] = {}, yy = 0;
+  for (int idx = 0; idx < f.n; ++idx) {
+    const float gain = 1.0f + static_cast<float>(p->lx) * f.x[idx] + static_cast<float>(p->ly) * f.y[idx];
+    const float sw0 = gain * f.A[idx], sw1 = gain * f.B[idx], sw2 = gain * f.C[idx];
+    const float o = f.obs[idx];
+    atb[0] += sw0 * o;
+    atb[1] += sw1 * o;
+    atb[2] += sw2 * o;
+    yy += static_cast<double>(o) * o;
+    ata[0][0] += sw0 * sw0;
+    ata[0][1] += sw0 * sw1;
+    ata[0][2] += sw0 * sw2;
+    ata[1][1] += sw1 * sw1;
+    ata[1][2] += sw1 * sw2;
+    ata[2][2] += sw2 * sw2;
+  }
+  ata[1][0] = ata[0][1];
+  ata[2][0] = ata[0][2];
+  ata[2][1] = ata[1][2];
   for (int a = 0; a < 3; ++a) ata[a][a] += 1e-6 * (ata[0][0] + ata[1][1] + ata[2][2]) + 1e-9;
   double m[9] = {ata[0][0], ata[0][1], ata[0][2], ata[1][0], ata[1][1], ata[1][2], ata[2][0], ata[2][1], ata[2][2]};
   double inv[9];
@@ -423,88 +666,193 @@ bool FitLevels(const Fit &f, Params *p, double *sse = nullptr) {
   return true;
 }
 
-// A cheap robust scale: the median absolute residual of the current model.
+// The median absolute residual of the current model over every third pixel (a cheap robust scale).
 double MedianAbsResidual(const Fit &f, const Params &p) {
   thread_local std::vector<float> res;
   res.clear();
-  double lv[4];
-  ClassLevels(p, lv);
-  PixelEval e;
-  for (size_t idx = 0; idx < f.obs.size(); ++idx) {
-    ModelPixel(f, p, lv, f.nx[idx], f.ny[idx], false, &e);
-    const double gain = 1.0 + p.lx * f.nx[idx] + p.ly * f.ny[idx];
-    res.push_back(static_cast<float>(std::fabs(f.obs[idx] - gain * (lv[0] * e.S[0] + lv[1] * e.S[1] + lv[2] * e.S[2] + lv[3] * e.S[3]))));
+  for (int idx = 0; idx < f.n; idx += 3) {
+    const double gain = 1.0 + p.lx * f.x[idx] + p.ly * f.y[idx];
+    res.push_back(static_cast<float>(std::fabs(f.obs[idx] - gain * (p.lev[0] * f.A[idx] + p.lev[1] * f.B[idx] + p.lev[2] * f.C[idx]))));
   }
   if (res.empty()) return 0;
   std::nth_element(res.begin(), res.begin() + res.size() / 2, res.end());
   return res[res.size() / 2];
 }
 
-// Levenberg-Marquardt on the normal equations; returns the final cost and leaves the best
+struct Accum {
+  double cost = 0;
+  int n = 0;
+  double jtj[kMaxT][kMaxT];
+  double jtr[kMaxT];
+};
+
+// Evaluates the model at p and accumulates the cost and, with `normal`, the normal equations of the
+// geometry, blur, level and illumination slope parameters over the Huber-weighted residuals.
+void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc) {
+  const bool normal = mode >= 1;
+  RunModel(f, *p, mode == 2);
+  const int n = f->n;
+  const float kc = static_cast<float>(kcut);
+  const int ng = p->box ? 11 : 10;
+  const int nt = ng + 5;
+  acc->cost = 0;
+  acc->n = 0;
+  if (mode == 2) {
+    for (auto &r : acc->jtj) std::fill(std::begin(r), std::end(r), 0.0);
+  }
+  if (normal) std::fill(std::begin(acc->jtr), std::end(acc->jtr), 0.0);
+  const float L0 = static_cast<float>(p->lev[0]), L1 = static_cast<float>(p->lev[1]), L2 = static_cast<float>(p->lev[2]);
+  const float lx = static_cast<float>(p->lx), ly = static_cast<float>(p->ly);
+  double cost = 0;
+  int count = 0;
+  float bj[kMaxT][kMaxT];
+  float br[kMaxT];
+  int in_block = 0;
+  int hcount = 0;
+  const int hstride = std::max(1, static_cast<int>(kKnobs.hstride));
+  const float hscale = static_cast<float>(hstride);
+  auto flush = [&]() {
+    for (int i = 0; i < nt; ++i) {
+      acc->jtr[i] += br[i];
+      if (mode == 2) {
+        for (int k = i; k < nt; ++k) acc->jtj[i][k] += bj[i][k];
+      }
+    }
+    std::fill(&bj[0][0], &bj[0][0] + kMaxT * kMaxT, 0.0f);
+    std::fill(br, br + kMaxT, 0.0f);
+    in_block = 0;
+  };
+  std::fill(&bj[0][0], &bj[0][0] + kMaxT * kMaxT, 0.0f);
+  std::fill(br, br + kMaxT, 0.0f);
+  for (int idx = 0; idx < n; ++idx) {
+    const float a = f->A[idx], bb = f->B[idx], c = f->C[idx];
+    const float base = L0 * a + L1 * bb + L2 * c;
+    const float gain = 1.0f + lx * f->x[idx] + ly * f->y[idx];
+    const float pred = gain * base;
+    const float ob = f->obs[idx];
+    if ((ob >= 255.0f && pred >= 255.0f) || (ob <= 0.0f && pred <= 0.0f)) continue;
+    const float r = ob - pred;
+    const float ar = std::fabs(r);
+    const float wt = ar <= kc ? 1.0f : kc / ar;
+    cost += ar <= kc ? r * r : kc * (2.0f * ar - kc);
+    ++count;
+    if (!normal) continue;
+    const float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
+    float col[kMaxT];
+    for (int k = 0; k < kMaxT; ++k) col[k] = 0.0f;
+    for (int k = 0; k < ng; ++k) col[k] = gain * J[k];
+    col[ng] = gain * a;
+    col[ng + 1] = gain * bb;
+    col[ng + 2] = gain * c;
+    col[ng + 3] = base * f->x[idx];
+    col[ng + 4] = base * f->y[idx];
+    if (mode == 1 || ++hcount < hstride) {
+      for (int i = 0; i < nt; ++i) br[i] += wt * col[i] * r;
+      continue;
+    }
+    hcount = 0;
+    for (int i = 0; i < nt; ++i) {
+      const float wc = wt * col[i];
+      br[i] += wc * r;
+      const float wh = wc * hscale;
+      for (int k = 0; k < kMaxT; ++k) bj[i][k] += wh * col[k];
+    }
+    if (++in_block == 64) flush();
+  }
+  if (normal) flush();
+  acc->cost = cost;
+  acc->n = count;
+  if (mode == 2) {
+    for (int i = 0; i < nt; ++i) {
+      for (int k = 0; k < i; ++k) acc->jtj[i][k] = acc->jtj[k][i];
+    }
+  }
+}
+
+// Applies a solved step to the parameters.
+void ApplyStep(const double *delta, Params *q) {
+  for (int k = 0; k < 8; ++k) q->map.g[k] += delta[k];
+  int ng = 10;
+  if (q->box) {
+    q->s[0] = std::clamp(q->s[0] + delta[8], 0.3, 3.0);
+    q->s[1] += delta[9];
+    q->s[2] += delta[10];
+    const double len = std::hypot(q->s[1], q->s[2]);
+    if (len > 24.0) {
+      q->s[1] *= 24.0 / len;
+      q->s[2] *= 24.0 / len;
+    }
+    ng = 11;
+  } else {
+    q->s[0] = std::clamp(q->s[0] + delta[8], 0.35, q->smax);
+    q->s[1] = std::clamp(q->s[1] + delta[9], 0.35, q->smax);
+  }
+  for (int k = 0; k < 3; ++k) q->lev[k] += delta[ng + k];
+  q->lx += delta[ng + 3];
+  q->ly += delta[ng + 4];
+}
+
+bool SolveStep(const Accum &cur, bool box, double lambda, double *delta) {
+  const int nt = (box ? 11 : 10) + 5;
+  double a[kMaxT][kMaxT], b[kMaxT];
+  for (int r = 0; r < nt; ++r) {
+    const double diag = std::max(cur.jtj[r][r], 1e-9);
+    for (int c = 0; c < nt; ++c) a[r][c] = cur.jtj[r][c];
+    a[r][r] += lambda * diag;
+    b[r] = cur.jtr[r];
+  }
+  return Solve(nt, a, b, delta);
+}
+
+// Levenberg-Marquardt over the geometry and blur; returns the final cost and leaves the best
 // parameters in *p. Stops when the corners move less than `tol` pixels.
-double Optimise(const Fit &f, Params *p, double kcut, int max_iter, double tol, int width, double *initial_cost = nullptr) {
+double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int width, double *initial_cost = nullptr) {
   Accum cur, trial;
-  Evaluate(f, *p, kcut, true, &cur);
+  const int full_passes = static_cast<int>(kKnobs.full);
+  Evaluate(f, p, kcut, 2, &cur);
   if (initial_cost != nullptr) *initial_cost = cur.cost;
   double lambda = 1e-3;
   double prev[4][2];
   CellCorners(p->map, width, prev);
   for (int iter = 0; iter < max_iter; ++iter) {
-    double diag[kNP];
-    for (int k = 0; k < kNP; ++k) diag[k] = std::max(cur.jtj[k][k], 1e-9);
     bool accepted = false;
     for (int attempt = 0; attempt < 6 && !accepted; ++attempt) {
-      double a[kNP][kNP], b[kNP], delta[kNP];
-      for (int r = 0; r < kNP; ++r) {
-        for (int c = 0; c < kNP; ++c) a[r][c] = cur.jtj[r][c];
-        a[r][r] += lambda * diag[r];
-        b[r] = cur.jtr[r];
-      }
-      if (!Solve(a, b, delta)) {
+      double delta[kMaxT];
+      if (!SolveStep(cur, p->box, lambda, delta)) {
         lambda *= 10;
         continue;
       }
       Params q = *p;
-      for (int k = 0; k < 8; ++k) q.map.g[k] += delta[k];
-      if (q.motion) {
-        q.su = q.sv = std::clamp(q.su + delta[8], 0.35, 6.0);
-        q.mx += delta[9];
-        q.my += delta[13];
-        const double len = std::hypot(q.mx, q.my);
-        if (len > 24.0) {
-          q.mx *= 24.0 / len;
-          q.my *= 24.0 / len;
-        }
-      } else {
-        q.su = std::clamp(q.su + delta[8], 0.35, 8.0);
-        q.sv = std::clamp(q.sv + delta[9], 0.35, 8.0);
+      ApplyStep(delta, &q);
+      double corners[4][2];
+      CellCorners(q.map, width, corners);
+      double move = 0;
+      for (int k = 0; k < 4; ++k) move = std::max(move, std::hypot((corners[k][0] - prev[k][0]) * f->scale, (corners[k][1] - prev[k][1]) * f->scale));
+      if (move < tol) {
+        *p = q;
+        return cur.cost;
       }
-      for (int k = 0; k < 3; ++k) q.lev[k] += delta[10 + k];
-      q.lx += delta[14];
-      q.ly += delta[15];
-      Evaluate(f, q, kcut, true, &trial);
+      const int mode = iter + 1 < full_passes ? 2 : 1;
+      if (mode == 1) std::copy(&cur.jtj[0][0], &cur.jtj[0][0] + kMaxT * kMaxT, &trial.jtj[0][0]);
+      Evaluate(f, &q, kcut, mode, &trial);
       if (trial.n > 0 && trial.cost < cur.cost) {
         *p = q;
         std::swap(cur, trial);
         lambda = std::max(lambda / 4, 1e-7);
         accepted = true;
+        for (int k = 0; k < 4; ++k) {
+          prev[k][0] = corners[k][0];
+          prev[k][1] = corners[k][1];
+        }
       } else {
         lambda *= 5;
       }
     }
     if (!accepted) break;
-    double corners[4][2];
-    CellCorners(p->map, width, corners);
-    double move = 0;
-    for (int k = 0; k < 4; ++k) {
-      move = std::max(move, std::hypot((corners[k][0] - prev[k][0]) * f.scale, (corners[k][1] - prev[k][1]) * f.scale));
-      prev[k][0] = corners[k][0];
-      prev[k][1] = corners[k][1];
-    }
-    if (move < tol) break;
   }
   return cur.cost;
 }
+
 
 }  // namespace
 
@@ -515,15 +863,20 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   if (W < 4 || W > kMaxCells || det->id < 0 || det->id >= static_cast<int>(fam->ncodes)) return false;
 
   static thread_local Fit fit;
+  static thread_local Fit scan;
+  static thread_local Cand cand;
   fit.width = W;
+  for (int j = 0; j < kPad; ++j) {
+    for (int i = 0; i < kPad; ++i) fit.cls[j][i] = 2;
+  }
   for (int j = 0; j < W; ++j) {
-    for (int i = 0; i < W; ++i) fit.cls[j][i] = 0;
+    for (int i = 0; i < W; ++i) fit.cls[j + 1][i + 1] = 0;
   }
   const uint64_t code = fam->codes[det->id];
   for (uint32_t b = 0; b < fam->nbits; ++b) {
     const uint32_t bx = fam->bit_x[b], by = fam->bit_y[b];
     if (bx >= static_cast<uint32_t>(W) || by >= static_cast<uint32_t>(W)) return false;
-    if ((code >> (fam->nbits - 1 - b)) & 1u) fit.cls[by][bx] = 1;
+    if ((code >> (fam->nbits - 1 - b)) & 1u) fit.cls[by + 1][bx + 1] = 1;
   }
 
   // The detection's tag-to-pixel homography, composed with tag [-1, 1] -> cell coordinates.
@@ -565,28 +918,44 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   CellCorners(start, W, start_corners);
 
   const int limit = MaxPixels();
-  // Blur: try a few widths on a narrow working set first.
+  const double base_window = kKnobs.base_window;
+  BuildCand(&cand, fit, p.map, base_window, limit, im);
+  const int thin = cand.thin;
+  if (cand.pix.size() < 40) return false;
+
+  // Blur: try a few widths on a sparse subset of the narrow window first.
+  const int scan_stride = std::max(1, static_cast<int>(cand.pix.size() / 400));
+  scan.width = W;
+  std::copy(&fit.cls[0][0], &fit.cls[0][0] + kPad * kPad, &scan.cls[0][0]);
+  scan.cx = fit.cx;
+  scan.cy = fit.cy;
+  scan.scale = fit.scale;
+  Select(&scan, cand, std::min(3.0, 0.5 * cell_px + 0.5), scan_stride);
+  if (scan.n < 40) return false;
   const double candidates[] = {0.7, 1.2, 2.0, 3.5};
-  BuildSet(&fit, p.map, std::min(3.0, 0.5 * cell_px + 0.5), limit, im);
-  if (fit.obs.size() < 40) return false;
   double best_cost = 1e300, best_s = 1.0;
-  Accum acc;
-  for (double s : candidates) {
-    p.su = p.sv = s;
+  double best_lev[3] = {p.lev[0], p.lev[1], p.lev[2]};
+  for (int ci = 0; ci < 4; ++ci) {
+    if (ci == 3 && best_s < 2.0) break;
+    const double s = candidates[ci];
+    p.s[0] = p.s[1] = s;
+    Freeze(&scan, s);
+    ModelPass<false, false>(&scan, p);
     double sse = 0;
-    if (!FitLevels(fit, &p, &sse)) continue;
+    if (!FitLevels(scan, &p, &sse)) continue;
     if (sse < best_cost) {
       best_cost = sse;
       best_s = s;
+      std::copy(p.lev, p.lev + 3, best_lev);
     }
   }
-  p.su = p.sv = best_s;
-  if (!FitLevels(fit, &p)) return false;
-  if (fit.thin > 1 && (DevFlags() & 16) == 0) {
+  p.s[0] = p.s[1] = best_s;
+  std::copy(best_lev, best_lev + 3, p.lev);
+  if (thin > 1 && (DevFlags() & 16) == 0) {
     // A tag too large for the working set keeps its profile fit unless it is blurred or clipped.
     size_t saturated = 0;
-    for (float v : fit.obs) saturated += v >= 255.0f;
-    if (best_s < 1.6 && saturated * 20 < fit.obs.size()) return false;
+    for (float v : scan.obs) saturated += v >= 255.0f;
+    if (best_s < 1.6 && saturated * 20 < scan.obs.size()) return false;
   }
   if (det->hamming > 0) {
     // A cell whose centre reads far from the level its code bit implies (covered, or a corrected bit) is left out.
@@ -602,72 +971,87 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
           const double py = (inv_map[3] * cu + inv_map[4] * cv + inv_map[5]) / w * fit.scale + fit.cy;
           const int ix = static_cast<int>(px), iy = static_cast<int>(py);
           if (ix < 0 || iy < 0 || ix >= im->width || iy >= im->height) continue;
-          const double expected = fit.cls[j][i] ? p.lev[1] : p.lev[0];
+          const double expected = fit.cls[j + 1][i + 1] ? p.lev[1] : p.lev[0];
           if (std::fabs(im->buf[iy * im->stride + ix] - expected) > 0.3 * range) marked[j][i] = 1;
         }
       }
       for (int j = 0; j < W; ++j) {
         for (int i = 0; i < W; ++i) {
-          if (marked[j][i]) fit.cls[j][i] = 3;
+          if (marked[j][i]) fit.cls[j + 1][i + 1] = 3;
         }
       }
     }
   }
-  double window = std::min(2.5 * best_s + 0.3, 0.75 * cell_px + 0.5);
-  window = std::max(window, 1.8);
-  BuildSet(&fit, p.map, window, limit, im);
-  if (fit.obs.size() < 40) return false;
+  const double window_mult = kKnobs.win_mult;
+  double window = std::min(window_mult * best_s + 0.3 + kKnobs.blur_extra * std::max(0.0, best_s - 1.2), 0.75 * cell_px + 0.5);
+  window = std::max(window, kKnobs.min_win);
+  if (window > base_window) BuildCand(&cand, fit, p.map, window, limit, im);
+  Select(&fit, cand, window, 1);
+  if (fit.n < 40) return false;
+  const double reach_s = std::min(kKnobs.smax_mult * best_s, 8.0);
+  Freeze(&fit, reach_s);
+  p.smax = reach_s;
+  ModelPass<false, false>(&fit, p);
   FitLevels(fit, &p);
 
   const double kcut = std::max(6.0, 4.0 * 1.4826 * MedianAbsResidual(fit, p));
   double start_cost = 0;
-  double cost = Optimise(fit, &p, kcut, 8, 0.01, W, &start_cost);
+  const double tol = kKnobs.tol;
+  const int iters = static_cast<int>(kKnobs.iters);
+  double cost = Optimise(&fit, &p, kcut, iters, tol, W, &start_cost);
 
   bool moving_accepted = false;
-  if (std::max(p.su, p.sv) > 1.4 && (DevFlags() & 8) == 0) {
-    // A wide blur may be motion: refit with a straight blur segment, from the best of eight directions,
-    // on a thinner working set (the model costs a sample per tap).
-    static thread_local Fit small;
-    small.width = W;
-    std::copy(&fit.cls[0][0], &fit.cls[0][0] + kMaxCells * kMaxCells, &small.cls[0][0]);
-    small.cx = fit.cx;
-    small.cy = fit.cy;
-    small.scale = fit.scale;
-    BuildSet(&small, p.map, window, std::min(limit, 2500), im);
-    if (small.obs.size() >= 40) {
-      const double sigma0 = 0.7;
-      const double smax = std::max(p.su, p.sv);
-      const double length0 = std::sqrt(12.0 * std::max(smax * smax - sigma0 * sigma0, 1.0));
-      Evaluate(small, p, kcut, false, &acc);
-      const double cost_plain = acc.cost;
+  if (std::max(p.s[0], p.s[1]) > 1.4 && (DevFlags() & 8) == 0) {
+    // A wide blur may be motion: refit with a Gaussian blur plus a straight blur segment.
+    const double sigma0 = 0.7;
+    const double lu = std::sqrt(12.0 * std::max(p.s[0] * p.s[0] - sigma0 * sigma0, 0.5));
+    const double lv = std::sqrt(12.0 * std::max(p.s[1] * p.s[1] - sigma0 * sigma0, 0.5));
+    const double *g = p.map.g;
+    double nux = g[0] - g[2] * g[6], nuy = g[1] - g[2] * g[7], nvx = g[3] - g[5] * g[6], nvy = g[4] - g[5] * g[7];
+    const double nul = std::hypot(nux, nuy), nvl = std::hypot(nvx, nvy);
+    nux /= nul;
+    nuy /= nul;
+    nvx /= nvl;
+    nvy /= nvl;
+    const double det2 = nux * nvy - nuy * nvx;
+    if (std::fabs(det2) > 0.2) {
       Params moving = p;
-      moving.motion = true;
-      moving.su = moving.sv = sigma0;
-      double best_move = 1e300;
-      Params best = moving;
-      for (int d = 0; d < 8; ++d) {
-        const double ang = d * 3.14159265358979323846 / 8.0;
-        moving.mx = length0 * std::cos(ang);
-        moving.my = length0 * std::sin(ang);
+      moving.box = true;
+      moving.s[0] = sigma0;
+      double best_sse = 1e300;
+      Params best_start = moving;
+      for (int sign = 0; sign < 2; ++sign) {
+        const double a2 = lu, b2 = sign == 0 ? lv : -lv;
+        moving.s[1] = (a2 * nvy - b2 * nuy) / det2;
+        moving.s[2] = (nux * b2 - nvx * a2) / det2;
+        const double len = std::hypot(moving.s[1], moving.s[2]);
+        moving.taps = std::clamp(static_cast<int>(std::ceil(len / 1.6)), 3, 9);
+        const double st = std::sqrt(sigma0 * sigma0 + len * len / 12.0);
+        Freeze(&fit, st, 0.5 * len);
+        ModelPass<true, false>(&fit, moving);
         double sse = 0;
-        if (!FitLevels(small, &moving, &sse)) continue;
-        if (sse < best_move) {
-          best_move = sse;
-          best = moving;
+        if (FitLevels(fit, &moving, &sse) && sse < best_sse) {
+          best_sse = sse;
+          best_start = moving;
         }
       }
-      if (best_move < 1e300) {
-        const double cost_moving = Optimise(small, &best, kcut, 10, 0.01, W);
-        if (cost_moving < 0.97 * cost_plain) {
-          p = best;
+      if (best_sse < 1e300) {
+        Params moving2 = best_start;
+        const double len = std::hypot(moving2.s[1], moving2.s[2]);
+        Freeze(&fit, std::sqrt(sigma0 * sigma0 + len * len / 12.0) * 1.15, 0.6 * len);
+        const double cost_moving = Optimise(&fit, &moving2, kcut, 5, 2.5 * tol, W);
+        Params plain = p;
+        Accum tmp;
+        Evaluate(&fit, &plain, kcut, 0, &tmp);
+        if (cost_moving < 0.97 * tmp.cost) {
+          p = moving2;
           moving_accepted = true;
-          if ((DevFlags() & 32) == 0) Optimise(fit, &p, kcut, 3, 0.01, W);
         }
       }
     }
   }
 
-  if (!moving_accepted && !(cost < start_cost)) return false;
+  if (!moving_accepted && cost > start_cost) return false;
   double corners[4][2];
   CellCorners(p.map, W, corners);
   const double limit_px = std::max(0.5, std::min(2.0, 0.3 * cell_px));
