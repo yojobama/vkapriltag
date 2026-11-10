@@ -94,6 +94,8 @@ WorkerPoolOptions ResolveWorkerPoolOptions(const WorkerPoolOptions &configured) 
   if (const char *v = std::getenv("APRILTAG_CPU_INLINE")) o.inline_max = std::atoi(v);
   if (const char *v = std::getenv("APRILTAG_CPU_INLINE_IDLE_US")) o.inline_idle_us = std::atoi(v);
   if (const char *v = std::getenv("APRILTAG_CPU_BIG_CORES")) o.big_cores = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_CPU_SPIN_YIELD")) o.spin_yield = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_CPU_SPIN_WORKERS")) o.spin_workers = std::atoi(v);
   if (const char *v = std::getenv("APRILTAG_CPU_PIN_CALLER")) o.pin_caller = v[0] != '0';
   return o;
 }
@@ -184,9 +186,13 @@ void WorkerPool::SpinForWork(uint64_t seen) {
   const int64_t deadline = NowNs() + static_cast<int64_t>(options_.spin_us) * 1000;
   for (unsigned n = 0;; ++n) {
     if (generation_.load(std::memory_order_acquire) != seen || stop_.load(std::memory_order_acquire)) return;
-    CpuRelax();
+    if (options_.spin_yield) std::this_thread::yield(); else CpuRelax();
     if ((n & 31) == 31 && NowNs() >= deadline) return;
   }
+}
+
+bool WorkerPool::ShouldSpin(unsigned slot) const {
+  return options_.spin_us > 0 && (options_.spin_workers <= 0 || slot <= static_cast<unsigned>(options_.spin_workers));
 }
 
 void WorkerPool::WorkerMain(unsigned slot) {
@@ -196,7 +202,7 @@ void WorkerPool::WorkerMain(unsigned slot) {
   uint64_t seen_warm = 0;
   bool spin = false;
   for (;;) {
-    if (spin && options_.spin_us > 0) SpinForWork(seen);
+    if (spin && ShouldSpin(slot)) SpinForWork(seen);
     bool batch = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
