@@ -829,6 +829,9 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
 
 constexpr double kSuspectFraction = 0.02;
 
+// Most hull fits attempted in one frame.
+constexpr size_t kMaxHullAttempts = 6;
+
 // Whether every corner of `a` is within `tolerance` pixels of a corner of `b`.
 bool SameCorners(const DetectedQuad &a, const DetectedQuad &b, double tolerance) {
   for (int i = 0; i < 4; ++i) {
@@ -906,7 +909,7 @@ std::vector<DetectedQuad> QuadDecode::Decode(
 
   // Fit and refit every blob independently; each entry is written by exactly one task.
   struct SpanResult {
-    bool dp_attempted = false, dp_used = false, has_quad = false, has_hull = false;
+    bool dp_attempted = false, dp_used = false, has_quad = false, has_hull = false, hull_candidate = false;
     DetectedQuad quad, hull_quad;
     bool has_box = false;
     DetectedQuad box;
@@ -951,16 +954,35 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     if (config_.hull_quad) {
       const bool large = !r.has_quad || std::hypot(r.quad.p[0][0] - r.quad.p[2][0], r.quad.p[0][1] - r.quad.p[2][1]) >=
                                             kMinHullExtent * config_.decimation * 0.5;
-      const bool suspect = large && (!r.has_quad || HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
+      r.hull_candidate = large && (!r.has_quad || HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
                                                config_.decimation, 4.0, kSuspectFraction));
-      if (suspect) {
-        const FitQuadResult hq =
-            FitQuadHull(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
-        r.has_hull = hq.valid && UpdateFitQuad(config_, hq, &r.hull_quad);
-        if (r.has_hull && r.has_quad && SameCorners(r.quad, r.hull_quad, 2.0)) r.has_hull = false;
-      }
     }
   });
+
+  // The hull fit runs on the largest candidates only, so a frame full of failing blobs stays cheap.
+  if (config_.hull_quad) {
+    std::vector<size_t> candidates;
+    for (size_t s = 0; s < spans.size(); ++s) {
+      if (per_span[s].hull_candidate) candidates.push_back(s);
+    }
+    if (candidates.size() > kMaxHullAttempts) {
+      std::nth_element(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(kMaxHullAttempts),
+                       candidates.end(),
+                       [&](size_t a, size_t b) {
+                         const size_t na = spans[a].end - spans[a].begin, nb = spans[b].end - spans[b].begin;
+                         return na != nb ? na > nb : a < b;
+                       });
+      candidates.resize(kMaxHullAttempts);
+    }
+    pool_->ParallelFor(candidates.size(), [&](size_t c, unsigned slot) {
+      const size_t s = candidates[c];
+      SpanResult &r = per_span[s];
+      const FitQuadResult hq =
+          FitQuadHull(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
+      r.has_hull = hq.valid && UpdateFitQuad(config_, hq, &r.hull_quad);
+      if (r.has_hull && r.has_quad && SameCorners(r.quad, r.hull_quad, 2.0)) r.has_hull = false;
+    });
+  }
 
   last_dp_stats_ = DpStats{};
   for (const SpanResult &r : per_span) {
