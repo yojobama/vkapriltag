@@ -45,5 +45,37 @@ Hull quad:
 Whole corpus at d1 and d2 with both switches on: scores identical to the version before these changes (recall,
 false detections, median, p95 per scenario).
 
-## Timing (interleaved ABBA medians, ms per frame, off versus both on)
-See the table in the final report; raw lines in `timing_before*.txt` / `timing_after.txt` in the scratchpad.
+4. `QuadDecode.cpp` hull support sweep in float, bounding-box aspect gate 0.6 (no tag lost in border-occlusion; jpeg
+   candidates past the gates -28%). No measurable timing change beyond noise.
+
+## Timing (interleaved ABBA, 4 rounds, 20 iterations, 3 warmup; median ms per frame, off versus both on)
+Before (binary at 956d502 merge, `timing_before*.txt`) -> after (`timing_after2.txt`):
+
+| scenario | dec | off | on before | on after | delta before | delta after |
+|---|---|---|---|---|---|---|
+| clutter-only | 2 | 0.45 | 1.010 | 0.611 | +123% | +30% |
+| busy-background | 2 | 0.50 | 0.972 | 0.672 | +97% | +38% |
+| jpeg | 2 | 0.76 | 0.913 | 0.907 | +21% | +13% |
+| noise | 2 | 0.34 | 0.386 | 0.350 | +14% | +5% |
+| dense-tags | 2 | 0.59 | 0.609 | 0.645 | +3% | +14% (noise, off 0.567) |
+| one-tag | 2 | 0.30 | 0.333 | 0.298 | +12% | +12% |
+| decoys | 2 | 0.46 | 0.497 | 0.376 | +9% | +1% |
+| range | 2 | 0.17 | 0.200 | 0.190 | +15% | +17% (real rescue work) |
+| border-occlusion | 2 | 0.32 | 0.516 | 0.420 | +63% | +49% |
+| clutter-only | 1 | 0.53 | 0.610 | 0.543 | +15% | +14% |
+| jpeg | 1 | 1.31 | 1.545 | 1.432 | +18% | +18% |
+| border-occlusion | 1 | 0.39 | 0.653 | 0.628 | +69% | +81% |
+
+The machine was shared with other agents, so run-to-run noise is about +-0.05 ms; deltas under 0.05 ms are not
+significant. Single switches (jpeg d2, 3 rounds): small rescue alone -4% (free), hull alone +15%; clutter-only d2: small
++23%, hull +18% (before the later float/aspect change). Hull with the cap but K=0 (candidate machinery only) is about
++0.01 ms on jpeg d2, K=6 +0.05, K unlimited +0.10: the remaining hull cost is the few fits that still run (one task of
+about 1 ms is the critical path of the parallel pass).
+
+## Left
+- The 5% target is not reached on clutter-only / busy-background (small rescue: one Otsu + flood per box, 28 boxes per
+  frame) or jpeg (hull). Ideas not done: rank boxes and cap them per frame; a cheaper support sweep (subsample points,
+  coarse angle steps are unsafe on long sides); do the hull only for blobs whose normal quad failed to decode (needs the
+  decode result, i.e. a second pass through TagDecoder); skip box refits when the frame already has many failed boxes.
+- Fixed cost of about 0.03 ms on quiet scenes at decimation 2 (one-tag, noise): GPU min_cluster_pixels 8 instead of 24
+  (more blobs read back) and the per-span bounding box and gradient loop.
