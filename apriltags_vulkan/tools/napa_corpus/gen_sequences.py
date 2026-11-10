@@ -29,6 +29,7 @@ SEQUENCES = {
     "fast-2tag-640": {"size": (640, 480), "tags": 2, "speed": 30.0, "blur": True},
     "fast-1tag-1280": {"size": (1280, 720), "tags": 1, "speed": 30.0, "blur": True},
     "enterleave-3tag-640": {"size": (640, 480), "tags": 3, "speed": 5.0, "cross": True},
+    "enter-3tag-640": {"size": (640, 480), "tags": 3, "speed": 3.0, "enter": True},
     "noise-2tag-640": {"size": (640, 480), "tags": 2, "speed": 6.0, "noise": 8.0},
 }
 
@@ -63,6 +64,18 @@ def tag_paths(cfg, rng, n_frames, w, h):
             continue
         ax, ay = max(8.0, cw / 2 - extent), max(8.0, ch / 2 - extent)
         cx, cy = (i % cols + 0.5) * cw, (i // cols + 0.5) * ch
+        if cfg.get("enter") and i > 0:
+            # enters from the nearer side edge at a staggered time at 5 px/frame, then stays in its cell
+            start = 40 + 60 * (i - 1)
+            sign = 1 if cx < w / 2 else -1
+            x_off = -1.2 * extent if sign > 0 else w + 1.2 * extent
+
+            def path(f, cx=cx, cy=cy, x_off=x_off, sign=sign, start=start, th0=th0, spin=spin, tilt0=tilt0, axis=axis):
+                x = x_off + sign * 5.0 * max(0.0, f - start)
+                return ((min(x, cx) if sign > 0 else max(x, cx)), cy), th0 + spin * f, tilt0, axis
+
+            tags.append((size, path))
+            continue
         # peak speed = amplitude * omega, split between the axes
         sx, sy = float(rng.uniform(0.5, 1.0)), float(rng.uniform(0.5, 1.0))
         norm = math.hypot(sx, sy)
