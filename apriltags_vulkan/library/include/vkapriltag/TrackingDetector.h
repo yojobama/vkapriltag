@@ -70,8 +70,8 @@ struct TrackingConfig {
   // The background detector starts at most every this many frames.
   // Env override: APRILTAG_VK_TRACKING_ASYNC_INTERVAL=<n>
   uint32_t async_interval = 1;
-  // Threads of the background decoder, 0 = the default. Env override: APRILTAG_VK_TRACKING_ASYNC_THREADS=<n>
-  uint32_t async_threads = 0;
+  // Threads of the background decoder (0 = all cores). Env override: APRILTAG_VK_TRACKING_ASYNC_THREADS=<n>
+  uint32_t async_threads = 1;
   // Copies a frame for the background detector. Off: the caller keeps each frame valid until the next
   // Detect(), which waits for the background pass if it still reads it.
   // Env override: APRILTAG_VK_TRACKING_ASYNC_COPY=0|1
