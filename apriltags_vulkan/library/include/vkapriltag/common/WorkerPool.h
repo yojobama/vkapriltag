@@ -14,7 +14,7 @@
 
 namespace apriltag_vulkan {
 
-// Optional behaviours of WorkerPool; all off by default. Negative values mean "unset".
+// Optional behaviours of WorkerPool; only big_cores is on by default (no effect where core capacities are equal). Negative values mean "unset".
 struct WorkerPoolOptions {
   // Microseconds a worker spins for the next batch after a batch or a Warm() before it blocks.
   int spin_us = 0;
@@ -27,7 +27,7 @@ struct WorkerPoolOptions {
   int inline_idle_us = 1000;
   // On CPUs whose cores differ in capacity, pins workers to the highest-capacity cores and sizes
   // the default thread count to their number; pin_caller also pins the calling thread.
-  bool big_cores = false;
+  bool big_cores = true;
   bool pin_caller = false;
 };
 

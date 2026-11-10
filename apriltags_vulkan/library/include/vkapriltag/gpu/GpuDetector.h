@@ -129,13 +129,13 @@ struct DetectorConfig {
   // Env override: APRILTAG_CPU_THREADS=<n>
   uint32_t cpu_threads = 0;
 
-  // CPU tail worker pool options (see WorkerPoolOptions); all off by default.
+  // CPU tail worker pool options (see WorkerPoolOptions); only cpu_big_cores is on by default.
   // Env override: APRILTAG_CPU_SPIN_US, APRILTAG_CPU_INLINE, APRILTAG_CPU_INLINE_IDLE_US,
   // APRILTAG_CPU_BIG_CORES, APRILTAG_CPU_PIN_CALLER
   int cpu_spin_us = 0;
   int cpu_inline_max = 0;
   int cpu_inline_idle_us = 1000;
-  bool cpu_big_cores = false;
+  bool cpu_big_cores = true;
   bool cpu_pin_caller = false;
 
   WorkerPoolOptions PoolOptions() const {
