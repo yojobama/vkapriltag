@@ -4,10 +4,31 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+#include <chrono>
+#include <cstdio>
 #include <vector>
 
 namespace apriltag_vulkan {
 namespace {
+
+struct ProfCounters {
+  double t[12] = {};
+  long n[12] = {};
+  long tags = 0, pixels = 0, evals = 0;
+  ~ProfCounters() {
+    if (tags == 0) return;
+    static const char *names[12] = {"setup", "cand", "scan", "select", "freeze+lev", "opt-model", "opt-accum", "motion", "final", "total", "gather", "dots"};
+    for (int i = 0; i < 12; ++i) std::fprintf(stderr, "PROF %-10s %8.1f us/tag\n", names[i], t[i] * 1e6 / tags);
+    std::fprintf(stderr, "PROF tags %ld px/tag %.0f evals/tag %.2f\n", tags, static_cast<double>(pixels) / tags, static_cast<double>(evals) / tags);
+  }
+};
+thread_local ProfCounters g_prof_local;
+inline double NowS() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 constexpr int kMaxCells = 16;        // widest supported grid
 constexpr int kPad = kMaxCells + 2;  // class grid with one outside row and column on each side
@@ -35,9 +56,10 @@ int MaxPixels() {
 }
 
 struct Knobs {
-  double blur_extra, hstride, base_window, win_mult, min_win, smax_mult, tol, iters, full, scan_n, reach;
+  double blur_extra, hstride, base_window, win_mult, min_win, smax_mult, tol, iters, full, scan_n, reach, fast;
   Knobs() {
     hstride = Get("APRILTAG_VK_POLISH_HSTRIDE", 1);
+    fast = Get("APRILTAG_VK_POLISH_FAST", 0);
     blur_extra = Get("APRILTAG_VK_POLISH_BLUREXTRA", 2.0);
     base_window = Get("APRILTAG_VK_POLISH_BASEWIN", 3.0);
     win_mult = Get("APRILTAG_VK_POLISH_WINMULT", 0.8);
@@ -408,6 +430,178 @@ void Select(Fit *f, const Cand &c, double half_window_px, int stride) {
   f->gv.resize(out);
 }
 
+// The bounding box of the tag in the image, its largest cell-per-pixel scale and the lattice step that
+// keeps the working set under `limit` pixels.
+struct BoxInfo {
+  int x0 = 0, y0 = 0, x1 = -1, y1 = -1;
+  double gmax = 0;
+  double area = 0;
+  int thin = 1;
+};
+
+void ComputeBox(const Fit &f, const Mapping &map, int limit, const image_u8_t *im, BoxInfo *b) {
+  const int W = f.width;
+  double inv[9];
+  CellToNormalised(map, inv);
+  double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
+  const double ext = 0.8;
+  const double cu[4] = {-ext, W + ext, W + ext, -ext}, cv[4] = {-ext, -ext, W + ext, W + ext};
+  double gmax = 0;
+  for (int k = 0; k < 4; ++k) {
+    const double w = inv[6] * cu[k] + inv[7] * cv[k] + inv[8];
+    const double nx = (inv[0] * cu[k] + inv[1] * cv[k] + inv[2]) / w;
+    const double ny = (inv[3] * cu[k] + inv[4] * cv[k] + inv[5]) / w;
+    const double x = nx * f.scale + f.cx;
+    const double y = ny * f.scale + f.cy;
+    minx = std::min(minx, x);
+    maxx = std::max(maxx, x);
+    miny = std::min(miny, y);
+    maxy = std::max(maxy, y);
+    double u, v, gu, gv;
+    LocalScale(map, nx, ny, f.scale, &u, &v, &gu, &gv);
+    gmax = std::max(gmax, std::max(gu, gv));
+  }
+  b->x0 = std::max(0, static_cast<int>(std::floor(minx)));
+  b->x1 = std::min(im->width - 1, static_cast<int>(std::ceil(maxx)));
+  b->y0 = std::max(0, static_cast<int>(std::floor(miny)));
+  b->y1 = std::min(im->height - 1, static_cast<int>(std::ceil(maxy)));
+  b->gmax = gmax;
+  b->area = static_cast<double>(std::max(0, b->x1 - b->x0 + 1)) * std::max(0, b->y1 - b->y0 + 1);
+  b->thin = std::max(1, static_cast<int>(0.45 * b->area / std::max(limit, 1)));
+}
+
+// A sparse sample of pixels beside the class-changing cell edges, for the blur scan.
+void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, const image_u8_t *im) {
+  const int W = f.width;
+  scan->Clear();
+  double inv[9];
+  CellToNormalised(map, inv);
+  static const double kOffset[4] = {-1.2, 0.4, -0.4, 1.2};
+  int count = 0;
+  const auto add = [&](double u, double v) {
+    const double w = inv[6] * u + inv[7] * v + inv[8];
+    const double X = (inv[0] * u + inv[1] * v + inv[2]) / w * f.scale + f.cx;
+    const double Y = (inv[3] * u + inv[4] * v + inv[5]) / w * f.scale + f.cy;
+    if (!(X >= 0 && Y >= 0 && X < im->width && Y < im->height)) return;
+    const int px = static_cast<int>(X), py = static_cast<int>(Y);
+    const double xn = (px + 0.5 - f.cx) / f.scale, yn = (py + 0.5 - f.cy) / f.scale;
+    double u2, v2, gu, gv;
+    LocalScale(map, xn, yn, f.scale, &u2, &v2, &gu, &gv);
+    scan->x.push_back(static_cast<float>(xn));
+    scan->y.push_back(static_cast<float>(yn));
+    scan->obs.push_back(static_cast<float>(im->buf[static_cast<size_t>(py) * im->stride + px]));
+    scan->u0.push_back(static_cast<float>(u2));
+    scan->v0.push_back(static_cast<float>(v2));
+    scan->gu.push_back(static_cast<float>(gu));
+    scan->gv.push_back(static_cast<float>(gv));
+  };
+  const double inv_cell = 1.0 / cell_px;
+  for (int axis = 0; axis < 2; ++axis) {
+    for (int line = 0; line <= W; ++line) {
+      for (int pos = 0; pos < W; ++pos) {
+        // Class on the low and high side of the unit edge at `line` beside position pos.
+        const int lo = axis == 0 ? f.cls[pos + 1][line] : f.cls[line][pos + 1];
+        const int hi = axis == 0 ? f.cls[pos + 1][line + 1] : f.cls[line + 1][pos + 1];
+        if (lo == hi || lo == 3 || hi == 3) continue;
+        for (int along = 0; along < 2; ++along) {
+          const double a = pos + (along == 0 ? 0.3 : 0.7);
+          const double d = kOffset[count++ & 3] * inv_cell;
+          if (axis == 0) add(line + d, a);
+          else add(a, line + d);
+        }
+      }
+    }
+  }
+  scan->n = static_cast<int>(scan->x.size());
+  scan->width = W;
+  std::copy(&f.cls[0][0], &f.cls[0][0] + kPad * kPad, &scan->cls[0][0]);
+  scan->cx = f.cx;
+  scan->cy = f.cy;
+  scan->scale = f.scale;
+}
+
+// The working set directly: pixels whose window (half_window_px) touches more than one known cell class and no
+// unknown cell, on the lattice of `box.thin`.
+void BuildFit(Fit *f, const Mapping &map, double half_window_px, const BoxInfo &box, const image_u8_t *im) {
+  const int W = f->width;
+  f->Clear();
+  f->n = 0;
+  if (box.x1 < box.x0 || box.y1 < box.y0) return;
+  const float g0 = static_cast<float>(map.g[0]), g1 = static_cast<float>(map.g[1]), g2 = static_cast<float>(map.g[2]);
+  const float g3 = static_cast<float>(map.g[3]), g4 = static_cast<float>(map.g[4]), g5 = static_cast<float>(map.g[5]);
+  const float g6 = static_cast<float>(map.g[6]), g7 = static_cast<float>(map.g[7]);
+  const float inv_scale = static_cast<float>(1.0 / f->scale);
+  const float hw = static_cast<float>(half_window_px);
+  const float rmax = hw * static_cast<float>(box.gmax) * 1.02f;
+  const float ext = 0.8f, lim = static_cast<float>(W) + ext;
+  const float cxf = static_cast<float>(f->cx), cyf = static_cast<float>(f->cy);
+  const int k = box.thin;
+  const int lr = std::max(1, static_cast<int>(std::lround(k * 0.382)));
+  const int x0 = box.x0, x1 = box.x1;
+  const int width = (x1 - x0) / k + 2;
+  thread_local std::vector<float> row_u, row_v, row_iw;
+  row_u.resize(width);
+  row_v.resize(width);
+  row_iw.resize(width);
+  const size_t reserve = static_cast<size_t>(box.area * 0.6 / k) + 16;
+  f->x.reserve(reserve);
+  f->y.reserve(reserve);
+  f->obs.reserve(reserve);
+  f->u0.reserve(reserve);
+  f->v0.reserve(reserve);
+  f->gu.reserve(reserve);
+  f->gv.reserve(reserve);
+  for (int py = box.y0; py <= box.y1; ++py) {
+    const uint8_t *row = im->buf + static_cast<size_t>(py) * im->stride;
+    const float y = (static_cast<float>(py) + 0.5f - cyf) * inv_scale;
+    const float a0 = g1 * y + g2, b0 = g4 * y + g5, c0 = g7 * y + 1.0f;
+    const int off = ((-(py * lr)) % k + k) % k;
+    const int xfirst = x0 + (((off - x0) % k) + k) % k;
+    if (xfirst > x1) continue;
+    const int count = (x1 - xfirst) / k + 1;
+    const float xs = (static_cast<float>(xfirst) + 0.5f - cxf) * inv_scale;
+    const float xstep = static_cast<float>(k) * inv_scale;
+    for (int i = 0; i < count; ++i) {
+      const float x = xs + static_cast<float>(i) * xstep;
+      const float iw = 1.0f / (g6 * x + c0);
+      row_iw[i] = iw;
+      row_u[i] = (g0 * x + a0) * iw;
+      row_v[i] = (g3 * x + b0) * iw;
+    }
+    for (int i = 0; i < count; ++i) {
+      const float u = row_u[i], v = row_v[i];
+      if (u < -ext || u > lim || v < -ext || v > lim) continue;
+      if (FloorI(u - rmax) == FloorI(u + rmax) && FloorI(v - rmax) == FloorI(v + rmax)) continue;
+      const float iw = row_iw[i];
+      const float gux = (g0 - u * g6) * iw, guy = (g1 - u * g7) * iw;
+      const float gvx = (g3 - v * g6) * iw, gvy = (g4 - v * g7) * iw;
+      const float gu = std::sqrt(gux * gux + guy * guy) * inv_scale;
+      const float gv = std::sqrt(gvx * gvx + gvy * gvy) * inv_scale;
+      const float ru = hw * gu, rv = hw * gv;
+      const int i0 = std::clamp(FloorI(u - ru), -1, W), i1 = std::clamp(FloorI(u + ru), -1, W);
+      const int j0 = std::clamp(FloorI(v - rv), -1, W), j1 = std::clamp(FloorI(v + rv), -1, W);
+      const int first = ClassOf(*f, j0, i0);
+      bool varies = false, unknown = false;
+      for (int j = j0; j <= j1; ++j) {
+        for (int ii = i0; ii <= i1; ++ii) {
+          const int cl = ClassOf(*f, j, ii);
+          varies |= cl != first;
+          unknown |= cl == 3;
+        }
+      }
+      if (!varies || unknown) continue;
+      f->x.push_back(xs + static_cast<float>(i) * xstep);
+      f->y.push_back(y);
+      f->obs.push_back(static_cast<float>(row[xfirst + i * k]));
+      f->u0.push_back(u);
+      f->v0.push_back(v);
+      f->gu.push_back(gu);
+      f->gv.push_back(gv);
+    }
+  }
+  f->n = static_cast<int>(f->x.size());
+}
+
 // Fixes each pixel's column and row window for blur widths up to sigma_px.
 void Freeze(Fit *f, double sigma_px, double extra_px = 0) {
   const int W = f->width;
@@ -690,7 +884,11 @@ struct Accum {
 // geometry, blur, level and illumination slope parameters over the Huber-weighted residuals.
 void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc) {
   const bool normal = mode >= 1;
+  const double tp0 = NowS();
   RunModel(f, *p, mode == 2);
+  const double tp1 = NowS();
+  g_prof_local.t[5] += tp1 - tp0;
+  ++g_prof_local.evals;
   const int n = f->n;
   const float kc = static_cast<float>(kcut);
   const int ng = p->box ? 11 : 10;
@@ -767,6 +965,136 @@ void Evaluate(Fit *f, Params *p, double kcut, int mode, Accum *acc) {
       for (int k = 0; k < i; ++k) acc->jtj[i][k] = acc->jtj[k][i];
     }
   }
+  g_prof_local.t[6] += NowS() - tp1;
+}
+
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+using V4 = __m128;
+inline V4 VZero() { return _mm_setzero_ps(); }
+inline V4 VLoad(const float *p) { return _mm_loadu_ps(p); }
+inline V4 VMulAdd(V4 acc, V4 a, V4 b) { return _mm_add_ps(acc, _mm_mul_ps(a, b)); }
+inline double VSum(V4 v) {
+  alignas(16) float t[4];
+  _mm_store_ps(t, v);
+  return (static_cast<double>(t[0]) + t[1]) + (static_cast<double>(t[2]) + t[3]);
+}
+#elif defined(__ARM_NEON)
+using V4 = float32x4_t;
+inline V4 VZero() { return vdupq_n_f32(0.0f); }
+inline V4 VLoad(const float *p) { return vld1q_f32(p); }
+inline V4 VMulAdd(V4 acc, V4 a, V4 b) { return vmlaq_f32(acc, a, b); }
+inline double VSum(V4 v) { return static_cast<double>(vgetq_lane_f32(v, 0)) + vgetq_lane_f32(v, 1) + vgetq_lane_f32(v, 2) + vgetq_lane_f32(v, 3); }
+#else
+struct V4 {
+  float v[4];
+};
+inline V4 VZero() { return V4{{0, 0, 0, 0}}; }
+inline V4 VLoad(const float *p) { return V4{{p[0], p[1], p[2], p[3]}}; }
+inline V4 VMulAdd(V4 acc, V4 a, V4 b) {
+  for (int l = 0; l < 4; ++l) acc.v[l] += a.v[l] * b.v[l];
+  return acc;
+}
+inline double VSum(V4 v) { return (static_cast<double>(v.v[0]) + v.v[1]) + (static_cast<double>(v.v[2]) + v.v[3]); }
+#endif
+
+// Dot products of column a with four columns b0..b3 over n8 (a multiple of 8) elements.
+inline void Dot4(const float *a, const float *b0, const float *b1, const float *b2, const float *b3, int n8, double *out) {
+  V4 s0 = VZero(), s1 = VZero(), s2 = VZero(), s3 = VZero();
+  V4 t0 = VZero(), t1 = VZero(), t2 = VZero(), t3 = VZero();
+  for (int i = 0; i < n8; i += 8) {
+    const V4 a0 = VLoad(a + i), a1 = VLoad(a + i + 4);
+    s0 = VMulAdd(s0, a0, VLoad(b0 + i));
+    t0 = VMulAdd(t0, a1, VLoad(b0 + i + 4));
+    s1 = VMulAdd(s1, a0, VLoad(b1 + i));
+    t1 = VMulAdd(t1, a1, VLoad(b1 + i + 4));
+    s2 = VMulAdd(s2, a0, VLoad(b2 + i));
+    t2 = VMulAdd(t2, a1, VLoad(b2 + i + 4));
+    s3 = VMulAdd(s3, a0, VLoad(b3 + i));
+    t3 = VMulAdd(t3, a1, VLoad(b3 + i + 4));
+  }
+  out[0] = VSum(s0) + VSum(t0);
+  out[1] = VSum(s1) + VSum(t1);
+  out[2] = VSum(s2) + VSum(t2);
+  out[3] = VSum(s3) + VSum(t3);
+}
+
+// As Evaluate, but the weighted columns are gathered first and the normal equations formed as dot products.
+void EvaluateFast(Fit *f, Params *p, double kcut, int mode, Accum *acc, bool run_model = true) {
+  const bool normal = mode >= 1;
+  const double tp0 = NowS();
+  if (run_model) RunModel(f, *p, normal);
+  const double tp1 = NowS();
+  g_prof_local.t[5] += tp1 - tp0;
+  ++g_prof_local.evals;
+  const int n = f->n;
+  const float kc = static_cast<float>(kcut);
+  const int ng = p->box ? 11 : 10;
+  const int nt = ng + 5;
+  const int stride = (n + 7) & ~7;
+  thread_local std::vector<float> buf;
+  if (normal) buf.resize(static_cast<size_t>(nt + 1) * stride);
+  float *base_col = buf.data();
+  const float L0 = static_cast<float>(p->lev[0]), L1 = static_cast<float>(p->lev[1]), L2 = static_cast<float>(p->lev[2]);
+  const float lx = static_cast<float>(p->lx), ly = static_cast<float>(p->ly);
+  double cost = 0;
+  int count = 0;
+  for (int idx = 0; idx < n; ++idx) {
+    const float a = f->A[idx], bb = f->B[idx], c = f->C[idx];
+    const float base = L0 * a + L1 * bb + L2 * c;
+    const float gain = 1.0f + lx * f->x[idx] + ly * f->y[idx];
+    const float pred = gain * base;
+    const float ob = f->obs[idx];
+    if ((ob >= 255.0f && pred >= 255.0f) || (ob <= 0.0f && pred <= 0.0f)) continue;
+    const float r = ob - pred;
+    const float ar = std::fabs(r);
+    const float sw = ar <= kc ? 1.0f : std::sqrt(kc / ar);
+    cost += ar <= kc ? r * r : kc * (2.0f * ar - kc);
+    if (normal) {
+      const float *J = &f->J[static_cast<size_t>(idx) * kStrideJ];
+      const float g = gain * sw;
+      float *dst = base_col + count;
+      for (int k = 0; k < ng; ++k) dst[static_cast<size_t>(k) * stride] = g * J[k];
+      dst[static_cast<size_t>(ng) * stride] = g * a;
+      dst[static_cast<size_t>(ng + 1) * stride] = g * bb;
+      dst[static_cast<size_t>(ng + 2) * stride] = g * c;
+      const float sb = sw * base;
+      dst[static_cast<size_t>(ng + 3) * stride] = sb * f->x[idx];
+      dst[static_cast<size_t>(ng + 4) * stride] = sb * f->y[idx];
+      dst[static_cast<size_t>(nt) * stride] = sw * r;
+    }
+    ++count;
+  }
+  acc->cost = cost;
+  acc->n = count;
+  const double tp2 = NowS();
+  g_prof_local.t[10] += tp2 - tp1;
+  if (normal) {
+    const int n8 = (count + 7) & ~7;
+    for (int k = 0; k <= nt; ++k) {
+      float *col = base_col + static_cast<size_t>(k) * stride;
+      for (int i = count; i < n8; ++i) col[i] = 0.0f;
+    }
+    // Columns i..nt (the residual is column nt) in groups of four; the last group repeats a column.
+    for (int i = 0; i < nt; ++i) {
+      const float *ci = base_col + static_cast<size_t>(i) * stride;
+      for (int k = i; k <= nt; k += 4) {
+        const float *b[4];
+        for (int l = 0; l < 4; ++l) b[l] = base_col + static_cast<size_t>(std::min(k + l, nt)) * stride;
+        double v[4];
+        Dot4(ci, b[0], b[1], b[2], b[3], n8, v);
+        for (int l = 0; l < 4 && k + l <= nt; ++l) {
+          if (k + l == nt) {
+            acc->jtr[i] = v[l];
+          } else {
+            acc->jtj[i][k + l] = v[l];
+            acc->jtj[k + l][i] = v[l];
+          }
+        }
+      }
+    }
+  }
+  g_prof_local.t[11] += NowS() - tp2;
+  g_prof_local.t[6] += NowS() - tp1;
 }
 
 // Applies a solved step to the parameters.
@@ -806,10 +1134,16 @@ bool SolveStep(const Accum &cur, bool box, double lambda, double *delta) {
 
 // Levenberg-Marquardt over the geometry and blur; returns the final cost and leaves the best
 // parameters in *p. Stops when the corners move less than `tol` pixels.
-double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int width, double *initial_cost = nullptr) {
+double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int width, double *initial_cost = nullptr, bool model_done = false) {
   Accum cur, trial;
   const int full_passes = static_cast<int>(kKnobs.full);
-  Evaluate(f, p, kcut, 2, &cur);
+  const bool fast = kKnobs.fast != 0;
+  const auto eval = [&](Params *q, int mode, Accum *a) {
+    if (fast) EvaluateFast(f, q, kcut, mode == 0 ? 0 : 2, a);
+    else Evaluate(f, q, kcut, mode, a);
+  };
+  if (fast) EvaluateFast(f, p, kcut, 2, &cur, !model_done);
+  else Evaluate(f, p, kcut, 2, &cur);
   if (initial_cost != nullptr) *initial_cost = cur.cost;
   double lambda = 1e-3;
   double prev[4][2];
@@ -834,7 +1168,7 @@ double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int wi
       }
       const int mode = iter + 1 < full_passes ? 2 : 1;
       if (mode == 1) std::copy(&cur.jtj[0][0], &cur.jtj[0][0] + kMaxT * kMaxT, &trial.jtj[0][0]);
-      Evaluate(f, &q, kcut, mode, &trial);
+      eval(&q, mode, &trial);
       if (trial.n > 0 && trial.cost < cur.cost) {
         *p = q;
         std::swap(cur, trial);
@@ -857,6 +1191,14 @@ double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int wi
 }  // namespace
 
 bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
+  const double tt0 = NowS();
+  struct Done {
+    double t0;
+    ~Done() {
+      g_prof_local.t[9] += NowS() - t0;
+      ++g_prof_local.tags;
+    }
+  } done{tt0};
   const apriltag_family_t *fam = det->family;
   if (fam == nullptr || fam->reversed_border) return false;
   const int W = static_cast<int>(fam->width_at_border);
@@ -919,19 +1261,35 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
 
   const int limit = MaxPixels();
   const double base_window = kKnobs.base_window;
-  BuildCand(&cand, fit, p.map, base_window, limit, im);
-  const int thin = cand.thin;
-  if (cand.pix.size() < 40) return false;
+  double tq = NowS();
+  g_prof_local.t[0] += tq - tt0;
+  const bool fast = kKnobs.fast != 0;
+  BoxInfo box;
+  int thin = 1;
+  if (fast) {
+    ComputeBox(fit, p.map, limit, im, &box);
+    thin = box.thin;
+    BuildScan(&scan, fit, p.map, cell_px, im);
+    g_prof_local.t[1] += NowS() - tq;
+    tq = NowS();
+    if (scan.n < 40) return false;
+  } else {
+    BuildCand(&cand, fit, p.map, base_window, limit, im);
+    g_prof_local.t[1] += NowS() - tq;
+    tq = NowS();
+    thin = cand.thin;
+    if (cand.pix.size() < 40) return false;
 
-  // Blur: try a few widths on a sparse subset of the narrow window first.
-  const int scan_stride = std::max(1, static_cast<int>(cand.pix.size() / 400));
-  scan.width = W;
-  std::copy(&fit.cls[0][0], &fit.cls[0][0] + kPad * kPad, &scan.cls[0][0]);
-  scan.cx = fit.cx;
-  scan.cy = fit.cy;
-  scan.scale = fit.scale;
-  Select(&scan, cand, std::min(3.0, 0.5 * cell_px + 0.5), scan_stride);
-  if (scan.n < 40) return false;
+    // Blur: try a few widths on a sparse subset of the narrow window first.
+    const int scan_stride = std::max(1, static_cast<int>(cand.pix.size() / 400));
+    scan.width = W;
+    std::copy(&fit.cls[0][0], &fit.cls[0][0] + kPad * kPad, &scan.cls[0][0]);
+    scan.cx = fit.cx;
+    scan.cy = fit.cy;
+    scan.scale = fit.scale;
+    Select(&scan, cand, std::min(3.0, 0.5 * cell_px + 0.5), scan_stride);
+    if (scan.n < 40) return false;
+  }
   const double candidates[] = {0.7, 1.2, 2.0, 3.5};
   double best_cost = 1e300, best_s = 1.0;
   double best_lev[3] = {p.lev[0], p.lev[1], p.lev[2]};
@@ -951,6 +1309,7 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   }
   p.s[0] = p.s[1] = best_s;
   std::copy(best_lev, best_lev + 3, p.lev);
+  g_prof_local.t[2] += NowS() - tq;
   if (thin > 1 && (DevFlags() & 16) == 0) {
     // A tag too large for the working set keeps its profile fit unless it is blurred or clipped.
     size_t saturated = 0;
@@ -985,21 +1344,35 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   const double window_mult = kKnobs.win_mult;
   double window = std::min(window_mult * best_s + 0.3 + kKnobs.blur_extra * std::max(0.0, best_s - 1.2), 0.75 * cell_px + 0.5);
   window = std::max(window, kKnobs.min_win);
-  if (window > base_window) BuildCand(&cand, fit, p.map, window, limit, im);
-  Select(&fit, cand, window, 1);
+  tq = NowS();
+  if (fast) {
+    BuildFit(&fit, p.map, window, box, im);
+  } else {
+    if (window > base_window) BuildCand(&cand, fit, p.map, window, limit, im);
+    Select(&fit, cand, window, 1);
+  }
+  g_prof_local.t[3] += NowS() - tq;
+  tq = NowS();
   if (fit.n < 40) return false;
+  g_prof_local.pixels += fit.n;
   const double reach_s = std::min(kKnobs.smax_mult * best_s, 8.0);
   Freeze(&fit, reach_s);
   p.smax = reach_s;
-  ModelPass<false, false>(&fit, p);
+  if (fast) ModelPass<false, true>(&fit, p);
+  else ModelPass<false, false>(&fit, p);
   FitLevels(fit, &p);
 
   const double kcut = std::max(6.0, 4.0 * 1.4826 * MedianAbsResidual(fit, p));
+  g_prof_local.t[4] += NowS() - tq;
+  tq = NowS();
   double start_cost = 0;
   const double tol = kKnobs.tol;
   const int iters = static_cast<int>(kKnobs.iters);
-  double cost = Optimise(&fit, &p, kcut, iters, tol, W, &start_cost);
+  double cost = Optimise(&fit, &p, kcut, iters, tol, W, &start_cost, fast);
 
+  const double topt = NowS() - tq;
+  (void)topt;
+  tq = NowS();
   bool moving_accepted = false;
   if (std::max(p.s[0], p.s[1]) > 1.4 && (DevFlags() & 8) == 0) {
     // A wide blur may be motion: refit with a Gaussian blur plus a straight blur segment.
@@ -1051,6 +1424,7 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
     }
   }
 
+  g_prof_local.t[7] += NowS() - tq;
   if (!moving_accepted && cost > start_cost) return false;
   double corners[4][2];
   CellCorners(p.map, W, corners);
