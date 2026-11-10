@@ -67,8 +67,21 @@ run in every scenario at both decimations. Worst relative p95 versus old polish:
 
 ## 5. Time (see timing.txt for the interleaved medians; ms per frame)
 
-Filled in by the final report. Remaining per-pixel cost (bench, one thread): model 30 to 40 ns, model with derivatives
-40 to 50 ns, full evaluation with 16x16 normal equations 70 to 100 ns; about 4 evaluations per tag.
+Interleaved (3 rounds, median), decimation 2, ms per frame, off / old polish / new polish:
+
+| scenario | 1 thread | default threads |
+|---|---|---|
+| one-tag | 0.31 / 2.02 / 0.67 | 0.31 / 1.99 / 0.64 |
+| dense-tags (about 30 tags) | 1.60 / 81.1 / 14.2 | 0.59 / 12.8 / 2.42 |
+| motion-blur | 0.40 / 26.0 / 4.24 | 0.36 / 20.8 / 3.28 |
+| blur | 0.71 / 11.9 / 2.25 | 0.37 / 7.94 / 1.38 |
+| jpeg | 2.23 / 7.10 / 2.89 | 0.73 / 3.65 / 1.33 |
+| range | 0.17 / 3.14 / 0.72 | (not completed) |
+
+Per ordinary tag (dense-tags): old 2.7 ms, new 0.43 ms (6.4x). Polish overhead per frame: one-tag 1.7 -> 0.36 ms (4.7x),
+motion-blur 25.6 -> 3.8 ms (6.7x), blur 11.2 -> 1.5 ms (7.5x), jpeg 4.9 -> 0.65 ms (7.5x), range 3.0 -> 0.55 ms (5.5x).
+Target of 10x not reached. Remaining per-pixel cost (bench, one thread): model 30 to 40 ns, with derivatives 40 to 50 ns,
+full evaluation with the 16x16 normal equations 70 to 100 ns; about 4 evaluations per tag.
 
 ## 6. Dev knobs
 
