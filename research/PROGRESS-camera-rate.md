@@ -25,3 +25,34 @@ ext/avk-compare/build-camera-rate; track_eval in build-camera-rate-t. Driver: sc
   15.6 ms timer tick (sleep gap, no timeBeginPeriod) it recovers nothing: the wait_for rounds up to a tick.
 - CPU phase after a gap: 0.042 -> 0.085. A 2 ms busy spin of the calling thread right before the frame only brings
   it to 0.060; spinning for the whole gap gives 0.055. Not core frequency; caches/predictors after the core idles.
+
+## Step 1, Orange Pi (all runs through pi_clean.sh: service stopped, governors performance)
+
+- pool_wake (tool in ext/avk-compare/camrate-tools, built on the Pi with g++ against WorkerPool.cpp): 8 items of 30 us,
+  threads 4: first item of a worker starts 8-17 us after the call when the pool was used a moment ago, 77-85 us on the
+  little cores (cpus 1-3) after a 16 ms sleep, 9 us on the big cores; threads 8, 16 ms: batch takes 170 us against 30
+  ideal, 3 of the little cores never get an item. cpus of slot 0 sometimes migrate to a little core.
+- Not reproduced: tracked frames at camera rate. track_eval --modes key, slow-3tag-640: tracked-frame median
+  0.257 (gap 0), 0.258 (gap 16), 0.258 (spin 16), also 0.266 pinned to 4-7. medium-4tag-1280 tracked 0.336 / 0.338.
+  The 0.776 in the task brief is not seen with governors pinned (it would need the board's ondemand governor).
+- Full detector, 8 threads: slow-3tag-640 0.796 (gap 0), 0.829 (16), 0.845 (33) = +4 to +6 %; medium-4tag-1280
+  1.88 / 1.91 / 1.90 = +1.5 %. Thread counts 1/2/4/8 at gap 16 vs 0: within +-5 %, no pool wake-up effect worth fixing
+  (the 4-thread run is slow at gap 0 as well: placement on little cores).
+- What does go wrong on the Pi: keyframes in tracking mode. Tracked frames never call GpuDetector::Detect, so the keep-alive
+  stops after 100 ms and the next keyframe finds a cold GPU: keyframe median 0.76 (gap 0) -> 1.15-1.22 ms (gap 16), 1.05-1.10 (33).
+
+## Fixes built (commit 5dea039, f201d0c)
+
+KeepAlive rewritten: Windows high-resolution waitable timer (fixes the 15.6 ms rounding that made the periodic keep-alive
+useless on the desktop), predictive burst (`prewarm_lead_us`, default 3000 us, `prewarm_burst` 2, `prewarm_gap_us` 1000;
+envs APRILTAG_VK_PREWARM_LEAD_US / _BURST / _GAP_US), `GpuDetector::Prewarm()` for the application,
+`NoteFrame()` / `ExpectGpuFrame()` used by TrackingDetector so a burst fires before each keyframe.
+The period is the median of the last 6 inter-arrival times, used only if at least 4 are seen and all are within 25 % of the
+median and the period is 2..200 ms; back to back frames therefore never arm it and cost one uncontended lock per Detect.
+
+Desktop sweeps (640 one-tag, gap 16, gpu ms): keep-alive 1/2/4 ms 0.29/0.28/0.31 (was 0.75 with the old timer);
+lead x burst x gap: 400x2x100 0.66, 600x4x100 0.54, 800x6x100 0.47, 1000x8x100 0.41, 1200x3x300 0.36, 1500x3x300 0.30,
+2000x3x500 0.32, 2000x2x800 0.31, 3000x2x1000 0.30, 2000x1 0.34; heavier keep-alive dispatches (64 to 16384 groups) are no better
+(0.30 to 0.32). The GPU needs more than 1 ms after the first submission to be awake.
+Pi (key mode, gap 16, keyframe median ms; back to back 0.76): default 1.22, ka0 1.15, lead 1000 0.82, 2000 0.91, 3000 0.83,
+5000 0.86, 8000 0.86, burst 3 0.82, burst 1 0.84 (about 25 samples each, differences below 0.08 are noise).
