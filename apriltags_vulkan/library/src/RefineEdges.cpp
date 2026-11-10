@@ -293,6 +293,9 @@ unsigned ProfileFeatures() {
 
 constexpr double kTruncatedFraction = 0.25;  // profiles touching a window end that mark a blurred quad
 constexpr double kMinBlurRamp = 2.0;  // narrowest 20% to 80% rise, in pixels, of a blurred edge
+constexpr double kLevelTaps = 20;      // taps across the window of the level pass (finest step 0.25 px)
+constexpr double kMinLevelContrast = 50.0;  // smallest white minus black, in grey levels, the level pass accepts
+constexpr double kLevelSpacing = 1.5;  // pixels between its profiles along a side
 constexpr int kMaxProfileTaps = 96;
 constexpr double kCrossingCells = 0.6;  // ramps wider than this many cells use the halfway crossing
 
@@ -493,7 +496,7 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
 // could be refitted.
 bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ramp = nullptr) {
   const double r_out = std::min(0.5 * cell, 20.0), r_in = std::min(0.5 * cell, 20.0);
-  const float step = static_cast<float>(std::max<double>(kProfileStep, (r_in + r_out) / 80.0));
+  const float step = static_cast<float>(std::max<double>(kProfileStep, std::min(1.0, (r_in + r_out) / kLevelTaps)));
   const int taps = static_cast<int>((r_in + r_out) / step) + 1;
   if (taps < 8 || taps > kMaxProfileTaps) return false;
   const int ends = std::max(2, static_cast<int>(1.0f / step));
@@ -515,36 +518,47 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
       nx = -nx;
       ny = -ny;
     }
-    const int np = std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / kProfileSpacing)));
+    const int np = std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / kLevelSpacing)));
     const float fnx = static_cast<float>(nx), fny = static_cast<float>(ny);
     const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
     const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
 
-    float prof[kMaxProfilePoints][kMaxProfileTaps];
+    // Tap m of the profile through (x0, y0); false outside the image.
+    auto at = [&](float fx0, float fy0, int m, float *v) {
+      const float u = static_cast<float>(-r_in) + step * m;
+      const float x = fx0 + u * fnx - 0.5f;
+      const float y = fy0 + u * fny - 0.5f;
+      const float xt = std::floor(x), yt = std::floor(y);
+      const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
+      if (xi < 0 || xi >= max_x || yi < 0 || yi >= max_y) return false;
+      *v = BilinearAt<float>(im, xi, yi, x - xt, y - yt);
+      return true;
+    };
     double px[kMaxProfilePoints], py[kMaxProfilePoints], outer[kMaxProfilePoints], inner[kMaxProfilePoints];
     int count = 0;
-    for (int s = 0; s < np; s++) {
+    // Three profiles whose ends differ by too little rule the side out before the rest are sampled.
+    bool contrast = false;
+    for (int k = 1; k <= 3 && !contrast; ++k) {
+      const double alpha = k / 4.0;
+      const float fx0 = static_cast<float>(alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0]);
+      const float fy0 = static_cast<float>(alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1]);
+      float lo = 0, hi = 0;
+      contrast = at(fx0, fy0, 0, &lo) && at(fx0, fy0, taps - 1, &hi) && hi - lo >= kMinLevelContrast;
+    }
+    for (int s = 0; s < np && contrast; s++) {
       const double alpha = (1.0 + s) / (np + 1);
       const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
       const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
       const float fx0 = static_cast<float>(x0), fy0 = static_cast<float>(y0);
-      float *pr = prof[count];
       bool inside = true;
-      for (int m = 0; m < taps && inside; ++m) {
-        const float u = static_cast<float>(-r_in) + step * m;
-        const float x = fx0 + u * fnx - 0.5f;
-        const float y = fy0 + u * fny - 0.5f;
-        const float xt = std::floor(x), yt = std::floor(y);
-        const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
-        inside = xi >= 0 && xi < max_x && yi >= 0 && yi < max_y;
-        if (inside) pr[m] = BilinearAt<float>(im, xi, yi, x - xt, y - yt);
+      double lo = 0, hi = 0;
+      for (int m = 0; m < ends && inside; ++m) {
+        float vl = 0, vh = 0;
+        inside = at(fx0, fy0, m, &vl) && at(fx0, fy0, taps - 1 - m, &vh);
+        lo += vl;
+        hi += vh;
       }
       if (!inside) continue;
-      double lo = 0, hi = 0;
-      for (int m = 0; m < ends; ++m) {
-        lo += pr[m];
-        hi += pr[taps - 1 - m];
-      }
       inner[count] = lo / ends;
       outer[count] = hi / ends;
       px[count] = x0;
@@ -561,15 +575,15 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
       std::copy(inner, inner + count, tmp);
       std::nth_element(tmp, tmp + count / 2, tmp + count);
       const double black = tmp[count / 2];
-      if (white - black >= 20.0) {
+      if (white - black >= kMinLevelContrast) {
         const double mid = 0.5 * (white + black), margin = 0.25 * (white - black);
         for (int i = 0; i < count; ++i) {
           if (outer[i] < mid + margin || inner[i] > mid - margin) continue;
-          const float *pr = prof[i];
-          int below = 0;
-          for (int m = 0; m < taps; ++m) below += pr[m] < mid;
-          int below20 = 0, below80 = 0;
+          float pr[kMaxProfileTaps];
+          for (int m = 0; m < taps; ++m) at(static_cast<float>(px[i]), static_cast<float>(py[i]), m, &pr[m]);
+          int below = 0, below20 = 0, below80 = 0;
           for (int m = 0; m < taps; ++m) {
+            below += pr[m] < mid;
             below20 += pr[m] < mid - 0.3 * (white - black);
             below80 += pr[m] < mid + 0.3 * (white - black);
           }
@@ -792,14 +806,12 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
   // Lobes running into the window ends mean a blurred quad: place its edges by the halfway crossing.
   bool widened = false;
   if ((ProfileFeatures() & kWidenBlur) != 0 && truncated > kTruncatedFraction) {
-    for (int iter = 0; iter < 2; ++iter) {
-      struct quad before = *quad;
-      double ramp = 0;
-      if (!LevelPass(cell, im, quad, &ramp) || (iter == 0 && ramp < kMinBlurRamp)) {
-        *quad = before;
-        break;
-      }
+    struct quad before = *quad;
+    double ramp = 0;
+    if (LevelPass(cell, im, quad, &ramp) && ramp >= kMinBlurRamp) {
       widened = true;
+    } else {
+      *quad = before;
     }
   }
 

@@ -44,3 +44,11 @@ underexposed p95 0.136 -> 0.159); both fixed in the committed code.
 
 ## 3. Results
 (see the sections below; filled in as the gates are run)
+
+Update (final): level pass uses ~20 taps (step up to 1 px), one iteration, contrast gate (3 profiles, then median
+white-black >= 50) before the full sampling, ramp >= 2 px. Final numbers, tables, timings and the failed variants are in
+PERFORMANCE.md section 8bd. Gates passed: corpus d1/d2 only blur and motion-blur change (also with SMALL_RESCUE+HULL_QUAD
+and +POLISH); PROFILE_FEATURES=15 identical to base (corpus, fast sequences); track_eval full/key/async non-fast
+sequences identical, fast ones improved; async fast-2tag recall 99.0 -> 98.0 (timing, tracked path loses a tag at 30 px/frame).
+Left: fast-2tag at 25-31 px/frame (blur ~ cell, needs an overlapping-ramp model); no unit test (repo has no test tree).
+Scripts in $S/blur-corners: gate.sh, timing.sh, t1.sh, t2.sh, diffs.py.

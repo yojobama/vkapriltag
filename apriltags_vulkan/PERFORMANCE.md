@@ -3133,6 +3133,81 @@ are identical (corpus at decimation 2 with the pre-warm, without it and with a 2
 slow-3tag-640 identical). ThreadSanitizer on the Pi (vk_eval with 16 and 5 ms gaps and bursts of 3, track_eval
 with full, key and async modes at 8 ms gaps): no reports.
 
+## 8bd. Motion-blurred edges: the level pass
+
+**Defect.** Under fast motion the profile fit (8ac and following) was far less precise than NAPA: on
+`napa-seq` `fast-1tag-1280` (up to 30 px per frame, five renders averaged over half a frame, so ramps of up to
+15 px) the worst-corner error was 0.360 / 1.463 / 2.420 px (median / p95 / max, decimation 2) against NAPA's
+0.047 / 0.117 / 2.633. The error was scatter, not bias, and grew with speed.
+
+**Cause.** The first pass samples `quad_decimate + 1` pixels either side of the side (a 6.5 px window at
+decimation 2), and a blurred ramp is wider than that: 55 to 77% of the first-pass profiles of the fast sequences
+have a gradient lobe running into a window end (against 0.1 to 2.4% on the slow and medium ones), so the
+centre of mass is the window centre, which is the unrefined decimated position. The coarse-to-fine loop only
+narrows the window. Widening the window alone did not help (fast-1tag, decimation 2: 0.155 / 0.298 / 0.677):
+the tails of a 15 px lobe have a gradient far below the image noise, so no threshold of the gradient lobe ends
+the walk; the noise taps run it to the window end whatever the cut or the allowed gap across the dips between
+the risers of a staircase. The centre of mass of a thresholded lobe is the wrong estimator for a wide ramp.
+
+**Fix (`LevelPass`, bit 16 of `APRILTAG_VK_PROFILE_FEATURES`, default mask now 31).** When more than 25% of the
+first-pass profiles touch a window end, every side is refitted by the halfway crossing: a profile from half a
+cell outside to half a cell inside the side (the middle of the quiet zone and of the border: plateaus for any
+ramp narrower than a cell, so no neighbouring edge or background is in the window), about 20 taps; white is the
+median over the side's profiles of the outer end and black the median of the inner end; the edge is where the
+profile crosses the mid level (the number of taps below it, interpolated), which is exact for a symmetric blur
+whatever its shape (a staircase of risers, a box) and needs no threshold; same weighted line fit and outlier
+drop as before. It is accepted only if the median 20% to 80% rise is at least 2 px and the white to black
+contrast at least 50 grey levels (a sharp or dim quad whose lobes were truncated by noise keeps the old result);
+when taken, the coarse-to-fine passes are skipped. Sharp quads take the old path untouched.
+`APRILTAG_VK_PROFILE_FEATURES=15` reproduces the previous output byte for byte (corpus and sequences, both
+decimations; the same one-line run-to-run differences as between two runs of the previous build).
+
+Things that failed on the way: a window reaching 0.8 cell outward (its outer end sits in the ramp towards the
+background for blur above 10 px: bias +0.4 px growing with blur); the black level from the 10th percentile
+(biased low by the noise: `underexposed` p95 0.136 to 0.159); profile spacing 3 px instead of 1.5 (p95 0.126 to
+0.217 on fast-1tag, not understood); a second recentring iteration (no gain).
+
+**Result, `napa-seq` (worst corner, median / p95 / max px; NAPA 0.047 / 0.117 / 2.633 and 0.116 / 2.009 / 4.942).**
+
+| sequence | decimation | before | after |
+|---|---|---|---|
+| fast-1tag-1280 | 2 | 0.360 / 1.463 / 2.420 | 0.059 / 0.114 / 0.165 |
+| fast-1tag-1280 | 1 | 0.142 / 0.703 / 0.944 | 0.060 / 0.136 / 0.186 |
+| fast-2tag-640 | 2 | 0.537 / 1.747 / 4.281 | 0.138 / 0.701 / 2.730 |
+| fast-2tag-640 | 1 (98.8% recall) | 0.441 / 1.542 / 3.104 | 0.132 / 0.440 / 2.425 |
+
+Within 1.5x of NAPA's median and p95 for fast-1tag (median 1.26x and 1.28x, p95 0.97x and 1.16x) and better than
+NAPA's p95 and max on fast-2tag (median 1.19x and 1.14x). Along the motion the sd at 25 to 31 px per frame
+falls from 0.65 to 0.04 (fast-1tag, decimation 2); the decimation 1 bias at 20 to 25 px per frame (leading
++0.11, trailing -0.11) is gone. What is left on fast-2tag at 25 to 31 px per frame (sd along 0.57 leading, 0.34
+trailing, decimation 2) is blur approaching a cell (cells of 12 to 16 px, ramps up to 15): the white to black
+plateaus no longer exist and the black level is wrong; a model fit of the overlapping ramps would be needed.
+`track_eval` (ten sequences, full / key / async): non-fast sequences identical to before; fast-1tag key and
+async, and fast-2tag key and async, take the same improvement (key fast-1tag 0.360 / 1.463 to 0.061 / 0.120);
+async recall on fast-2tag fell from 99.0% to 98.0% because the slower full detection makes the tracked path
+(which loses one of two tags in about half its frames at 30 px per frame) run more often; the sharp sequences'
+async recall varies by several points between runs with or without the change.
+
+**Corpus (decimation 1 | 2; median / p95).** Only `blur` and `motion-blur` change (every other scenario within
+0.0005 px, recall and false detections identical):
+
+| scenario | before | after |
+|---|---|---|
+| blur | 0.039 / 0.138 \| 0.045 / 0.162 | 0.020 / 0.070 \| 0.018 / 0.068 (NAPA p95 0.071) |
+| motion-blur | 0.066 / 0.434 \| 0.059 / 0.456 | 0.030 / 0.201 \| 0.026 / 0.181 (NAPA p95 0.132) |
+
+With `APRILTAG_VK_SMALL_RESCUE=1 APRILTAG_VK_HULL_QUAD=1` the same two rows move identically; with
+`APRILTAG_VK_POLISH=1` added blur goes 0.021 / 0.057 to 0.015 / 0.040 (decimation 1) and 0.019 / 0.068 to
+0.015 / 0.038, motion-blur 0.026 / 0.104 to 0.021 / 0.076 and 0.024 / 0.142 to 0.020 / 0.073 (polish itself was
+not changed).
+
+**Time (desktop, interleaved ABBA, three rounds, 50 iterations, medians of `median_total`).** Blurred frames
+pay for the extra pass: blur +19 to +22%, motion-blur +21 to +22%, fast-1tag-1280 +19 to +33%, fast-2tag-640 +23%
+(about +0.07 to +0.08 ms per frame). Sharp scenarios: mean of 24 scenario medians +1.5% (decimation 2) and
++0.6% (decimation 1), within the run spread; whole corpus mean of scenario medians 0.337 to 0.347 ms (+3.0%)
+and 0.412 to 0.420 ms (+2.1%). `underexposed` at decimation 1 is +5% (same binary, `PROFILE_FEATURES` 15 against
+31: 0.356 to 0.377 ms): its quads trigger the contrast check.
+
 ## 9. Measuring
 
 ```
