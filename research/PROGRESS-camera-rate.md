@@ -56,3 +56,14 @@ lead x burst x gap: 400x2x100 0.66, 600x4x100 0.54, 800x6x100 0.47, 1000x8x100 0
 (0.30 to 0.32). The GPU needs more than 1 ms after the first submission to be awake.
 Pi (key mode, gap 16, keyframe median ms; back to back 0.76): default 1.22, ka0 1.15, lead 1000 0.82, 2000 0.91, 3000 0.83,
 5000 0.86, 8000 0.86, burst 3 0.82, burst 1 0.84 (about 25 samples each, differences below 0.08 are noise).
+
+## Final measurements (see PERFORMANCE.md 8bc for the tables)
+
+- Desktop vk_eval matrix: scratchpad/camera-rate/matrix1.txt (r.py, 3 reps interleaved); track_eval matrix: tmatrix.txt (3 reps).
+- Pi: pi_t6_1.txt / pi_t6_2.txt (off = APRILTAG_VK_PREWARM_LEAD_US=0, on = default), pi_t3_a.txt (ka x lead), pi_t4_a.txt (lead sweep),
+  pi_t5_a.txt (thread counts), pool_wake runs in step 1.
+- Correctness: corpus decimation 2 on/off/ka2 identical except one noise.txt line (known nondeterminism); track_eval slow-3tag-640
+  full and key dumps identical on/off; TSan on the Pi (camrate-tsan, camrate-tsan-t): no reports.
+- Not done: worker pool spinning / big-core pinning / inline-when-cold (measured wake-up effect on whole frames <= 3 % on the Pi,
+  tracked frames not affected with governors pinned); no GPU power measurement (only CPU time and submission counts).
+- Resume: `git log research/2026-11-camera-rate`; Pi trees ~/w/camrate (src, build, tbuild), ~/w/camrate-tsan, ~/w/camrate-tsan-t.
