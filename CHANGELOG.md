@@ -16,6 +16,16 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
   off), and `GpuDetector::Prewarm()` for an application that knows a frame is about to arrive.
   `TrackingDetector` pre-warms before each keyframe (Orange Pi, keyframe 1.11 -> 0.87 ms at 16 ms gaps).
 
+### Accuracy
+
+- **Motion-blurred edges are placed by the halfway crossing.** When more than a quarter of the profile fit's
+  first-pass profiles run into the window ends, each side is refitted from half a cell outside to half a cell
+  inside, at the mid level between its white and black (exact for any symmetric blur). Worst-corner error on
+  the fast `napa-seq` sequences (decimation 2, median / p95): fast-1tag-1280 0.360 / 1.463 to 0.059 / 0.114
+  px (NAPA 0.047 / 0.117), fast-2tag-640 0.537 / 1.747 to 0.138 / 0.701; corpus `blur` p95 0.162 to 0.068,
+  `motion-blur` 0.456 to 0.181; no other scenario changes. Costs about 0.07 ms on blurred frames, nothing
+  measurable on sharp ones. `APRILTAG_VK_PROFILE_FEATURES=15` (bit 16 off) restores the previous output.
+
 ### Fixed
 
 - **The keep-alive works on Windows.** Its wait rounded up to the 15.6 ms timer tick; it now uses a

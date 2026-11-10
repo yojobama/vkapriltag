@@ -279,16 +279,24 @@ constexpr int kMaxProfilePoints = 96;
 constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient falls below this fraction
 constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
 
-// Refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once; all four by default).
-enum ProfileFeature : unsigned { kDropOutliers = 1u, kCoarseToFine = 2u, kHalfwayCrossing = 4u, kClipBias = 8u };
+// Refinements of the profile fit, from APRILTAG_VK_PROFILE_FEATURES (a bit mask, read once; all five by default).
+enum ProfileFeature : unsigned {
+  kDropOutliers = 1u, kCoarseToFine = 2u, kHalfwayCrossing = 4u, kClipBias = 8u, kWidenBlur = 16u
+};
 unsigned ProfileFeatures() {
   static const unsigned features = [] {
     const char *v = std::getenv("APRILTAG_VK_PROFILE_FEATURES");
-    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 15u;
+    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 31u;
   }();
   return features;
 }
 
+constexpr double kTruncatedFraction = 0.25;  // profiles touching a window end that mark a blurred quad
+constexpr double kMinBlurRamp = 2.0;  // narrowest 20% to 80% rise, in pixels, of a blurred edge
+constexpr double kLevelTaps = 20;      // taps across the window of the level pass (finest step 0.25 px)
+constexpr double kMinLevelContrast = 50.0;  // smallest white minus black, in grey levels, the level pass accepts
+constexpr double kLevelSpacing = 1.5;  // pixels between its profiles along a side
+constexpr int kMaxProfileTaps = 96;
 constexpr double kCrossingCells = 0.6;  // ramps wider than this many cells use the halfway crossing
 
 // Bilinear sample of the image at pixel-edge coordinates (x, y); false outside it.
@@ -301,6 +309,44 @@ bool SampleAt(const image_u8_t *im, double x, double y, double *out) {
   return true;
 }
 
+// Weighted total-least-squares line through the points (relative to the side's midpoint): its centre
+// and normal angle. With kDropOutliers, points far from the line are dropped and the line refitted.
+void FitSide(double *bxs, double *bys, double *ws, int used, double range, double *mx, double *my,
+             double *normal_theta) {
+  auto fit = [&](int n) {
+    double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+    for (int i = 0; i < n; ++i) {
+      sw += ws[i];
+      sx += ws[i] * bxs[i];
+      sy += ws[i] * bys[i];
+      sxx += ws[i] * bxs[i] * bxs[i];
+      sxy += ws[i] * bxs[i] * bys[i];
+      syy += ws[i] * bys[i] * bys[i];
+    }
+    *mx = sx / sw;
+    *my = sy / sw;
+    const double Cxx = sxx / sw - *mx * *mx;
+    const double Cxy = sxy / sw - *mx * *my;
+    const double Cyy = syy / sw - *my * *my;
+    *normal_theta = 0.5 * std::atan2(-2 * Cxy, Cyy - Cxx);
+  };
+  fit(used);
+  if ((ProfileFeatures() & kDropOutliers) != 0) {
+    // Drop points further than about a pixel from the line and refit, if most of them agree.
+    const double tol = 1.0 + 0.1 * range;
+    const double lx = -std::sin(*normal_theta), ly = std::cos(*normal_theta);  // the line's direction
+    int kept = 0;
+    for (int i = 0; i < used; ++i) {
+      if (std::fabs((bxs[i] - *mx) * -ly + (bys[i] - *my) * lx) > tol) continue;
+      bxs[kept] = bxs[i];
+      bys[kept] = bys[i];
+      ws[kept] = ws[i];
+      ++kept;
+    }
+    if (kept < used && kept >= 3 && 2 * kept >= used) fit(kept);
+  }
+}
+
 // One pass: profiles within `range` pixels either side of each current side, the sides refitted and
 // intersected into new corners. Reports the mean width of the gradient lobes in *edge_width.
 // With `cell` > 0 and kHalfwayCrossing, an edge whose ramp is wider than 0.6 of a cell is placed where
@@ -308,13 +354,13 @@ bool SampleAt(const image_u8_t *im, double x, double y, double *out) {
 // exact for any symmetric blur under about two cells (the gradient's centre of mass does not).
 // Returns false, leaving the quad as it was, if a side's fit is degenerate.
 bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *quad,
-                 double *edge_width) {
+                 double *edge_width, double *truncated = nullptr) {
   const int taps = 2 * static_cast<int>(range / kProfileStep) + 3;
   constexpr int kMaxTaps = 96;
   if (taps > kMaxTaps) return false;
   const bool halfway = (ProfileFeatures() & kHalfwayCrossing) != 0;
   double width_sum = 0;
-  int width_n = 0;
+  int width_n = 0, touching = 0;
   const int max_x = im->width - 1;
   const int max_y = im->height - 1;
   double lines[4][4];
@@ -385,6 +431,7 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
         gs += g[j];
         gj += static_cast<double>(g[j]) * j;
       }
+      if (jl == 1 || jr == taps - 2) ++touching;
       width_sum += (jr - jl + 1) * kProfileStep;
       ++width_n;
       double cj = gj / gs;  // the edge's position, in taps
@@ -429,40 +476,8 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
       lines[edge][3] = ny;
       continue;
     }
-    // Weighted total-least-squares line through the points: its centre and normal angle.
     double mx = 0, my = 0, normal_theta = 0;
-    auto fit = [&](int n) {
-      double sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
-      for (int i = 0; i < n; ++i) {
-        sw += ws[i];
-        sx += ws[i] * bxs[i];
-        sy += ws[i] * bys[i];
-        sxx += ws[i] * bxs[i] * bxs[i];
-        sxy += ws[i] * bxs[i] * bys[i];
-        syy += ws[i] * bys[i] * bys[i];
-      }
-      mx = sx / sw;
-      my = sy / sw;
-      const double Cxx = sxx / sw - mx * mx;
-      const double Cxy = sxy / sw - mx * my;
-      const double Cyy = syy / sw - my * my;
-      normal_theta = 0.5 * std::atan2(-2 * Cxy, Cyy - Cxx);
-    };
-    fit(used);
-    if ((ProfileFeatures() & kDropOutliers) != 0) {
-      // Drop points further than about a pixel from the line and refit, if most of them agree.
-      const double tol = 1.0 + 0.1 * range;
-      const double lx = -std::sin(normal_theta), ly = std::cos(normal_theta);  // the line's direction
-      int kept = 0;
-      for (int i = 0; i < used; ++i) {
-        if (std::fabs((bxs[i] - mx) * -ly + (bys[i] - my) * lx) > tol) continue;
-        bxs[kept] = bxs[i];
-        bys[kept] = bys[i];
-        ws[kept] = ws[i];
-        ++kept;
-      }
-      if (kept < used && kept >= 3 && 2 * kept >= used) fit(kept);
-    }
+    FitSide(bxs, bys, ws, used, range, &mx, &my, &normal_theta);
     lines[edge][0] = xm + mx;
     lines[edge][1] = ym + my;
     lines[edge][2] = std::cos(normal_theta);
@@ -470,6 +485,143 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
   }
   IntersectLines(lines, quad);
   *edge_width = width_n > 0 ? width_sum / width_n : 0.0;
+  if (truncated != nullptr) *truncated = width_n > 0 ? static_cast<double>(touching) / width_n : 0.0;
+  return true;
+}
+
+// For quads whose edges are motion-blurred. Each profile spans the outer quiet zone to the middle of
+// the border; the edge is placed where it crosses halfway between the side's white and black levels
+// (the white from the outer end, the black from the inner end), which is exact for a symmetric blur.
+// *ramp receives the median 20% to 80% rise. Returns false, leaving the quad as it was, if no side
+// could be refitted.
+bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ramp = nullptr) {
+  const double r_out = std::min(0.5 * cell, 20.0), r_in = std::min(0.5 * cell, 20.0);
+  const float step = static_cast<float>(std::max<double>(kProfileStep, std::min(1.0, (r_in + r_out) / kLevelTaps)));
+  const int taps = static_cast<int>((r_in + r_out) / step) + 1;
+  if (taps < 8 || taps > kMaxProfileTaps) return false;
+  const int ends = std::max(2, static_cast<int>(1.0f / step));
+  const int max_x = im->width - 1;
+  const int max_y = im->height - 1;
+  double lines[4][4];
+  bool any = false;
+  double widths[4 * kMaxProfilePoints];
+  int nwidths = 0;
+
+  for (int edge = 0; edge < 4; edge++) {
+    const int a = edge, b = (edge + 1) & 3;
+    double nx = quad->p[b][1] - quad->p[a][1];
+    double ny = -quad->p[b][0] + quad->p[a][0];
+    const double mag = std::sqrt(nx * nx + ny * ny);
+    nx /= mag;
+    ny /= mag;
+    if (quad->reversed_border) {
+      nx = -nx;
+      ny = -ny;
+    }
+    const int np = std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / kLevelSpacing)));
+    const float fnx = static_cast<float>(nx), fny = static_cast<float>(ny);
+    const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
+    const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
+
+    // Tap m of the profile through (x0, y0); false outside the image.
+    auto at = [&](float fx0, float fy0, int m, float *v) {
+      const float u = static_cast<float>(-r_in) + step * m;
+      const float x = fx0 + u * fnx - 0.5f;
+      const float y = fy0 + u * fny - 0.5f;
+      const float xt = std::floor(x), yt = std::floor(y);
+      const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
+      if (xi < 0 || xi >= max_x || yi < 0 || yi >= max_y) return false;
+      *v = BilinearAt<float>(im, xi, yi, x - xt, y - yt);
+      return true;
+    };
+    double px[kMaxProfilePoints], py[kMaxProfilePoints], outer[kMaxProfilePoints], inner[kMaxProfilePoints];
+    int count = 0;
+    // Three profiles whose ends differ by too little rule the side out before the rest are sampled.
+    bool contrast = false;
+    for (int k = 1; k <= 3 && !contrast; ++k) {
+      const double alpha = k / 4.0;
+      const float fx0 = static_cast<float>(alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0]);
+      const float fy0 = static_cast<float>(alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1]);
+      float lo = 0, hi = 0;
+      contrast = at(fx0, fy0, 0, &lo) && at(fx0, fy0, taps - 1, &hi) && hi - lo >= kMinLevelContrast;
+    }
+    for (int s = 0; s < np && contrast; s++) {
+      const double alpha = (1.0 + s) / (np + 1);
+      const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
+      const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+      const float fx0 = static_cast<float>(x0), fy0 = static_cast<float>(y0);
+      bool inside = true;
+      double lo = 0, hi = 0;
+      for (int m = 0; m < ends && inside; ++m) {
+        float vl = 0, vh = 0;
+        inside = at(fx0, fy0, m, &vl) && at(fx0, fy0, taps - 1 - m, &vh);
+        lo += vl;
+        hi += vh;
+      }
+      if (!inside) continue;
+      inner[count] = lo / ends;
+      outer[count] = hi / ends;
+      px[count] = x0;
+      py[count] = y0;
+      ++count;
+    }
+    double bxs[kMaxProfilePoints], bys[kMaxProfilePoints], ws[kMaxProfilePoints];
+    int used = 0;
+    if (count >= 3) {
+      double tmp[kMaxProfilePoints];
+      std::copy(outer, outer + count, tmp);
+      std::nth_element(tmp, tmp + count / 2, tmp + count);
+      const double white = tmp[count / 2];
+      std::copy(inner, inner + count, tmp);
+      std::nth_element(tmp, tmp + count / 2, tmp + count);
+      const double black = tmp[count / 2];
+      if (white - black >= kMinLevelContrast) {
+        const double mid = 0.5 * (white + black), margin = 0.25 * (white - black);
+        for (int i = 0; i < count; ++i) {
+          if (outer[i] < mid + margin || inner[i] > mid - margin) continue;
+          float pr[kMaxProfileTaps];
+          for (int m = 0; m < taps; ++m) at(static_cast<float>(px[i]), static_cast<float>(py[i]), m, &pr[m]);
+          int below = 0, below20 = 0, below80 = 0;
+          for (int m = 0; m < taps; ++m) {
+            below += pr[m] < mid;
+            below20 += pr[m] < mid - 0.3 * (white - black);
+            below80 += pr[m] < mid + 0.3 * (white - black);
+          }
+          widths[nwidths++] = step * (below80 - below20);
+          if (below < 1 || below >= taps) continue;
+          double frac = 0.5;
+          if (pr[below] > pr[below - 1]) {
+            frac = std::min(1.0, std::max(0.0, (mid - pr[below - 1]) / (pr[below] - pr[below - 1])));
+          }
+          const double n0 = -r_in + step * (below - 1 + frac);
+          bxs[used] = px[i] + n0 * nx - xm;
+          bys[used] = py[i] + n0 * ny - ym;
+          ws[used] = 1.0;
+          ++used;
+        }
+      }
+    }
+    if (used < 3) {
+      lines[edge][0] = xm;
+      lines[edge][1] = ym;
+      lines[edge][2] = nx;
+      lines[edge][3] = ny;
+      continue;
+    }
+    any = true;
+    double mx = 0, my = 0, normal_theta = 0;
+    FitSide(bxs, bys, ws, used, 0.5 * (r_in + r_out), &mx, &my, &normal_theta);
+    lines[edge][0] = xm + mx;
+    lines[edge][1] = ym + my;
+    lines[edge][2] = std::cos(normal_theta);
+    lines[edge][3] = std::sin(normal_theta);
+  }
+  if (!any) return false;
+  if (ramp != nullptr && nwidths > 0) {
+    std::nth_element(widths, widths + nwidths / 2, widths + nwidths);
+    *ramp = widths[nwidths / 2];
+  }
+  IntersectLines(lines, quad);
   return true;
 }
 
@@ -644,15 +796,28 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
     }
     cell = side / family->width_at_border;
   }
-  if (!ProfilePass(reach, cell, im, quad, &edge_width)) {
+  double truncated = 0;
+  if (!ProfilePass(reach, cell, im, quad, &edge_width, &truncated)) {
     RefineEdgesT<double>(quad_decimate, im, quad);
     return;
   }
   if (cell <= 0) return;
 
+  // Lobes running into the window ends mean a blurred quad: place its edges by the halfway crossing.
+  bool widened = false;
+  if ((ProfileFeatures() & kWidenBlur) != 0 && truncated > kTruncatedFraction) {
+    struct quad before = *quad;
+    double ramp = 0;
+    if (LevelPass(cell, im, quad, &ramp) && ramp >= kMinBlurRamp) {
+      widened = true;
+    } else {
+      *quad = before;
+    }
+  }
+
   // Narrow the window to the measured edge width (never above half a cell, so the next payload edge
   // stays out) and refit around the refined sides, while that still shrinks it.
-  for (int pass = 0; pass < 3 && (ProfileFeatures() & kCoarseToFine) != 0; ++pass) {
+  for (int pass = 0; pass < 3 && !widened && (ProfileFeatures() & kCoarseToFine) != 0; ++pass) {
     double next = std::max(1.5, 1.25 * edge_width);
     if (cell >= 3.0) next = std::min(next, 0.45 * cell);
     if (next >= 0.9 * reach) break;
