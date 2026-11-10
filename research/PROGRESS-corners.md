@@ -79,3 +79,45 @@ removed; the unknown-cell masking is what fixes obstruction.)
 
 Results with the committed defaults (N 8000), whole corpus, median / p95 px, base -> polish
 (`$S/corners/base_d{1,2}.score`, `n8000_d{1,2}.score`): see section 4.
+
+## 4. Final state (commit after "motion stage on a thinner set") and measurements
+
+Motion stage: eight start directions scored by closed-form SSE on a working set thinned to 2500 px, LM there, then 3
+LM iterations on the full set; at most 13 taps. motion-blur frame cost 81 -> 25 ms (one thread).
+
+Whole corpus, median / p95 px, base (v1.10.1 profile fit) -> `APRILTAG_VK_POLISH=1`; recall and false detections are
+identical in every scenario at both decimations (dumps `$S/corners/fin_d{1,2}`, scores `fin_d{1,2}.score`):
+
+| scenario | d2 base | d2 polish | d1 base | d1 polish |
+|---|---|---|---|---|
+| motion-blur (max) | 0.059 / 0.456 (1.15) | 0.018 / 0.167 (0.70) | 0.066 / 0.434 (1.66) | 0.020 / 0.116 (0.34) |
+| overexposed | 0.069 / 0.294 | 0.020 / 0.053 | 0.067 / 0.294 | 0.020 / 0.053 |
+| blur | 0.045 / 0.162 | 0.015 / 0.065 | 0.039 / 0.138 | 0.017 / 0.057 |
+| underexposed | 0.065 / 0.142 | 0.049 / 0.116 | 0.060 / 0.136 | 0.043 / 0.119 |
+| noise | 0.034 / 0.079 | 0.026 / 0.063 | 0.031 / 0.069 | 0.025 / 0.057 |
+| jpeg | 0.031 / 0.070 | 0.026 / 0.052 | 0.030 / 0.067 | 0.026 / 0.056 |
+| range | 0.016 / 0.100 | 0.009 / 0.048 | 0.017 / 0.129 | 0.009 / 0.047 |
+| border-occlusion | 0.204 / 1.084 | 0.116 / 1.084 | 0.448 / 1.624 | 0.100 / 1.142 |
+| dense-tags | 0.018 / 0.074 | 0.010 / 0.042 | 0.018 / 0.075 | 0.010 / 0.042 |
+| small-tags | 0.021 / 0.080 | 0.011 / 0.038 | 0.020 / 0.075 | 0.011 / 0.038 |
+| one-tag, large-tags, many-tags | unchanged or slightly better (large tags keep the profile fit) | | | |
+
+noise / jpeg / underexposed gain less because the cap (8000 px) and the sensor noise limit them; with the cap
+raised to all pixels (APRILTAG_VK_POLISH_N=100000, d2) noise 0.014 / 0.035, jpeg 0.016 / 0.041, underexposed
+0.024 / 0.056, motion-blur 0.010 / 0.063 (about 10x the time on large tags).
+
+Cost, one thread, per frame (interleaved ABBA, `$S/corners/timing.txt`; shared GPU, desktop CPU):
+| scenario | off | on |
+|---|---|---|
+| one-tag (170 px tag) | 0.36 ms | 1.96 ms |
+| jpeg | 2.2 ms | 7.1 ms |
+| motion-blur | 0.4 ms | 25 ms |
+| dense-tags (~30 small tags) | 1.5 ms | 75 ms (2.5 ms per tag) |
+All threads (default): dense-tags 1.0 -> 17 ms, jpeg 1.1 -> 4.9, one-tag 0.37 -> 2.7, motion-blur 0.4 -> 83 (before
+the motion-stage speed-up; about 25 now single-threaded).
+The polish runs only on decoded tags (after decode), never on rejected quads.
+
+Left to do / ideas: per-pixel cost (float and wider SIMD for the 16-parameter normal equations, an analytic fast
+path for pixels that touch one column and one row only); an adaptive cap by predicted accuracy instead of a tag
+size cut-off; border-occlusion p95 1.08 is one tag whose polish is rejected (corner moves too far); the gt-clip
+scenario (overexposed) is now unbiased.
