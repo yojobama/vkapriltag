@@ -884,7 +884,8 @@ bool HasOutliers(std::span<const RawLineFitPoint> points, size_t begin, size_t e
 
 QuadDecode::QuadDecode(const DetectorConfig &config)
     : config_(config),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker")),
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker",
+                                   ResolveWorkerPoolOptions(config.PoolOptions()))),
       scratch_(pool_->threads()) {
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
   if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) config_.small_tag_rescue = v[0] != '0';
