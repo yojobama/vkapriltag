@@ -73,6 +73,10 @@ class TagDecoder {
   };
   const Stats &last_stats() const { return last_stats_; }
 
+  // Whole-tag photometric polish of decoded tags (off by default; APRILTAG_VK_POLISH=1 turns it on).
+  void SetPolish(bool on) { polish_ = on; }
+  bool polish() const { return polish_; }
+
   // Margin gate (off by default): quads whose unrefined decision margin is below this, or whose
   // border polarity is wrong, skip refinement. APRILTAG_VK_PROBE_MARGIN overrides it.
   void SetProbeMargin(float grey_levels) { probe_margin_ = grey_levels; }
@@ -94,6 +98,8 @@ class TagDecoder {
   bool grey_margin_ = true;
   // APRILTAG_VK_SMALL_RESCUE=1 turns on: refit boxes and small undecoded quads from the full-resolution image.
   bool small_rescue_ = false;
+  // APRILTAG_VK_POLISH=1 turns on: refit each decoded tag's homography to every cell edge of its code.
+  bool polish_ = false;
   // APRILTAG_VK_SIDE_ONE_OUT=0 turns off: refit a side whose border cells read white, one cell further in.
   bool side_one_out_ = true;
   // APRILTAG_VK_THIRD_BIT=0 turns off: accept a third corrected bit when the three wrong cells touch.

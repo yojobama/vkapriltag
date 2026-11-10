@@ -159,6 +159,7 @@ add_library(vkapriltag STATIC
   src/TrackingDetector.cpp
   src/SmallQuad.cpp
   src/RefineEdges.cpp
+  src/PolishFit.cpp
   src/BorderSample.cpp
   src/FramePipeline.cpp
   src/PoseEstimator.cpp
