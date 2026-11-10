@@ -38,6 +38,9 @@ struct TrackingConfig {
   // is too slow to settle from there); the next 1, 2, 4... frames, up to keyframe_interval, then run full.
   float max_first_shift_px = 3.0f;
   float converge_px = 0.05f;
+  // A track predicted to move more than this many pixels per frame (corner speed) is not tracked: on
+  // blurred tags the refine settles up to 2 px off. 0 = no limit. Env override: APRILTAG_VK_TRACKING_MAX_SPEED=<px>
+  float max_speed_px = 0.0f;
   uint32_t max_iterations = 3;
   // When the predicted corners do not decode, search a region around the tag with libapriltag's quad
   // detector before giving up. Env override: APRILTAG_VK_TRACKING_SEARCH=0|1
@@ -143,6 +146,7 @@ class TrackingDetector {
     bool tentative = false;  // from the background detector, not yet measured on a frame
   };
 
+  static double Speed(const Track &t);
   zarray_t *DetectFull(const uint8_t *gray_frame);
   zarray_t *DetectAsync(const uint8_t *gray_frame);
   // Tracks every entry of tracks_ on the frame. Not partial: all or nullptr. Partial: the tracks that

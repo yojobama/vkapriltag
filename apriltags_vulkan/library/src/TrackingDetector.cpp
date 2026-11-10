@@ -31,6 +31,7 @@ void ApplyEnv(TrackingConfig *c) {
   }
   if (const char *v = std::getenv("APRILTAG_VK_TRACKING_SEARCH")) c->roi_search = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_TRACKING_CAPTURE")) c->capture = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_MAX_SPEED")) c->max_speed_px = static_cast<float>(std::atof(v));
   if (const char *v = std::getenv("APRILTAG_VK_TRACKING_CAPTURE_SPEED")) c->capture_speed_px = static_cast<float>(std::atof(v));
   if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ASYNC")) c->async = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ASYNC_INTERVAL")) {
@@ -77,6 +78,12 @@ void BoxDecimate(const uint8_t *src, int stride, int x0, int y0, int w, int h, i
 }
 
 }  // namespace
+
+double TrackingDetector::Speed(const Track &t) {
+  double speed = 0.0;
+  for (int k = 0; k < 4; ++k) speed = std::max(speed, std::hypot(t.v[k][0], t.v[k][1]));
+  return speed;
+}
 
 TrackingDetector::TrackingDetector(vk::Context &ctx, apriltag_detector_t *td,
                                    const DetectorConfig &config, const TrackingConfig &tracking)
@@ -516,8 +523,7 @@ bool TrackingDetector::CaptureStart(const uint8_t *gray_frame, const Track &t, D
   if (best <= tracking_.max_first_shift_px) return true;
 
   EnsureCapture();
-  double speed = 4.0;
-  for (int k = 0; k < 4; ++k) speed = std::max(speed, std::hypot(t.v[k][0], t.v[k][1]));
+  const double speed = std::max(4.0, Speed(t));
   const int d0 = std::clamp(static_cast<int>(std::ceil(speed / 8.0)), 2, 8);
   for (int d : {d0, 2 * d0}) {
     if (d <= 8 && CoarseStart(gray_frame, t, d, out)) return true;
@@ -585,6 +591,8 @@ zarray_t *TrackingDetector::TrackFrame(const uint8_t *gray_frame, bool partial, 
       alive[i] = 0;
     } else if (edge) {
       return nullptr;
+    } else if (tracking_.max_speed_px > 0.0f && !tracks_[i].tentative && Speed(tracks_[i]) > tracking_.max_speed_px) {
+      return nullptr;
     } else {
       active.push_back(i);
     }
@@ -593,8 +601,7 @@ zarray_t *TrackingDetector::TrackFrame(const uint8_t *gray_frame, bool partial, 
   // A track from the background detector is not trusted to a refine from its old corners: it starts from
   // a decimated refine; so does a fast track when capture_speed_px is set.
   for (size_t i : std::vector<size_t>(active)) {
-    double speed = 0.0;
-    for (int k = 0; k < 4; ++k) speed = std::max(speed, std::hypot(tracks_[i].v[k][0], tracks_[i].v[k][1]));
+    const double speed = Speed(tracks_[i]);
     const bool fast = tracking_.capture && tracking_.capture_speed_px > 0.0f && speed > tracking_.capture_speed_px;
     if (!tracks_[i].tentative && !fast) continue;
     EnsureCapture();
