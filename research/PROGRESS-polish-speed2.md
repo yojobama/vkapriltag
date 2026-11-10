@@ -60,3 +60,34 @@ model 45, accumulate 51 (gather 28, dots 23), scan 11, cand 6. 729 pixels per ta
 - Lattice thinning by 2 for blurred tags (best blur >= 1.2 px): p95 unchanged in every scenario except blur d2
   0.065 -> 0.068 (+4.6 %); motion-blur 3.4 -> 2.2 ms. Sharp tags (dense-tags, small-tags, range) never use it.
 - ITERS=3 with TOL=0.007: overexposed p95 0.048 -> 0.056 (+17 %), rejected; defaults stay 6 / 0.004.
+
+## Final state (HEAD of this branch)
+
+Fast path is the only path; `APRILTAG_VK_POLISH=1` alone selects it. Profiler removed. Accuracy tables:
+`$S/polish-speed2/final_table.txt` (off | old | final, median/p95 and found, d1 and d2). No scenario worse than old
+polish by more than 5 % of p95 (blur d2 0.065 -> 0.068 is the worst, +4.6 %; overexposed d1 0.047 -> 0.050,
++6 % but 0.003 px); motion-blur better (d1 0.115 -> 0.104, d2 0.166 -> 0.142); recall and false detections identical.
+
+Frame ms (4 ABBA rounds, median, decimation 2) off / old polish / new polish:
+
+| scenario | 1 thread | default threads |
+|---|---|---|
+| one-tag | 0.31 / 0.67 / 0.43 | 0.29 / 0.67 / 0.40 |
+| dense-tags (30 tags) | 1.52 / 14.26 / 6.80 | 0.58 / 2.46 / 1.49 |
+| motion-blur | 0.39 / 3.70 / 1.86 | 0.35 / 3.16 / 1.58 |
+| blur | 0.40 / 2.15 / 0.82 | 0.35 / 1.36 / 0.60 |
+| jpeg | 2.41 / 3.16 / 2.56 | 0.76 / 1.35 / 1.00 |
+| range | 0.16 / 0.70 / 0.36 | 0.18 / 0.68 / 0.38 |
+| noise | 0.39 / 1.26 / 0.66 | 0.36 / 0.79 / 0.48 |
+
+Polish overhead per ordinary tag (dense-tags, 1 thread): old 0.42 ms, new 0.18 ms (2.4x). Overhead ratios old/new:
+one-tag 3.1x, motion-blur 2.2x, blur 4.3x, jpeg 4.9x, range 2.7x, noise 3.2x. Target of 3 to 4x per ordinary
+tag (0.1 to 0.15 ms) not reached; motion-blur 1.5 ms overhead per frame (about 1.5 tags per frame there) not under target.
+
+## Left to do
+
+- Per ordinary tag (about 200 us profiled): select 60 (stage 1 box scan 25, per-candidate window test 35),
+  model 50, accumulate 45, freeze + first model + levels 24, scan 13. Ideas: clip rows to the quad before the
+  interior test; vectorise the candidate test; variable projection (8 parameters) to shrink the normal equations.
+- Motion stage: closed-form segment-blurred edge for single-edge pixels (about 43 % of motion pixels), taps for corners.
+- Orange Pi (aarch64) timing not measured here (desktop only).
