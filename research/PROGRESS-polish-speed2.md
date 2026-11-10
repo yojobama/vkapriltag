@@ -50,3 +50,13 @@ model 45, accumulate 51 (gather 28, dots 23), scan 11, cand 6. 729 pixels per ta
 - Fast path is now the only path (`APRILTAG_VK_POLISH=1` alone): slow Evaluate, BuildCand, Select, Cand, the
   slope experiment and its knobs removed. Output equals the previous fast+offsets run to float rounding (a few
   dump lines differ in the last digit).
+- Struct-of-arrays Jacobian columns weighted in place (no gather): accumulate phase 51 -> 45 us/tag.
+- Motion stage: 131 of 142 tags in motion-blur accept the motion model, with 2000 to 8000 pixels each (wide windows),
+  so the box model (pixels x taps) dominates (2.4 ms of 3.6 ms per tag). Fewer taps (spacing 2.4 to 3.2 px, max 4 to 5):
+  accuracy ok but no clear time gain. Motion fit on a strided subset of at most 800 pixels followed by one
+  Gauss-Newton iteration on the full set: motion-blur p95 unchanged (d1 0.108 -> 0.114, d2 0.144 -> 0.144), median
+  unchanged (the full-set final iteration is needed: without it the median rose 0.022 -> 0.035). Frame time
+  3.4 -> 2.65 ms (noisy machine).
+- Lattice thinning by 2 for blurred tags (best blur >= 1.2 px): p95 unchanged in every scenario except blur d2
+  0.065 -> 0.068 (+4.6 %); motion-blur 3.4 -> 2.2 ms. Sharp tags (dense-tags, small-tags, range) never use it.
+- ITERS=3 with TOL=0.007: overexposed p95 0.048 -> 0.056 (+17 %), rejected; defaults stay 6 / 0.004.

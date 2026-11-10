@@ -41,6 +41,7 @@ constexpr int kMaxCells = 16;        // widest supported grid
 constexpr int kPad = kMaxCells + 2;  // class grid with one outside row and column on each side
 constexpr int kMaxC = 8;             // columns (or rows) one pixel's frozen window may hold
 constexpr int kMaxJ = 11;            // homography plus up to three blur parameters
+constexpr int kMotionPixels = 800;  // working-set size of the motion-blur search
 constexpr int kMaxT = 16;           // all parameters: geometry, blur, three levels, two slopes
 
 
@@ -1149,6 +1150,7 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   window = std::max(window, kKnobs.min_win);
   tq = NowS();
   const double reach_s = std::min(kKnobs.smax_mult * best_s, 8.0);
+  if (best_s >= 1.2) box.thin = std::max(box.thin, 2);
   BuildFit(&fit, p.map, window, kKnobs.reach * reach_s, box, im);
   g_prof_local.t[3] += NowS() - tq;
   tq = NowS();
@@ -1172,6 +1174,32 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   bool moving_accepted = false;
   if (std::max(p.s[0], p.s[1]) > 1.4 && (DevFlags() & 8) == 0) {
     // A wide blur may be motion: refit with a Gaussian blur plus a straight blur segment.
+    const int motion_cap = kMotionPixels;
+    static thread_local Fit sub;
+    Fit *mf = &fit;
+    const bool thinned = fit.n > motion_cap;
+    if (thinned) {
+      const int k = (fit.n + motion_cap - 1) / motion_cap;
+      const int m = (fit.n + k - 1) / k;
+      sub.width = fit.width;
+      sub.cx = fit.cx;
+      sub.cy = fit.cy;
+      sub.scale = fit.scale;
+      std::copy(&fit.cls[0][0], &fit.cls[0][0] + kPad * kPad, &sub.cls[0][0]);
+      const auto take = [&](std::vector<float> &dst, const std::vector<float> &src) {
+        if (dst.size() < static_cast<size_t>(m)) dst.resize(m);
+        for (int i = 0, idx = 0; i < m; ++i, idx += k) dst[i] = src[idx];
+      };
+      take(sub.x, fit.x);
+      take(sub.y, fit.y);
+      take(sub.obs, fit.obs);
+      take(sub.u0, fit.u0);
+      take(sub.v0, fit.v0);
+      take(sub.gu, fit.gu);
+      take(sub.gv, fit.gv);
+      sub.n = m;
+      mf = &sub;
+    }
     const double sigma0 = 0.7;
     const double lu = std::sqrt(12.0 * std::max(p.s[0] * p.s[0] - sigma0 * sigma0, 0.5));
     const double lv = std::sqrt(12.0 * std::max(p.s[1] * p.s[1] - sigma0 * sigma0, 0.5));
@@ -1196,10 +1224,10 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
         const double len = std::hypot(moving.s[1], moving.s[2]);
         moving.taps = std::clamp(static_cast<int>(std::ceil(len / 1.6)), 3, 9);
         const double st = std::sqrt(sigma0 * sigma0 + len * len / 12.0);
-        Freeze(&fit, st, 0.5 * len);
-        ModelPass<true, false>(&fit, moving);
+        Freeze(mf, st, 0.5 * len);
+        ModelPass<true, false>(mf, moving);
         double sse = 0;
-        if (FitLevels(fit, &moving, &sse) && sse < best_sse) {
+        if (FitLevels(*mf, &moving, &sse) && sse < best_sse) {
           best_sse = sse;
           best_start = moving;
         }
@@ -1207,12 +1235,16 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
       if (best_sse < 1e300) {
         Params moving2 = best_start;
         const double len = std::hypot(moving2.s[1], moving2.s[2]);
-        Freeze(&fit, std::sqrt(sigma0 * sigma0 + len * len / 12.0) * 1.15, 0.6 * len);
-        const double cost_moving = Optimise(&fit, &moving2, kcut, 5, 2.5 * tol, W);
+        Freeze(mf, std::sqrt(sigma0 * sigma0 + len * len / 12.0) * 1.15, 0.6 * len);
+        const double cost_moving = Optimise(mf, &moving2, kcut, 5, 2.5 * tol, W);
         Params plain = p;
         Accum tmp;
-        Evaluate(&fit, &plain, kcut, 0, &tmp);
+        Evaluate(mf, &plain, kcut, 0, &tmp);
         if (cost_moving < 0.97 * tmp.cost) {
+          if (thinned) {
+            Freeze(&fit, std::sqrt(sigma0 * sigma0 + len * len / 12.0) * 1.15, 0.6 * len);
+            Optimise(&fit, &moving2, kcut, 1, 2.5 * tol, W);
+          }
           p = moving2;
           moving_accepted = true;
         }
