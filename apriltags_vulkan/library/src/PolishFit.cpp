@@ -486,7 +486,7 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
   scan->Clear();
   double inv[9];
   CellToNormalised(map, inv);
-  static const double kOffset[4] = {-1.2, 0.4, -0.4, 1.2};
+  static const double kOffset[4] = {-4.2, 1.4, -1.4, 4.2};
   int count = 0;
   const auto add = [&](double u, double v) {
     const double w = inv[6] * u + inv[7] * v + inv[8];

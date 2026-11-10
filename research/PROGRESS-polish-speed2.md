@@ -38,3 +38,12 @@ model 45, accumulate 51 (gather 28, dots 23), scan 11, cand 6. 729 pixels per ta
 - ITERS=3: accuracy neutral, small saving; ITERS=2: dense p95 0.041 -> 0.046 (rejected); TOL=0.007 neutral.
 - BuildFit computing the gradient magnitudes only for pixels that survive the interior test: no measurable
   change in the select phase.
+- Found the motion-blur p95 regression of the fast path (0.166 -> 0.219 at d2): the edge-sampled blur scan
+  (offsets +-1.2 px) misjudges wide blur; with the old candidate scan (`OLDSCAN` hack) it is 0.166. Scaling the
+  scan offsets (OFFS, px multiplier of the old offsets) d2 p95: 1 -> 0.219, 2 -> 0.195, 3 -> 0.166, 3.5 -> 0.144,
+  4 -> 0.115, 5 -> 0.102, 6 -> 0.118, 8 -> 0.142; blur p95 0.052 (1), 0.070 (2.5), 0.065 (3.5 to 6), 0.087 (8);
+  overexposed 0.047 (1 to 3.5), 0.051 (4 to 6). Kept 3.5 (offsets -4.2, -1.4, 1.4, 4.2 px): every scenario
+  within 5 % of old polish at d1 and d2, motion-blur better (d2 0.166 -> 0.144, d1 0.115 -> 0.108).
+- Band rasterisation in BuildFit (per row intervals from the monotone u(x), v(x)): slower (select 58 -> 80 us)
+  because the bands still cover about 60 % of the box and the cost is the per-candidate exact test; reverted.
+- Double precision dot products: no change in motion-blur p95, so float accumulation is not the problem.
