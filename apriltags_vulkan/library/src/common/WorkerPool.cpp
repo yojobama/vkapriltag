@@ -204,7 +204,10 @@ void WorkerPool::WorkerMain(unsigned slot) {
   for (;;) {
     if (spin && ShouldSpin(slot)) SpinForWork(seen);
     bool batch = false;
-    {
+    if (spin && generation_.load(std::memory_order_acquire) != seen && !stop_.load(std::memory_order_acquire)) {
+      seen = generation_.load(std::memory_order_acquire);  // a spinning worker takes the batch without the lock
+      batch = true;
+    } else {
       std::unique_lock<std::mutex> lock(mutex_);
       batch_ready_.wait(lock, [this, &seen, &seen_warm] {
         return stop_.load(std::memory_order_relaxed) || generation_.load(std::memory_order_relaxed) != seen ||
@@ -223,9 +226,9 @@ void WorkerPool::WorkerMain(unsigned slot) {
 
     DrainBatch(slot);
 
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (--outstanding_ == 0) batch_done_.notify_one();
+    if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      std::lock_guard<std::mutex> lock(mutex_);  // orders the notification after the caller's wait
+      batch_done_.notify_one();
     }
   }
 }
@@ -264,7 +267,7 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
     fn_ = &fn;
     count_ = count;
     next_.store(0, std::memory_order_relaxed);
-    outstanding_ = workers_.size();
+    outstanding_.store(workers_.size(), std::memory_order_relaxed);
     generation_.fetch_add(1, std::memory_order_release);
   }
   batch_ready_.notify_all();
@@ -277,7 +280,7 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
     // The tail of the batch: time the caller idles while a worker finishes its last item.
     VKA_PROF_SCOPE("pool.join_wait");
     std::unique_lock<std::mutex> lock(mutex_);
-    batch_done_.wait(lock, [this] { return outstanding_ == 0; });
+    batch_done_.wait(lock, [this] { return outstanding_.load(std::memory_order_acquire) == 0; });
     // Every participant has returned from DrainBatch().
     fn_ = nullptr;
     count_ = 0;

@@ -83,7 +83,7 @@ class WorkerPool {
   const std::function<void(size_t, unsigned)> *fn_ = nullptr;
   size_t count_ = 0;
   std::atomic<size_t> next_{0};
-  size_t outstanding_ = 0;  // workers still inside the current batch
+  std::atomic<size_t> outstanding_{0};  // workers still inside the current batch
   // Read by spinning workers; kept on a cache line of their own, away from the written members.
   alignas(64) std::atomic<uint64_t> generation_{0};
   std::atomic<uint64_t> warm_epoch_{0};
