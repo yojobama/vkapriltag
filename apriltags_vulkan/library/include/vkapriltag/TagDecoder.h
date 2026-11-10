@@ -42,7 +42,8 @@ class TagDecoder {
   // Margin gate in grey levels (0 = off); APRILTAG_VK_PROBE_MARGIN overrides it.
   explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0,
                       RefineEdgesMethod refine_method = RefineEdgesMethod::kProfile,
-                      float probe_margin = 0.0f);
+                      float probe_margin = 0.0f, const WorkerPoolOptions &pool_options = WorkerPoolOptions(),
+                      bool background_thread = false);
   ~TagDecoder();
 
   TagDecoder(const TagDecoder &) = delete;

@@ -91,7 +91,8 @@ TrackingDetector::TrackingDetector(vk::Context &ctx, apriltag_detector_t *td,
   ApplyEnv(&tracking_);
   gpu_ = std::make_unique<GpuDetector>(ctx, config_);
   quad_decode_ = std::make_unique<QuadDecode>(config_);
-  full_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, config_.cpu_threads);
+  full_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, config_.cpu_threads, RefineEdgesMethod::kProfile,
+                                              0.0f, config_.PoolOptions());
   search_td_ = apriltag_detector_create();
   for (int i = 0; i < zarray_size(td_->tag_families); ++i) {
     apriltag_family_t *family = nullptr;
@@ -149,7 +150,7 @@ zarray_t *TrackingDetector::Detect(const uint8_t *gray_frame) {
     Path path = Path::kTracked;
     if (zarray_t *dets = TrackFrame(gray_frame, false, &path)) {
       ++tracked_run_;
-      gpu_->NoteFrame();
+      gpu_->NoteFrame(true);
       if (tracked_run_ + 1 >= tracking_.keyframe_interval) gpu_->ExpectGpuFrame();
       backoff_ = 1;
       last_path_ = path;
@@ -213,7 +214,8 @@ zarray_t *TrackingDetector::DetectFull(const uint8_t *gray_frame) {
 
 void TrackingDetector::EnsureBackground() {
   if (bg_thread_.joinable()) return;
-  bg_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, tracking_.async_threads);
+  bg_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, tracking_.async_threads, RefineEdgesMethod::kProfile,
+                                          0.0f, config_.PoolOptions(), true);
   bg_stop_ = false;
   bg_thread_ = std::thread([this] { BackgroundMain(); });
 }

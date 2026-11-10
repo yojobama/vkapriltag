@@ -167,10 +167,23 @@ void ResetScratch(zarray_t *scratch) { zarray_truncate(scratch, 0); }
 
 }  // namespace
 
+namespace {
+
+// A decoder used from a background thread never pins threads.
+WorkerPoolOptions ResolvePoolOptions(const WorkerPoolOptions &configured, bool background_thread) {
+  WorkerPoolOptions o = ResolveWorkerPoolOptions(configured);
+  if (background_thread) o.big_cores = o.pin_caller = false;
+  return o;
+}
+
+}  // namespace
+
 TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads,
-                       RefineEdgesMethod refine_method, float probe_margin)
+                       RefineEdgesMethod refine_method, float probe_margin,
+                       const WorkerPoolOptions &pool_options, bool background_thread)
     : td_(td),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker")),
+      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker",
+                                         ResolvePoolOptions(pool_options, background_thread))),
       refine_method_(ResolveRefineEdgesMethod(refine_method)),
       probe_margin_(probe_margin) {
   // refine_edges() reads td_->quad_decimate for its search radius.

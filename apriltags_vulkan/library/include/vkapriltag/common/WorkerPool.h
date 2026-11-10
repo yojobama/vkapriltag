@@ -14,13 +14,32 @@
 
 namespace apriltag_vulkan {
 
+// Optional behaviours of WorkerPool; all off by default. Negative values mean "unset".
+struct WorkerPoolOptions {
+  // Microseconds a worker spins for the next batch after a batch or a Warm() before it blocks.
+  int spin_us = 0;
+  // Batches of at most this many items run on the calling thread when the pool has been idle for
+  // longer than inline_idle_us.
+  int inline_max = 0;
+  int inline_idle_us = 1000;
+  // On CPUs whose cores differ in capacity, pins workers to the highest-capacity cores and sizes
+  // the default thread count to their number; pin_caller also pins the calling thread.
+  bool big_cores = false;
+  bool pin_caller = false;
+};
+
+// Returns `configured` with the APRILTAG_CPU_SPIN_US, APRILTAG_CPU_INLINE, APRILTAG_CPU_INLINE_IDLE_US,
+// APRILTAG_CPU_BIG_CORES and APRILTAG_CPU_PIN_CALLER environment variables applied.
+WorkerPoolOptions ResolveWorkerPoolOptions(const WorkerPoolOptions &configured);
+
 // Persistent worker pool for the CPU tail; work is handed out by an atomic index.
 class WorkerPool {
  public:
   // `threads` is the total parallelism including the calling thread (1 runs inline; 0 selects
   // hardware_concurrency), capped at 4 x hardware_concurrency (at least 16).
   // `name` labels the worker threads in profiler traces ("<name> <slot>"); it is copied.
-  explicit WorkerPool(unsigned threads = 0, const char *name = "cpu-worker");
+  explicit WorkerPool(unsigned threads = 0, const char *name = "cpu-worker",
+                      const WorkerPoolOptions &options = WorkerPoolOptions());
   ~WorkerPool();
 
   WorkerPool(const WorkerPool &) = delete;
@@ -33,10 +52,18 @@ class WorkerPool {
   // first exception is rethrown here once every thread has left the batch.
   void ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn);
 
+  // Makes the workers of this pool spin for options.spin_us so that a batch due soon starts without
+  // a wake-up; no effect when spinning is off.
+  void Warm();
+  // Warm() on every pool that exists.
+  static void WarmAll();
+
   unsigned threads() const { return 1 + static_cast<unsigned>(workers_.size()); }
 
  private:
   void WorkerMain(unsigned slot);
+  void SpinForWork(uint64_t seen);
+  void PinCaller();
   void StopWorkers();
   // Claims indices until the batch is exhausted; used by workers and the calling thread.
   void DrainBatch(unsigned slot);
@@ -53,8 +80,13 @@ class WorkerPool {
   size_t count_ = 0;
   std::atomic<size_t> next_{0};
   size_t outstanding_ = 0;  // workers still inside the current batch
-  uint64_t generation_ = 0;
-  bool stop_ = false;
+  std::atomic<uint64_t> generation_{0};
+  std::atomic<uint64_t> warm_epoch_{0};
+  std::atomic<bool> stop_{false};
+  WorkerPoolOptions options_;
+  std::atomic<int64_t> last_end_ns_{0};
+  std::vector<int> big_cpus_;  // empty unless pinning applies
+  std::atomic<size_t> pinned_caller_{0};
   std::exception_ptr error_;  // the batch's first exception
 };
 
