@@ -9,6 +9,7 @@
 #include <string>
 
 #include "BorderSample.h"
+#include "SmallQuad.h"
 #include "vkapriltag/common/Profiler.h"
 
 extern "C" {
@@ -181,6 +182,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
   if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) small_rescue_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] != '0';
@@ -316,6 +318,20 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     quad_original.reversed_border = reversed_border;
     quad_original.H = nullptr;
     quad_original.Hinv = nullptr;
+
+    if (q.coarse) {
+      double fitted[4][2];
+      const double xlo = std::min(q.p[0][0], q.p[2][0]), xhi = std::max(q.p[0][0], q.p[2][0]);
+      const double ylo = std::min(q.p[0][1], q.p[2][1]), yhi = std::max(q.p[0][1], q.p[2][1]);
+      if (!small_rescue_ || !FitSmallQuad(gray_frame, static_cast<int>(width), static_cast<int>(height), xlo, ylo, xhi, yhi, fitted)) {
+        finish(false, 0.0);
+        return;
+      }
+      for (int k = 0; k < 4; ++k) {
+        quad_original.p[k][0] = static_cast<float>(fitted[k][0]);
+        quad_original.p[k][1] = static_cast<float>(fitted[k][1]);
+      }
+    }
 
     // kUltraFast refines only quads that already decode unrefined; the rest are rejected here.
     if (td_->refine_edges && refine_method_ == RefineEdgesMethod::kUltraFast) {
@@ -544,6 +560,34 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
       if (sampled.H) matd_destroy(sampled.H);
       if (sampled.Hinv) matd_destroy(sampled.Hinv);
+    }
+
+    // A small quad that did not decode: refit it from the full-resolution image and try again.
+    if (small_rescue_ && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f && td_->refine_edges && zarray_size(per_quad_[i]) == 0) {
+      double xlo = 1e30, ylo = 1e30, xhi = -1e30, yhi = -1e30;
+      for (int k = 0; k < 4; ++k) {
+        xlo = std::min(xlo, q.p[k][0]);
+        xhi = std::max(xhi, q.p[k][0]);
+        ylo = std::min(ylo, q.p[k][1]);
+        yhi = std::max(yhi, q.p[k][1]);
+      }
+      double fitted[4][2];
+      if (xhi - xlo <= 40.0 && yhi - ylo <= 40.0 &&
+          FitSmallQuad(gray_frame, static_cast<int>(width), static_cast<int>(height), xlo, ylo, xhi, yhi, fitted)) {
+        VKA_PROF_SCOPE("tag.rescue");
+        struct quad refit;
+        for (int k = 0; k < 4; ++k) {
+          refit.p[k][0] = static_cast<float>(fitted[k][0]);
+          refit.p[k][1] = static_cast<float>(fitted[k][1]);
+        }
+        refit.reversed_border = reversed_border;
+        refit.H = nullptr;
+        refit.Hinv = nullptr;
+        RefineEdges(refine_method_, td_, &im, &refit);
+        quad_decode_index(td_, &refit, &im, /*im_samples=*/nullptr, per_quad_[i]);
+        if (refit.H) matd_destroy(refit.H);
+        if (refit.Hinv) matd_destroy(refit.Hinv);
+      }
     }
 
     // Drop corrections beyond what the family can bear before they count as detections.

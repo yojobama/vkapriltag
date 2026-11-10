@@ -23,6 +23,16 @@ constexpr std::array<double, 7> kFilterCoefficients = {
 
 constexpr int kNMaxima = 10;
 
+// Largest bounding box, in full-resolution pixels, of a blob handed on for the small-tag rescue.
+constexpr double kMaxRescueBox = 40.0;
+constexpr double kRescueMergeGap = 8.0;
+// Mean edge gradient a small blob needs to be refitted (noise blobs stay under 40, tag edges are above 70).
+constexpr double kMinRescueGradient = 60.0;
+// With the rescue on, blobs of fewer points than this and a mean gradient below the second value are dropped.
+constexpr size_t kRescueFlatPoints = 64;
+constexpr double kRescueFlatGradient = 25.0;
+constexpr size_t kMaxRescueBoxes = 64;
+
 // Hypotenuse of two floats, evaluated in double and rounded once to float.
 inline float Hypot(float x, float y) {
   const double dx = x, dy = y;
@@ -582,6 +592,7 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
       reject = true;
     }
   }
+
   if (reject) return false;
 
   // Decimated grid to full-resolution pixels: a plain scale. decimate.comp point-samples the
@@ -601,6 +612,7 @@ QuadDecode::QuadDecode(const DetectorConfig &config)
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker")),
       scratch_(pool_->threads()) {
   config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
+  if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) config_.small_tag_rescue = v[0] != '0';
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
@@ -629,17 +641,46 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   struct SpanResult {
     bool dp_attempted = false, dp_used = false, has_quad = false;
     DetectedQuad quad;
+    bool has_box = false;
+    DetectedQuad box;
   };
   std::vector<SpanResult> per_span(spans.size());
   pool_->ParallelFor(spans.size(), [&](size_t s, unsigned slot) {
     prof::Scope fit_scope("quad.fit_blob");
     fit_scope.set_arg(static_cast<int64_t>(spans[s].end - spans[s].begin));
     SpanResult &r = per_span[s];
-    const FitQuadResult fq =
-        FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
+    const bool rescue = config_.small_tag_rescue && config_.decimation > 1;
+    const size_t n_points = spans[s].end - spans[s].begin;
+    int32_t xlo = INT32_MAX, ylo = INT32_MAX, xhi = 0, yhi = 0;
+    double mean_w = 0.0;
+    if (rescue) {
+      int64_t w_sum = 0;
+      for (size_t k = spans[s].begin; k < spans[s].end; ++k) {
+        xlo = std::min(xlo, line_fit_points[k].x2());
+        xhi = std::max(xhi, line_fit_points[k].x2());
+        ylo = std::min(ylo, line_fit_points[k].y2());
+        yhi = std::max(yhi, line_fit_points[k].y2());
+        w_sum += line_fit_points[k].W();
+      }
+      mean_w = static_cast<double>(w_sum) / static_cast<double>(n_points);
+      if (n_points < kRescueFlatPoints && mean_w < kRescueFlatGradient) return;
+    }
+    FitQuadResult fq;
+    if (!(rescue && n_points < config_.min_cluster_pixels)) {
+      fq = FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
+    }
     r.dp_attempted = fq.dp_attempted;
     r.dp_used = fq.dp_used;
     r.has_quad = fq.valid && UpdateFitQuad(config_, fq, &r.quad);
+    r.quad.gradient = static_cast<float>(mean_w);
+    const double d = 0.5 * config_.decimation;
+    if (rescue && !r.has_quad && mean_w >= kMinRescueGradient && (xhi - xlo) * d <= kMaxRescueBox &&
+        (yhi - ylo) * d <= kMaxRescueBox) {
+      r.has_box = true;
+      r.box.coarse = true;
+      const double xs[4] = {xlo * d, xhi * d, xhi * d, xlo * d}, ys[4] = {ylo * d, ylo * d, yhi * d, yhi * d};
+      for (int k = 0; k < 4; ++k) r.box.p[k][0] = xs[k], r.box.p[k][1] = ys[k];
+    }
   });
 
   last_dp_stats_ = DpStats{};
@@ -653,6 +694,53 @@ std::vector<DetectedQuad> QuadDecode::Decode(
   // Collect survivors in span order so the output is independent of thread scheduling.
   for (const SpanResult &r : per_span) {
     if (r.has_quad) output.push_back(r.quad);
+  }
+
+  // Boxes of fragments of one small tag are merged, so each tag is refitted once.
+  std::vector<std::array<double, 4>> boxes;
+  for (const SpanResult &r : per_span) {
+    if (r.has_box && !r.has_quad) boxes.push_back({r.box.p[0][0], r.box.p[0][1], r.box.p[2][0], r.box.p[2][1]});
+  }
+  for (bool merged = !boxes.empty() && boxes.size() <= kMaxRescueBoxes; merged;) {
+    merged = false;
+    for (size_t a = 0; a < boxes.size() && !merged; ++a) {
+      for (size_t b = a + 1; b < boxes.size() && !merged; ++b) {
+        const std::array<double, 4> &u = boxes[a], &v = boxes[b];
+        const double x0 = std::min(u[0], v[0]), y0 = std::min(u[1], v[1]);
+        const double x1 = std::max(u[2], v[2]), y1 = std::max(u[3], v[3]);
+        const bool near = v[0] <= u[2] + kRescueMergeGap && u[0] <= v[2] + kRescueMergeGap &&
+                          v[1] <= u[3] + kRescueMergeGap && u[1] <= v[3] + kRescueMergeGap;
+        if (near && x1 - x0 <= kMaxRescueBox && y1 - y0 <= kMaxRescueBox) {
+          boxes[a] = {x0, y0, x1, y1};
+          boxes.erase(boxes.begin() + static_cast<std::ptrdiff_t>(b));
+          merged = true;
+        }
+      }
+    }
+  }
+  if (boxes.size() > kMaxRescueBoxes) boxes.resize(kMaxRescueBoxes);
+  // A box whose centre lies inside a fitted quad is a data cell of a larger tag, not a small tag.
+  const size_t n_quads = output.size();
+  auto inside_quad = [&](double x, double y) {
+    for (size_t i = 0; i < n_quads; ++i) {
+      const DetectedQuad &q = output[i];
+      bool pos = false, neg = false;
+      for (int k = 0; k < 4; ++k) {
+        const double *a = q.p[k], *b = q.p[(k + 1) & 3];
+        const double c = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+        (c >= 0 ? pos : neg) = true;
+      }
+      if (!(pos && neg)) return true;
+    }
+    return false;
+  };
+  for (const std::array<double, 4> &bx : boxes) {
+    if (inside_quad(0.5 * (bx[0] + bx[2]), 0.5 * (bx[1] + bx[3]))) continue;
+    DetectedQuad box;
+    box.coarse = true;
+    const double xs[4] = {bx[0], bx[2], bx[2], bx[0]}, ys[4] = {bx[1], bx[1], bx[3], bx[3]};
+    for (int k = 0; k < 4; ++k) box.p[k][0] = xs[k], box.p[k][1] = ys[k];
+    output.push_back(box);
   }
 
   return output;

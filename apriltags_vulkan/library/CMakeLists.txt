@@ -157,6 +157,7 @@ add_library(vkapriltag STATIC
   src/apriltag_family.cpp
   src/TagDecoder.cpp
   src/TrackingDetector.cpp
+  src/SmallQuad.cpp
   src/RefineEdges.cpp
   src/BorderSample.cpp
   src/FramePipeline.cpp

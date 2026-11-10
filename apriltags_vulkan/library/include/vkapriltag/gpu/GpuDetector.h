@@ -56,6 +56,11 @@ struct DetectorConfig {
   // Env override: APRILTAG_VK_MIN_TAG_PX=<n>
   uint32_t min_tag_pixels = 0;
 
+  // Small-tag rescue (decimation above 1): labels blobs down to 8 boundary points, hands those that
+  // fit no quad to TagDecoder as boxes, and refits them from the full-resolution image.
+  // Env override: APRILTAG_VK_SMALL_RESCUE=0|1
+  bool small_tag_rescue = false;
+
   // Largest tag side in full-resolution pixels; 0 disables. Otherwise max_cluster_pixels is lowered
   // to twice the boundary-point count of a square tag of that size.
   uint32_t max_tag_pixels = 0;
@@ -112,6 +117,10 @@ struct DetectorConfig {
 // A detected quad's corners in full-resolution pixel coordinates.
 struct DetectedQuad {
   double p[4][2];
+  // Only the bounding box of a small blob that did not fit a quad; TagDecoder refits it at full resolution.
+  bool coarse = false;
+  // Mean edge gradient of the blob; set only with small_tag_rescue.
+  float gradient = 0.0f;
 };
 
 // Vulkan compute pipeline for decimation, thresholding, connected-component labelling,
