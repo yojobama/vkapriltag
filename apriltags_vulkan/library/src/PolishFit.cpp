@@ -13,7 +13,7 @@ constexpr int kMaxCells = 16;   // widest supported grid
 constexpr int kMaxCols = 24;    // columns (or rows) one pixel's blur window may touch
 constexpr int kNP = 16;         // homography, three blur/motion terms, three levels, two illumination slopes
 constexpr double kReach = 3.5;  // blur window, in standard deviations
-constexpr int kMaxTaps = 25;    // samples along the motion blur segment
+constexpr int kMaxTaps = 13;    // samples along the motion blur segment
 
 unsigned DevFlags() {
   static const unsigned v = [] {
@@ -196,7 +196,7 @@ void ModelPixel(const Fit &f, const Params &p, const double lv[4], double x, dou
   double length = 0;
   if (p.motion) {
     length = std::hypot(p.mx, p.my);
-    if (length > 0.05) taps = std::clamp(static_cast<int>(2.0 * length) + 2, 3, kMaxTaps);
+    if (length > 0.05) taps = std::clamp(static_cast<int>(length) + 2, 3, kMaxTaps);
   }
   for (int c = 0; c < 4; ++c) e->S[c] = 0;
   if (normal) std::fill(std::begin(e->dbase), std::end(e->dbase), 0.0);
@@ -623,37 +623,51 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   double start_cost = 0;
   double cost = Optimise(fit, &p, kcut, 8, 0.01, W, &start_cost);
 
+  bool moving_accepted = false;
   if (std::max(p.su, p.sv) > 1.4 && (DevFlags() & 8) == 0) {
-    // A wide blur may be motion: refit with a straight blur segment, from the best of eight directions.
-    const double sigma0 = 0.7;
-    const double smax = std::max(p.su, p.sv);
-    const double length0 = std::sqrt(12.0 * std::max(smax * smax - sigma0 * sigma0, 1.0));
-    Params moving = p;
-    moving.motion = true;
-    moving.su = moving.sv = sigma0;
-    double best_move = 1e300;
-    Params best = moving;
-    for (int d = 0; d < 8; ++d) {
-      const double ang = d * 3.14159265358979323846 / 8.0;
-      moving.mx = length0 * std::cos(ang);
-      moving.my = length0 * std::sin(ang);
-      if (!FitLevels(fit, &moving)) continue;
-      Evaluate(fit, moving, kcut, false, &acc);
-      if (acc.n > 0 && acc.cost < best_move) {
-        best_move = acc.cost;
-        best = moving;
+    // A wide blur may be motion: refit with a straight blur segment, from the best of eight directions,
+    // on a thinner working set (the model costs a sample per tap).
+    static thread_local Fit small;
+    small.width = W;
+    std::copy(&fit.cls[0][0], &fit.cls[0][0] + kMaxCells * kMaxCells, &small.cls[0][0]);
+    small.cx = fit.cx;
+    small.cy = fit.cy;
+    small.scale = fit.scale;
+    BuildSet(&small, p.map, window, std::min(limit, 2500), im);
+    if (small.obs.size() >= 40) {
+      const double sigma0 = 0.7;
+      const double smax = std::max(p.su, p.sv);
+      const double length0 = std::sqrt(12.0 * std::max(smax * smax - sigma0 * sigma0, 1.0));
+      Evaluate(small, p, kcut, false, &acc);
+      const double cost_plain = acc.cost;
+      Params moving = p;
+      moving.motion = true;
+      moving.su = moving.sv = sigma0;
+      double best_move = 1e300;
+      Params best = moving;
+      for (int d = 0; d < 8; ++d) {
+        const double ang = d * 3.14159265358979323846 / 8.0;
+        moving.mx = length0 * std::cos(ang);
+        moving.my = length0 * std::sin(ang);
+        double sse = 0;
+        if (!FitLevels(small, &moving, &sse)) continue;
+        if (sse < best_move) {
+          best_move = sse;
+          best = moving;
+        }
       }
-    }
-    if (best_move < 1e300) {
-      const double cost_moving = Optimise(fit, &best, kcut, 10, 0.01, W);
-      if (cost_moving < 0.97 * cost) {
-        p = best;
-        cost = cost_moving;
+      if (best_move < 1e300) {
+        const double cost_moving = Optimise(small, &best, kcut, 10, 0.01, W);
+        if (cost_moving < 0.97 * cost_plain) {
+          p = best;
+          moving_accepted = true;
+          if ((DevFlags() & 32) == 0) Optimise(fit, &p, kcut, 3, 0.01, W);
+        }
       }
     }
   }
 
-  if (!(cost < start_cost)) return false;
+  if (!moving_accepted && !(cost < start_cost)) return false;
   double corners[4][2];
   CellCorners(p.map, W, corners);
   const double limit_px = std::max(0.5, std::min(2.0, 0.3 * cell_px));

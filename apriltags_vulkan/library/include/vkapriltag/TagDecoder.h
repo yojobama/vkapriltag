@@ -73,6 +73,10 @@ class TagDecoder {
   };
   const Stats &last_stats() const { return last_stats_; }
 
+  // Whole-tag photometric polish of decoded tags (off by default; APRILTAG_VK_POLISH=1 turns it on).
+  void SetPolish(bool on) { polish_ = on; }
+  bool polish() const { return polish_; }
+
   // Margin gate (off by default): quads whose unrefined decision margin is below this, or whose
   // border polarity is wrong, skip refinement. APRILTAG_VK_PROBE_MARGIN overrides it.
   void SetProbeMargin(float grey_levels) { probe_margin_ = grey_levels; }

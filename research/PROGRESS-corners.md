@@ -59,3 +59,23 @@ slow; see the optimisation notes below.
 
 (Notes on experiments: illumination slope terms (multiplicative gradient) gave no change on uneven-light and were
 removed; the unknown-cell masking is what fixes obstruction.)
+
+## 3. Later versions
+
+- Motion blur: when the fitted blur is wide (> 1.4 px) the model is refitted with a straight blur segment (mx, my)
+  plus a small Gaussian, from the best of eight start directions; accepted when its cost is 3 % lower. Alone this
+  took motion-blur p95 (d2, all pixels) from 0.285 to 0.063.
+- Illumination slope (multiplicative linear gain, 2 parameters): needed once all pixels are used (uneven-light was
+  0.065 / 0.185 at N = infinity without it, 0.007 / 0.023 with it); at a pixel cap the noise hid the bias.
+- Accuracy is set by the number of edge pixels N in the working set (error ~ 1/sqrt(N)). With N capped by a uniform
+  lattice thinning, large tags got worse than the profile fit (cap 3000: large-tags 0.046 / 0.102 vs 0.009 / 0.043).
+  Hence: the working set is capped at APRILTAG_VK_POLISH_N (default 8000, about a 135 px tag), and a tag that would
+  need thinning keeps its profile fit unless it is blurred (sigma >= 1.6 px) or has > 5 % saturated pixels in the set
+  (there the profile fit is worse than any thinned polish).
+- Cost reductions: candidate blur scan in one pass each (levels and SSE in closed form), merged LM passes, max 8
+  iterations, stop at 0.01 px, narrower window (2.5 sigma). One-tag (170 px), one thread: 13 ms -> 1.3 ms at N = 1500,
+  3.8 ms at N = 6000 (minus 0.44 ms without the polish).
+- Dev knobs: APRILTAG_VK_POLISH_DEV bit 8 = no motion model, bit 16 = polish thinned tags too; APRILTAG_VK_POLISH_N.
+
+Results with the committed defaults (N 8000), whole corpus, median / p95 px, base -> polish
+(`$S/corners/base_d{1,2}.score`, `n8000_d{1,2}.score`): see section 4.
