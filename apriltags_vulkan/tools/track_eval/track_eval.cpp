@@ -74,7 +74,7 @@ std::string DetsText(int index, zarray_t *z) {
 
 struct Sample {
   double ms;
-  int path;  // 0 full, 1 tracked, 2 search, 3 capture
+  int path;  // 0 full, 1 tracked
 };
 
 struct ModeStats {
@@ -88,14 +88,12 @@ struct ModeStats {
 
 struct Mode {
   std::string name;
-  bool enabled, async, capture, drop_lost;
+  bool enabled, async, drop_lost;
 };
 
 bool ParseMode(const std::string &name, Mode *m) {
-  const bool cap = name.size() > 3 && name.substr(name.size() - 3) == "cap";
-  const std::string base = cap ? name.substr(0, name.size() - 3) : name;
-  *m = {name, name != "full", base == "async" || base == "asyncsync", cap, base != "asyncsync"};
-  return base == "full" || base == "key" || base == "async" || base == "asyncsync";
+  *m = {name, name != "full", name == "async" || name == "asyncsync", name != "asyncsync"};
+  return name == "full" || name == "key" || name == "async" || name == "asyncsync";
 }
 
 }  // namespace
@@ -132,7 +130,7 @@ int main(int argc, char **argv) {
     }
   } catch (const std::exception &e) {
     std::cerr << e.what() << "\nusage: track_eval --list files.txt [--out-prefix p] [--rounds N] [--dump-rounds N] [--gap-ms ms]\n"
-                             "  [--decimation N] [--keyframe K] [--modes full,key,keycap,async,asyncsync,asynccap] [--async-interval N]\n"
+                             "  [--decimation N] [--keyframe K] [--modes full,key,async,asyncsync] [--async-interval N]\n"
                              "  [--bg-threads N] [--no-copy] [--family name]\n";
     return 2;
   }
@@ -210,7 +208,6 @@ int main(int argc, char **argv) {
         det.tracking() = base;
         det.tracking().enabled = m.enabled;
         det.tracking().async = m.async;
-        det.tracking().capture = m.capture;
         det.tracking().async_drop_lost = m.drop_lost;
         det.Reset();
         const bool dump = round >= 0 && round < dump_rounds && !prefix.empty();
@@ -262,7 +259,7 @@ int main(int argc, char **argv) {
       }
     }
     for (size_t mi = 0; mi < nm; ++mi) {
-      std::vector<double> all, by_path[4];
+      std::vector<double> all, by_path[2];
       for (const Sample &s : stats[mi].samples) {
         all.push_back(s.ms);
         by_path[s.path].push_back(s.ms);
@@ -273,8 +270,8 @@ int main(int argc, char **argv) {
                   all.empty() ? 0.0 : *std::max_element(all.begin(), all.end()),
                   all.empty() ? 0.0 : std::accumulate(all.begin(), all.end(), 0.0) / total,
                   stats[mi].frames ? 1000.0 * stats[mi].cpu_s / static_cast<double>(stats[mi].frames) : 0.0);
-      const char *names[4] = {"full", "tracked", "search", "capture"};
-      for (int p = 0; p < 4; ++p) {
+      const char *names[2] = {"full", "tracked"};
+      for (int p = 0; p < 2; ++p) {
         std::printf(" %s=%.1f%%(med %.4f)", names[p], 100.0 * static_cast<double>(by_path[p].size()) / total,
                     Percentile(by_path[p], 0.5));
       }
