@@ -40,3 +40,16 @@ The local `record_uf_chunk` lambda was identical to `RecordUfChunk(cmd, n)` with
 Push-constant structs keep their `count_from_buffer` field (passed 0), so the shaders are unchanged. New `GpuDetector::CollectGpuTimings()`
 holds the timestamp / dispatch-probe post-processing that `FinishFused` and `DetectUnfused` both had (the two copies differed only in line wrapping).
 The unfused flow itself (fallback for devices without host-cached memory, `APRILTAG_VK_FUSE_SUBMITS=0`) is unchanged in what it records and submits.
+
+## Gate (desktop, RX 9060 XT; scripts in the session scratchpad `del-exp/`: gate.sh, golden_env.sh, seq.sh, rep.sh)
+- ctest 5/5 pass, goldens unchanged.
+- Golden compare passes (0 differing frames, all 5 profiles) under: default, FORCE_NO_8BIT, FORCE_NO_SUBGROUP, FORCE_NO_INT64_ATOMIC,
+  FORCE_NO_CONDITIONAL_RENDERING, FUSE_SUBMITS=0, and FUSE_SUBMITS=0 with NO_8BIT / NO_CONDITIONAL_RENDERING / NO_SUBGROUP+NO_INT64_ATOMIC.
+- Full napa corpus dumps vs a build of 02f0162 (base run twice for the noise level; differing non-comment lines, max numeric difference):
+  d2: base vs base2 1 line (noise), base vs new 0 lines. d1: base vs base2 4 lines (max 0.0012), base vs new 6 lines (max 0.0022).
+  FUSE_SUBMITS=0 d2: base vs base2 1, base vs new 2 lines (max 0.0027); d1: 3 vs 4 lines (0.0022). FUSE_SUBMITS=0 with UF_VERIFY=0 d2 and with
+  TIMESTAMPS=1 d2: 0 lines differ. No ID or structural difference anywhere.
+- track_eval, ten sequences, modes full,key,async,asyncsync, 2 rounds: full and key identical to base in every column (recall, false, median/p95/max error,
+  path shares); async and asyncsync identical in error and path shares, recall differs only on enter-3tag-640 and medium-2tag-640, where the background
+  timing makes recall bimodal in the base too: enter-3tag-640 async over 8 interleaved runs base 84.8 96.2 83.5 84.8 94.9 84.5 85.0 94.9, new 84.0 96.4 84.8 83.8
+  95.7 94.7 83.8 89.6; asyncsync base 85.5 98.5 84.8 84.8 94.2 84.5 85.3 98.0, new 84.8 85.3 84.0 84.3 84.8 98.5 85.5 84.5 (%).
