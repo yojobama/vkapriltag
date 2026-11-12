@@ -511,6 +511,47 @@ void TryInnerSquare(const DecodeEnv &env, Candidate &c) {
   quad_decode_index(env.td, &inner.q, env.im, /*im_samples=*/nullptr, c.found);
 }
 
+// Moves a side whose border cells read white one cell in and refits; keeps the result if it decodes
+// the same tag with a darker border.
+void TrySideOneOut(const DecodeEnv &env, Candidate &c) {
+  if (!(env.side_one_out && c.quad.q.H && zarray_size(c.found) == 1 && env.family_count > 0)) return;
+  const int w = env.family->width_at_border;
+  BorderLevels before;
+  int bad = 0;
+  if (ReadBorder(c.quad.q.H, env.im, w, &before)) {
+    for (int k = 0; k < 4; ++k) bad |= (before.side_level[k] > 0.3) << k;
+  }
+  if (bad == 0 || bad == 15) return;
+  VKA_PROF_SCOPE("tag.side");
+  const double one = 2.0 / w;  // a cell, in the tag's [-1, 1] coordinates
+  const double u0 = (bad & 8) ? -1 + one : -1, u1 = (bad & 2) ? 1 - one : 1;
+  const double v0 = (bad & 1) ? -1 + one : -1, v1 = (bad & 4) ? 1 - one : 1;
+  const double us[4] = {u0, u1, u1, u0}, vs[4] = {v0, v0, v1, v1};
+  OwnedQuad moved;
+  QuadFromHomography(c.quad.q.H, us, vs, env.reversed_border, &moved.q);
+  RefineEdges(env.refine_method, env.td, env.im, &moved.q);
+  zarray_truncate(c.probe, 0);
+  quad_decode_index(env.td, &moved.q, env.im, /*im_samples=*/nullptr, c.probe);
+  bool keep = false;
+  if (zarray_size(c.probe) == 1 && moved.q.H) {
+    apriltag_detection_t *old_det = nullptr, *new_det = nullptr;
+    zarray_get(c.found, 0, &old_det);
+    zarray_get(c.probe, 0, &new_det);
+    BorderLevels after;
+    if (new_det->id == old_det->id && ReadBorder(moved.q.H, env.im, w, &after)) {
+      double level_before = 0, level_after = 0;
+      for (int k = 0; k < 4; ++k) level_before += before.side_level[k], level_after += after.side_level[k];
+      keep = level_after < level_before - 0.2;
+    }
+    if (keep) {
+      apriltag_detection_destroy(old_det);
+      zarray_set(c.found, 0, &new_det, nullptr);
+      zarray_truncate(c.probe, 0);  // the detection now belongs to c.found
+    }
+  }
+  if (!keep) ClearDetections(c.probe);
+}
+
 // How RunSteps ended; only kFinished candidates reach the probe statistics.
 enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 
@@ -526,51 +567,7 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
 
   TryInnerSquare(env, c);
 
-  // A side whose border cells read white was fitted on the quiet zone's outer edge, one cell too far
-  // out (the payload still decodes through error correction). Move it in a cell, refit, and keep the
-  // result if it decodes the same tag with a darker border.
-  if (env.side_one_out && c.quad.q.H && zarray_size(c.found) == 1 &&
-      zarray_size(env.td->tag_families) > 0) {
-    apriltag_family_t *family = nullptr;
-    zarray_get(env.td->tag_families, 0, &family);
-    const int w = family->width_at_border;
-    BorderLevels before;
-    int bad = 0;
-    if (ReadBorder(c.quad.q.H, env.im, w, &before)) {
-      for (int k = 0; k < 4; ++k) bad |= (before.side_level[k] > 0.3) << k;
-    }
-    if (bad != 0 && bad != 15) {
-      VKA_PROF_SCOPE("tag.side");
-      const double one = 2.0 / w;  // a cell, in the tag's [-1, 1] coordinates
-      const double u0 = (bad & 8) ? -1 + one : -1, u1 = (bad & 2) ? 1 - one : 1;
-      const double v0 = (bad & 1) ? -1 + one : -1, v1 = (bad & 4) ? 1 - one : 1;
-      const double us[4] = {u0, u1, u1, u0}, vs[4] = {v0, v0, v1, v1};
-      OwnedQuad moved;
-      QuadFromHomography(c.quad.q.H, us, vs, env.reversed_border, &moved.q);
-      RefineEdges(env.refine_method, env.td, env.im, &moved.q);
-      zarray_t *probe = c.probe;
-      zarray_truncate(probe, 0);
-      quad_decode_index(env.td, &moved.q, env.im, /*im_samples=*/nullptr, probe);
-      bool keep = false;
-      if (zarray_size(probe) == 1 && moved.q.H) {
-        apriltag_detection_t *old_det = nullptr, *new_det = nullptr;
-        zarray_get(c.found, 0, &old_det);
-        zarray_get(probe, 0, &new_det);
-        BorderLevels after;
-        if (new_det->id == old_det->id && ReadBorder(moved.q.H, env.im, w, &after)) {
-          double level_before = 0, level_after = 0;
-          for (int k = 0; k < 4; ++k) level_before += before.side_level[k], level_after += after.side_level[k];
-          keep = level_after < level_before - 0.2;
-        }
-        if (keep) {
-          apriltag_detection_destroy(old_det);
-          zarray_set(c.found, 0, &new_det, nullptr);
-          zarray_truncate(probe, 0);  // the detection now belongs to c.found
-        }
-      }
-      if (!keep) ClearDetections(probe);
-    }
-  }
+  TrySideOneOut(env, c);
 
   // A third corrected bit, accepted only when the three wrong cells touch: damage such as a finger
   // or glare is coherent, a chance match is scattered.
