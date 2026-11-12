@@ -406,7 +406,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     const bool check_dark = dark_reject_ && !reversed_border && single_family;
     apriltag_family_t *family = nullptr;
     if (single_family) zarray_get(td_->tag_families, 0, &family);
-    // Under grey margin a quad under 1.5 pixels per cell is not rejected: its unrefined sample is too coarse.
+    // Under grey margin a coarse box or a quad under 1.5 pixels per cell is not rejected: its unrefined sample is too coarse.
     bool large_enough = true;
     if (grey_margin_ && family) {
       double min_side = 1e30;
@@ -415,7 +415,18 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         const double dy = quad_original.p[(k + 1) % 4][1] - quad_original.p[k][1];
         min_side = std::min(min_side, std::hypot(dx, dy));
       }
-      large_enough = min_side >= 1.5 * family->width_at_border;
+      large_enough = !q.coarse && min_side >= 1.5 * family->width_at_border;
+      // A quad the small rescue would refit when it fails to decode is kept.
+      if (small_rescue_ && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f) {
+        double xlo = 1e30, ylo = 1e30, xhi = -1e30, yhi = -1e30;
+        for (int k = 0; k < 4; ++k) {
+          xlo = std::min(xlo, q.p[k][0]);
+          xhi = std::max(xhi, q.p[k][0]);
+          ylo = std::min(ylo, q.p[k][1]);
+          yhi = std::max(yhi, q.p[k][1]);
+        }
+        if (xhi - xlo <= 40.0 && yhi - ylo <= 40.0) large_enough = false;
+      }
     }
     if ((!grey_margin_ || (early_reject_ && large_enough)) && (check_border || check_dark)) {
       // A border read below 22 of 28 dark cells, or fewer white payload cells than the sparsest code
