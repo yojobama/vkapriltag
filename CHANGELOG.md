@@ -42,6 +42,12 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
 - **The `fast`, `ultrafast` and `upstream` edge-refinement methods.** `APRILTAG_VK_REFINE` now accepts only
   `exact` and `profile`; any other value is ignored and the default (`profile`) runs. The `refine_edges`
   export in the upstream patch is gone with `upstream`.
+- **A/B-only environment switches whose choice is settled.** `APRILTAG_VK_FIND_MODE`,
+  `APRILTAG_VK_MERGE_FLAG_MODE`, `APRILTAG_VK_DEC1_ALIAS`, `APRILTAG_VK_UF_INIT_RUN`, `APRILTAG_VK_THRESH_RUN`,
+  `APRILTAG_VK_SORT_CHUNK`, `APRILTAG_VK_REDUCE_X4` and `APRILTAG_VK_GRAY_MAPPED` are ignored; each keeps the
+  behaviour it had by default on its device. The naive union-find walk, the sorting-network path of
+  `sort_points_local`, and the one-point-per-thread extents shaders `reduce_extents_hash.comp` and
+  `reduce_extents_hash_atomic64.comp` (with `reduce_extents_hash_body.glsl`) are deleted.
 
 ### Fixed
 

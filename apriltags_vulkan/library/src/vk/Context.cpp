@@ -478,7 +478,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   // 8-bit-storage variants selected via caps().has_8bit_storage.
   supports_8bit_storage_ = !options.force_no_8bit_storage && Supports8BitStorage(physical_device_);
 
-  // Optional feature with a shader variant behind it; see reduce_extents_hash_atomic64.comp.
+  // Optional feature with a shader variant behind it; see reduce_extents_hash_atomic64_x4.comp.
   supports_int64_atomics_ =
       !options.force_no_int64_atomics && SupportsInt64Atomics(physical_device_);
 

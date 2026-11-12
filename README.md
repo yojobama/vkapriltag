@@ -433,7 +433,7 @@ not show in its throughput there.
   points sorted by ranking every key in one pass, and sort workgroups of up to 1,024 threads on
   discrete GPUs.
 - **Discrete GPUs:** frames are written straight into device memory the host can map, removing a
-  38 us copy per frame (`APRILTAG_VK_GRAY_MAPPED=0` keeps the staging copy).
+  38 us copy per frame (devices without a mappable window keep the staging copy).
 - **Fixes:** the validation layer's synchronisation checks now also cover compute shaders' buffer
   accesses (`syncval_shader_accesses_heuristic`); the three reports it then raised (on disjoint byte
   ranges, one also present in 1.8.0) are gone, with no extra barriers. AddressSanitizer, UBSan, LeakSanitizer and ThreadSanitizer are clean on the Orange
