@@ -1,5 +1,7 @@
 #include "vkapriltag/TrackingDetector.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -18,26 +20,25 @@ double Side(const double p[4][2]) {
 }
 
 void ApplyEnv(TrackingConfig *c) {
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING")) c->enabled = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_KEYFRAME")) {
-    c->keyframe_interval = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  const Options env = Options::FromEnvironment();
+  c->enabled = env.Bool("APRILTAG_VK_TRACKING", c->enabled);
+  if (env.Has("APRILTAG_VK_TRACKING_KEYFRAME")) {
+    c->keyframe_interval = static_cast<uint32_t>(std::max(1, env.Int("APRILTAG_VK_TRACKING_KEYFRAME", 1)));
   }
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_MIN_MARGIN")) {
-    c->min_margin = static_cast<float>(std::atof(v));
+  c->min_margin = static_cast<float>(env.Float("APRILTAG_VK_TRACKING_MIN_MARGIN", c->min_margin));
+  c->converge_px = static_cast<float>(env.Float("APRILTAG_VK_TRACKING_CONVERGE", c->converge_px));
+  if (env.Has("APRILTAG_VK_TRACKING_ITERATIONS")) {
+    c->max_iterations = static_cast<uint32_t>(std::max(1, env.Int("APRILTAG_VK_TRACKING_ITERATIONS", 1)));
   }
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_CONVERGE")) c->converge_px = static_cast<float>(std::atof(v));
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ITERATIONS")) {
-    c->max_iterations = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  c->async = env.Bool("APRILTAG_VK_TRACKING_ASYNC", c->async);
+  if (env.Has("APRILTAG_VK_TRACKING_ASYNC_INTERVAL")) {
+    c->async_interval = static_cast<uint32_t>(std::max(1, env.Int("APRILTAG_VK_TRACKING_ASYNC_INTERVAL", 1)));
   }
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ASYNC")) c->async = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ASYNC_INTERVAL")) {
-    c->async_interval = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  if (env.Has("APRILTAG_VK_TRACKING_ASYNC_THREADS")) {
+    c->async_threads = static_cast<uint32_t>(std::max(0, env.Int("APRILTAG_VK_TRACKING_ASYNC_THREADS", 0)));
   }
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ASYNC_THREADS")) {
-    c->async_threads = static_cast<uint32_t>(std::max(0, std::atoi(v)));
-  }
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ASYNC_COPY")) c->async_copy = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_TRACKING_ASYNC_DROP")) c->async_drop_lost = v[0] != '0';
+  c->async_copy = env.Bool("APRILTAG_VK_TRACKING_ASYNC_COPY", c->async_copy);
+  c->async_drop_lost = env.Bool("APRILTAG_VK_TRACKING_ASYNC_DROP", c->async_drop_lost);
 }
 
 // Detection corners run opposite to quad corners (quad p[k] = detection p[3 - k]).
@@ -88,7 +89,7 @@ TrackingDetector::TrackingDetector(vk::Context &ctx, apriltag_detector_t *td,
   gpu_ = std::make_unique<GpuDetector>(ctx, config_);
   quad_decode_ = std::make_unique<QuadDecode>(config_);
   full_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, config_.cpu_threads, RefineEdgesMethod::kProfile,
-                                              0.0f, config_.PoolOptions());
+                                              0.0f, config_.PoolOptions(), false, config_.small_tag_rescue);
 }
 
 TrackingDetector::~TrackingDetector() {
@@ -200,7 +201,7 @@ zarray_t *TrackingDetector::DetectFull(const uint8_t *gray_frame) {
 void TrackingDetector::EnsureBackground() {
   if (bg_thread_.joinable()) return;
   bg_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, tracking_.async_threads, RefineEdgesMethod::kProfile,
-                                          0.0f, config_.PoolOptions(), true);
+                                          0.0f, config_.PoolOptions(), true, config_.small_tag_rescue);
   bg_stop_ = false;
   bg_thread_ = std::thread([this] { BackgroundMain(); });
 }
@@ -426,7 +427,8 @@ void TrackingDetector::EnsureCoarse() {
   coarse_td_->refine_edges = td_->refine_edges;
   coarse_td_->quad_sigma = td_->quad_sigma;
   coarse_td_->decode_sharpening = td_->decode_sharpening;
-  coarse_decoder_ = std::make_unique<TagDecoder>(coarse_td_, 2, 1);
+  coarse_decoder_ = std::make_unique<TagDecoder>(coarse_td_, 2, 1, RefineEdgesMethod::kProfile, 0.0f,
+                                                 WorkerPoolOptions(), false, config_.small_tag_rescue);
 }
 
 // Decodes from cur[i] for i in `active`, feeding each tag's refined corners back until they stop moving.

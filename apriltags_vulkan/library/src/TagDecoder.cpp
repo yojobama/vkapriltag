@@ -1,5 +1,7 @@
 #include "vkapriltag/TagDecoder.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -180,7 +182,8 @@ WorkerPoolOptions ResolvePoolOptions(const WorkerPoolOptions &configured, bool b
 
 TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads,
                        RefineEdgesMethod refine_method, float probe_margin,
-                       const WorkerPoolOptions &pool_options, bool background_thread)
+                       const WorkerPoolOptions &pool_options, bool background_thread,
+                       bool small_tag_rescue)
     : td_(td),
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker",
                                          ResolvePoolOptions(pool_options, background_thread))),
@@ -195,21 +198,20 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
     probe_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
   }
   slot_stats_.assign(pool_->threads(), SlotStats{});
-  if (const char *v = std::getenv("APRILTAG_VK_GREY_MARGIN")) grey_margin_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) small_rescue_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_POLISH")) polish_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_SIDE_ONE_OUT")) side_one_out_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_THIRD_BIT")) third_bit_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_BORDER_PRECHECK")) border_precheck_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_DARK_REJECT")) dark_reject_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_EARLY_REJECT")) early_reject_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
-    probe_margin_ = static_cast<float>(std::atof(v));
-  }
-  if (const char *v = std::getenv("APRILTAG_VK_PROBE_CSV")) {
-    probe_csv_ = v;
+  const Options env = Options::FromEnvironment();
+  grey_margin_ = env.Bool("APRILTAG_VK_GREY_MARGIN", grey_margin_);
+  small_rescue_ = ResolveSmallTagRescue(env, small_tag_rescue);
+  polish_ = env.Bool("APRILTAG_VK_POLISH", polish_);
+  side_one_out_ = env.Bool("APRILTAG_VK_SIDE_ONE_OUT", side_one_out_);
+  third_bit_ = env.Bool("APRILTAG_VK_THIRD_BIT", third_bit_);
+  family_limits_ = env.Bool("APRILTAG_VK_FAMILY_LIMITS", family_limits_);
+  border_precheck_ = env.Bool("APRILTAG_VK_BORDER_PRECHECK", border_precheck_);
+  dark_reject_ = env.Bool("APRILTAG_VK_DARK_REJECT", dark_reject_);
+  early_reject_ = env.Bool("APRILTAG_VK_EARLY_REJECT", early_reject_);
+  collect_probe_ = env.Bool("APRILTAG_VK_PROBE_STATS", collect_probe_);
+  probe_margin_ = static_cast<float>(env.Float("APRILTAG_VK_PROBE_MARGIN", probe_margin_));
+  if (const auto csv = env.String("APRILTAG_VK_PROBE_CSV")) {
+    probe_csv_ = *csv;
     collect_probe_ = true;
   }
   slot_rows_.assign(pool_->threads(), {});

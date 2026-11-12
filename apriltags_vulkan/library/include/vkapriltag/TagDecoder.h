@@ -40,10 +40,11 @@ class TagDecoder {
   // `cpu_threads` is the total parallelism (0 = hardware_concurrency, or APRILTAG_CPU_THREADS).
   // `refine_method` may be overridden by APRILTAG_VK_REFINE; used only if `td->refine_edges` is set.
   // Margin gate in grey levels (0 = off); APRILTAG_VK_PROBE_MARGIN overrides it.
+  // `small_tag_rescue` is DetectorConfig::small_tag_rescue; APRILTAG_VK_SMALL_RESCUE overrides it.
   explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0,
                       RefineEdgesMethod refine_method = RefineEdgesMethod::kProfile,
                       float probe_margin = 0.0f, const WorkerPoolOptions &pool_options = WorkerPoolOptions(),
-                      bool background_thread = false);
+                      bool background_thread = false, bool small_tag_rescue = false);
   ~TagDecoder();
 
   TagDecoder(const TagDecoder &) = delete;
