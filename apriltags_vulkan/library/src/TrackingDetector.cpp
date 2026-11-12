@@ -2,6 +2,8 @@
 
 #include "vkapriltag/common/Options.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,13 +13,7 @@
 namespace apriltag_vulkan {
 namespace {
 
-double Side(const double p[4][2]) {
-  double sum = 0.0;
-  for (int k = 0; k < 4; ++k) {
-    sum += std::hypot(p[k][0] - p[(k + 1) % 4][0], p[k][1] - p[(k + 1) % 4][1]);
-  }
-  return sum * 0.25;
-}
+double Side(const double p[4][2]) { return geom::MeanSide(p); }
 
 void ApplyEnv(TrackingConfig *c) {
   const Options env = Options::FromEnvironment();
@@ -354,11 +350,8 @@ bool TrackingDetector::Accept(const apriltag_detection_t *det, const Track &t,
   const double side = Side(t.p);
   const double ratio = Side(det->p) / side;
   if (ratio > tracking_.max_scale_change || ratio * tracking_.max_scale_change < 1.0) return false;
-  double cx = 0.0, cy = 0.0;
-  for (int k = 0; k < 4; ++k) {
-    cx += from.p[k][0] * 0.25;
-    cy += from.p[k][1] * 0.25;
-  }
+  double cx, cy;
+  geom::QuadCentre(from.p, &cx, &cy);
   return std::hypot(det->c[0] - cx, det->c[1] - cy) <= tracking_.max_jump_frac * side;
 }
 

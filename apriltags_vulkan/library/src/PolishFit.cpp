@@ -966,12 +966,9 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
     m[3 * r + 1] = h1 / hw;
     m[3 * r + 2] = h2 - h0 - h1;
   }
-  double cxy[2] = {0, 0}, side = 0;
-  for (int k = 0; k < 4; ++k) {
-    cxy[0] += 0.25 * det->p[k][0];
-    cxy[1] += 0.25 * det->p[k][1];
-    side += 0.25 * std::hypot(det->p[(k + 1) & 3][0] - det->p[k][0], det->p[(k + 1) & 3][1] - det->p[k][1]);
-  }
+  double cxy[2];
+  geom::QuadCentre(det->p, &cxy[0], &cxy[1]);
+  const double side = geom::MeanSide(det->p);
   const double cell_px = side / W;
   if (cell_px < 1.2 || !std::isfinite(side)) return false;
   fit.cx = cxy[0];

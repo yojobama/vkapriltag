@@ -392,12 +392,33 @@ void TestHull() {
   CHECK_NEAR(area2, 8.0, 1e-12);
 }
 
+void TestQuadShape() {
+  const double rect[4][2] = {{1, 2}, {7, 2}, {7, 10}, {1, 10}};  // 6 x 8
+  CHECK_NEAR(geo::MeanSide(rect), 7.0, 1e-15);
+  CHECK_NEAR(geo::MinSide(rect), 6.0, 1e-15);
+  double cx, cy;
+  geo::QuadCentre(rect, &cx, &cy);
+  CHECK(cx == 4.0 && cy == 6.0);
+  const geo::Bounds b = geo::QuadBounds(rect);
+  CHECK(b.xlo == 1.0 && b.xhi == 7.0 && b.ylo == 2.0 && b.yhi == 10.0);
+
+  // Float corners (upstream's quad) take the float path and a rotated corner order changes nothing.
+  const float fq[4][2] = {{3, 4}, {3, 0}, {0, 0}, {0, 4}};
+  CHECK_NEAR(geo::MeanSide(fq), 3.5, 1e-6);
+  CHECK_NEAR(geo::MinSide(fq), 3.0, 1e-6);
+  geo::QuadCentre(fq, &cx, &cy);
+  CHECK(cx == 1.5 && cy == 2.0);
+  const geo::Bounds fb = geo::QuadBounds(fq);
+  CHECK(fb.xlo == 0.0 && fb.xhi == 3.0 && fb.ylo == 0.0 && fb.yhi == 4.0);
+}
+
 void TestGeom() {
   TestBilinearAndMedian();
   TestLineCorners();
   TestProjectHomography();
   TestSmallSolvers();
   TestHull();
+  TestQuadShape();
 }
 
 // ---------------------------------------------------------------- edge locators on rendered edges

@@ -149,4 +149,52 @@ size_t MonotoneChain(const P *p, size_t n, P *h, Cross cross) {
   return k - 1;
 }
 
+// Mean of the four side lengths of the quad p (corners in order). The hypot of the element type is used, so
+// float corners give float side lengths.
+template <typename T>
+inline double MeanSide(const T p[4][2]) {
+  double side = 0;
+  for (int k = 0; k < 4; ++k) side += 0.25 * std::hypot(p[(k + 1) & 3][0] - p[k][0], p[(k + 1) & 3][1] - p[k][1]);
+  return side;
+}
+
+// Shortest side length of the quad p.
+template <typename T>
+inline double MinSide(const T p[4][2]) {
+  double side = 1e30;
+  for (int k = 0; k < 4; ++k) {
+    const double dx = p[(k + 1) & 3][0] - p[k][0];
+    const double dy = p[(k + 1) & 3][1] - p[k][1];
+    side = std::min(side, std::hypot(dx, dy));
+  }
+  return side;
+}
+
+// Mean of the four corners.
+template <typename T>
+inline void QuadCentre(const T p[4][2], double *cx, double *cy) {
+  *cx = 0;
+  *cy = 0;
+  for (int k = 0; k < 4; ++k) {
+    *cx += 0.25 * p[k][0];
+    *cy += 0.25 * p[k][1];
+  }
+}
+
+// Axis-aligned bounding box of the four corners.
+struct Bounds {
+  double xlo, ylo, xhi, yhi;
+};
+template <typename T>
+inline Bounds QuadBounds(const T p[4][2]) {
+  Bounds b{1e30, 1e30, -1e30, -1e30};
+  for (int k = 0; k < 4; ++k) {
+    b.xlo = std::min(b.xlo, static_cast<double>(p[k][0]));
+    b.xhi = std::max(b.xhi, static_cast<double>(p[k][0]));
+    b.ylo = std::min(b.ylo, static_cast<double>(p[k][1]));
+    b.yhi = std::max(b.yhi, static_cast<double>(p[k][1]));
+  }
+  return b;
+}
+
 }  // namespace apriltag_vulkan::geom

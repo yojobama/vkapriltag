@@ -10,6 +10,7 @@
 #include <string>
 
 #include "BorderSample.h"
+#include "Geometry.h"
 #include "SmallQuad.h"
 #include "TestHooks.h"
 #include "vkapriltag/PolishFit.h"
@@ -387,23 +388,12 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     // Under grey margin a coarse box or a quad under 1.5 pixels per cell is not rejected: its unrefined sample is too coarse.
     bool large_enough = true;
     if (grey_margin_ && family) {
-      double min_side = 1e30;
-      for (int k = 0; k < 4; ++k) {
-        const double dx = quad_original.p[(k + 1) % 4][0] - quad_original.p[k][0];
-        const double dy = quad_original.p[(k + 1) % 4][1] - quad_original.p[k][1];
-        min_side = std::min(min_side, std::hypot(dx, dy));
-      }
+      const double min_side = geom::MinSide(quad_original.p);
       large_enough = !q.coarse && min_side >= 1.5 * family->width_at_border;
       // A quad the small rescue would refit when it fails to decode is kept.
       if (small_rescue_ && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f) {
-        double xlo = 1e30, ylo = 1e30, xhi = -1e30, yhi = -1e30;
-        for (int k = 0; k < 4; ++k) {
-          xlo = std::min(xlo, q.p[k][0]);
-          xhi = std::max(xhi, q.p[k][0]);
-          ylo = std::min(ylo, q.p[k][1]);
-          yhi = std::max(yhi, q.p[k][1]);
-        }
-        if (xhi - xlo <= 40.0 && yhi - ylo <= 40.0) large_enough = false;
+        const geom::Bounds box = geom::QuadBounds(q.p);
+        if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0) large_enough = false;
       }
     }
     if ((!grey_margin_ || (early_reject_ && large_enough)) && (check_border || check_dark)) {
@@ -600,16 +590,10 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
 
     // A small quad that did not decode: refit it from the full-resolution image and try again.
     if (small_rescue_ && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f && td_->refine_edges && zarray_size(per_quad_[i]) == 0) {
-      double xlo = 1e30, ylo = 1e30, xhi = -1e30, yhi = -1e30;
-      for (int k = 0; k < 4; ++k) {
-        xlo = std::min(xlo, q.p[k][0]);
-        xhi = std::max(xhi, q.p[k][0]);
-        ylo = std::min(ylo, q.p[k][1]);
-        yhi = std::max(yhi, q.p[k][1]);
-      }
+      const geom::Bounds box = geom::QuadBounds(q.p);
       double fitted[4][2];
-      if (xhi - xlo <= 40.0 && yhi - ylo <= 40.0 &&
-          FitSmallQuad(gray_frame, static_cast<int>(width), static_cast<int>(height), xlo, ylo, xhi, yhi, fitted)) {
+      if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0 &&
+          FitSmallQuad(gray_frame, static_cast<int>(width), static_cast<int>(height), box.xlo, box.ylo, box.xhi, box.yhi, fitted)) {
         VKA_PROF_SCOPE("tag.rescue");
         struct quad refit;
         for (int k = 0; k < 4; ++k) {

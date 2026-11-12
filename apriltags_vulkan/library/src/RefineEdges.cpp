@@ -642,11 +642,7 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
   if (zarray_size(td->tag_families) > 0) {
     apriltag_family_t *family = nullptr;
     zarray_get(td->tag_families, 0, &family);
-    double side = 0;
-    for (int k = 0; k < 4; ++k) {
-      side += 0.25 * std::hypot(quad->p[(k + 1) & 3][0] - quad->p[k][0], quad->p[(k + 1) & 3][1] - quad->p[k][1]);
-    }
-    cell = side / family->width_at_border;
+    cell = geom::MeanSide(quad->p) / family->width_at_border;
   }
   double truncated = 0;
   if (!ProfilePass(reach, cell, im, quad, &edge_width, &truncated)) {
