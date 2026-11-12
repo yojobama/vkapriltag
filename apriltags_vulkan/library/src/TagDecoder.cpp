@@ -478,6 +478,20 @@ bool PreRefineRejects(const DecodeEnv &env, Candidate &c) {
   return reject;
 }
 
+// Refines the quad's corners against the image, if edge refinement is on.
+void RefineCandidate(const DecodeEnv &env, Candidate &c) {
+  if (!env.td->refine_edges) return;
+  VKA_PROF_SCOPE("tag.refine");
+  RefineEdges(env.refine_method, env.td, env.im, &c.quad.q);
+  c.clock.Lap(&c.refine_ms);
+}
+
+// Decodes the quad into c.found; quad_decode_index allocates the quad's homographies.
+void DecodeCandidate(const DecodeEnv &env, Candidate &c) {
+  VKA_PROF_SCOPE("tag.decode");
+  quad_decode_index(env.td, &c.quad.q, env.im, /*im_samples=*/nullptr, c.found);
+}
+
 // How RunSteps ended; only kFinished candidates reach the probe statistics.
 enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 
@@ -488,18 +502,8 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
   if (PreRefineRejects(env, c)) return Outcome::kPreCheck;
   c.unrefined.reset();
 
-  // Refine (if enabled) before decode; both are safe to run concurrently across quads.
-  if (env.td->refine_edges) {
-    VKA_PROF_SCOPE("tag.refine");
-    RefineEdges(env.refine_method, env.td, env.im, &c.quad.q);
-    c.clock.Lap(&c.refine_ms);
-  }
-
-  // quad_decode_index appends decodes to c.found and allocates quad->H/Hinv.
-  {
-    VKA_PROF_SCOPE("tag.decode");
-    quad_decode_index(env.td, &c.quad.q, env.im, /*im_samples=*/nullptr, c.found);
-  }
+  RefineCandidate(env, c);
+  DecodeCandidate(env, c);
 
   // A grey quiet zone on a bright wall makes the quiet zone's outline the dark blob, so the quad is
   // the (W + 2) cell square: if it did not decode, try its inner W cells, once that decodes unrefined.
