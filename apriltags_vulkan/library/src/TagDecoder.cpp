@@ -7,10 +7,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string>
 
 #include "BorderSample.h"
+#include "DecodeSwitches.h"
 #include "Geometry.h"
 #include "SmallQuad.h"
 #include "TestHooks.h"
@@ -322,19 +324,16 @@ TagDecoder::~TagDecoder() {
 }
 
 // What every candidate of one Decode() call shares: the frame, the switches and the family, read once.
-struct DecodeEnv {
-  apriltag_detector_t *td;
-  image_u8_t *im;
-  bool reversed_border;
-  bool timing;
-  RefineEdgesMethod refine_method;
-  int min_white_cells;
-  const ThirdBitIndex *third_index;
-  apriltag_family_t *family;  // the first registered family, null if none
-  int family_count;
-  bool grey_margin, small_rescue, polish, side_one_out, third_bit, family_limits, border_precheck,
-      dark_reject, early_reject, collect_probe;
-  float probe_margin;
+struct DecodeEnv : DecodeSwitches {
+  apriltag_detector_t *td = nullptr;
+  image_u8_t *im = nullptr;
+  bool reversed_border = false;
+  bool timing = false;
+  RefineEdgesMethod refine_method = RefineEdgesMethod::kProfile;
+  int min_white_cells = 0;
+  const ThirdBitIndex *third_index = nullptr;
+  apriltag_family_t *family = nullptr;  // the first registered family, null if none
+  int family_count = 0;
 };
 
 namespace {
@@ -690,45 +689,51 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
   st.busy_ms += c.clock.SinceStartMs();
 }
 
+namespace {
+
+DecodeEnv MakeDecodeEnv(apriltag_detector_t *td, image_u8_t *im, bool reversed_border, bool timing,
+                        RefineEdgesMethod refine_method, const ThirdBitIndex *third_index,
+                        const DecodeSwitches &switches) {
+  DecodeEnv env;
+  static_cast<DecodeSwitches &>(env) = switches;
+  env.td = td;
+  env.im = im;
+  env.reversed_border = reversed_border;
+  env.timing = timing;
+  env.refine_method = refine_method;
+  env.third_index = third_index;
+  env.family_count = zarray_size(td->tag_families);
+  if (env.family_count > 0) zarray_get(td->tag_families, 0, &env.family);
+  if (switches.dark_reject && env.family_count == 1) {
+    env.min_white_cells = env.family->nbits;
+    for (uint32_t k = 0; k < env.family->ncodes; ++k) {
+      env.min_white_cells = std::min(env.min_white_cells, std::popcount(env.family->codes[k]));
+    }
+  }
+  return env;
+}
+
+}  // namespace
+
 DecodeEnv TagDecoder::MakeEnv(image_u8_t *im, bool reversed_border, bool timing) {
   if (third_bit_ && zarray_size(td_->tag_families) > 0) {
     apriltag_family_t *family = nullptr;
     zarray_get(td_->tag_families, 0, &family);
     if (third_index_.family != family) BuildThirdBitIndex(family, &third_index_);
   }
-  const int family_count = zarray_size(td_->tag_families);
-  apriltag_family_t *first_family = nullptr;
-  if (family_count > 0) zarray_get(td_->tag_families, 0, &first_family);
-  int min_white_cells = 0;
-  if (dark_reject_ && family_count == 1) {
-    apriltag_family_t *family = first_family;
-    min_white_cells = family->nbits;
-    for (uint32_t k = 0; k < family->ncodes; ++k) {
-      min_white_cells = std::min(min_white_cells, std::popcount(family->codes[k]));
-    }
-  }
-  return {
-      .td = td_,
-      .im = im,
-      .reversed_border = reversed_border,
-      .timing = timing,
-      .refine_method = refine_method_,
-      .min_white_cells = min_white_cells,
-      .third_index = &third_index_,
-      .family = family_count > 0 ? first_family : nullptr,
-      .family_count = family_count,
-      .grey_margin = grey_margin_,
-      .small_rescue = small_rescue_,
-      .polish = polish_,
-      .side_one_out = side_one_out_,
-      .third_bit = third_bit_,
-      .family_limits = family_limits_,
-      .border_precheck = border_precheck_,
-      .dark_reject = dark_reject_,
-      .early_reject = early_reject_,
-      .collect_probe = collect_probe_,
-      .probe_margin = probe_margin_,
-  };
+  DecodeSwitches switches;
+  switches.grey_margin = grey_margin_;
+  switches.small_rescue = small_rescue_;
+  switches.polish = polish_;
+  switches.side_one_out = side_one_out_;
+  switches.third_bit = third_bit_;
+  switches.family_limits = family_limits_;
+  switches.border_precheck = border_precheck_;
+  switches.dark_reject = dark_reject_;
+  switches.early_reject = early_reject_;
+  switches.collect_probe = collect_probe_;
+  switches.probe_margin = probe_margin_;
+  return MakeDecodeEnv(td_, im, reversed_border, timing, refine_method_, &third_index_, switches);
 }
 
 void TagDecoder::MergeSlotRecords() {
@@ -823,6 +828,65 @@ bool MatchThreeTouchingBits(const ThirdBitIndex &index, uint64_t rcode, int *id,
   return apriltag_vulkan::MatchThreeTouchingBits(index, rcode, id, rotation);
 }
 int MaxCorrectedBits(const apriltag_family_t *f) { return apriltag_vulkan::MaxCorrectedBits(f); }
+
+namespace {
+
+// A candidate over the quad with the given corners, with its own scratch arrays.
+struct TestRun {
+  TestRun(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2], bool reversed_border,
+          const DecodeSwitches &switches)
+      : found(zarray_create(sizeof(apriltag_detection_t *))),
+        probe(zarray_create(sizeof(apriltag_detection_t *))) {
+    BuildThirdBitIndex(td, &third_index);
+    for (int k = 0; k < 4; ++k) {
+      input.p[k][0] = corners[k][0];
+      input.p[k][1] = corners[k][1];
+    }
+    env = MakeDecodeEnv(td, im, reversed_border, false, RefineEdgesMethod::kProfile, &third_index, switches);
+    candidate.emplace(env, input, found, probe);
+  }
+  ~TestRun() {
+    ClearDetections(found);
+    zarray_destroy(found);
+    zarray_destroy(probe);
+  }
+  static void BuildThirdBitIndex(apriltag_detector_t *td, ThirdBitIndex *index) {
+    apriltag_family_t *family = nullptr;
+    if (zarray_size(td->tag_families) > 0) zarray_get(td->tag_families, 0, &family);
+    if (family) apriltag_vulkan::BuildThirdBitIndex(family, index);
+  }
+
+  DetectedQuad input;
+  zarray_t *found;
+  zarray_t *probe;
+  ThirdBitIndex third_index;
+  DecodeEnv env;
+  std::optional<Candidate> candidate;
+};
+
+}  // namespace
+
+bool PreRefineRejects(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2], bool reversed_border,
+                      const DecodeSwitches &switches) {
+  TestRun run(td, im, corners, reversed_border, switches);
+  return apriltag_vulkan::PreRefineRejects(run.env, *run.candidate);
+}
+
+StepResult RunCandidateSteps(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2],
+                             bool reversed_border, const DecodeSwitches &switches) {
+  TestRun run(td, im, corners, reversed_border, switches);
+  StepResult result;
+  result.outcome = static_cast<int>(RunSteps(run.env, *run.candidate));
+  result.count = zarray_size(run.found);
+  if (result.count > 0) {
+    apriltag_detection_t *det = nullptr;
+    zarray_get(run.found, 0, &det);
+    result.id = det->id;
+    result.hamming = det->hamming;
+    for (int k = 0; k < 4; ++k) std::memcpy(result.corners[k], det->p[k], sizeof(det->p[k]));
+  }
+  return result;
+}
 
 }  // namespace testing
 
