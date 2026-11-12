@@ -16,6 +16,17 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
   off), and `GpuDetector::Prewarm()` for an application that knows a frame is about to arrive.
   `TrackingDetector` pre-warms before each keyframe (Orange Pi, keyframe 1.11 -> 0.87 ms at 16 ms gaps).
 
+### Performance
+
+- **Early reject of non-tag candidates with grey margin on.** The border pre-check and the dark reject were
+  skipped whenever grey margin was on (the default), so every candidate was refined. They now run on the
+  unrefined quad and reject it only if its inner W cells (what the grey margin retry decodes) fail them too;
+  quads under 1.5 pixels per cell, coarse boxes and quads the small rescue would refit are kept. No tag is lost
+  on the corpus (decimation 1 and 2, with and without the rescue and polish options) or the ten sequences; the
+  CPU part of the frame falls 5 to 22% on clutter, busy background and jpeg frames and rises 0 to 6% on
+  frames full of real tags. `tag16h5` false detections fall (3 to 1 at decimation 2).
+  `APRILTAG_VK_EARLY_REJECT=0` restores the previous behaviour.
+
 ### Accuracy
 
 - **Motion-blurred edges are placed by the halfway crossing.** When more than a quarter of the profile fit's

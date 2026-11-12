@@ -204,6 +204,7 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
   if (const char *v = std::getenv("APRILTAG_VK_FAMILY_LIMITS")) family_limits_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_BORDER_PRECHECK")) border_precheck_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_DARK_REJECT")) dark_reject_ = v[0] != '0';
+  if (const char *v = std::getenv("APRILTAG_VK_EARLY_REJECT")) early_reject_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_STATS")) collect_probe_ = v[0] != '0';
   if (const char *v = std::getenv("APRILTAG_VK_PROBE_MARGIN")) {
     probe_margin_ = static_cast<float>(std::atof(v));
@@ -398,38 +399,79 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
     }
 
-    // (Skipped with grey_margin_, whose retry needs the quads these checks reject.)
-    // A tag's border is black all round: reject a quad where fewer than 22 of 28 border cells (scaled
-    // per family) read dark. Quads that cannot be read through the image are kept.
-    if (border_precheck_ && !grey_margin_ && zarray_size(td_->tag_families) == 1) {
-      apriltag_family_t *family = nullptr;
-      zarray_get(td_->tag_families, 0, &family);
-      struct quad unrefined = quad_original;
-      unrefined.H = nullptr;
-      unrefined.Hinv = nullptr;
-      uint64_t rcode = 0;
-      quad_sample_code(td_, &unrefined, &im, &rcode);
-      BorderLevels border;
-      const bool read = unrefined.H && ReadBorder(unrefined.H, &im, family->width_at_border, &border);
-      if (unrefined.H) matd_destroy(unrefined.H);
-      if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
-      if (read && border.dark * 28 < 22 * border.cells) {
-        finish(false, 0.0);
-        return;
+    // The border and dark checks on the unrefined quad. With grey margin on (see early_reject_), a quad
+    // is rejected only if its inner W cells also fail them, as that is what the grey margin retry decodes.
+    const bool single_family = zarray_size(td_->tag_families) == 1;
+    const bool check_border = border_precheck_ && single_family;
+    const bool check_dark = dark_reject_ && !reversed_border && single_family;
+    apriltag_family_t *family = nullptr;
+    if (single_family) zarray_get(td_->tag_families, 0, &family);
+    // Under grey margin a coarse box or a quad under 1.5 pixels per cell is not rejected: its unrefined sample is too coarse.
+    bool large_enough = true;
+    if (grey_margin_ && family) {
+      double min_side = 1e30;
+      for (int k = 0; k < 4; ++k) {
+        const double dx = quad_original.p[(k + 1) % 4][0] - quad_original.p[k][0];
+        const double dy = quad_original.p[(k + 1) % 4][1] - quad_original.p[k][1];
+        min_side = std::min(min_side, std::hypot(dx, dy));
+      }
+      large_enough = !q.coarse && min_side >= 1.5 * family->width_at_border;
+      // A quad the small rescue would refit when it fails to decode is kept.
+      if (small_rescue_ && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f) {
+        double xlo = 1e30, ylo = 1e30, xhi = -1e30, yhi = -1e30;
+        for (int k = 0; k < 4; ++k) {
+          xlo = std::min(xlo, q.p[k][0]);
+          xhi = std::max(xhi, q.p[k][0]);
+          ylo = std::min(ylo, q.p[k][1]);
+          yhi = std::max(yhi, q.p[k][1]);
+        }
+        if (xhi - xlo <= 40.0 && yhi - ylo <= 40.0) large_enough = false;
       }
     }
-
-    // A quad whose payload shows fewer white cells than the sparsest code has (less the two cells error
-    // correction may flip) cannot decode, so skip refining it.
-    if (dark_reject_ && !grey_margin_ && !reversed_border && zarray_size(td_->tag_families) == 1) {
-      struct quad unrefined = quad_original;
-      unrefined.H = nullptr;
-      unrefined.Hinv = nullptr;
-      uint64_t rcode = 0;
-      quad_sample_code(td_, &unrefined, &im, &rcode);
-      if (unrefined.H) matd_destroy(unrefined.H);
-      if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
-      if (std::popcount(rcode) + 2 < min_white_cells_) {
+    if ((!grey_margin_ || (early_reject_ && large_enough)) && (check_border || check_dark)) {
+      // A border read below 22 of 28 dark cells, or fewer white payload cells than the sparsest code
+      // has (less two cells of error correction), cannot be a tag. Unreadable quads are kept.
+      auto cannot_decode = [&](struct quad candidate, matd_t **keep_h) {
+        candidate.H = nullptr;
+        candidate.Hinv = nullptr;
+        uint64_t rcode = 0;
+        quad_sample_code(td_, &candidate, &im, &rcode);
+        bool bad = false;
+        if (check_border) {
+          BorderLevels border;
+          const bool read = candidate.H && ReadBorder(candidate.H, &im, family->width_at_border, &border);
+          bad = read && border.dark * 28 < 22 * border.cells;
+        }
+        if (check_dark && !bad) bad = std::popcount(rcode) + 2 < min_white_cells_;
+        if (keep_h) {
+          *keep_h = candidate.H;
+          candidate.H = nullptr;
+        }
+        if (candidate.H) matd_destroy(candidate.H);
+        if (candidate.Hinv) matd_destroy(candidate.Hinv);
+        return bad;
+      };
+      matd_t *outer_h = nullptr;
+      bool reject = cannot_decode(quad_original, grey_margin_ ? &outer_h : nullptr);
+      if (reject && grey_margin_) {
+        reject = false;
+        if (outer_h) {
+          const double r = static_cast<double>(family->width_at_border) / (family->width_at_border + 2);
+          struct quad inner;
+          const double sx[4] = {-1, 1, 1, -1}, sy[4] = {-1, -1, 1, 1};
+          for (int k = 0; k < 4; ++k) {
+            double x, y;
+            homography_project(outer_h, sx[k] * r, sy[k] * r, &x, &y);
+            inner.p[k][0] = static_cast<float>(x);
+            inner.p[k][1] = static_cast<float>(y);
+          }
+          inner.reversed_border = reversed_border;
+          reject = cannot_decode(inner, nullptr);
+        }
+      }
+      if (outer_h) matd_destroy(outer_h);
+      if (timing) st.probe_ms += lap();
+      if (reject) {
         finish(false, 0.0);
         return;
       }
