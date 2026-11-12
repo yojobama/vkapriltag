@@ -49,6 +49,21 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
   `sort_points_local`, and the one-point-per-thread extents shaders `reduce_extents_hash.comp` and
   `reduce_extents_hash_atomic64.comp` (with `reduce_extents_hash_body.glsl`) are deleted.
 
+- **Tracking experiments that lost.** `TrackingConfig::roi_search`, `capture`, `capture_speed_px` and
+  `max_speed_px` (`APRILTAG_VK_TRACKING_SEARCH`, `_CAPTURE`, `_CAPTURE_SPEED`, `_MAX_SPEED`) are gone, with
+  `Path::kSearch` and `kCapture`, the matching `Stats` fields and the `keycap` and `asynccap` modes of
+  `track_eval`. The keyframe and asynchronous modes are unchanged; the decimated start of background tracks
+  (`coarse_pad_frac`, `coarse_converge_px`, formerly `capture_pad_frac`, `capture_converge_px`) stays.
+- **Worker spinning, cold inline batches and caller pinning.** `cpu_spin_us`, `cpu_inline_max`,
+  `cpu_inline_idle_us`, `cpu_pin_caller` and `APRILTAG_CPU_SPIN_US`, `_SPIN_YIELD`, `_SPIN_WORKERS`,
+  `APRILTAG_CPU_INLINE`, `_INLINE_IDLE_US`, `APRILTAG_CPU_PIN_CALLER` are ignored; none beat the default on the
+  Orange Pi or the desktop. `WorkerPool::Warm`/`WarmAll`, `KeepAlive::Options::on_warm` and the `warm_pool`
+  argument of `NoteFrame` (which only served spinning) are removed. Big-core pinning
+  (`cpu_big_cores`, `APRILTAG_CPU_BIG_CORES`) and `APRILTAG_CPU_THREADS` stay.
+- **Dead code.** The unused `QuadCorners` type, and the dead `fuse` branches and duplicated timestamp
+  post-processing in the unfused GPU flow (the flow itself stays, as the fallback for devices without
+  host-cached memory).
+
 ### Fixed
 
 - **The keep-alive works on Windows.** Its wait rounded up to the 15.6 ms timer tick; it now uses a
