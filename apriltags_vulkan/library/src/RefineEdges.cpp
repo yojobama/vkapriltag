@@ -2,6 +2,7 @@
 
 #include "vkapriltag/common/Options.h"
 
+#include "Geometry.h"
 #include "TestHooks.h"
 
 #include <algorithm>
@@ -13,55 +14,84 @@
 namespace apriltag_vulkan {
 namespace {
 
-// The four-tap bilinear order is upstream's verbatim; reassociating it breaks kExact's bit-identity.
-template <typename S>
-inline S BilinearAt(const image_u8_t *im, int xi, int yi, S fx, S fy) {
-  const uint8_t *row0 = im->buf + yi * im->stride + xi;
-  const uint8_t *row1 = row0 + im->stride;
-  return (1 - fx) * (1 - fy) * row0[0] + fx * (1 - fy) * row0[1] + (1 - fx) * fy * row1[0] +
-         fx * fy * row1[1];
-}
+using geom::BilinearAt;
+
+constexpr int kMaxProfilePoints = 96;
 
 // Moves each corner to the intersection of its two adjacent fitted lines.
 void IntersectLines(const double lines[4][4], struct quad *quad) {
   for (int i = 0; i < 4; i++) {
-    const double A00 = lines[i][3], A01 = -lines[(i + 1) & 3][3];
-    const double A10 = -lines[i][2], A11 = lines[(i + 1) & 3][2];
-    const double B0 = -lines[i][0] + lines[(i + 1) & 3][0];
-    const double B1 = -lines[i][1] + lines[(i + 1) & 3][1];
-
-    const double det = A00 * A11 - A10 * A01;
-
+    double x, y, det;
+    geom::LineCorner(lines[i], lines[(i + 1) & 3], &x, &y, &det);
+    // A degenerate intersection keeps the existing corner (as upstream).
     if (std::fabs(det) > 0.001) {
-      const double W00 = A11 / det, W01 = -A01 / det;
-      const double L0 = W00 * B0 + W01 * B1;
-
-      quad->p[(i + 1) & 3][0] = lines[i][0] + L0 * A00;
-      quad->p[(i + 1) & 3][1] = lines[i][1] + L0 * A10;
+      quad->p[(i + 1) & 3][0] = x;
+      quad->p[(i + 1) & 3][1] = y;
     }
-    // else: degenerate intersection; keep the existing corner (as upstream).
   }
 }
+
+// The frame of one side of a quad: its unit normal (flipped for a reversed border) and midpoint, the
+// points along the side where profiles are taken, and the line stored for the side.
+struct SideSampler {
+  const struct quad *quad;
+  int a, b;
+  double nx, ny, mag, xm, ym;
+  float fnx, fny;
+
+  SideSampler(const struct quad *q, int edge) : quad(q), a(edge), b((edge + 1) & 3) {
+    nx = q->p[b][1] - q->p[a][1];
+    ny = -q->p[b][0] + q->p[a][0];
+    mag = std::sqrt(nx * nx + ny * ny);
+    nx /= mag;
+    ny /= mag;
+    if (q->reversed_border) {
+      nx = -nx;
+      ny = -ny;
+    }
+    fnx = static_cast<float>(nx);
+    fny = static_cast<float>(ny);
+    xm = 0.5 * (q->p[a][0] + q->p[b][0]);
+    ym = 0.5 * (q->p[a][1] + q->p[b][1]);
+  }
+
+  // The point a fraction alpha of the way from corner b to corner a.
+  void PointAt(double alpha, double *x, double *y) const {
+    *x = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
+    *y = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+  }
+
+  // The number of profiles, one per `spacing` pixels, at least 8 and at most kMaxProfilePoints.
+  int Profiles(double spacing) const {
+    return std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / spacing)));
+  }
+
+  // The side's line, [Ex Ey nx ny], left where it was.
+  void KeepLine(double line[4]) const {
+    line[0] = xm;
+    line[1] = ym;
+    line[2] = nx;
+    line[3] = ny;
+  }
+
+  // The side's line from a fit relative to the midpoint: its centre offset and normal angle.
+  void FittedLine(double mx, double my, double normal_theta, double line[4]) const {
+    line[0] = xm + mx;
+    line[1] = ym + my;
+    line[2] = std::cos(normal_theta);
+    line[3] = std::sin(normal_theta);
+  }
+};
 
 template <typename Sample>
 void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
   double lines[4][4];  // for each line, [Ex Ey nx ny]
 
   for (int edge = 0; edge < 4; edge++) {
-    const int a = edge, b = (edge + 1) & 3;
+    const SideSampler side(quad, edge);
+    const double nx = side.nx, ny = side.ny;
 
-    double nx = quad->p[b][1] - quad->p[a][1];
-    double ny = -quad->p[b][0] + quad->p[a][0];
-    const double mag = std::sqrt(nx * nx + ny * ny);
-    nx /= mag;
-    ny /= mag;
-
-    if (quad->reversed_border) {
-      nx = -nx;
-      ny = -ny;
-    }
-
-    const int nsamples = std::max(16, static_cast<int>(mag / 8));
+    const int nsamples = std::max(16, static_cast<int>(side.mag / 8));
 
     double Mx = 0, My = 0, Mxx = 0, Mxy = 0, Myy = 0, N = 0;
 
@@ -69,15 +99,14 @@ void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
     const int steps_per_unit = 4;
     const int max_steps = 2 * steps_per_unit * range + 1;
     const Sample step_length = Sample(1) / steps_per_unit;
-    const Sample delta = Sample(0.5);
     const Sample grange = 1;
     const Sample snx = static_cast<Sample>(nx);
     const Sample sny = static_cast<Sample>(ny);
 
     for (int s = 0; s < nsamples; s++) {
       const double alpha = (1.0 + s) / (nsamples + 1);
-      const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
-      const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+      double x0, y0;
+      side.PointAt(alpha, &x0, &y0);
 
       const Sample sx0 = static_cast<Sample>(x0);
       const Sample sy0 = static_cast<Sample>(y0);
@@ -88,14 +117,11 @@ void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
       // Bilinear tap at n + grange for virtual step v; false when it falls outside the image.
       auto tap = [&](int v, Sample *g) {
         const Sample n = -range + step_length * v;
-        const Sample x1 = sx0 + (n + grange) * snx - delta;
-        const Sample y1 = sy0 + (n + grange) * sny - delta;
-        const Sample x1t = std::trunc(x1);
-        const Sample y1t = std::trunc(y1);
-        const int x1i = static_cast<int>(x1t);
-        const int y1i = static_cast<int>(y1t);
-        if (x1i < 0 || x1i + 1 >= im->width || y1i < 0 || y1i + 1 >= im->height) return false;
-        *g = BilinearAt<Sample>(im, x1i, y1i, x1 - x1t, y1 - y1t);
+        int xi, yi;
+        Sample fx, fy;
+        geom::TapAlong<Sample, true>(sx0, sy0, n + grange, snx, sny, &xi, &yi, &fx, &fy);
+        if (!geom::BlockInside(im, xi, yi)) return false;
+        *g = BilinearAt<Sample>(im, xi, yi, fx, fy);
         return true;
       };
 
@@ -159,7 +185,6 @@ void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
 // width), and a strength-weighted total-least-squares line is fitted through the points.
 constexpr float kProfileStep = 0.25f;   // pixels between taps
 constexpr double kProfileSpacing = 1.5;  // pixels between profiles along a side
-constexpr int kMaxProfilePoints = 96;
 constexpr float kLobeCut = 0.05f;        // the lobe ends where the gradient falls below this fraction
 constexpr float kMinStep = 3.0f;         // weakest accepted step, in grey levels over two taps
 
@@ -180,16 +205,6 @@ constexpr double kMinLevelContrast = 50.0;  // smallest white minus black, in gr
 constexpr double kLevelSpacing = 1.5;  // pixels between its profiles along a side
 constexpr int kMaxProfileTaps = 96;
 constexpr double kCrossingCells = 0.6;  // ramps wider than this many cells use the halfway crossing
-
-// Bilinear sample of the image at pixel-edge coordinates (x, y); false outside it.
-bool SampleAt(const image_u8_t *im, double x, double y, double *out) {
-  const float fx = static_cast<float>(x) - 0.5f, fy = static_cast<float>(y) - 0.5f;
-  const float xt = std::floor(fx), yt = std::floor(fy);
-  const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
-  if (xi < 0 || xi + 1 >= im->width || yi < 0 || yi + 1 >= im->height) return false;
-  *out = BilinearAt<float>(im, xi, yi, fx - xt, fy - yt);
-  return true;
-}
 
 // Weighted total-least-squares line through the points (relative to the side's midpoint): its centre
 // and normal angle. With kDropOutliers, points far from the line are dropped and the line refitted.
@@ -243,34 +258,21 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
   const bool halfway = (ProfileFeatures() & kHalfwayCrossing) != 0;
   double width_sum = 0;
   int width_n = 0, touching = 0;
-  const int max_x = im->width - 1;
-  const int max_y = im->height - 1;
   double lines[4][4];
 
   for (int edge = 0; edge < 4; edge++) {
-    const int a = edge, b = (edge + 1) & 3;
-    double nx = quad->p[b][1] - quad->p[a][1];
-    double ny = -quad->p[b][0] + quad->p[a][0];
-    const double mag = std::sqrt(nx * nx + ny * ny);
-    nx /= mag;
-    ny /= mag;
-    if (quad->reversed_border) {
-      nx = -nx;
-      ny = -ny;
-    }
-    const int np = std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / kProfileSpacing)));
-
-    const float fnx = static_cast<float>(nx), fny = static_cast<float>(ny);
-    const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
-    const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
+    const SideSampler side(quad, edge);
+    const double nx = side.nx, ny = side.ny, xm = side.xm, ym = side.ym;
+    const float fnx = side.fnx, fny = side.fny;
+    const int np = side.Profiles(kProfileSpacing);
     // The refined points of this side, relative to its midpoint, and their weights.
     double bxs[kMaxProfilePoints], bys[kMaxProfilePoints], ws[kMaxProfilePoints];
     int used = 0;
 
     for (int s = 0; s < np; s++) {
       const double alpha = (1.0 + s) / (np + 1);
-      const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
-      const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+      double x0, y0;
+      side.PointAt(alpha, &x0, &y0);
       // The tap positions first (a loop the compiler can vectorise), then the loads. The positions
       // move along a line, so the first and last taps bound every tap's pixel.
       int xis[kMaxTaps], yis[kMaxTaps];
@@ -278,18 +280,9 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
       const float fx0 = static_cast<float>(x0), fy0 = static_cast<float>(y0);
       for (int m = 0; m < taps; ++m) {
         const float u = -range - kProfileStep + kProfileStep * m;
-        const float x = fx0 + u * fnx - 0.5f;
-        const float y = fy0 + u * fny - 0.5f;
-        const float xt = std::floor(x), yt = std::floor(y);
-        xis[m] = static_cast<int>(xt);
-        yis[m] = static_cast<int>(yt);
-        fxs[m] = x - xt;
-        fys[m] = y - yt;
+        geom::TapAlong<float, false>(fx0, fy0, u, fnx, fny, &xis[m], &yis[m], &fxs[m], &fys[m]);
       }
-      if (xis[0] < 0 || xis[0] >= max_x || yis[0] < 0 || yis[0] >= max_y || xis[taps - 1] < 0 ||
-          xis[taps - 1] >= max_x || yis[taps - 1] < 0 || yis[taps - 1] >= max_y) {
-        continue;
-      }
+      if (!geom::BlockInside(im, xis[0], yis[0]) || !geom::BlockInside(im, xis[taps - 1], yis[taps - 1])) continue;
       float prof[kMaxTaps];
       for (int m = 0; m < taps; ++m) prof[m] = BilinearAt<float>(im, xis[m], yis[m], fxs[m], fys[m]);
 
@@ -323,8 +316,8 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
         for (int iter = 0; iter < 3; ++iter) {
           const double pos = -range - kProfileStep + kProfileStep * cj;
           double white, black;
-          if (!SampleAt(im, x0 + (pos - half) * nx, y0 + (pos - half) * ny, &white) ||
-              !SampleAt(im, x0 + (pos + half) * nx, y0 + (pos + half) * ny, &black)) {
+          if (!geom::SampleEdge<float>(im, x0 + (pos - half) * nx, y0 + (pos - half) * ny, &white) ||
+              !geom::SampleEdge<float>(im, x0 + (pos + half) * nx, y0 + (pos + half) * ny, &black)) {
             break;
           }
           const double mid = 0.5 * (white + black);  // along +n the image goes from black to white
@@ -352,18 +345,12 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
     }
     if (used < 3) {
       // Too few usable profiles: keep this side where it was.
-      lines[edge][0] = xm;
-      lines[edge][1] = ym;
-      lines[edge][2] = nx;
-      lines[edge][3] = ny;
+      side.KeepLine(lines[edge]);
       continue;
     }
     double mx = 0, my = 0, normal_theta = 0;
     FitSide(bxs, bys, ws, used, range, &mx, &my, &normal_theta);
-    lines[edge][0] = xm + mx;
-    lines[edge][1] = ym + my;
-    lines[edge][2] = std::cos(normal_theta);
-    lines[edge][3] = std::sin(normal_theta);
+    side.FittedLine(mx, my, normal_theta, lines[edge]);
   }
   IntersectLines(lines, quad);
   *edge_width = width_n > 0 ? width_sum / width_n : 0.0;
@@ -382,38 +369,25 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
   const int taps = static_cast<int>((r_in + r_out) / step) + 1;
   if (taps < 8 || taps > kMaxProfileTaps) return false;
   const int ends = std::max(2, static_cast<int>(1.0f / step));
-  const int max_x = im->width - 1;
-  const int max_y = im->height - 1;
   double lines[4][4];
   bool any = false;
   double widths[4 * kMaxProfilePoints];
   int nwidths = 0;
 
   for (int edge = 0; edge < 4; edge++) {
-    const int a = edge, b = (edge + 1) & 3;
-    double nx = quad->p[b][1] - quad->p[a][1];
-    double ny = -quad->p[b][0] + quad->p[a][0];
-    const double mag = std::sqrt(nx * nx + ny * ny);
-    nx /= mag;
-    ny /= mag;
-    if (quad->reversed_border) {
-      nx = -nx;
-      ny = -ny;
-    }
-    const int np = std::min(kMaxProfilePoints, std::max(8, static_cast<int>(mag / kLevelSpacing)));
-    const float fnx = static_cast<float>(nx), fny = static_cast<float>(ny);
-    const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
-    const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
+    const SideSampler side(quad, edge);
+    const double nx = side.nx, ny = side.ny, xm = side.xm, ym = side.ym;
+    const float fnx = side.fnx, fny = side.fny;
+    const int np = side.Profiles(kLevelSpacing);
 
     // Tap m of the profile through (x0, y0); false outside the image.
     auto at = [&](float fx0, float fy0, int m, float *v) {
       const float u = static_cast<float>(-r_in) + step * m;
-      const float x = fx0 + u * fnx - 0.5f;
-      const float y = fy0 + u * fny - 0.5f;
-      const float xt = std::floor(x), yt = std::floor(y);
-      const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
-      if (xi < 0 || xi >= max_x || yi < 0 || yi >= max_y) return false;
-      *v = BilinearAt<float>(im, xi, yi, x - xt, y - yt);
+      int xi, yi;
+      float fx, fy;
+      geom::TapAlong<float, false>(fx0, fy0, u, fnx, fny, &xi, &yi, &fx, &fy);
+      if (!geom::BlockInside(im, xi, yi)) return false;
+      *v = BilinearAt<float>(im, xi, yi, fx, fy);
       return true;
     };
     double px[kMaxProfilePoints], py[kMaxProfilePoints], outer[kMaxProfilePoints], inner[kMaxProfilePoints];
@@ -421,16 +395,16 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
     // Three profiles whose ends differ by too little rule the side out before the rest are sampled.
     bool contrast = false;
     for (int k = 1; k <= 3 && !contrast; ++k) {
-      const double alpha = k / 4.0;
-      const float fx0 = static_cast<float>(alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0]);
-      const float fy0 = static_cast<float>(alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1]);
+      double x0, y0;
+      side.PointAt(k / 4.0, &x0, &y0);
+      const float fx0 = static_cast<float>(x0), fy0 = static_cast<float>(y0);
       float lo = 0, hi = 0;
       contrast = at(fx0, fy0, 0, &lo) && at(fx0, fy0, taps - 1, &hi) && hi - lo >= kMinLevelContrast;
     }
     for (int s = 0; s < np && contrast; s++) {
       const double alpha = (1.0 + s) / (np + 1);
-      const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
-      const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
+      double x0, y0;
+      side.PointAt(alpha, &x0, &y0);
       const float fx0 = static_cast<float>(x0), fy0 = static_cast<float>(y0);
       bool inside = true;
       double lo = 0, hi = 0;
@@ -452,11 +426,9 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
     if (count >= 3) {
       double tmp[kMaxProfilePoints];
       std::copy(outer, outer + count, tmp);
-      std::nth_element(tmp, tmp + count / 2, tmp + count);
-      const double white = tmp[count / 2];
+      const double white = geom::MedianInPlace(tmp, count);
       std::copy(inner, inner + count, tmp);
-      std::nth_element(tmp, tmp + count / 2, tmp + count);
-      const double black = tmp[count / 2];
+      const double black = geom::MedianInPlace(tmp, count);
       if (white - black >= kMinLevelContrast) {
         const double mid = 0.5 * (white + black), margin = 0.25 * (white - black);
         for (int i = 0; i < count; ++i) {
@@ -484,24 +456,17 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
       }
     }
     if (used < 3) {
-      lines[edge][0] = xm;
-      lines[edge][1] = ym;
-      lines[edge][2] = nx;
-      lines[edge][3] = ny;
+      side.KeepLine(lines[edge]);
       continue;
     }
     any = true;
     double mx = 0, my = 0, normal_theta = 0;
     FitSide(bxs, bys, ws, used, 0.5 * (r_in + r_out), &mx, &my, &normal_theta);
-    lines[edge][0] = xm + mx;
-    lines[edge][1] = ym + my;
-    lines[edge][2] = std::cos(normal_theta);
-    lines[edge][3] = std::sin(normal_theta);
+    side.FittedLine(mx, my, normal_theta, lines[edge]);
   }
   if (!any) return false;
   if (ramp != nullptr && nwidths > 0) {
-    std::nth_element(widths, widths + nwidths / 2, widths + nwidths);
-    *ramp = widths[nwidths / 2];
+    *ramp = geom::MedianInPlace(widths, nwidths);
   }
   IntersectLines(lines, quad);
   return true;
@@ -559,7 +524,7 @@ double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
   auto at = [&](double u, double v, double *out) {
     double x, y;
     SquareToQuad(q, u, v, &x, &y);
-    return SampleAt(im, x, y, out);
+    return geom::SampleEdge<float>(im, x, y, out);
   };
   for (int i = 0; i < width_cells && nb < 62; ++i) {  // border cells along the top and bottom
     double v;
@@ -572,9 +537,7 @@ double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
     if (at((i + 0.5) / cells, (cells + 0.5) / cells, &v)) white_v[nw++] = v;
   }
   if (nb < 4 || nw < 4) return 0;
-  std::nth_element(black_v, black_v + nb / 2, black_v + nb);
-  std::nth_element(white_v, white_v + nw / 2, white_v + nw);
-  const double black = black_v[nb / 2], white = white_v[nw / 2];
+  const double black = geom::MedianInPlace(black_v, nb), white = geom::MedianInPlace(white_v, nw);
   if (white < 250 && black > 4) return 0;
   const double mid = 0.5 * (black + white);
 
@@ -598,7 +561,7 @@ double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
       for (int j = 0; j < kN && ok; ++j) {
         uv(-0.5 + 2.0 * j / (kN - 1), &u, &v);
         SquareToQuad(q, u, v, &px[j], &py[j]);
-        ok = SampleAt(im, px[j], py[j], &prof[j]);
+        ok = geom::SampleEdge<float>(im, px[j], py[j], &prof[j]);
       }
       if (!ok) continue;
       const double jo = LobeCentroid(prof, 1, kN / 2 - 1, true);
@@ -655,11 +618,10 @@ void GrowQuad(struct quad *q, double d) {
   }
   for (int k = 0; k < 4; ++k) {
     const int p = (k + 3) & 3;
-    const double cross = dx[p] * dy[k] - dy[p] * dx[k];
-    if (std::fabs(cross) < 1e-9) return;
-    const double t = ((px[k] - px[p]) * dy[k] - (py[k] - py[p]) * dx[k]) / cross;
-    q->p[k][0] = static_cast<float>(px[p] + t * dx[p]);
-    q->p[k][1] = static_cast<float>(py[p] + t * dy[p]);
+    double x, y;
+    if (!geom::IntersectDirected(px[p], py[p], dx[p], dy[p], px[k], py[k], dx[k], dy[k], &x, &y)) return;
+    q->p[k][0] = static_cast<float>(x);
+    q->p[k][1] = static_cast<float>(y);
   }
 }
 
@@ -672,11 +634,7 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
   if (zarray_size(td->tag_families) > 0) {
     apriltag_family_t *family = nullptr;
     zarray_get(td->tag_families, 0, &family);
-    double side = 0;
-    for (int k = 0; k < 4; ++k) {
-      side += 0.25 * std::hypot(quad->p[(k + 1) & 3][0] - quad->p[k][0], quad->p[(k + 1) & 3][1] - quad->p[k][1]);
-    }
-    cell = side / family->width_at_border;
+    cell = geom::MeanSide(quad->p) / family->width_at_border;
   }
   double truncated = 0;
   if (!ProfilePass(reach, cell, im, quad, &edge_width, &truncated)) {

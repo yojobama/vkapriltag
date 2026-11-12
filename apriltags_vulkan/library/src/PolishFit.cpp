@@ -2,6 +2,8 @@
 
 #include "vkapriltag/common/Options.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -187,25 +189,13 @@ struct Mapping {
 };
 
 inline void Project(const Mapping &m, double x, double y, double *u, double *v, double *w) {
-  *w = m.g[6] * x + m.g[7] * y + 1.0;
-  *u = (m.g[0] * x + m.g[1] * y + m.g[2]) / *w;
-  *v = (m.g[3] * x + m.g[4] * y + m.g[5]) / *w;
+  geom::ProjectHomography(m.g, 1.0, x, y, u, v, w);
 }
 
 bool Invert3(const double a[9], double out[9]) {
-  const double c00 = a[4] * a[8] - a[5] * a[7], c01 = a[5] * a[6] - a[3] * a[8], c02 = a[3] * a[7] - a[4] * a[6];
-  const double det = a[0] * c00 + a[1] * c01 + a[2] * c02;
+  const double det = geom::Det3(a);
   if (std::fabs(det) < 1e-300) return false;
-  const double id = 1.0 / det;
-  out[0] = c00 * id;
-  out[1] = (a[2] * a[7] - a[1] * a[8]) * id;
-  out[2] = (a[1] * a[5] - a[2] * a[4]) * id;
-  out[3] = c01 * id;
-  out[4] = (a[0] * a[8] - a[2] * a[6]) * id;
-  out[5] = (a[2] * a[3] - a[0] * a[5]) * id;
-  out[6] = c02 * id;
-  out[7] = (a[1] * a[6] - a[0] * a[7]) * id;
-  out[8] = (a[0] * a[4] - a[1] * a[3]) * id;
+  geom::Adjugate3(a, 1.0 / det, out);
   return true;
 }
 
@@ -221,9 +211,7 @@ void CellCorners(const Mapping &m, int width, double xy[4][2]) {
   const double cu[4] = {0, static_cast<double>(width), static_cast<double>(width), 0};
   const double cv[4] = {0, 0, static_cast<double>(width), static_cast<double>(width)};
   for (int k = 0; k < 4; ++k) {
-    const double w = inv[6] * cu[k] + inv[7] * cv[k] + inv[8];
-    xy[k][0] = (inv[0] * cu[k] + inv[1] * cv[k] + inv[2]) / w;
-    xy[k][1] = (inv[3] * cu[k] + inv[4] * cv[k] + inv[5]) / w;
+    geom::ProjectHomography(inv, cu[k], cv[k], &xy[k][0], &xy[k][1]);
   }
 }
 
@@ -268,9 +256,8 @@ void ComputeBox(const Fit &f, const Mapping &map, int limit, const image_u8_t *i
   const double cu[4] = {-ext, W + ext, W + ext, -ext}, cv[4] = {-ext, -ext, W + ext, W + ext};
   double gmax = 0;
   for (int k = 0; k < 4; ++k) {
-    const double w = inv[6] * cu[k] + inv[7] * cv[k] + inv[8];
-    const double nx = (inv[0] * cu[k] + inv[1] * cv[k] + inv[2]) / w;
-    const double ny = (inv[3] * cu[k] + inv[4] * cv[k] + inv[5]) / w;
+    double nx, ny;
+    geom::ProjectHomography(inv, cu[k], cv[k], &nx, &ny);
     const double x = nx * f.scale + f.cx;
     const double y = ny * f.scale + f.cy;
     minx = std::min(minx, x);
@@ -299,9 +286,10 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
   static const double kOffset[4] = {-4.2, 1.4, -1.4, 4.2};
   int count = 0;
   const auto add = [&](double u, double v) {
-    const double w = inv[6] * u + inv[7] * v + inv[8];
-    const double X = (inv[0] * u + inv[1] * v + inv[2]) / w * f.scale + f.cx;
-    const double Y = (inv[3] * u + inv[4] * v + inv[5]) / w * f.scale + f.cy;
+    double nx, ny;
+    geom::ProjectHomography(inv, u, v, &nx, &ny);
+    const double X = nx * f.scale + f.cx;
+    const double Y = ny * f.scale + f.cy;
     if (!(X >= 0 && Y >= 0 && X < im->width && Y < im->height)) return;
     const int px = static_cast<int>(X), py = static_cast<int>(Y);
     const double xn = (px + 0.5 - f.cx) / f.scale, yn = (py + 0.5 - f.cy) / f.scale;
@@ -690,33 +678,6 @@ inline void RunModel(Fit *f, const Params &p, bool deriv) {
   }
 }
 
-// Solves (A) x = b by Gaussian elimination with partial pivoting; false if singular.
-bool Solve(int N, double a[kMaxT][kMaxT], double b[kMaxT], double x[kMaxT]) {
-  for (int c = 0; c < N; ++c) {
-    int piv = c;
-    for (int r = c + 1; r < N; ++r) {
-      if (std::fabs(a[r][c]) > std::fabs(a[piv][c])) piv = r;
-    }
-    if (std::fabs(a[piv][c]) < 1e-18) return false;
-    if (piv != c) {
-      for (int k = 0; k < N; ++k) std::swap(a[c][k], a[piv][k]);
-      std::swap(b[c], b[piv]);
-    }
-    for (int r = c + 1; r < N; ++r) {
-      const double m = a[r][c] / a[c][c];
-      if (m == 0.0) continue;
-      for (int k = c; k < N; ++k) a[r][k] -= m * a[c][k];
-      b[r] -= m * b[c];
-    }
-  }
-  for (int r = N - 1; r >= 0; --r) {
-    double s = b[r];
-    for (int k = r + 1; k < N; ++k) s -= a[r][k] * x[k];
-    x[r] = s / a[r][r];
-  }
-  return true;
-}
-
 // Linear least squares for the three levels at fixed mapping and blur, from the model pass. Returns the SSE.
 bool FitLevels(const Fit &f, Params *p, double *sse = nullptr) {
   double ata[3][3] = {}, atb[3] = {}, yy = 0;
@@ -756,8 +717,7 @@ double MedianAbsResidual(const Fit &f, const Params &p) {
     res.push_back(static_cast<float>(std::fabs(f.obs[idx] - gain * (p.lev[0] * f.A[idx] + p.lev[1] * f.B[idx] + p.lev[2] * f.C[idx]))));
   }
   if (res.empty()) return 0;
-  std::nth_element(res.begin(), res.begin() + res.size() / 2, res.end());
-  return res[res.size() / 2];
+  return geom::MedianInPlace(res.data(), res.size());
 }
 
 struct Accum {
@@ -922,7 +882,7 @@ bool SolveStep(const Accum &cur, bool box, double lambda, double *delta) {
     a[r][r] += lambda * diag;
     b[r] = cur.jtr[r];
   }
-  return Solve(nt, a, b, delta);
+  return geom::SolveGauss(nt, a, b, delta);
 }
 
 // Levenberg-Marquardt over the geometry and blur; returns the final cost and leaves the best
@@ -1006,12 +966,9 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
     m[3 * r + 1] = h1 / hw;
     m[3 * r + 2] = h2 - h0 - h1;
   }
-  double cxy[2] = {0, 0}, side = 0;
-  for (int k = 0; k < 4; ++k) {
-    cxy[0] += 0.25 * det->p[k][0];
-    cxy[1] += 0.25 * det->p[k][1];
-    side += 0.25 * std::hypot(det->p[(k + 1) & 3][0] - det->p[k][0], det->p[(k + 1) & 3][1] - det->p[k][1]);
-  }
+  double cxy[2];
+  geom::QuadCentre(det->p, &cxy[0], &cxy[1]);
+  const double side = geom::MeanSide(det->p);
   const double cell_px = side / W;
   if (cell_px < 1.2 || !std::isfinite(side)) return false;
   fit.cx = cxy[0];
@@ -1073,9 +1030,10 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
       for (int j = 0; j < W; ++j) {
         for (int i = 0; i < W; ++i) {
           const double cu = i + 0.5, cv = j + 0.5;
-          const double w = inv_map[6] * cu + inv_map[7] * cv + inv_map[8];
-          const double px = (inv_map[0] * cu + inv_map[1] * cv + inv_map[2]) / w * fit.scale + fit.cx;
-          const double py = (inv_map[3] * cu + inv_map[4] * cv + inv_map[5]) / w * fit.scale + fit.cy;
+          double nx, ny;
+          geom::ProjectHomography(inv_map, cu, cv, &nx, &ny);
+          const double px = nx * fit.scale + fit.cx;
+          const double py = ny * fit.scale + fit.cy;
           const int ix = static_cast<int>(px), iy = static_cast<int>(py);
           if (ix < 0 || iy < 0 || ix >= im->width || iy >= im->height) continue;
           const double expected = fit.cls[j + 1][i + 1] ? p.lev[1] : p.lev[0];

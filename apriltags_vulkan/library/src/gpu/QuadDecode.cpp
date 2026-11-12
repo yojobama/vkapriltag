@@ -4,6 +4,8 @@
 
 #include "vkapriltag/common/Profiler.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -597,16 +599,7 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
            static_cast<int64_t>(a.second - o.second) * (b.first - o.first);
   };
   hull.assign(2 * pts.size(), {0, 0});
-  size_t h = 0;
-  for (size_t i = 0; i < pts.size(); ++i) {
-    while (h >= 2 && cross(hull[h - 2], hull[h - 1], pts[i]) <= 0) --h;
-    hull[h++] = pts[i];
-  }
-  for (size_t i = pts.size() - 1, lower = h + 1; i-- > 0;) {
-    while (h >= lower && cross(hull[h - 2], hull[h - 1], pts[i]) <= 0) --h;
-    hull[h++] = pts[i];
-  }
-  hull.resize(h - 1);
+  hull.resize(geom::MonotoneChain(pts.data(), pts.size(), hull.data(), cross));
   const size_t m = hull.size();
   if (m < 4) return result;
 
@@ -655,11 +648,11 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   size_t best[4] = {};
   auto corner_ok = [&](size_t a, size_t b) {
     if (std::fabs(ux[a] * ux[b] + uy[a] * uy[b]) > kMaxCos) return false;
-    const double det = ux[a] * uy[b] - uy[a] * ux[b];
-    if (std::fabs(det) < 1e-9) return false;
     const auto &pa = v[a], &pb = v[b];
-    const double t = ((pb.first - pa.first) * uy[b] - (pb.second - pa.second) * ux[b]) / det;
-    const double cx = pa.first + t * ux[a], cy = pa.second + t * uy[a];
+    double cx, cy;
+    if (!geom::IntersectDirected(pa.first, pa.second, ux[a], uy[a], pb.first, pb.second, ux[b], uy[b], &cx, &cy)) {
+      return false;
+    }
     const auto &ea = v[(a + 1) % k];
     return std::hypot(cx - ea.first, cy - ea.second) <= kReach * len[a] &&
            std::hypot(cx - pb.first, cy - pb.second) <= kReach * len[b];
@@ -775,22 +768,12 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
   double corners[4][2];
   bool bad_determinant = false;
   for (int i = 0; i < 4; ++i) {
-    const int j = (i + 1) & 3;
-    double A00 = lines[i][3], A01 = -lines[j][3];
-    double A10 = -lines[i][2], A11 = lines[j][2];
-    double B0 = -lines[i][0] + lines[j][0];
-    double B1 = -lines[i][1] + lines[j][1];
-
-    double det = A00 * A11 - A10 * A01;
+    double det;
+    geom::LineCorner(lines[i], lines[(i + 1) & 3], &corners[i][0], &corners[i][1], &det);
     if (std::fabs(det) < 0.001) {
       bad_determinant = true;
       break;
     }
-    double W00 = A11 / det, W01 = -A01 / det;
-    double L0 = W00 * B0 + W01 * B1;
-
-    corners[i][0] = lines[i][0] + L0 * A00;
-    corners[i][1] = lines[i][1] + L0 * A10;
   }
   if (bad_determinant) return false;
 

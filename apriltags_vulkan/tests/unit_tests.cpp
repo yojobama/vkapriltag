@@ -1,5 +1,5 @@
 // CPU-only unit tests of the pure helpers and the CPU stages; no Vulkan device is used.
-// usage: unit_tests [decode|geometry|edges|quadfit|options]   (no argument runs all)
+// usage: unit_tests [decode|geometry|geom|edges|quadfit|options]   (no argument runs all)
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "Geometry.h"
 #include "TestHooks.h"
 #include "test_check.h"
 #include "vkapriltag/RefineEdges.h"
@@ -251,6 +252,173 @@ void TestFitSide() {
 void TestGeometry() {
   TestIntersectLines();
   TestFitSide();
+}
+
+// ---------------------------------------------------------------- shared geometry helpers (Geometry.h)
+
+namespace geo = apriltag_vulkan::geom;
+
+void TestBilinearAndMedian() {
+  // A 4 x 3 image with two bytes of row padding.
+  uint8_t buf[6 * 3] = {0, 100, 8, 8, 0, 0, 200, 40, 8, 8, 0, 0, 16, 32, 64, 128, 0, 0};
+  image_u8_t im = {4, 3, 6, buf};
+  CHECK_NEAR(geo::BilinearAt<double>(&im, 0, 0, 0.25, 0.5), 92.5, 0.0);
+  CHECK_NEAR(geo::BilinearAt<float>(&im, 0, 0, 0.25f, 0.5f), 92.5, 0.0);
+  CHECK_NEAR(geo::BilinearAt<double>(&im, 2, 1, 1.0, 1.0), 128.0, 0.0);
+
+  double v = -1;
+  // Pixel centres are at i + 0.5 in pixel-edge coordinates.
+  CHECK(geo::SampleEdge<double>(&im, 0.5, 0.5, &v) && v == 0.0);
+  CHECK(geo::SampleEdge<float>(&im, 1.5, 0.5, &v) && v == 100.0);
+  CHECK(geo::SampleEdge<double>(&im, 0.75, 1.0, &v) && v == 92.5);
+  CHECK(!geo::SampleEdge<double>(&im, 0.25, 0.5, &v));   // left of the first pixel centre
+  CHECK(!geo::SampleEdge<double>(&im, 0.5, 2.75, &v));   // below the last row's centre
+  CHECK(!geo::SampleEdge<float>(&im, 3.5, 0.5, &v));     // right of the last pixel centre
+  CHECK(geo::SampleEdge<float>(&im, 3.25, 1.5, &v));
+
+  double five[5] = {5, 1, 9, 3, 7};
+  CHECK(geo::MedianInPlace(five, 5) == 5.0);
+  float four[4] = {4, 1, 3, 2};
+  CHECK(geo::MedianInPlace(four, 4) == 3.0f);
+}
+
+void TestLineCorners() {
+  // x = 10 (point (10, 5), normal (1, 0)) meets y = 20 (point (3, 20), normal (0, 1)) at (10, 20).
+  const double vertical[4] = {10, 5, 1, 0}, horizontal[4] = {3, 20, 0, 1};
+  double x = 0, y = 0, det = 0;
+  geo::LineCorner(vertical, horizontal, &x, &y, &det);
+  CHECK_NEAR(x, 10.0, 1e-12);
+  CHECK_NEAR(y, 20.0, 1e-12);
+  CHECK_NEAR(std::fabs(det), 1.0, 1e-12);
+  const double parallel[4] = {7, 1, 1, 0};
+  geo::LineCorner(vertical, parallel, &x, &y, &det);
+  CHECK(std::fabs(det) < 1e-12);
+
+  // Point-and-direction form.
+  CHECK(geo::IntersectDirected(0, 0, 1, 0, 3, -2, 0, 1, &x, &y));
+  CHECK_NEAR(x, 3.0, 1e-12);
+  CHECK_NEAR(y, 0.0, 1e-12);
+  CHECK(geo::IntersectDirected(1, 1, 1, 1, 4, 0, -1, 1, &x, &y));  // y = x and y = 4 - x
+  CHECK_NEAR(x, 2.0, 1e-12);
+  CHECK_NEAR(y, 2.0, 1e-12);
+  CHECK(!geo::IntersectDirected(0, 0, 1, 0, 0, 5, 2, 0, &x, &y));
+}
+
+void TestProjectHomography() {
+  const double affine[9] = {2, 0, 1, 0, 2, 3, 0, 0, 1};
+  double u = 0, v = 0, w = 0;
+  geo::ProjectHomography(affine, 1.0, 1.0, &u, &v);
+  CHECK(u == 3.0 && v == 5.0);
+  const double persp[9] = {1, 0, 0, 0, 1, 0, 0.5, 0, 1};  // w = 0.5 x + 1
+  geo::ProjectHomography(persp, 2.0, 3.0, &u, &v);
+  CHECK(u == 1.0 && v == 1.5);
+  // The eight-entry form takes the last entry separately and reports the denominator.
+  geo::ProjectHomography(persp, 1.0, 2.0, 3.0, &u, &v, &w);
+  CHECK(u == 1.0 && v == 1.5 && w == 2.0);
+  // The unit square's corners under a scale and shift.
+  const double shift[9] = {10, 0, 5, 0, 10, 7, 0, 0, 1};
+  const double cu[4] = {0, 1, 1, 0}, cv[4] = {0, 0, 1, 1};
+  const double want[4][2] = {{5, 7}, {15, 7}, {15, 17}, {5, 17}};
+  for (int k = 0; k < 4; ++k) {
+    geo::ProjectHomography(shift, cu[k], cv[k], &u, &v);
+    CHECK(u == want[k][0] && v == want[k][1]);
+  }
+}
+
+void TestSmallSolvers() {
+  const double diag[9] = {2, 0, 0, 0, 4, 0, 0, 0, 5};
+  CHECK(geo::Det3(diag) == 40.0);
+  double inv[9];
+  geo::Adjugate3(diag, 1.0 / 40.0, inv);
+  const double want_diag[9] = {0.5, 0, 0, 0, 0.25, 0, 0, 0, 0.2};
+  for (int i = 0; i < 9; ++i) CHECK_NEAR(inv[i], want_diag[i], 1e-15);
+
+  // det = 1; the inverse is integral.
+  const double m[9] = {1, 2, 3, 0, 1, 4, 5, 6, 0};
+  CHECK(geo::Det3(m) == 1.0);
+  geo::Adjugate3(m, 1.0, inv);
+  const double want[9] = {-24, 18, 5, 20, -15, -4, -5, 4, 1};
+  for (int i = 0; i < 9; ++i) CHECK(inv[i] == want[i]);
+
+  // A system that needs a row swap: x = (2, 3, -1).
+  double a[4][4] = {{2, 1, -1, 0}, {-3, -1, 2, 0}, {-2, 1, 2, 0}, {0, 0, 0, 1}};
+  double b[4] = {8, -11, -3, 7}, x[4] = {};
+  CHECK(geo::SolveGauss(3, a, b, x));
+  CHECK_NEAR(x[0], 2.0, 1e-12);
+  CHECK_NEAR(x[1], 3.0, 1e-12);
+  CHECK_NEAR(x[2], -1.0, 1e-12);
+  // A zero leading entry is pivoted away; a singular matrix is refused.
+  double p[4][4] = {{0, 1, 0, 0}, {1, 0, 0, 0}, {0, 0, 2, 0}, {0, 0, 0, 1}};
+  double pb[4] = {3, 4, 6, 0};
+  CHECK(geo::SolveGauss(3, p, pb, x));
+  CHECK(x[0] == 4.0 && x[1] == 3.0 && x[2] == 3.0);
+  double sing[4][4] = {{1, 2, 0, 0}, {2, 4, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+  double sb[4] = {1, 2, 3, 0};
+  CHECK(!geo::SolveGauss(3, sing, sb, x));
+}
+
+void TestHull() {
+  // Sorted unique points of a 4 x 4 grid plus interior points: the hull is the four corners.
+  using P = std::pair<int, int>;
+  std::vector<P> pts;
+  for (int x = 0; x <= 4; ++x)
+    for (int y = 0; y <= 4; ++y) pts.push_back({x, y});
+  auto cross = [](const P &o, const P &a, const P &b) {
+    return static_cast<int64_t>(a.first - o.first) * (b.second - o.second) -
+           static_cast<int64_t>(a.second - o.second) * (b.first - o.first);
+  };
+  std::vector<P> hull(2 * pts.size());
+  hull.resize(geo::MonotoneChain(pts.data(), pts.size(), hull.data(), cross));
+  const P want[4] = {{0, 0}, {4, 0}, {4, 4}, {0, 4}};  // counter-clockwise from the lowest-x, lowest-y point
+  CHECK(hull.size() == 4);
+  for (size_t i = 0; i < hull.size() && i < 4; ++i) CHECK(hull[i] == want[i]);
+
+  // Doubles, with a collinear point on an edge that is dropped.
+  struct Pt {
+    double x, y;
+  };
+  const Pt sq[6] = {{0, 0}, {0, 2}, {1, 1}, {2, 0}, {2, 2}, {1, 0}};
+  std::vector<Pt> sorted(sq, sq + 6);
+  std::sort(sorted.begin(), sorted.end(), [](const Pt &a, const Pt &b) { return a.x < b.x || (a.x == b.x && a.y < b.y); });
+  auto dcross = [](const Pt &o, const Pt &a, const Pt &b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); };
+  std::vector<Pt> dh(2 * sorted.size());
+  dh.resize(geo::MonotoneChain(sorted.data(), sorted.size(), dh.data(), dcross));
+  CHECK(dh.size() == 4);
+  double area2 = 0;  // twice the signed area: positive for counter-clockwise
+  for (size_t i = 0; i < dh.size(); ++i) {
+    const Pt &a = dh[i], &b = dh[(i + 1) % dh.size()];
+    area2 += a.x * b.y - a.y * b.x;
+  }
+  CHECK_NEAR(area2, 8.0, 1e-12);
+}
+
+void TestQuadShape() {
+  const double rect[4][2] = {{1, 2}, {7, 2}, {7, 10}, {1, 10}};  // 6 x 8
+  CHECK_NEAR(geo::MeanSide(rect), 7.0, 1e-15);
+  CHECK_NEAR(geo::MinSide(rect), 6.0, 1e-15);
+  double cx, cy;
+  geo::QuadCentre(rect, &cx, &cy);
+  CHECK(cx == 4.0 && cy == 6.0);
+  const geo::Bounds b = geo::QuadBounds(rect);
+  CHECK(b.xlo == 1.0 && b.xhi == 7.0 && b.ylo == 2.0 && b.yhi == 10.0);
+
+  // Float corners (upstream's quad) take the float path and a rotated corner order changes nothing.
+  const float fq[4][2] = {{3, 4}, {3, 0}, {0, 0}, {0, 4}};
+  CHECK_NEAR(geo::MeanSide(fq), 3.5, 1e-6);
+  CHECK_NEAR(geo::MinSide(fq), 3.0, 1e-6);
+  geo::QuadCentre(fq, &cx, &cy);
+  CHECK(cx == 1.5 && cy == 2.0);
+  const geo::Bounds fb = geo::QuadBounds(fq);
+  CHECK(fb.xlo == 0.0 && fb.xhi == 3.0 && fb.ylo == 0.0 && fb.yhi == 4.0);
+}
+
+void TestGeom() {
+  TestBilinearAndMedian();
+  TestLineCorners();
+  TestProjectHomography();
+  TestSmallSolvers();
+  TestHull();
+  TestQuadShape();
 }
 
 // ---------------------------------------------------------------- edge locators on rendered edges
@@ -572,6 +740,7 @@ int main(int argc, char **argv) {
   bool ran = false;
   if (all || !std::strcmp(which, "decode")) TestDecode(), ran = true;
   if (all || !std::strcmp(which, "geometry")) TestGeometry(), ran = true;
+  if (all || !std::strcmp(which, "geom")) TestGeom(), ran = true;
   if (all || !std::strcmp(which, "edges")) TestEdges(), ran = true;
   if (all || !std::strcmp(which, "quadfit")) TestQuadFit(), ran = true;
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;

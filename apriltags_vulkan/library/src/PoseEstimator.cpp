@@ -1,5 +1,7 @@
 #include "vkapriltag/PoseEstimator.h"
 
+#include "Geometry.h"
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -67,26 +69,14 @@ void Mat3TransposedMulVec(const Mat3 a, const Vec3 x, Vec3 out) {
   for (int i = 0; i < 3; ++i) out[i] = a[0][i] * x[0] + a[1][i] * x[1] + a[2][i] * x[2];
 }
 
-double Mat3Det(const Mat3 a) {
-  return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) -
-         a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
-         a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
-}
+double Mat3Det(const Mat3 a) { return geom::Det3(&a[0][0]); }
 
 // Adjugate inverse. Returns false when `a` is singular to working precision.
 bool Mat3Inverse(const Mat3 a, Mat3 out) {
   const double det = Mat3Det(a);
   if (!(std::fabs(det) > 0.0) || !std::isfinite(det)) return false;
   const double inv_det = 1.0 / det;
-  out[0][0] = (a[1][1] * a[2][2] - a[1][2] * a[2][1]) * inv_det;
-  out[0][1] = (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * inv_det;
-  out[0][2] = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * inv_det;
-  out[1][0] = (a[1][2] * a[2][0] - a[1][0] * a[2][2]) * inv_det;
-  out[1][1] = (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * inv_det;
-  out[1][2] = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * inv_det;
-  out[2][0] = (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * inv_det;
-  out[2][1] = (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * inv_det;
-  out[2][2] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * inv_det;
+  geom::Adjugate3(&a[0][0], inv_det, &out[0][0]);
   for (int i = 0; i < 3; ++i)
     for (int j = 0; j < 3; ++j)
       if (!std::isfinite(out[i][j])) return false;

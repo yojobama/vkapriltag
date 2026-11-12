@@ -1,5 +1,7 @@
 #include "vkapriltag/gpu/MultiLevelDetector.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -12,12 +14,8 @@ struct QuadShape {
 };
 
 QuadShape ShapeOf(const DetectedQuad &q) {
-  QuadShape s{0, 0, 0};
-  for (int k = 0; k < 4; ++k) {
-    s.cx += 0.25 * q.p[k][0];
-    s.cy += 0.25 * q.p[k][1];
-    s.side += 0.25 * std::hypot(q.p[(k + 1) & 3][0] - q.p[k][0], q.p[(k + 1) & 3][1] - q.p[k][1]);
-  }
+  QuadShape s{0, 0, geom::MeanSide(q.p)};
+  geom::QuadCentre(q.p, &s.cx, &s.cy);
   return s;
 }
 
