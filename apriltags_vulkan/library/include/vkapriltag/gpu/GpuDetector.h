@@ -12,6 +12,7 @@
 #include <span>
 #include <vector>
 
+#include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/WorkerPool.h"
 #include "vkapriltag/gpu/KeepAlive.h"
 #include "vkapriltag/gpu/Types.h"
@@ -314,6 +315,7 @@ class GpuDetector {
   VkSemaphore upload_semaphore_ = VK_NULL_HANDLE;
   VkSemaphore pending_wait_ = VK_NULL_HANDLE;
   DetectorConfig config_;
+  Options env_;  // the environment, read once at construction
 
   // Launch geometry, taken from the device's limits.
   vk::WorkgroupSize wg1d_;

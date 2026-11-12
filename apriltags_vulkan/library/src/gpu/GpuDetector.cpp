@@ -99,7 +99,8 @@ GpuDetector::~GpuDetector() {
 
 GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_lane,
                          const DetectorConfig &config)
-    : ctx_(ctx), lane_(lane), transfer_lane_(transfer_lane), config_(config) {
+    : ctx_(ctx), lane_(lane), transfer_lane_(transfer_lane), config_(config),
+      env_(Options::FromEnvironment()) {
   if (transfer_lane_ != nullptr) {
     VkSemaphoreCreateInfo sem_info{};
     sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -138,27 +139,24 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // or launch geometry is derived from the config. ---
 
   // Caps the boundary-point count, and with it device memory.
-  if (const char *v = std::getenv("APRILTAG_VK_MIN_DIFF")) {
-    config_.min_white_black_diff = static_cast<uint32_t>(std::max(0, std::atoi(v)));
+  if (env_.Has("APRILTAG_VK_MIN_DIFF")) {
+    config_.min_white_black_diff = static_cast<uint32_t>(std::max(0, env_.Int("APRILTAG_VK_MIN_DIFF", 0)));
   }
-  if (const char *cap = std::getenv("APRILTAG_VK_MAX_POINTS")) {
-    const long parsed = std::strtol(cap, nullptr, 10);
-    if (parsed > 0) config_.max_boundary_points = static_cast<uint32_t>(parsed);
+  if (const auto parsed = env_.Long("APRILTAG_VK_MAX_POINTS"); parsed && *parsed > 0) {
+    config_.max_boundary_points = static_cast<uint32_t>(*parsed);
   }
   // Labelling iterations per chunk.
-  if (const char *chunk = std::getenv("APRILTAG_VK_UF_CHUNK")) {
-    const long parsed = std::strtol(chunk, nullptr, 10);
-    if (parsed > 0) config_.uf_iterations_per_chunk = static_cast<uint32_t>(parsed);
+  if (const auto parsed = env_.Long("APRILTAG_VK_UF_CHUNK"); parsed && *parsed > 0) {
+    config_.uf_iterations_per_chunk = static_cast<uint32_t>(*parsed);
   }
   if (config_.uf_iterations_per_chunk == 0) config_.uf_iterations_per_chunk = 1;
 
   // Derives a minimum cluster size from the smallest tag side (full-resolution pixels) and raises
   // min_cluster_pixels to it if lower.
-  if (const char *min_tag_px = std::getenv("APRILTAG_VK_MIN_TAG_PX")) {
-    const long parsed = std::strtol(min_tag_px, nullptr, 10);
-    if (parsed > 0) config_.min_tag_pixels = static_cast<uint32_t>(parsed);
+  if (const auto parsed = env_.Long("APRILTAG_VK_MIN_TAG_PX"); parsed && *parsed > 0) {
+    config_.min_tag_pixels = static_cast<uint32_t>(*parsed);
   }
-  if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) config_.small_tag_rescue = v[0] != '0';
+  config_.small_tag_rescue = ResolveSmallTagRescue(env_, config_.small_tag_rescue);
   if (config_.small_tag_rescue && config_.decimation > 1) {
     config_.min_cluster_pixels = std::min<uint32_t>(config_.min_cluster_pixels, 8u);
     // Raises the contrast floor so noise specks of 8 to 24 pixels are not labelled.
@@ -220,8 +218,8 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // Limited to 256 threads on integrated GPUs and 1,024 on others; APRILTAG_VK_SORT_WG overrides it.
   local_sort_cap_ = std::min(
       local_sort_cap_, caps.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 256u : 1024u);
-  if (const char *v = std::getenv("APRILTAG_VK_SORT_WG")) {
-    const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+  if (const auto v = env_.ULong("APRILTAG_VK_SORT_WG")) {
+    const uint32_t wanted = static_cast<uint32_t>(*v);
     if (wanted >= 1u) {
       local_sort_cap_ = std::min(PrevPow2(wanted), PrevPow2(std::max(caps.max_workgroup_invocations, 1u)));
     }
@@ -234,13 +232,13 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
   // 1024 rather than 2048: half the shared memory, and more workgroups on a large blob.
   local_sort_split_ = std::min(1024u, shared_cap);
   // APRILTAG_VK_SORT_SPLIT overrides it (a power of two, at most the capacity).
-  if (const char *v = std::getenv("APRILTAG_VK_SORT_SPLIT")) {
-    const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+  if (const auto v = env_.ULong("APRILTAG_VK_SORT_SPLIT")) {
+    const uint32_t wanted = static_cast<uint32_t>(*v);
     if (wanted >= 1u) local_sort_split_ = PrevPow2(wanted);
   }
   local_sort_split_ = std::min(local_sort_split_, shared_cap);
-  if (const char *v = std::getenv("APRILTAG_VK_SORT_RANK_ALL")) {
-    sort_rank_all_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) & ~3u;
+  if (const auto v = env_.ULong("APRILTAG_VK_SORT_RANK_ALL")) {
+    sort_rank_all_ = static_cast<uint32_t>(*v) & ~3u;
   }
   // sort_points_local's shared memory: s_packed and s_merge of local_sort_split_ words each, plus
   // s_rank's sort_rank_all_ words; it must fit the device.
@@ -278,25 +276,21 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
 
   // Completion by polling a flag: on by default only with device-coherent host memory, where the
   // write is visible to the host while the submission runs; APRILTAG_VK_FLAG_POLL=1 forces it.
-  const char *flag_env = std::getenv("APRILTAG_VK_FLAG_POLL");
-  const bool want_flag =
-      flag_env != nullptr ? flag_env[0] != '0' : ctx_.caps().has_device_coherent_memory;
+  const bool want_flag = env_.Bool("APRILTAG_VK_FLAG_POLL", ctx_.caps().has_device_coherent_memory);
   if (want_flag && prerecord_ && fused_submits_) {
     completion_flag_ = std::make_unique<vk::CompletionFlag>(ctx_);
   }
 
-  int keepalive_ms = config_.keepalive_ms;
-  if (const char *v = std::getenv("APRILTAG_VK_KEEPALIVE_MS")) keepalive_ms = std::atoi(v);
+  int keepalive_ms = env_.Int("APRILTAG_VK_KEEPALIVE_MS", config_.keepalive_ms);
   if (keepalive_ms < 0) {
     keepalive_ms = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 6 : 0;
   }
-  int prewarm_lead_us = config_.prewarm_lead_us;
-  if (const char *v = std::getenv("APRILTAG_VK_PREWARM_LEAD_US")) prewarm_lead_us = std::atoi(v);
+  int prewarm_lead_us = env_.Int("APRILTAG_VK_PREWARM_LEAD_US", config_.prewarm_lead_us);
   if (prewarm_lead_us < 0) prewarm_lead_us = 3000;
   uint32_t prewarm_burst = config_.prewarm_burst;
-  if (const char *v = std::getenv("APRILTAG_VK_PREWARM_BURST")) prewarm_burst = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+  if (env_.Has("APRILTAG_VK_PREWARM_BURST")) prewarm_burst = static_cast<uint32_t>(std::max(1, env_.Int("APRILTAG_VK_PREWARM_BURST", 1)));
   uint32_t prewarm_gap_us = config_.prewarm_gap_us;
-  if (const char *v = std::getenv("APRILTAG_VK_PREWARM_GAP_US")) prewarm_gap_us = static_cast<uint32_t>(std::max(0, std::atoi(v)));
+  if (env_.Has("APRILTAG_VK_PREWARM_GAP_US")) prewarm_gap_us = static_cast<uint32_t>(std::max(0, env_.Int("APRILTAG_VK_PREWARM_GAP_US", 0)));
   if (keepalive_ms > 0 || prewarm_lead_us > 0) {
     if (std::unique_ptr<vk::Lane> keepalive_lane = ctx_.CreateSiblingLane(lane_)) {
       keepalive_buf_ = vk::Buffer(ctx_, 4, kSsboUsage, vk::MemoryKind::DeviceLocal);
@@ -306,7 +300,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
       options.interval = std::chrono::milliseconds(std::max(keepalive_ms, 0));
       options.lead = std::chrono::microseconds(prewarm_lead_us);
       options.burst = prewarm_burst;
-      if (const char *v = std::getenv("APRILTAG_VK_PREWARM_GROUPS")) options.groups = static_cast<uint32_t>(std::max(1, std::atoi(v)));
+      if (env_.Has("APRILTAG_VK_PREWARM_GROUPS")) options.groups = static_cast<uint32_t>(std::max(1, env_.Int("APRILTAG_VK_PREWARM_GROUPS", 1)));
       options.burst_gap = std::chrono::microseconds(prewarm_gap_us);
       keepalive_ = std::make_unique<KeepAlive>(std::move(keepalive_lane), keepalive_pl_, options);
     }
@@ -317,9 +311,7 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
 
   // Opt-in per-shader GPU timing; tracing also enables it for the GPU track.
   bool want_timestamps = prof::Enabled();
-  if (const char *ts = std::getenv("APRILTAG_VK_TIMESTAMPS")) {
-    want_timestamps = want_timestamps || std::strtol(ts, nullptr, 10) != 0;
-  }
+  if (const auto ts = env_.Long("APRILTAG_VK_TIMESTAMPS")) want_timestamps = want_timestamps || *ts != 0;
   if (want_timestamps && caps.timestamps_supported) {
     timestamp_pool_ = vk::QueryPool(ctx_.device(), kNumGpuStageSpans * 2);
     timestamps_enabled_ = timestamp_pool_.valid();
@@ -414,17 +406,17 @@ void GpuDetector::CreateBuffers() {
   // With both readbacks in place, the last three submissions record as one (see fused_submits_ and
   // build_indirect_args.comp).
   fused_submits_ = linefit_direct_read_ && extents_direct_read_;
-  if (const char *v = std::getenv("APRILTAG_VK_FUSE_SUBMITS")) {
-    fused_submits_ = (v[0] != '0') && linefit_direct_read_ && extents_direct_read_;
+  if (env_.Has("APRILTAG_VK_FUSE_SUBMITS")) {
+    fused_submits_ = env_.Bool("APRILTAG_VK_FUSE_SUBMITS", true) && linefit_direct_read_ && extents_direct_read_;
   }
 
-  if (const char *v = std::getenv("APRILTAG_VK_UF_VERIFY")) uf_verify_ = v[0] != '0';
+  uf_verify_ = env_.Bool("APRILTAG_VK_UF_VERIFY", uf_verify_);
 
   // Replays pre-recorded command buffers on the fused path (APRILTAG_VK_PRERECORD=0 records every
   // frame, for per-dispatch timing and capture); not used with the transfer-queue upload.
   prerecord_ = fused_submits_ && transfer_lane_ == nullptr;
-  if (const char *v = std::getenv("APRILTAG_VK_PRERECORD")) {
-    prerecord_ = prerecord_ && v[0] != '0';
+  if (env_.Has("APRILTAG_VK_PRERECORD")) {
+    prerecord_ = prerecord_ && env_.Bool("APRILTAG_VK_PRERECORD", true);
   }
 
   // Open-addressing table for the (rep0, rep1) grouping, sized to max_raw_blobs; hash_group.comp
@@ -504,17 +496,16 @@ void GpuDetector::CreatePipelines() {
   // 2D dispatches recover (x, y) from gl_GlobalInvocationID.xy without a divide. decimation is
   // specialization constant 3, after the workgroup size's 0-2.
   // APRILTAG_VK_BOX_DECIMATE=1 averages each block instead of copying its top-left pixel.
-  const char *box_env = std::getenv("APRILTAG_VK_BOX_DECIMATE");
-  const bool want_box = box_env != nullptr ? box_env[0] != '0' : config_.box_decimate;
+  const bool want_box = env_.Bool("APRILTAG_VK_BOX_DECIMATE", config_.box_decimate);
   box_decimate_ = want_box && config_.decimation > 1;
   // Box sums of whole 2 or 4 byte rows use the integer dot product where the device has it.
-  const char *dot_env = std::getenv("APRILTAG_VK_DOT");
+  const bool dot_off = env_.Has("APRILTAG_VK_DOT") && !env_.Bool("APRILTAG_VK_DOT", true);
 #ifdef VKAPRILTAG_HAVE_DOT_SHADER
   const bool box_dot = box_decimate_ && u8 && ctx_.caps().has_integer_dot_product &&
                        (config_.decimation == 2 || config_.decimation == 4) &&
-                       !(dot_env != nullptr && dot_env[0] == '0');
+                       !dot_off;
 #else
-  (void)dot_env;
+  (void)dot_off;
   const bool box_dot = false;
 #endif
   decimate_pl_ = vk::ComputePipeline(ctx_,
@@ -534,14 +525,13 @@ void GpuDetector::CreatePipelines() {
       {decimated_view, minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_,
       {threshold_run_});
   // One thread per 4x4 block; APRILTAG_VK_FUSED_THRESHOLD=0 keeps the separate passes.
-  const char *fused_env = std::getenv("APRILTAG_VK_FUSED_THRESHOLD");
-  const bool fused_threshold = u8 && !(fused_env != nullptr && fused_env[0] == '0');
+  const bool fused_threshold =
+      u8 && !(env_.Has("APRILTAG_VK_FUSED_THRESHOLD") && !env_.Bool("APRILTAG_VK_FUSED_THRESHOLD", true));
   minmax_decimate_ = fused_threshold && !alias_decimated_ && !box_decimate_;
   threshold_block_ = fused_threshold;
   // The adaptive contrast floor (DetectorConfig::adaptive_floor_scale) is set per frame on the device
   // and needs the fused threshold.
-  double floor_scale = config_.adaptive_floor_scale;
-  if (const char *v = std::getenv("APRILTAG_VK_ADAPTIVE_FLOOR")) floor_scale = std::atof(v);
+  const double floor_scale = env_.Float("APRILTAG_VK_ADAPTIVE_FLOOR", config_.adaptive_floor_scale);
   floor_scale_tenths_ = static_cast<uint32_t>(std::max(0.0, floor_scale * 10.0 + 0.5));
   adaptive_floor_ = threshold_block_ && floor_scale_tenths_ > 0;
   if (minmax_decimate_) {
@@ -557,18 +547,17 @@ void GpuDetector::CreatePipelines() {
   // keeps uf_init and a compression.
   uf_init_scan_ = !uf_verify_ && ctx_.caps().has_subgroup_arithmetic &&
                   ctx_.caps().subgroup_size > 0 && wg1d_.x / ctx_.caps().subgroup_size <= 64u;
-  if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_SCAN")) {
-    uf_init_scan_ = uf_init_scan_ && v[0] != '0';
+  if (env_.Has("APRILTAG_VK_UF_INIT_SCAN")) {
+    uf_init_scan_ = uf_init_scan_ && env_.Bool("APRILTAG_VK_UF_INIT_SCAN", true);
   }
   // Blob sizes counted per run piece (uf_count_runs) on integrated GPUs with uf_init_scan;
   // APRILTAG_VK_COUNT_RUNS overrides the device test.
   count_runs_ = uf_init_scan_ && ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-  if (const char *v = std::getenv("APRILTAG_VK_COUNT_RUNS")) {
-    count_runs_ = uf_init_scan_ && v[0] != '0';
+  if (env_.Has("APRILTAG_VK_COUNT_RUNS")) {
+    count_runs_ = uf_init_scan_ && env_.Bool("APRILTAG_VK_COUNT_RUNS", true);
   }
   // DetectorConfig::sparse_labelling needs the fused threshold, uf_init_scan and uf_count_runs.
-  bool want_sparse = config_.sparse_labelling;
-  if (const char *v = std::getenv("APRILTAG_VK_SPARSE")) want_sparse = v[0] != '0';
+  const bool want_sparse = env_.Bool("APRILTAG_VK_SPARSE", config_.sparse_labelling);
   sparse_ = threshold_block_ && uf_init_scan_ && count_runs_ && want_sparse;
   if (threshold_block_) {
     threshold_block_pl_ = vk::ComputePipeline(
@@ -608,8 +597,8 @@ void GpuDetector::CreatePipelines() {
   // APRILTAG_VK_MERGE_X4 overrides the device test.
   const bool merge_x4_possible = u8 && decimated_width_ % 4u == 0u;
   merge_x4_ = merge_x4_possible && ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
-  if (const char *v = std::getenv("APRILTAG_VK_MERGE_X4")) {
-    merge_x4_ = merge_x4_possible && v[0] != '0';
+  if (env_.Has("APRILTAG_VK_MERGE_X4")) {
+    merge_x4_ = merge_x4_possible && env_.Bool("APRILTAG_VK_MERGE_X4", true);
   }
   uf_merge_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(merge_x4_ ? "uf_merge_x4_u8" : pick("uf_merge", "uf_merge_u8")),
@@ -619,8 +608,8 @@ void GpuDetector::CreatePipelines() {
   // Rows merged in bands of this many (a power of two) before the band boundaries, on discrete GPUs;
   // 0 is one pass. APRILTAG_VK_MERGE_BAND overrides.
   merge_band_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || sparse_ ? 0u : 8u;
-  if (const char *v = std::getenv("APRILTAG_VK_MERGE_BAND")) {
-    const uint32_t wanted = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+  if (const auto v = env_.ULong("APRILTAG_VK_MERGE_BAND")) {
+    const uint32_t wanted = static_cast<uint32_t>(*v);
     merge_band_ = wanted >= 2u ? PrevPow2(wanted) : 0u;
   }
   // Binding 1 / the third push constant are the convergence flag and the
@@ -648,9 +637,7 @@ void GpuDetector::CreatePipelines() {
 
   // A leaner tail where a dispatch is costly (bit 1: fixed-grid kernels, bit 2: offsets from select).
   lean_tail_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3u : 0u;
-  if (const char *v = std::getenv("APRILTAG_VK_LEAN_TAIL")) {
-    lean_tail_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
-  }
+  if (const auto v = env_.ULong("APRILTAG_VK_LEAN_TAIL")) lean_tail_ = static_cast<uint32_t>(*v);
   if (!fused_submits_) lean_tail_ &= ~2u;
   select_blobs_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("select_blobs"),
