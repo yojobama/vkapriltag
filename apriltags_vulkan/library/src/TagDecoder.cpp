@@ -350,35 +350,12 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
     }
 
-    // kUltraFast refines only quads that already decode unrefined; the rest are rejected here.
-    if (td_->refine_edges && refine_method_ == RefineEdgesMethod::kUltraFast) {
-      bool decodes;
-      {
-        VKA_PROF_SCOPE("tag.probe");
-        zarray_t *probe = probe_[slot];
-        zarray_truncate(probe, 0);
-        quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, probe);
-        decodes = zarray_size(probe) > 0;
-        ClearDetections(probe);
-        if (quad_original.H) matd_destroy(quad_original.H);
-        if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
-        quad_original.H = nullptr;
-        quad_original.Hinv = nullptr;
-      }
-      if (timing) st.probe_ms += lap();
-      if (!decodes) {
-        finish(false, 0.0);
-        return;
-      }
-    }
-
     // Margin gate and probe statistics: sample the unrefined quad.
     int probe_bin = -1;
     float probe_margin = 0.0f;
     // The gate reads the first family only, so it needs exactly one registered.
     const bool gate = probe_margin_ > 0.0f && zarray_size(td_->tag_families) == 1;
-    if ((collect_probe_ || gate) && td_->refine_edges &&
-        refine_method_ != RefineEdgesMethod::kUltraFast) {
+    if ((collect_probe_ || gate) && td_->refine_edges) {
       struct quad unrefined = quad_original;
       unrefined.H = nullptr;
       unrefined.Hinv = nullptr;

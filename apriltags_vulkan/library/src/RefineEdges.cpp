@@ -8,11 +8,6 @@
 #include <cstdlib>
 #include <string>
 
-extern "C" {
-// Exposed non-static by cmake/patches/apriltag-expose-decode-steps.patch.
-void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct quad *quad);
-}
-
 namespace apriltag_vulkan {
 namespace {
 
@@ -151,121 +146,6 @@ void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
     lines[edge][1] = Ey;
     lines[edge][2] = cosf(normal_theta);
     lines[edge][3] = sinf(normal_theta);
-  }
-
-  IntersectLines(lines, quad);
-}
-
-// Single-precision refinement. Each sample's search profile is evaluated once per position: the
-// gradient's far tap at one step is the near tap eight steps earlier. The weighting pass is
-// branch-free with independent accumulators, and the line fit uses moments centred on the edge
-// midpoint so float suffices.
-constexpr int kStepsPerUnit = 4;
-constexpr int kTapLag = 2 * kStepsPerUnit;  // steps between a tap and the same point as the far tap
-constexpr int kMaxProfile = 128;
-constexpr int kLanes = 4;
-
-void RefineEdgesFast(int quad_decimate, const image_u8_t *im, struct quad *quad) {
-  const int range = quad_decimate + 1;
-  const int max_steps = 2 * kStepsPerUnit * range + 1;
-  const int profile_len = max_steps + kTapLag;
-  if (profile_len > kMaxProfile) {
-    RefineEdgesT<double>(quad_decimate, im, quad);
-    return;
-  }
-
-  const float step_length = 1.0f / kStepsPerUnit;
-  const float delta = 0.5f;
-  const int max_x = im->width - 1;  // bilinear taps need x + 1 < width
-  const int max_y = im->height - 1;
-
-  double lines[4][4];  // for each line, [Ex Ey nx ny]
-
-  for (int edge = 0; edge < 4; edge++) {
-    const int a = edge, b = (edge + 1) & 3;
-
-    double nx = quad->p[b][1] - quad->p[a][1];
-    double ny = -quad->p[b][0] + quad->p[a][0];
-    const double mag = std::sqrt(nx * nx + ny * ny);
-    nx /= mag;
-    ny /= mag;
-    if (quad->reversed_border) {
-      nx = -nx;
-      ny = -ny;
-    }
-
-    const int nsamples = std::max(16, static_cast<int>(mag / 8));
-    const float snx = static_cast<float>(nx);
-    const float sny = static_cast<float>(ny);
-
-    // Moments of the refined points relative to the edge midpoint.
-    const double xm = 0.5 * (quad->p[a][0] + quad->p[b][0]);
-    const double ym = 0.5 * (quad->p[a][1] + quad->p[b][1]);
-    float Mx = 0, My = 0, Mxx = 0, Mxy = 0, Myy = 0, N = 0;
-
-    for (int s = 0; s < nsamples; s++) {
-      const double alpha = (1.0 + s) / (nsamples + 1);
-      const double x0 = alpha * quad->p[a][0] + (1 - alpha) * quad->p[b][0];
-      const double y0 = alpha * quad->p[a][1] + (1 - alpha) * quad->p[b][1];
-      const float sx0 = static_cast<float>(x0);
-      const float sy0 = static_cast<float>(y0);
-
-      // profile[m] samples the image at offset -range - 1 + m / kStepsPerUnit along the normal.
-      float profile[kMaxProfile];
-      float valid[kMaxProfile];
-      for (int m = 0; m < profile_len; ++m) {
-        const float u = -range - 1 + step_length * m;
-        const float x = sx0 + u * snx - delta;
-        const float y = sy0 + u * sny - delta;
-        const float xt = std::trunc(x);
-        const float yt = std::trunc(y);
-        const float fx = x - xt;
-        const float fy = y - yt;
-        const int xi = static_cast<int>(xt);
-        const int yi = static_cast<int>(yt);
-        const bool in = xi >= 0 && xi < max_x && yi >= 0 && yi < max_y;
-        const int xc = std::min(std::max(xi, 0), max_x - 1);
-        const int yc = std::min(std::max(yi, 0), max_y - 1);
-        profile[m] = BilinearAt<float>(im, xc, yc, fx, fy);
-        valid[m] = in ? 1.0f : 0.0f;
-      }
-
-      float Mn[kLanes] = {}, Mc[kLanes] = {};
-      for (int step = 0; step < max_steps; ++step) {
-        const float g2 = profile[step];
-        const float g1 = profile[step + kTapLag];
-        const float d = g2 - g1;
-        const float ok = (valid[step] * valid[step + kTapLag]) * (g1 >= g2 ? 1.0f : 0.0f);
-        const float weight = ok * d * d;
-        const float n = -range + step_length * step;
-        Mn[step % kLanes] += weight * n;
-        Mc[step % kLanes] += weight;
-      }
-      const float Mnsum = (Mn[0] + Mn[1]) + (Mn[2] + Mn[3]);
-      const float Mcount = (Mc[0] + Mc[1]) + (Mc[2] + Mc[3]);
-      if (Mcount == 0) continue;
-
-      const float n0 = Mnsum / Mcount;
-      const float bx = static_cast<float>(x0 - xm) + n0 * snx;
-      const float by = static_cast<float>(y0 - ym) + n0 * sny;
-      Mx += bx;
-      My += by;
-      Mxx += bx * bx;
-      Mxy += bx * by;
-      Myy += by * by;
-      N++;
-    }
-
-    const float mx = Mx / N, my = My / N;
-    const float Cxx = Mxx / N - mx * mx;
-    const float Cxy = Mxy / N - mx * my;
-    const float Cyy = Myy / N - my * my;
-
-    const double normal_theta = .5 * atan2f(-2 * Cxy, (Cyy - Cxx));
-    lines[edge][0] = xm + mx;
-    lines[edge][1] = ym + my;
-    lines[edge][2] = cosf(static_cast<float>(normal_theta));
-    lines[edge][3] = sinf(static_cast<float>(normal_theta));
   }
 
   IntersectLines(lines, quad);
@@ -853,10 +733,7 @@ void FitSide(double *bxs, double *bys, double *ws, int used, double range, doubl
 RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured) {
   if (const char *m = std::getenv("APRILTAG_VK_REFINE")) {
     const std::string method = m;
-    if (method == "upstream") return RefineEdgesMethod::kUpstream;
     if (method == "exact") return RefineEdgesMethod::kExact;
-    if (method == "fast") return RefineEdgesMethod::kFast;
-    if (method == "ultrafast") return RefineEdgesMethod::kUltraFast;
     if (method == "profile") return RefineEdgesMethod::kProfile;
   }
   return configured;
@@ -868,15 +745,8 @@ void RefineEdges(RefineEdgesMethod method, apriltag_detector_t *td, image_u8_t *
     case RefineEdgesMethod::kExact:
       RefineEdgesT<double>(td->quad_decimate, im, quad);
       return;
-    case RefineEdgesMethod::kFast:
-    case RefineEdgesMethod::kUltraFast:
-      RefineEdgesFast(td->quad_decimate, im, quad);
-      return;
     case RefineEdgesMethod::kProfile:
       RefineEdgesProfile(td, im, quad);
-      return;
-    case RefineEdgesMethod::kUpstream:
-      refine_edges(td, im, quad);
       return;
   }
 }

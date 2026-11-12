@@ -37,6 +37,12 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
   `motion-blur` 0.456 to 0.181; no other scenario changes. Costs about 0.07 ms on blurred frames, nothing
   measurable on sharp ones. `APRILTAG_VK_PROFILE_FEATURES=15` (bit 16 off) restores the previous output.
 
+### Removed
+
+- **The `fast`, `ultrafast` and `upstream` edge-refinement methods.** `APRILTAG_VK_REFINE` now accepts only
+  `exact` and `profile`; any other value is ignored and the default (`profile`) runs. The `refine_edges`
+  export in the upstream patch is gone with `upstream`.
+
 ### Fixed
 
 - **The keep-alive works on Windows.** Its wait rounded up to the 15.6 ms timer tick; it now uses a
