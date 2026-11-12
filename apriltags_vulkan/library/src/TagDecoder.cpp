@@ -148,6 +148,58 @@ int MaxCorrectedBits(const apriltag_family_t *f) {
   return best;
 }
 
+// A struct quad whose homographies (allocated by quad_decode_index and quad_sample_code) are freed with it.
+class OwnedQuad {
+ public:
+  OwnedQuad() { Reset(); }
+  // A copy of `from` that owns no homographies.
+  explicit OwnedQuad(const struct quad &from) : q(from) { Reset(); }
+  OwnedQuad(const OwnedQuad &) = delete;
+  OwnedQuad &operator=(const OwnedQuad &) = delete;
+  ~OwnedQuad() { Free(); }
+
+  void Free() {
+    if (q.H) matd_destroy(q.H);
+    if (q.Hinv) matd_destroy(q.Hinv);
+    Reset();
+  }
+  // Hands the caller the homography; the quad no longer owns it.
+  matd_t *ReleaseH() {
+    matd_t *h = q.H;
+    q.H = nullptr;
+    return h;
+  }
+
+  struct quad q;
+
+ private:
+  void Reset() {
+    q.H = nullptr;
+    q.Hinv = nullptr;
+  }
+};
+
+// The quad whose corners are the tag-coordinate points (us[k], vs[k]) projected through `h`.
+void QuadFromHomography(const matd_t *h, const double us[4], const double vs[4], bool reversed_border,
+                        struct quad *out) {
+  for (int k = 0; k < 4; ++k) {
+    double x, y;
+    homography_project(h, us[k], vs[k], &x, &y);
+    out->p[k][0] = static_cast<float>(x);
+    out->p[k][1] = static_cast<float>(y);
+  }
+  out->reversed_border = reversed_border;
+  out->H = nullptr;
+  out->Hinv = nullptr;
+}
+
+// The inner `width_cells` cells of a (width_cells + 2)-cell square whose homography is `h`.
+void InnerQuad(const matd_t *h, int width_cells, bool reversed_border, struct quad *out) {
+  const double r = static_cast<double>(width_cells) / (width_cells + 2);
+  const double us[4] = {-r, r, r, -r}, vs[4] = {-r, -r, r, r};  // quad_update_homographies' corners
+  QuadFromHomography(h, us, vs, reversed_border, out);
+}
+
 double NsToMs(prof::Ns ns) { return static_cast<double>(ns) / 1.0e6; }
 
 int DetectionCompare(const void *_a, const void *_b) {
@@ -329,14 +381,13 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     };
 
     const DetectedQuad &q = quads[i];
-    struct quad quad_original;
+    OwnedQuad original_owner;
+    struct quad &quad_original = original_owner.q;
     for (int k = 0; k < 4; ++k) {
       quad_original.p[k][0] = static_cast<float>(q.p[k][0]);
       quad_original.p[k][1] = static_cast<float>(q.p[k][1]);
     }
     quad_original.reversed_border = reversed_border;
-    quad_original.H = nullptr;
-    quad_original.Hinv = nullptr;
 
     if (q.coarse) {
       double fitted[4][2];
@@ -358,18 +409,15 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     // The gate reads the first family only, so it needs exactly one registered.
     const bool gate = probe_margin_ > 0.0f && zarray_size(td_->tag_families) == 1;
     if ((collect_probe_ || gate) && td_->refine_edges) {
-      struct quad unrefined = quad_original;
-      unrefined.H = nullptr;
-      unrefined.Hinv = nullptr;
+      OwnedQuad unrefined(quad_original);
       uint64_t rcode = 0;
-      const float margin = quad_sample_code(td_, &unrefined, &im, &rcode);
+      const float margin = quad_sample_code(td_, &unrefined.q, &im, &rcode);
       probe_margin = margin;
       // The nearest-code distance is only needed for the statistics.
       probe_bin = margin < 0.0f ? 16
                   : collect_probe_ ? std::min(15, apriltag_min_hamming(td_, rcode))
                                    : 0;
-      if (unrefined.H) matd_destroy(unrefined.H);
-      if (unrefined.Hinv) matd_destroy(unrefined.Hinv);
+      unrefined.Free();
       if (timing) st.probe_ms += lap();
       if (gate && margin < probe_margin_) {
         if (collect_probe_) slot_probe_[slot].rejected[probe_bin]++;
@@ -399,24 +447,18 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     if ((!grey_margin_ || (early_reject_ && large_enough)) && (check_border || check_dark)) {
       // A border read below 22 of 28 dark cells, or fewer white payload cells than the sparsest code
       // has (less two cells of error correction), cannot be a tag. Unreadable quads are kept.
-      auto cannot_decode = [&](struct quad candidate, matd_t **keep_h) {
-        candidate.H = nullptr;
-        candidate.Hinv = nullptr;
+      auto cannot_decode = [&](const struct quad &quad, matd_t **keep_h) {
+        OwnedQuad candidate(quad);
         uint64_t rcode = 0;
-        quad_sample_code(td_, &candidate, &im, &rcode);
+        quad_sample_code(td_, &candidate.q, &im, &rcode);
         bool bad = false;
         if (check_border) {
           BorderLevels border;
-          const bool read = candidate.H && ReadBorder(candidate.H, &im, family->width_at_border, &border);
+          const bool read = candidate.q.H && ReadBorder(candidate.q.H, &im, family->width_at_border, &border);
           bad = read && border.dark * 28 < 22 * border.cells;
         }
         if (check_dark && !bad) bad = std::popcount(rcode) + 2 < min_white_cells_;
-        if (keep_h) {
-          *keep_h = candidate.H;
-          candidate.H = nullptr;
-        }
-        if (candidate.H) matd_destroy(candidate.H);
-        if (candidate.Hinv) matd_destroy(candidate.Hinv);
+        if (keep_h) *keep_h = candidate.ReleaseH();
         return bad;
       };
       matd_t *outer_h = nullptr;
@@ -424,16 +466,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       if (reject && grey_margin_) {
         reject = false;
         if (outer_h) {
-          const double r = static_cast<double>(family->width_at_border) / (family->width_at_border + 2);
           struct quad inner;
-          const double sx[4] = {-1, 1, 1, -1}, sy[4] = {-1, -1, 1, 1};
-          for (int k = 0; k < 4; ++k) {
-            double x, y;
-            homography_project(outer_h, sx[k] * r, sy[k] * r, &x, &y);
-            inner.p[k][0] = static_cast<float>(x);
-            inner.p[k][1] = static_cast<float>(y);
-          }
-          inner.reversed_border = reversed_border;
+          InnerQuad(outer_h, family->width_at_border, reversed_border, &inner);
           reject = cannot_decode(inner, nullptr);
         }
       }
@@ -466,32 +500,17 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       VKA_PROF_SCOPE("tag.inner");
       apriltag_family_t *family = nullptr;
       zarray_get(td_->tag_families, 0, &family);
-      const double r = static_cast<double>(family->width_at_border) / (family->width_at_border + 2);
-      struct quad inner;
-      const double sx[4] = {-1, 1, 1, -1}, sy[4] = {-1, -1, 1, 1};  // quad_update_homographies' corners
-      for (int k = 0; k < 4; ++k) {
-        double x, y;
-        homography_project(quad_original.H, sx[k] * r, sy[k] * r, &x, &y);
-        inner.p[k][0] = static_cast<float>(x);
-        inner.p[k][1] = static_cast<float>(y);
-      }
-      inner.reversed_border = reversed_border;
-      inner.H = nullptr;
-      inner.Hinv = nullptr;
+      OwnedQuad inner;
+      InnerQuad(quad_original.H, family->width_at_border, reversed_border, &inner.q);
       zarray_t *probe = probe_[slot];
       zarray_truncate(probe, 0);
-      quad_decode_index(td_, &inner, &im, /*im_samples=*/nullptr, probe);
+      quad_decode_index(td_, &inner.q, &im, /*im_samples=*/nullptr, probe);
       const bool decodes = zarray_size(probe) > 0;
       ClearDetections(probe);
-      if (inner.H) matd_destroy(inner.H);
-      if (inner.Hinv) matd_destroy(inner.Hinv);
-      inner.H = nullptr;
-      inner.Hinv = nullptr;
+      inner.Free();
       if (decodes) {
-        RefineEdges(refine_method_, td_, &im, &inner);
-        quad_decode_index(td_, &inner, &im, /*im_samples=*/nullptr, per_quad_[i]);
-        if (inner.H) matd_destroy(inner.H);
-        if (inner.Hinv) matd_destroy(inner.Hinv);
+        RefineEdges(refine_method_, td_, &im, &inner.q);
+        quad_decode_index(td_, &inner.q, &im, /*im_samples=*/nullptr, per_quad_[i]);
       }
     }
 
@@ -514,27 +533,19 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         const double u0 = (bad & 8) ? -1 + one : -1, u1 = (bad & 2) ? 1 - one : 1;
         const double v0 = (bad & 1) ? -1 + one : -1, v1 = (bad & 4) ? 1 - one : 1;
         const double us[4] = {u0, u1, u1, u0}, vs[4] = {v0, v0, v1, v1};
-        struct quad moved;
-        for (int k = 0; k < 4; ++k) {
-          double x, y;
-          homography_project(quad_original.H, us[k], vs[k], &x, &y);
-          moved.p[k][0] = static_cast<float>(x);
-          moved.p[k][1] = static_cast<float>(y);
-        }
-        moved.reversed_border = reversed_border;
-        moved.H = nullptr;
-        moved.Hinv = nullptr;
-        RefineEdges(refine_method_, td_, &im, &moved);
+        OwnedQuad moved;
+        QuadFromHomography(quad_original.H, us, vs, reversed_border, &moved.q);
+        RefineEdges(refine_method_, td_, &im, &moved.q);
         zarray_t *probe = probe_[slot];
         zarray_truncate(probe, 0);
-        quad_decode_index(td_, &moved, &im, /*im_samples=*/nullptr, probe);
+        quad_decode_index(td_, &moved.q, &im, /*im_samples=*/nullptr, probe);
         bool keep = false;
-        if (zarray_size(probe) == 1 && moved.H) {
+        if (zarray_size(probe) == 1 && moved.q.H) {
           apriltag_detection_t *old_det = nullptr, *new_det = nullptr;
           zarray_get(per_quad_[i], 0, &old_det);
           zarray_get(probe, 0, &new_det);
           BorderLevels after;
-          if (new_det->id == old_det->id && ReadBorder(moved.H, &im, w, &after)) {
+          if (new_det->id == old_det->id && ReadBorder(moved.q.H, &im, w, &after)) {
             double level_before = 0, level_after = 0;
             for (int k = 0; k < 4; ++k) level_before += before.side_level[k], level_after += after.side_level[k];
             keep = level_after < level_before - 0.2;
@@ -546,8 +557,6 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
           }
         }
         if (!keep) ClearDetections(probe);
-        if (moved.H) matd_destroy(moved.H);
-        if (moved.Hinv) matd_destroy(moved.Hinv);
       }
     }
 
@@ -557,13 +566,11 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       VKA_PROF_SCOPE("tag.thirdbit");
       apriltag_family_t *family = nullptr;
       zarray_get(td_->tag_families, 0, &family);
-      struct quad sampled = quad_original;
-      sampled.H = nullptr;
-      sampled.Hinv = nullptr;
+      OwnedQuad sampled(quad_original);
       uint64_t rcode = 0;
-      const float margin = quad_sample_code(td_, &sampled, &im, &rcode);
+      const float margin = quad_sample_code(td_, &sampled.q, &im, &rcode);
       int id = 0, rotation = 0;
-      if (margin >= 0 && sampled.H && MatchThreeTouchingBits(third_index_, rcode, &id, &rotation)) {
+      if (margin >= 0 && sampled.q.H && MatchThreeTouchingBits(third_index_, rcode, &id, &rotation)) {
         apriltag_detection_t *det = static_cast<apriltag_detection_t *>(calloc(1, sizeof(apriltag_detection_t)));
         det->family = family;
         det->id = id;
@@ -576,7 +583,7 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         MATD_EL(R, 1, 0) = std::sin(theta);
         MATD_EL(R, 1, 1) = std::cos(theta);
         MATD_EL(R, 2, 2) = 1;
-        det->H = matd_op("M*M", sampled.H, R);
+        det->H = matd_op("M*M", sampled.q.H, R);
         matd_destroy(R);
         homography_project(det->H, 0, 0, &det->c[0], &det->c[1]);
         for (int k = 0; k < 4; ++k) {  // counter-clockwise from (-1, -1), as quad_decode_index
@@ -584,8 +591,6 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
         }
         zarray_add(per_quad_[i], &det);
       }
-      if (sampled.H) matd_destroy(sampled.H);
-      if (sampled.Hinv) matd_destroy(sampled.Hinv);
     }
 
     // A small quad that did not decode: refit it from the full-resolution image and try again.
@@ -595,18 +600,14 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0 &&
           FitSmallQuad(gray_frame, static_cast<int>(width), static_cast<int>(height), box.xlo, box.ylo, box.xhi, box.yhi, fitted)) {
         VKA_PROF_SCOPE("tag.rescue");
-        struct quad refit;
+        OwnedQuad refit;
         for (int k = 0; k < 4; ++k) {
-          refit.p[k][0] = static_cast<float>(fitted[k][0]);
-          refit.p[k][1] = static_cast<float>(fitted[k][1]);
+          refit.q.p[k][0] = static_cast<float>(fitted[k][0]);
+          refit.q.p[k][1] = static_cast<float>(fitted[k][1]);
         }
-        refit.reversed_border = reversed_border;
-        refit.H = nullptr;
-        refit.Hinv = nullptr;
-        RefineEdges(refine_method_, td_, &im, &refit);
-        quad_decode_index(td_, &refit, &im, /*im_samples=*/nullptr, per_quad_[i]);
-        if (refit.H) matd_destroy(refit.H);
-        if (refit.Hinv) matd_destroy(refit.Hinv);
+        refit.q.reversed_border = reversed_border;
+        RefineEdges(refine_method_, td_, &im, &refit.q);
+        quad_decode_index(td_, &refit.q, &im, /*im_samples=*/nullptr, per_quad_[i]);
       }
     }
 
@@ -632,10 +633,6 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       }
       if (timing) refine_ms += lap();
     }
-
-    // Free the homographies allocated on the stack-local quad.
-    if (quad_original.H) matd_destroy(quad_original.H);
-    if (quad_original.Hinv) matd_destroy(quad_original.Hinv);
 
     if (timing) st.decode_ms += lap();
     if (collect_probe_ && probe_bin >= 0) {
