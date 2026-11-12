@@ -583,6 +583,30 @@ void TryThirdBit(const DecodeEnv &env, Candidate &c) {
   zarray_add(c.found, &det);
 }
 
+// A small quad that did not decode: refit it from the full-resolution image and try again.
+void TrySmallRescue(const DecodeEnv &env, Candidate &c) {
+  const DetectedQuad &in = c.input;
+  if (!(env.small_rescue && env.td->quad_decimate > 1 && !in.coarse && in.gradient >= 60.0f && env.td->refine_edges &&
+        zarray_size(c.found) == 0)) {
+    return;
+  }
+  const geom::Bounds box = geom::QuadBounds(in.p);
+  double fitted[4][2];
+  if (!(box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0 &&
+        FitSmallQuad(env.im->buf, env.im->width, env.im->height, box.xlo, box.ylo, box.xhi, box.yhi, fitted))) {
+    return;
+  }
+  VKA_PROF_SCOPE("tag.rescue");
+  OwnedQuad refit;
+  for (int k = 0; k < 4; ++k) {
+    refit.q.p[k][0] = static_cast<float>(fitted[k][0]);
+    refit.q.p[k][1] = static_cast<float>(fitted[k][1]);
+  }
+  refit.q.reversed_border = env.reversed_border;
+  RefineEdges(env.refine_method, env.td, env.im, &refit.q);
+  quad_decode_index(env.td, &refit.q, env.im, /*im_samples=*/nullptr, c.found);
+}
+
 // How RunSteps ended; only kFinished candidates reach the probe statistics.
 enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 
@@ -602,23 +626,7 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
 
   TryThirdBit(env, c);
 
-  // A small quad that did not decode: refit it from the full-resolution image and try again.
-  if (env.small_rescue && env.td->quad_decimate > 1 && !c.input.coarse && c.input.gradient >= 60.0f && env.td->refine_edges && zarray_size(c.found) == 0) {
-    const geom::Bounds box = geom::QuadBounds(c.input.p);
-    double fitted[4][2];
-    if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0 &&
-        FitSmallQuad(env.im->buf, env.im->width, env.im->height, box.xlo, box.ylo, box.xhi, box.yhi, fitted)) {
-      VKA_PROF_SCOPE("tag.rescue");
-      OwnedQuad refit;
-      for (int k = 0; k < 4; ++k) {
-        refit.q.p[k][0] = static_cast<float>(fitted[k][0]);
-        refit.q.p[k][1] = static_cast<float>(fitted[k][1]);
-      }
-      refit.q.reversed_border = env.reversed_border;
-      RefineEdges(env.refine_method, env.td, env.im, &refit.q);
-      quad_decode_index(env.td, &refit.q, env.im, /*im_samples=*/nullptr, c.found);
-    }
-  }
+  TrySmallRescue(env, c);
 
   // Drop corrections beyond what the family can bear before they count as detections.
   if (env.family_limits) {
