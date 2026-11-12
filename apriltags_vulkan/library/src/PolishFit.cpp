@@ -1,5 +1,7 @@
 #include "vkapriltag/PolishFit.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -22,35 +24,27 @@ constexpr int kMotionPixels = 800;  // working-set size of the motion-blur searc
 constexpr int kMaxT = 16;           // all parameters: geometry, blur, three levels, two slopes
 
 unsigned DevFlags() {
-  static const unsigned v = [] {
-    const char *e = std::getenv("APRILTAG_VK_POLISH_DEV");
-    return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 0u;
-  }();
+  static const unsigned v = static_cast<unsigned>(
+      Options::FromEnvironment().ULong("APRILTAG_VK_POLISH_DEV").value_or(0ul));
   return v;
 }
 
 int MaxPixels() {
-  static const int v = [] {
-    const char *e = std::getenv("APRILTAG_VK_POLISH_N");
-    return e ? std::atoi(e) : 8000;
-  }();
+  static const int v = Options::FromEnvironment().Int("APRILTAG_VK_POLISH_N", 8000);
   return v;
 }
 
 struct Knobs {
   double blur_extra, win_mult, min_win, smax_mult, tol, iters, reach;
   Knobs() {
-    blur_extra = Get("APRILTAG_VK_POLISH_BLUREXTRA", 2.0);
-    win_mult = Get("APRILTAG_VK_POLISH_WINMULT", 0.8);
-    min_win = Get("APRILTAG_VK_POLISH_MINWIN", 0.5);
-    smax_mult = Get("APRILTAG_VK_POLISH_SMAXM", 1.3);
-    tol = Get("APRILTAG_VK_POLISH_TOL", 0.004);
-    iters = Get("APRILTAG_VK_POLISH_ITERS", 6);
-    reach = Get("APRILTAG_VK_POLISH_REACH", 1.6);
-  }
-  static double Get(const char *name, double fallback) {
-    const char *e = std::getenv(name);
-    return e ? std::atof(e) : fallback;
+    const Options env = Options::FromEnvironment();
+    blur_extra = env.Float("APRILTAG_VK_POLISH_BLUREXTRA", 2.0);
+    win_mult = env.Float("APRILTAG_VK_POLISH_WINMULT", 0.8);
+    min_win = env.Float("APRILTAG_VK_POLISH_MINWIN", 0.5);
+    smax_mult = env.Float("APRILTAG_VK_POLISH_SMAXM", 1.3);
+    tol = env.Float("APRILTAG_VK_POLISH_TOL", 0.004);
+    iters = env.Float("APRILTAG_VK_POLISH_ITERS", 6);
+    reach = env.Float("APRILTAG_VK_POLISH_REACH", 1.6);
   }
 };
 const Knobs kKnobs;

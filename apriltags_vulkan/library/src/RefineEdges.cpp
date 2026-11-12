@@ -1,5 +1,7 @@
 #include "vkapriltag/RefineEdges.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include "TestHooks.h"
 
 #include <algorithm>
@@ -166,10 +168,8 @@ enum ProfileFeature : unsigned {
   kDropOutliers = 1u, kCoarseToFine = 2u, kHalfwayCrossing = 4u, kClipBias = 8u, kWidenBlur = 16u
 };
 unsigned ProfileFeatures() {
-  static const unsigned features = [] {
-    const char *v = std::getenv("APRILTAG_VK_PROFILE_FEATURES");
-    return v != nullptr ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 31u;
-  }();
+  static const unsigned features = static_cast<unsigned>(
+      Options::FromEnvironment().ULong("APRILTAG_VK_PROFILE_FEATURES").value_or(31ul));
   return features;
 }
 
@@ -731,12 +731,11 @@ void FitSide(double *bxs, double *bys, double *ws, int used, double range, doubl
 }  // namespace testing
 
 RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured) {
-  if (const char *m = std::getenv("APRILTAG_VK_REFINE")) {
-    const std::string method = m;
-    if (method == "exact") return RefineEdgesMethod::kExact;
-    if (method == "profile") return RefineEdgesMethod::kProfile;
+  switch (Options::FromEnvironment().Choice("APRILTAG_VK_REFINE", {"exact", "profile"})) {
+    case 0: return RefineEdgesMethod::kExact;
+    case 1: return RefineEdgesMethod::kProfile;
+    default: return configured;
   }
-  return configured;
 }
 
 void RefineEdges(RefineEdgesMethod method, apriltag_detector_t *td, image_u8_t *im,

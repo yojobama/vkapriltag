@@ -1,5 +1,7 @@
 #include "vkapriltag/gpu/QuadDecode.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include "vkapriltag/common/Profiler.h"
 
 #include <algorithm>
@@ -749,14 +751,14 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   return result;
 }
 
-// Resolves quad_fit_method: explicit config wins, then APRILTAG_VK_QUADFIT.
-DetectorConfig::QuadFitMethod ResolveQuadFitMethod(DetectorConfig::QuadFitMethod configured) {
-  if (const char *m = std::getenv("APRILTAG_VK_QUADFIT")) {
-    const std::string method = m;
-    if (method == "dp") return DetectorConfig::QuadFitMethod::kDp;
-    if (method == "peaks") return DetectorConfig::QuadFitMethod::kPeaks;
+// Resolves quad_fit_method: APRILTAG_VK_QUADFIT (dp or peaks) overrides the configured value.
+DetectorConfig::QuadFitMethod ResolveQuadFitMethod(const Options &env,
+                                                   DetectorConfig::QuadFitMethod configured) {
+  switch (env.Choice("APRILTAG_VK_QUADFIT", {"dp", "peaks"})) {
+    case 0: return DetectorConfig::QuadFitMethod::kDp;
+    case 1: return DetectorConfig::QuadFitMethod::kPeaks;
+    default: return configured;
   }
-  return configured;
 }
 
 // UpdateFitQuads for one blob: refits the lines from the moments, intersects adjacent lines to
@@ -887,9 +889,10 @@ QuadDecode::QuadDecode(const DetectorConfig &config)
       pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker",
                                    ResolveWorkerPoolOptions(config.PoolOptions()))),
       scratch_(pool_->threads()) {
-  config_.quad_fit_method = ResolveQuadFitMethod(config_.quad_fit_method);
-  if (const char *v = std::getenv("APRILTAG_VK_SMALL_RESCUE")) config_.small_tag_rescue = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_VK_HULL_QUAD")) config_.hull_quad = v[0] != '0';
+  const Options env = Options::FromEnvironment();
+  config_.quad_fit_method = ResolveQuadFitMethod(env, config_.quad_fit_method);
+  config_.small_tag_rescue = ResolveSmallTagRescue(env, config_.small_tag_rescue);
+  config_.hull_quad = env.Bool("APRILTAG_VK_HULL_QUAD", config_.hull_quad);
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
