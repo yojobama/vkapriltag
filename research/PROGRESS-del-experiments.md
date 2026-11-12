@@ -23,3 +23,12 @@ argument of `NoteFrame` and the keep-alive `armed_pool_`/`warm_only` path. The G
 `NoteFrame()` cadence recording, `TrackingDetector`'s calls) is unchanged. One timing nuance: `NoteFrame(true)` used to wake the keep-alive thread;
 `NoteFrame()` now only records the arrival (the thread is woken by `Touch`/`ExpectGpuFrame` as before).
 Kept: `cpu_big_cores`/`APRILTAG_CPU_BIG_CORES`, `APRILTAG_CPU_THREADS`. Dropped the cache-line alignment of `generation_` (spinner-only layout).
+
+## 3. Dead code (commit 3)
+Removed: `QuadCorners` (Types.h, unused), the duplicate `#include <bit>` in TagDecoder.cpp, the unread `dwdh_pc` in `RecordUfChunk` (cppcheck unreadVariable).
+The write-only `alive` vector went with commit 1.
+Kept: `GpuDetector::last_selected_extents` and its per-frame copy: `FramePipeline::last_selected_extents()` exposes it publicly and the
+validate tool (`validate_against_libapriltag_opencv.cpp`, blob point-count histogram) reads it; the corpus tools do not.
+cppcheck (`--enable=warning,style --std=c++20 -I include src`) leftovers left alone: PoseEstimator array bounds (false positives), push-constant
+struct members reported as unused (read by shaders), `TagDecoder.cpp` knownCondition `!keep` (false positive: `keep` is set in the branch above),
+Context.cpp 32-bit `long` range compare, QuadDecode integer-overflow report, `os.fill` ignored return values, uninitialised-member and const-style notes.

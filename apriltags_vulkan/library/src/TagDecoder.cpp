@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <bit>
 #include <string>
 
 #include "BorderSample.h"

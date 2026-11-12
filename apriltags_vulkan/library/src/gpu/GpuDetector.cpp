@@ -851,7 +851,6 @@ void GpuDetector::RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier) {
 void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool trailing_compress) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
-  struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
 
   // Records `iterations` labelling passes, clearing the flag before the last merge.
   // Without `trailing_compress` the last merge is a verification merge with nothing after it.
