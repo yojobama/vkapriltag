@@ -32,3 +32,11 @@ validate tool (`validate_against_libapriltag_opencv.cpp`, blob point-count histo
 cppcheck (`--enable=warning,style --std=c++20 -I include src`) leftovers left alone: PoseEstimator array bounds (false positives), push-constant
 struct members reported as unused (read by shaders), `TagDecoder.cpp` knownCondition `!keep` (false positive: `keep` is set in the branch above),
 Context.cpp 32-bit `long` range compare, QuadDecode integer-overflow report, `os.fill` ignored return values, uninitialised-member and const-style notes.
+
+## 4. GpuDetector unfused flow (commit 4)
+`DetectUnfused`: removed `const bool fuse = false` and every `if (fuse)` branch, the `finish_frame` lambda (inlined: it ran once), the
+`final_*` copies of the counts (they equalled the unfused values), the unused fused-only indirect dispatches and `qbp_pc_count`.
+The local `record_uf_chunk` lambda was identical to `RecordUfChunk(cmd, n)` with its default `trailing_compress`, so it calls that.
+Push-constant structs keep their `count_from_buffer` field (passed 0), so the shaders are unchanged. New `GpuDetector::CollectGpuTimings()`
+holds the timestamp / dispatch-probe post-processing that `FinishFused` and `DetectUnfused` both had (the two copies differed only in line wrapping).
+The unfused flow itself (fallback for devices without host-cached memory, `APRILTAG_VK_FUSE_SUBMITS=0`) is unchanged in what it records and submits.

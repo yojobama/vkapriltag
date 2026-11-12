@@ -565,6 +565,7 @@ class GpuDetector {
   // Everything after the last submission of a fused frame: counter reads, host views of the
   // readback buffers, the profile and the GPU-timestamp spans.
   void FinishFused(const FrameStart &frame, std::chrono::steady_clock::time_point t_submitted);
+  void CollectGpuTimings();
   enum GpuStageSpan {
     kSpanClear = 0,
     kSpanThreshold,
