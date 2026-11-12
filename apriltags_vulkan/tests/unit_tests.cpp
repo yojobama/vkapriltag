@@ -282,6 +282,33 @@ void TestBilinearAndMedian() {
   CHECK(geo::MedianInPlace(four, 4) == 3.0f);
 }
 
+void TestLineCorners() {
+  // x = 10 (point (10, 5), normal (1, 0)) meets y = 20 (point (3, 20), normal (0, 1)) at (10, 20).
+  const double vertical[4] = {10, 5, 1, 0}, horizontal[4] = {3, 20, 0, 1};
+  double x = 0, y = 0, det = 0;
+  geo::LineCorner(vertical, horizontal, &x, &y, &det);
+  CHECK_NEAR(x, 10.0, 1e-12);
+  CHECK_NEAR(y, 20.0, 1e-12);
+  CHECK_NEAR(std::fabs(det), 1.0, 1e-12);
+  const double parallel[4] = {7, 1, 1, 0};
+  geo::LineCorner(vertical, parallel, &x, &y, &det);
+  CHECK(std::fabs(det) < 1e-12);
+
+  // Point-and-direction form.
+  CHECK(geo::IntersectDirected(0, 0, 1, 0, 3, -2, 0, 1, &x, &y));
+  CHECK_NEAR(x, 3.0, 1e-12);
+  CHECK_NEAR(y, 0.0, 1e-12);
+  CHECK(geo::IntersectDirected(1, 1, 1, 1, 4, 0, -1, 1, &x, &y));  // y = x and y = 4 - x
+  CHECK_NEAR(x, 2.0, 1e-12);
+  CHECK_NEAR(y, 2.0, 1e-12);
+  CHECK(!geo::IntersectDirected(0, 0, 1, 0, 0, 5, 2, 0, &x, &y));
+}
+
+void TestGeom() {
+  TestBilinearAndMedian();
+  TestLineCorners();
+}
+
 // ---------------------------------------------------------------- edge locators on rendered edges
 
 // A black square (corners given in pixel-edge coordinates, pixel i covering [i, i + 1)) on white,
@@ -601,7 +628,7 @@ int main(int argc, char **argv) {
   bool ran = false;
   if (all || !std::strcmp(which, "decode")) TestDecode(), ran = true;
   if (all || !std::strcmp(which, "geometry")) TestGeometry(), ran = true;
-  if (all || !std::strcmp(which, "geom")) TestBilinearAndMedian(), ran = true;
+  if (all || !std::strcmp(which, "geom")) TestGeom(), ran = true;
   if (all || !std::strcmp(which, "edges")) TestEdges(), ran = true;
   if (all || !std::strcmp(which, "quadfit")) TestQuadFit(), ran = true;
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;

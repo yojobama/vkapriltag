@@ -19,21 +19,13 @@ using geom::BilinearAt;
 // Moves each corner to the intersection of its two adjacent fitted lines.
 void IntersectLines(const double lines[4][4], struct quad *quad) {
   for (int i = 0; i < 4; i++) {
-    const double A00 = lines[i][3], A01 = -lines[(i + 1) & 3][3];
-    const double A10 = -lines[i][2], A11 = lines[(i + 1) & 3][2];
-    const double B0 = -lines[i][0] + lines[(i + 1) & 3][0];
-    const double B1 = -lines[i][1] + lines[(i + 1) & 3][1];
-
-    const double det = A00 * A11 - A10 * A01;
-
+    double x, y, det;
+    geom::LineCorner(lines[i], lines[(i + 1) & 3], &x, &y, &det);
+    // A degenerate intersection keeps the existing corner (as upstream).
     if (std::fabs(det) > 0.001) {
-      const double W00 = A11 / det, W01 = -A01 / det;
-      const double L0 = W00 * B0 + W01 * B1;
-
-      quad->p[(i + 1) & 3][0] = lines[i][0] + L0 * A00;
-      quad->p[(i + 1) & 3][1] = lines[i][1] + L0 * A10;
+      quad->p[(i + 1) & 3][0] = x;
+      quad->p[(i + 1) & 3][1] = y;
     }
-    // else: degenerate intersection; keep the existing corner (as upstream).
   }
 }
 
@@ -634,11 +626,10 @@ void GrowQuad(struct quad *q, double d) {
   }
   for (int k = 0; k < 4; ++k) {
     const int p = (k + 3) & 3;
-    const double cross = dx[p] * dy[k] - dy[p] * dx[k];
-    if (std::fabs(cross) < 1e-9) return;
-    const double t = ((px[k] - px[p]) * dy[k] - (py[k] - py[p]) * dx[k]) / cross;
-    q->p[k][0] = static_cast<float>(px[p] + t * dx[p]);
-    q->p[k][1] = static_cast<float>(py[p] + t * dy[p]);
+    double x, y;
+    if (!geom::IntersectDirected(px[p], py[p], dx[p], dy[p], px[k], py[k], dx[k], dy[k], &x, &y)) return;
+    q->p[k][0] = static_cast<float>(x);
+    q->p[k][1] = static_cast<float>(y);
   }
 }
 

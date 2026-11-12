@@ -44,4 +44,30 @@ inline T MedianInPlace(T *v, size_t n) {
   return v[n / 2];
 }
 
+// Corner of two lines, each [Ex Ey nx ny] (a point on it and a normal): the line `li` is met by `lj`.
+// *det is the determinant, near zero for parallel lines; the corner is meaningless then.
+inline void LineCorner(const double li[4], const double lj[4], double *x, double *y, double *det) {
+  const double A00 = li[3], A01 = -lj[3];
+  const double A10 = -li[2], A11 = lj[2];
+  const double B0 = -li[0] + lj[0];
+  const double B1 = -li[1] + lj[1];
+  *det = A00 * A11 - A10 * A01;
+  const double W00 = A11 / *det, W01 = -A01 / *det;
+  const double L0 = W00 * B0 + W01 * B1;
+  *x = li[0] + L0 * A00;
+  *y = li[1] + L0 * A10;
+}
+
+// Intersection of the line through (ax, ay) with direction (adx, ady) and the line through (bx, by) with
+// direction (bdx, bdy); false when they are parallel (|cross| < 1e-9).
+inline bool IntersectDirected(double ax, double ay, double adx, double ady, double bx, double by,
+                              double bdx, double bdy, double *x, double *y) {
+  const double cross = adx * bdy - ady * bdx;
+  if (std::fabs(cross) < 1e-9) return false;
+  const double t = ((bx - ax) * bdy - (by - ay) * bdx) / cross;
+  *x = ax + t * adx;
+  *y = ay + t * ady;
+  return true;
+}
+
 }  // namespace apriltag_vulkan::geom
