@@ -304,9 +304,31 @@ void TestLineCorners() {
   CHECK(!geo::IntersectDirected(0, 0, 1, 0, 0, 5, 2, 0, &x, &y));
 }
 
+void TestProjectHomography() {
+  const double affine[9] = {2, 0, 1, 0, 2, 3, 0, 0, 1};
+  double u = 0, v = 0, w = 0;
+  geo::ProjectHomography(affine, 1.0, 1.0, &u, &v);
+  CHECK(u == 3.0 && v == 5.0);
+  const double persp[9] = {1, 0, 0, 0, 1, 0, 0.5, 0, 1};  // w = 0.5 x + 1
+  geo::ProjectHomography(persp, 2.0, 3.0, &u, &v);
+  CHECK(u == 1.0 && v == 1.5);
+  // The eight-entry form takes the last entry separately and reports the denominator.
+  geo::ProjectHomography(persp, 1.0, 2.0, 3.0, &u, &v, &w);
+  CHECK(u == 1.0 && v == 1.5 && w == 2.0);
+  // The unit square's corners under a scale and shift.
+  const double shift[9] = {10, 0, 5, 0, 10, 7, 0, 0, 1};
+  const double cu[4] = {0, 1, 1, 0}, cv[4] = {0, 0, 1, 1};
+  const double want[4][2] = {{5, 7}, {15, 7}, {15, 17}, {5, 17}};
+  for (int k = 0; k < 4; ++k) {
+    geo::ProjectHomography(shift, cu[k], cv[k], &u, &v);
+    CHECK(u == want[k][0] && v == want[k][1]);
+  }
+}
+
 void TestGeom() {
   TestBilinearAndMedian();
   TestLineCorners();
+  TestProjectHomography();
 }
 
 // ---------------------------------------------------------------- edge locators on rendered edges

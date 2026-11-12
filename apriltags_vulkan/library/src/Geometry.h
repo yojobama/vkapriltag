@@ -70,4 +70,18 @@ inline bool IntersectDirected(double ax, double ay, double adx, double ady, doub
   return true;
 }
 
+// Projective map with row-major matrix h[0..7] and h22 as the last entry, applied to (x, y); *w is the
+// denominator.
+inline void ProjectHomography(const double *h, double h22, double x, double y, double *u, double *v, double *w) {
+  *w = h[6] * x + h[7] * y + h22;
+  *u = (h[0] * x + h[1] * y + h[2]) / *w;
+  *v = (h[3] * x + h[4] * y + h[5]) / *w;
+}
+
+// The same for a full row-major 3x3 matrix.
+inline void ProjectHomography(const double h[9], double x, double y, double *u, double *v) {
+  double w;
+  ProjectHomography(h, h[8], x, y, u, v, &w);
+}
+
 }  // namespace apriltag_vulkan::geom

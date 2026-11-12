@@ -189,9 +189,7 @@ struct Mapping {
 };
 
 inline void Project(const Mapping &m, double x, double y, double *u, double *v, double *w) {
-  *w = m.g[6] * x + m.g[7] * y + 1.0;
-  *u = (m.g[0] * x + m.g[1] * y + m.g[2]) / *w;
-  *v = (m.g[3] * x + m.g[4] * y + m.g[5]) / *w;
+  geom::ProjectHomography(m.g, 1.0, x, y, u, v, w);
 }
 
 bool Invert3(const double a[9], double out[9]) {
@@ -223,9 +221,7 @@ void CellCorners(const Mapping &m, int width, double xy[4][2]) {
   const double cu[4] = {0, static_cast<double>(width), static_cast<double>(width), 0};
   const double cv[4] = {0, 0, static_cast<double>(width), static_cast<double>(width)};
   for (int k = 0; k < 4; ++k) {
-    const double w = inv[6] * cu[k] + inv[7] * cv[k] + inv[8];
-    xy[k][0] = (inv[0] * cu[k] + inv[1] * cv[k] + inv[2]) / w;
-    xy[k][1] = (inv[3] * cu[k] + inv[4] * cv[k] + inv[5]) / w;
+    geom::ProjectHomography(inv, cu[k], cv[k], &xy[k][0], &xy[k][1]);
   }
 }
 
@@ -270,9 +266,8 @@ void ComputeBox(const Fit &f, const Mapping &map, int limit, const image_u8_t *i
   const double cu[4] = {-ext, W + ext, W + ext, -ext}, cv[4] = {-ext, -ext, W + ext, W + ext};
   double gmax = 0;
   for (int k = 0; k < 4; ++k) {
-    const double w = inv[6] * cu[k] + inv[7] * cv[k] + inv[8];
-    const double nx = (inv[0] * cu[k] + inv[1] * cv[k] + inv[2]) / w;
-    const double ny = (inv[3] * cu[k] + inv[4] * cv[k] + inv[5]) / w;
+    double nx, ny;
+    geom::ProjectHomography(inv, cu[k], cv[k], &nx, &ny);
     const double x = nx * f.scale + f.cx;
     const double y = ny * f.scale + f.cy;
     minx = std::min(minx, x);
@@ -301,9 +296,10 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
   static const double kOffset[4] = {-4.2, 1.4, -1.4, 4.2};
   int count = 0;
   const auto add = [&](double u, double v) {
-    const double w = inv[6] * u + inv[7] * v + inv[8];
-    const double X = (inv[0] * u + inv[1] * v + inv[2]) / w * f.scale + f.cx;
-    const double Y = (inv[3] * u + inv[4] * v + inv[5]) / w * f.scale + f.cy;
+    double nx, ny;
+    geom::ProjectHomography(inv, u, v, &nx, &ny);
+    const double X = nx * f.scale + f.cx;
+    const double Y = ny * f.scale + f.cy;
     if (!(X >= 0 && Y >= 0 && X < im->width && Y < im->height)) return;
     const int px = static_cast<int>(X), py = static_cast<int>(Y);
     const double xn = (px + 0.5 - f.cx) / f.scale, yn = (py + 0.5 - f.cy) / f.scale;
@@ -1074,9 +1070,10 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
       for (int j = 0; j < W; ++j) {
         for (int i = 0; i < W; ++i) {
           const double cu = i + 0.5, cv = j + 0.5;
-          const double w = inv_map[6] * cu + inv_map[7] * cv + inv_map[8];
-          const double px = (inv_map[0] * cu + inv_map[1] * cv + inv_map[2]) / w * fit.scale + fit.cx;
-          const double py = (inv_map[3] * cu + inv_map[4] * cv + inv_map[5]) / w * fit.scale + fit.cy;
+          double nx, ny;
+          geom::ProjectHomography(inv_map, cu, cv, &nx, &ny);
+          const double px = nx * fit.scale + fit.cx;
+          const double py = ny * fit.scale + fit.cy;
           const int ix = static_cast<int>(px), iy = static_cast<int>(py);
           if (ix < 0 || iy < 0 || ix >= im->width || iy >= im->height) continue;
           const double expected = fit.cls[j + 1][i + 1] ? p.lev[1] : p.lev[0];
