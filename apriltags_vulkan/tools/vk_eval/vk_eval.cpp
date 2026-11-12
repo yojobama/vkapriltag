@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "vkapriltag/TagDecoder.h"
+#include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/Profiler.h"
 #include "vkapriltag/apriltag_family.h"
 #include "vkapriltag/gpu/GpuDetector.h"
@@ -66,9 +67,15 @@ int main(int argc, char **argv) {
     else if (a == "--ref") ref = true;
     else if (a == "--family") family = next();
     else if (a == "--levels") levels_arg = next();
-    else {
+    else if (a == "--list-options") {
+      std::fputs(apriltag_vulkan::OptionsMarkdown().c_str(), stdout);
+      return 0;
+    } else if (a == "--list-option-names") {
+      for (const auto &d : apriltag_vulkan::OptionTable()) std::printf("%s\n", d.name);
+      return 0;
+    } else {
       std::cerr << "usage: vk_eval --list files.txt [--out dets.txt] [--iterations N] [--warmup N] "
-                   "[--decimation N] [--threads N] [--ref]\n";
+                   "[--decimation N] [--threads N] [--ref] | --list-options | --list-option-names\n";
       return 2;
     }
   }
