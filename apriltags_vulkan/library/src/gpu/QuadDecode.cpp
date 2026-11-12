@@ -599,16 +599,7 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
            static_cast<int64_t>(a.second - o.second) * (b.first - o.first);
   };
   hull.assign(2 * pts.size(), {0, 0});
-  size_t h = 0;
-  for (size_t i = 0; i < pts.size(); ++i) {
-    while (h >= 2 && cross(hull[h - 2], hull[h - 1], pts[i]) <= 0) --h;
-    hull[h++] = pts[i];
-  }
-  for (size_t i = pts.size() - 1, lower = h + 1; i-- > 0;) {
-    while (h >= lower && cross(hull[h - 2], hull[h - 1], pts[i]) <= 0) --h;
-    hull[h++] = pts[i];
-  }
-  hull.resize(h - 1);
+  hull.resize(geom::MonotoneChain(pts.data(), pts.size(), hull.data(), cross));
   const size_t m = hull.size();
   if (m < 4) return result;
 

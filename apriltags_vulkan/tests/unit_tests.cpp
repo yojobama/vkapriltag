@@ -357,11 +357,47 @@ void TestSmallSolvers() {
   CHECK(!geo::SolveGauss(3, sing, sb, x));
 }
 
+void TestHull() {
+  // Sorted unique points of a 4 x 4 grid plus interior points: the hull is the four corners.
+  using P = std::pair<int, int>;
+  std::vector<P> pts;
+  for (int x = 0; x <= 4; ++x)
+    for (int y = 0; y <= 4; ++y) pts.push_back({x, y});
+  auto cross = [](const P &o, const P &a, const P &b) {
+    return static_cast<int64_t>(a.first - o.first) * (b.second - o.second) -
+           static_cast<int64_t>(a.second - o.second) * (b.first - o.first);
+  };
+  std::vector<P> hull(2 * pts.size());
+  hull.resize(geo::MonotoneChain(pts.data(), pts.size(), hull.data(), cross));
+  const P want[4] = {{0, 0}, {4, 0}, {4, 4}, {0, 4}};  // counter-clockwise from the lowest-x, lowest-y point
+  CHECK(hull.size() == 4);
+  for (size_t i = 0; i < hull.size() && i < 4; ++i) CHECK(hull[i] == want[i]);
+
+  // Doubles, with a collinear point on an edge that is dropped.
+  struct Pt {
+    double x, y;
+  };
+  const Pt sq[6] = {{0, 0}, {0, 2}, {1, 1}, {2, 0}, {2, 2}, {1, 0}};
+  std::vector<Pt> sorted(sq, sq + 6);
+  std::sort(sorted.begin(), sorted.end(), [](const Pt &a, const Pt &b) { return a.x < b.x || (a.x == b.x && a.y < b.y); });
+  auto dcross = [](const Pt &o, const Pt &a, const Pt &b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); };
+  std::vector<Pt> dh(2 * sorted.size());
+  dh.resize(geo::MonotoneChain(sorted.data(), sorted.size(), dh.data(), dcross));
+  CHECK(dh.size() == 4);
+  double area2 = 0;  // twice the signed area: positive for counter-clockwise
+  for (size_t i = 0; i < dh.size(); ++i) {
+    const Pt &a = dh[i], &b = dh[(i + 1) % dh.size()];
+    area2 += a.x * b.y - a.y * b.x;
+  }
+  CHECK_NEAR(area2, 8.0, 1e-12);
+}
+
 void TestGeom() {
   TestBilinearAndMedian();
   TestLineCorners();
   TestProjectHomography();
   TestSmallSolvers();
+  TestHull();
 }
 
 // ---------------------------------------------------------------- edge locators on rendered edges

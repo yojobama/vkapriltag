@@ -133,4 +133,20 @@ bool SolveGauss(int n, double a[][kStride], double b[], double x[]) {
   return true;
 }
 
+// Andrew's monotone chain over points p[0..n) already sorted by (x, y) and unique, n >= 3: writes the hull,
+// counter-clockwise, to h (room for 2 n points) and returns its size. cross(o, a, b) is positive for a left turn.
+template <typename P, typename Cross>
+size_t MonotoneChain(const P *p, size_t n, P *h, Cross cross) {
+  size_t k = 0;
+  for (size_t i = 0; i < n; ++i) {
+    while (k >= 2 && cross(h[k - 2], h[k - 1], p[i]) <= 0) --k;
+    h[k++] = p[i];
+  }
+  for (size_t i = n - 1, lower = k + 1; i-- > 0;) {
+    while (k >= lower && cross(h[k - 2], h[k - 1], p[i]) <= 0) --k;
+    h[k++] = p[i];
+  }
+  return k - 1;
+}
+
 }  // namespace apriltag_vulkan::geom

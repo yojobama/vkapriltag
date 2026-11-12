@@ -1,5 +1,7 @@
 #include "SmallQuad.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -25,16 +27,7 @@ std::vector<Pt> ConvexHull(std::vector<Pt> &p) {
   const size_t n = p.size();
   if (n < 3) return p;
   std::vector<Pt> h(2 * n);
-  size_t k = 0;
-  for (size_t i = 0; i < n; ++i) {
-    while (k >= 2 && Cross(h[k - 2], h[k - 1], p[i]) <= 0) --k;
-    h[k++] = p[i];
-  }
-  for (size_t i = n - 1, t = k + 1; i > 0; --i) {
-    while (k >= t && Cross(h[k - 2], h[k - 1], p[i - 1]) <= 0) --k;
-    h[k++] = p[i - 1];
-  }
-  h.resize(k - 1);
+  h.resize(geom::MonotoneChain(p.data(), n, h.data(), Cross));
   return h;
 }
 
