@@ -492,6 +492,25 @@ void DecodeCandidate(const DecodeEnv &env, Candidate &c) {
   quad_decode_index(env.td, &c.quad.q, env.im, /*im_samples=*/nullptr, c.found);
 }
 
+// A grey quiet zone on a bright wall makes the quiet zone's outline the dark blob, so the quad is
+// the (W + 2) cell square: if it did not decode, try its inner W cells, once that decodes unrefined.
+void TryInnerSquare(const DecodeEnv &env, Candidate &c) {
+  if (!(env.grey_margin && env.td->refine_edges && zarray_size(c.found) == 0 && c.quad.q.H && env.family_count > 0)) {
+    return;
+  }
+  VKA_PROF_SCOPE("tag.inner");
+  OwnedQuad inner;
+  InnerQuad(c.quad.q.H, env.family->width_at_border, env.reversed_border, &inner.q);
+  zarray_truncate(c.probe, 0);
+  quad_decode_index(env.td, &inner.q, env.im, /*im_samples=*/nullptr, c.probe);
+  const bool decodes = zarray_size(c.probe) > 0;
+  ClearDetections(c.probe);
+  inner.Free();
+  if (!decodes) return;
+  RefineEdges(env.refine_method, env.td, env.im, &inner.q);
+  quad_decode_index(env.td, &inner.q, env.im, /*im_samples=*/nullptr, c.found);
+}
+
 // How RunSteps ended; only kFinished candidates reach the probe statistics.
 enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 
@@ -505,26 +524,7 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
   RefineCandidate(env, c);
   DecodeCandidate(env, c);
 
-  // A grey quiet zone on a bright wall makes the quiet zone's outline the dark blob, so the quad is
-  // the (W + 2) cell square: if it did not decode, try its inner W cells, once that decodes unrefined.
-  if (env.grey_margin && env.td->refine_edges && zarray_size(c.found) == 0 && c.quad.q.H &&
-      zarray_size(env.td->tag_families) > 0) {
-    VKA_PROF_SCOPE("tag.inner");
-    apriltag_family_t *family = nullptr;
-    zarray_get(env.td->tag_families, 0, &family);
-    OwnedQuad inner;
-    InnerQuad(c.quad.q.H, family->width_at_border, env.reversed_border, &inner.q);
-    zarray_t *probe = c.probe;
-    zarray_truncate(probe, 0);
-    quad_decode_index(env.td, &inner.q, env.im, /*im_samples=*/nullptr, probe);
-    const bool decodes = zarray_size(probe) > 0;
-    ClearDetections(probe);
-    inner.Free();
-    if (decodes) {
-      RefineEdges(env.refine_method, env.td, env.im, &inner.q);
-      quad_decode_index(env.td, &inner.q, env.im, /*im_samples=*/nullptr, c.found);
-    }
-  }
+  TryInnerSquare(env, c);
 
   // A side whose border cells read white was fitted on the quiet zone's outer edge, one cell too far
   // out (the payload still decodes through error correction). Move it in a cell, refit, and keep the
