@@ -92,7 +92,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_PROBE_STATS=1`, `APRILTAG_VK_PROBE_CSV=<file>` | Per-quad probe histograms and one CSV row per quad (analysis aid). |
 | `APRILTAG_VK_TRACE=<file>` | Write a Chrome-trace JSON of the CPU and GPU spans. See section 9. |
 | `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
-| `APRILTAG_VK_REFINE=exact\|fast\|ultrafast\|upstream` | Edge-refinement implementation; only consulted when the caller sets `td->refine_edges`. See section 4. |
+| `APRILTAG_VK_REFINE=exact\|profile` | Edge-refinement implementation (`profile` is the default); only consulted when the caller sets `td->refine_edges`. The `fast`, `ultrafast` and `upstream` methods described in section 4 have been removed. |
 | `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
 | `APRILTAG_VK_FORCE_NO_8BIT=1` | Force the 32-bit-per-pixel shader variants even where `VK_KHR_8bit_storage` is available. |
 | `APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1` | Force the 32-bit-atomic extents reduction even where `VK_KHR_shader_atomic_int64` is available. See section 3b. |

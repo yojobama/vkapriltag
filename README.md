@@ -37,14 +37,10 @@ optional fourth for pose:
    Optionally (`apriltag_detector_t::refine_edges`, off by default) also runs
    gradient-based corner refinement on each quad first, in the same per-quad
    task and the same order `apriltag_detector_detect()` uses internally.
-   Which implementation runs is `APRILTAG_VK_REFINE`'s choice: `exact` (the
-   default) is bit-identical to upstream *by construction* but drops the libm
-   `modf()` call from the inner loop, worth 25% of this stage on ARM; `fast`
-   is a single-precision variant (not bit-identical); `ultrafast` also skips
-   refinement for quads that do not decode unrefined (faster, slightly lower
-   recall on marginal tags); `upstream` calls
-   upstream's actual compiled function, so any suspected corner-accuracy
-   regression can be isolated with one environment variable. An opt-in
+   Which implementation runs is `APRILTAG_VK_REFINE`'s choice: `profile` (the
+   default) fits dense edge profiles; `exact` is bit-identical to upstream *by
+   construction* but drops the libm `modf()` call from the inner loop, worth 25%
+   of this stage on ARM. An opt-in
    margin gate (`probe_margin`, see [Performance](#performance)) skips the
    refinement of quads whose unrefined decision margin shows they cannot be
    tags.
@@ -490,8 +486,7 @@ With `refine_edges` on, 97% of the CPU refinement time goes to quads that never 
 first and skips refinement when the decision margin is below the gate or the border polarity is
 wrong. On the synthetic sweep the gated and ungated runs are byte-identical at gates 4 and 8, at
 contrast 1.0, 0.25 and 0.12 and noise sigma 3 and 8; junk quads sit at margin 4 or below and real
-tags well above it. It applies only with exactly one tag family, refinement on, and a refine mode
-other than `ultrafast`. The risk is a real tag whose unrefined margin is under the gate, so it
+tags well above it. It applies only with exactly one tag family, and refinement on. The risk is a real tag whose unrefined margin is under the gate, so it
 stays opt-in. On the Orange Pi it takes `pipeline_total` from 2.89 to 2.49 ms. A Hamming-distance
 probe was measured and rejected: it loses 9 to 20% of the tags that only decode after refinement.
 

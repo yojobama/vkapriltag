@@ -61,7 +61,7 @@ class TagDecoder {
     uint32_t quads = 0;    // candidates received
     uint32_t decoded = 0;  // candidates that produced a detection (before reconcile_detections)
     double wall_ms = 0.0;  // Decode() start to return, including the merge and reconcile
-    double probe_ms = 0.0;  // kUltraFast's unrefined decode gate
+    double probe_ms = 0.0;  // unrefined sampling before refinement
     // Refinement time, split by whether the quad went on to decode.
     double refine_ms_decoded = 0.0;
     double refine_ms_rejected = 0.0;
@@ -121,7 +121,7 @@ class TagDecoder {
   zarray_t *detections_;
   // One scratch zarray per candidate quad; grown, never shrunk, and truncated when reused.
   std::vector<zarray_t *> per_quad_;
-  // Per-thread scratch for the unrefined decode that gates kUltraFast refinement.
+  // Per-thread scratch for the unrefined decodes before refinement.
   std::vector<zarray_t *> probe_;
 
   // One cache line per thread so the per-quad accumulators do not false-share.
