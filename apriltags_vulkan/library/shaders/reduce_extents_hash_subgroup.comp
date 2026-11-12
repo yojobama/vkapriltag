@@ -1,5 +1,5 @@
 #version 450
-// Subgroup-aggregated variant of reduce_extents_hash.comp, selected at runtime
+// Subgroup-aggregated variant of the extents reduction, selected at runtime
 // when the subgroup supports BALLOT, ARITHMETIC and SHUFFLE in COMPUTE.
 //
 // Reduce by key: each iteration takes the first remaining lane as leader,

@@ -75,17 +75,11 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_FUSED_THRESHOLD=0` | Keep decimation, block min/max, block filter and threshold as separate passes. See section 8t. |
 | `APRILTAG_VK_MERGE_X4=0\|1` | `uf_merge` with 4 pixels per thread (default: on integrated GPUs only). See section 8t. |
 | `APRILTAG_VK_DISPATCH_TIMES=1` | Print the median GPU time of every dispatch when the detector is destroyed (one detector per process). See section 9. |
-| `APRILTAG_VK_GRAY_MAPPED=0` | On discrete GPUs, upload frames through a staging buffer and a GPU copy instead of writing them into mappable device memory. See section 8u. |
 | `APRILTAG_VK_MERGE_BAND=<n>` | Merge rows in bands of `n` (a power of two) before the band boundaries; `0` merges in one pass (default: 8 on discrete GPUs, 0 on integrated). See section 8u. |
-| `APRILTAG_VK_REDUCE_X4=0` | One boundary point per thread in the atomic extents reductions instead of 4. See section 8u. |
 | `APRILTAG_VK_SORT_RANK_ALL=<n>` | Blobs of at most `n` points are sorted by ranking every key in one pass (default 256; `0` disables). See section 8u. |
 | `APRILTAG_VK_COUNT_RUNS=0\|1` | Count blob sizes per run piece and find roots in two hops (default: integrated GPUs). See section 8u. |
 | `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
 | `APRILTAG_VK_PRERECORD=0` | Pre-recorded command buffers are on by default for the fused single-submission frame; `0` records every frame instead. See sections 8f and 8g. |
-| `APRILTAG_VK_UF_INIT_RUN=<n>` | Pixels of a row each `uf_init` thread initialises (default 4). See section 8q. |
-| `APRILTAG_VK_THRESH_RUN=<n>` | Pixels of a row each `threshold` thread covers (default 4). |
-| `APRILTAG_VK_DEC1_ALIAS=0` | At decimation 1, copy the grey image into the decimated buffer instead of reading it in place. |
-| `APRILTAG_VK_SORT_CHUNK=<n>` | Rank-merge sort run length (a power of two, default 16); `0` selects the Batcher sorting network. See section 8k. |
 | `APRILTAG_VK_SORT_WG=<n>` | Workgroup size of the point sort (default: the device maximum, at most 256 on integrated GPUs and 1,024 on others). See section 8w. |
 | `APRILTAG_VK_SORT_SPLIT=<n>` | Blobs of more than `n` points are sorted in runs of `n` by several workgroups and merged (a power of two; default 1,024 at decimation 1, off otherwise; `8192` turns it off). See section 8r. |
 | `APRILTAG_VK_PROBE_MARGIN=<grey levels>` | Margin gate before edge refinement (default off); overrides `TagDecoder`'s `probe_margin`. See section 8l. |
@@ -246,9 +240,9 @@ into the high half, being bounded by the boundary-point capacity, and the
 high half accumulates modulo 2^32 exactly as the 32-bit atomic did. Nothing
 unpacks afterwards - the two struct fields *are* the two halves.
 
-`reduce_extents_hash_atomic64.comp` is selected when the device reports the
+`reduce_extents_hash_atomic64_x4.comp` is selected when the device reports the
 extension plus `shaderBufferInt64Atomics` plus core `shaderInt64`;
-`reduce_extents_hash.comp` is the unconditional fallback. On the Mali-G610,
+`reduce_extents_hash_x4.comp` is the unconditional fallback. On the Mali-G610,
 A/B'd on one binary with `APRILTAG_VK_FORCE_NO_INT64_ATOMIC`:
 **`extents` 0.221 ms with, 0.252 ms without — -12 to -13%** on the span,
 ~1% of the frame, reproduced across two sessions.
@@ -1703,8 +1697,8 @@ clean on both machines):
 
 Together on the Orange Pi: `Detect()` 5.21 -> 4.78 ms at decimation 1 (-8%) and 2.12 -> 2.04 ms at
 decimation 2; load/store issue cycles -15%, starvation -10%, DRAM reads -3% and writes -6% per frame.
-`APRILTAG_VK_UF_INIT_RUN`, `APRILTAG_VK_THRESH_RUN` and `APRILTAG_VK_DEC1_ALIAS=0` restore the old
-behaviour for comparison.
+`APRILTAG_VK_UF_INIT_RUN`, `APRILTAG_VK_THRESH_RUN` and `APRILTAG_VK_DEC1_ALIAS=0` restored the old
+behaviour for comparison; they were removed in the next release after 1.10.1.
 
 **Measured and not changed.** Workgroup size (1D 64 to 512, 2D 8x8 to 32x8): within 1% everywhere.
 The sort's workgroup: 128 and 64 threads are 50% and 120% slower at decimation 1 and 512 or 1,024 no
@@ -1961,7 +1955,7 @@ synchronisation analysis):
 
 | change | where | effect |
 | --- | --- | --- |
-| frames written into mappable device memory on discrete GPUs (`APRILTAG_VK_GRAY_MAPPED=0` keeps the staging copy) | RX 9060 XT | 4 streams +13% to +32%, 1 stream +2% to +4%; 4 streams with `exact` at decimation 2 (CPU-bound) -2% |
+| frames written into mappable device memory on discrete GPUs (the `APRILTAG_VK_GRAY_MAPPED=0` switch that kept the staging copy has been removed) | RX 9060 XT | 4 streams +13% to +32%, 1 stream +2% to +4%; 4 streams with `exact` at decimation 2 (CPU-bound) -2% |
 | `uf_merge` in two phases, inside 8-row bands then across them, on discrete GPUs | RX 9060 XT | `uf_merge` 95 -> 59 us (decimation 1), 86 -> 32 us (decimation 2); `Detect()` -11% and about -29%; 4 streams +10% |
 | extents reduction with 4 boundary points per thread, combining a run of points in the same blob before its atomics (atomic variants) | Orange Pi | reduction 341 -> 223 us; `Detect()` 3.73 -> 3.63 ms, 1.83 -> 1.78 ms (RX 9060 XT without subgroups: 98 -> 20 us) |
 | blobs of up to 256 points sorted by ranking every key, four keys per shared load | Orange Pi | sort 425 -> 386 us; `Detect()` 3.63 -> 3.58 ms at decimation 1, unchanged at decimation 2 |

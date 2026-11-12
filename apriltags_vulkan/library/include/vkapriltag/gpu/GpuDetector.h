@@ -230,7 +230,7 @@ class GpuDetector {
       "uf_final",       // uf_final.comp - per-blob pixel-count histogram
       "boundary",       // blob_diff (blob-size test, append + compaction)
       "hash_group",     // hash_group.comp (also assigns dense raw blob ids)
-      "extents",        // reduce_extents_hash.comp
+      "extents",        // reduce_extents_hash*.comp
       "select",         // select_blobs.comp
       "blob_scan",      // scan_blob_counts.comp
       "scatter",        // scatter_index_points.comp
@@ -411,10 +411,10 @@ class GpuDetector {
   // True when a second uf_merge checks that the labelling converged (APRILTAG_VK_UF_VERIFY=1); one
   // merge pass joins every component, so by default the frame trusts it.
   bool uf_verify_ = false;
-  // True when reduce_extents_hash_atomic64.comp is the reduction shader; select_blobs.comp then
+  // True when reduce_extents_hash_atomic64_x4.comp is the reduction shader; select_blobs.comp then
   // unbiases gx_sum/gy_sum.
   bool extents_atomic64_ = false;
-  // True when the extents reduction takes 4 points per thread (reduce_extents_hash*_x4.comp).
+  // True when the extents reduction takes 4 points per thread (reduce_extents_hash_x4.comp, reduce_extents_hash_atomic64_x4.comp).
   bool reduce_x4_ = false;
   // Backs last_line_fit_points only on the staging path.
   std::vector<RawLineFitPoint> linefit_scratch_;
@@ -425,9 +425,9 @@ class GpuDetector {
   // Blobs of up to this many points (a power of two) are sorted whole in shared memory; larger
   // ones in runs of this length by several workgroups, then placed by one ranking pass.
   uint32_t local_sort_split_ = 0;
-  // Rank-merge run length (a power of two, 0 for the sorting network) and the largest blob ranked
-  // in one pass (0 disables); APRILTAG_VK_SORT_CHUNK and APRILTAG_VK_SORT_RANK_ALL override them.
-  uint32_t sort_chunk_ = 16u;
+  // Rank-merge run length (a power of two) and the largest blob ranked in one pass (0 disables);
+  // APRILTAG_VK_SORT_RANK_ALL overrides the latter.
+  static constexpr uint32_t kSortChunk = 16u;
   uint32_t sort_rank_all_ = 256u;
 
   // --- Pipelines ---
@@ -468,9 +468,9 @@ class GpuDetector {
   void RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier = vk::BarrierKind::Compute);
   bool uf_init_scan_ = false;
   // Pixels of a row each uf_init thread initialises.
-  uint32_t uf_init_run_ = 4;
+  static constexpr uint32_t uf_init_run_ = 4;
   // Pixels of a row each threshold thread covers.
-  uint32_t threshold_run_ = 4;
+  static constexpr uint32_t threshold_run_ = 4;
   // Also performs the atomic compaction of boundary points.
   // uf_compress plus uf_final's count, for the last real compression of the first attempt.
   vk::ComputePipeline uf_compress_count_pl_;

@@ -1,5 +1,5 @@
-// As reduce_extents_hash_body.glsl, with each thread taking 4 consecutive boundary points and
-// combining runs of points in the same blob before issuing that blob's atomics. blob_diff.comp
+// Each thread takes 4 consecutive boundary points and combines runs of points in the same blob
+// before issuing that blob's atomics. blob_diff.comp
 // appends a pixel's points together and they usually share a blob pair.
 layout(local_size_x_id = 0, local_size_x = 256) in;
 

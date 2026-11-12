@@ -8,9 +8,6 @@
 // uf_compress.comp, until changed_flag stays 0; it is set only when a union joined two distinct
 // components. Dispatched 2D with a one-row-tall workgroup so x is available without a divide.
 layout(local_size_x_id = 0, local_size_x = 256) in;
-// 0 = naive find(); 1 = path splitting (nodes on the walk are repointed to their grandparent
-// with plain stores). Set by GpuDetector::CreatePipelines; APRILTAG_VK_FIND_MODE overrides it.
-layout(constant_id = 3) const uint kFindMode = 0u;
 
 layout(std430, binding = 0) buffer Parent { uint parent[]; };
 layout(std430, binding = 2) buffer Changed { uint changed_flag; };
@@ -26,19 +23,9 @@ layout(push_constant) uniform PushConstants {
 
 shared uint wg_changed;
 
-// kFindMode == 0: read-only walk to the root.
-uint findNaive(uint n) {
-  uint p = parent[n];
-  while (p != n) {
-    n = p;
-    p = parent[n];
-  }
-  return n;
-}
-
-// kFindMode == 1: path splitting using plain non-atomic stores; a lost race only leaves a longer
-// path.
-uint findSplit(uint n) {
+// Path splitting using plain non-atomic stores: nodes on the walk are repointed to their
+// grandparent; a lost race only leaves a longer path.
+uint find(uint n) {
   uint p = parent[n];
   if (p != n) {
     uint prev = n;
@@ -52,10 +39,6 @@ uint findSplit(uint n) {
     n = p;
   }
   return n;
-}
-
-uint find(uint n) {
-  return (kFindMode != 0u) ? findSplit(n) : findNaive(n);
 }
 
 // Returns true if the two elements were in distinct components (i.e. this
@@ -87,10 +70,10 @@ bool doUnion(uint a, uint b) {
 //   0 = shared-memory aggregation: one atomicOr per workgroup.
 //   1 = read-guarded global atomicOr per pixel, with no shared memory or barriers.
 // Set by GpuDetector::CreatePipelines from ctx_.caps().unified_memory.
-layout(constant_id = 4) const uint kMergeFlagMode = 0u;
+layout(constant_id = 3) const uint kMergeFlagMode = 0u;
 // Non-zero: workgroups are dispatched over the listed cells, four (one per row) of 64 pixels each
 // (cell_list.glsl).
-layout(constant_id = 5) const uint kSparse = 0u;
+layout(constant_id = 4) const uint kSparse = 0u;
 
 #define CELL_LIST_BINDING 3
 #include "cell_list.glsl"

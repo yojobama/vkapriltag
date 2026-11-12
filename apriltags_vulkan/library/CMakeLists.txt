@@ -81,8 +81,6 @@ set(SHADER_SOURCES
   shaders/sort_points_large_u8.comp
   shaders/hash_group.comp
   shaders/build_indirect_args.comp
-  shaders/reduce_extents_hash.comp
-  shaders/reduce_extents_hash_atomic64.comp
   shaders/reduce_extents_hash_atomic64_x4.comp
   shaders/reduce_extents_hash_x4.comp
   shaders/reduce_extents_hash_subgroup.comp

@@ -239,19 +239,15 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
     if (wanted >= 1u) local_sort_split_ = PrevPow2(wanted);
   }
   local_sort_split_ = std::min(local_sort_split_, shared_cap);
-  if (const char *v = std::getenv("APRILTAG_VK_SORT_CHUNK")) {
-    sort_chunk_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
-    if (sort_chunk_ != 0u && (sort_chunk_ & (sort_chunk_ - 1u)) != 0u) sort_chunk_ = 0u;
-  }
   if (const char *v = std::getenv("APRILTAG_VK_SORT_RANK_ALL")) {
     sort_rank_all_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) & ~3u;
   }
-  // sort_points_local's shared memory: s_packed, and s_merge when rank-merging, of
-  // local_sort_split_ words each, plus s_rank's sort_rank_all_ words; it must fit the device.
+  // sort_points_local's shared memory: s_packed and s_merge of local_sort_split_ words each, plus
+  // s_rank's sort_rank_all_ words; it must fit the device.
   sort_rank_all_ = std::min(sort_rank_all_, local_sort_split_);
   const uint32_t shared_words = caps.max_shared_memory_bytes / 4u;
   while (local_sort_split_ > 1u &&
-         local_sort_split_ * (sort_chunk_ != 0u ? 2u : 1u) + sort_rank_all_ > shared_words) {
+         local_sort_split_ * 2u + sort_rank_all_ > shared_words) {
     local_sort_split_ /= 2u;
     sort_rank_all_ = std::min(sort_rank_all_, local_sort_split_) & ~3u;
   }
@@ -341,14 +337,11 @@ void GpuDetector::CreateBuffers() {
 
   // Host-visible device memory written directly where the device has it (unified memory, or a
   // discrete GPU's mappable window); otherwise device-local, filled through a persistently mapped
-  // staging buffer. APRILTAG_VK_GRAY_MAPPED=0 keeps the staging buffer on discrete GPUs.
-  const char *gray_mapped_env = std::getenv("APRILTAG_VK_GRAY_MAPPED");
-  const bool gray_mapped = ctx_.caps().unified_memory ||
-                           !(gray_mapped_env != nullptr && gray_mapped_env[0] == '0');
+  // staging buffer.
   gray_buf_ = vk::Buffer(
       ctx_, VkDeviceSize(gray_words_) * 4,
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-      gray_mapped ? vk::MemoryKind::DeviceLocalMapped : vk::MemoryKind::DeviceLocal,
+      vk::MemoryKind::DeviceLocalMapped,
       transfer_lane_ != nullptr ? ctx_.queue_families() : std::vector<uint32_t>{});
   device_bytes_ += gray_buf_.size();
   gray_direct_write_ = gray_buf_.host_visible();
@@ -429,7 +422,7 @@ void GpuDetector::CreateBuffers() {
   if (const char *v = std::getenv("APRILTAG_VK_UF_VERIFY")) uf_verify_ = v[0] != '0';
 
   // Replays pre-recorded command buffers on the fused path (APRILTAG_VK_PRERECORD=0 records every
-  // frame); not used with the transfer-queue upload.
+  // frame, for per-dispatch timing and capture); not used with the transfer-queue upload.
   prerecord_ = fused_submits_ && transfer_lane_ == nullptr;
   if (const char *v = std::getenv("APRILTAG_VK_PRERECORD")) {
     prerecord_ = prerecord_ && v[0] != '0';
@@ -499,9 +492,8 @@ void GpuDetector::CreatePipelines() {
     return u8 ? u8_name : base_name;
   };
   // At decimation 1 with one byte per pixel the decimated image is gray_buf_ itself, so the
-  // decimate pass is skipped; APRILTAG_VK_DEC1_ALIAS=0 keeps the copy.
-  const char *alias_env = std::getenv("APRILTAG_VK_DEC1_ALIAS");
-  alias_decimated_ = u8 && config_.decimation == 1 && !(alias_env != nullptr && alias_env[0] == '0');
+  // decimate pass is skipped.
+  alias_decimated_ = u8 && config_.decimation == 1;
   const VkBuffer decimated_view = alias_decimated_ ? gray_buf_.get() : decimated_buf_.get();
 
   // Subgroup aggregation is used only for reduce_extents_hash, and not on integrated GPUs. Needs
@@ -538,10 +530,6 @@ void GpuDetector::CreatePipelines() {
   block_filter_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
       8, wg2d_);
-  // threshold covers this many pixels of a row per thread; APRILTAG_VK_THRESH_RUN overrides.
-  if (const char *v = std::getenv("APRILTAG_VK_THRESH_RUN")) {
-    threshold_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
-  }
   threshold_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("threshold", "threshold_u8")),
       {decimated_view, minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, wg2d_,
@@ -562,10 +550,6 @@ void GpuDetector::CreatePipelines() {
         ctx_, ShaderPath("block_minmax_decimate_u8"),
         {gray_buf_.get(), decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, wg2d_,
         {config_.decimation});
-  }
-  // uf_init covers this many pixels of a row per thread; APRILTAG_VK_UF_INIT_RUN overrides.
-  if (const char *v = std::getenv("APRILTAG_VK_UF_INIT_RUN")) {
-    uf_init_run_ = static_cast<uint32_t>(std::max(1, std::atoi(v)));
   }
   uf_init_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
@@ -617,18 +601,10 @@ void GpuDetector::CreatePipelines() {
         {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), cell_list_buf_.get()},
         16, vk::WorkgroupSize{sparse_ ? 16u : wg1d_.x, 1, 1}, {sparse_ ? 1u : 0u});
   }
-  // Dispatched 2D with a one-row-tall workgroup. find_mode 1 is path splitting, 0 is naive;
-  // APRILTAG_VK_FIND_MODE overrides.
-  uint32_t find_mode = 1u;
-  if (const char *v = std::getenv("APRILTAG_VK_FIND_MODE")) {
-    find_mode = (v[0] != '0') ? 1u : 0u;
-  }
+  // Dispatched 2D with a one-row-tall workgroup.
   // Convergence-flag write mode (see uf_merge_body.glsl): 1 (read-guarded global atomicOr) on
   // unified memory, otherwise 0 (shared-memory aggregation).
-  uint32_t merge_flag_mode = ctx_.caps().unified_memory ? 1u : 0u;
-  if (const char *v = std::getenv("APRILTAG_VK_MERGE_FLAG_MODE")) {
-    merge_flag_mode = (v[0] != '0') ? 1u : 0u;
-  }
+  const uint32_t merge_flag_mode = ctx_.caps().unified_memory ? 1u : 0u;
   // 4 pixels per thread on integrated GPUs, with 8-bit storage and a width that is a multiple of 4;
   // APRILTAG_VK_MERGE_X4 overrides the device test.
   const bool merge_x4_possible = u8 && decimated_width_ % 4u == 0u;
@@ -640,7 +616,7 @@ void GpuDetector::CreatePipelines() {
       ctx_, ShaderPath(merge_x4_ ? "uf_merge_x4_u8" : pick("uf_merge", "uf_merge_u8")),
       {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get(), cell_list_buf_.get()}, 16,
       vk::WorkgroupSize{sparse_ ? (merge_x4_ ? 16u : 64u) : wg1d_.x, 1, 1},
-      {find_mode, merge_flag_mode, sparse_ ? 1u : 0u});
+      {merge_flag_mode, sparse_ ? 1u : 0u});
   // Rows merged in bands of this many (a power of two) before the band boundaries, on discrete GPUs;
   // 0 is one pass. APRILTAG_VK_MERGE_BAND overrides.
   merge_band_ = ctx_.caps().type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || sparse_ ? 0u : 8u;
@@ -704,7 +680,7 @@ void GpuDetector::CreatePipelines() {
          // binding 6: the device-side selected-blob count.
          selected_counter_buf_.get(), large_sort_buf_.get(), sort_scratch_buf_.get()},
         20, vk::WorkgroupSize{local_sort_cap_, 1, 1},
-        {local_sort_split_, sort_chunk_, mode, kLargeSortCap,
+        {local_sort_split_, kSortChunk, mode, kLargeSortCap,
          mode == 0u ? sort_rank_all_ : 0u});
   };
   sort_points_local_pl_ = make_sort(0u);
@@ -730,11 +706,8 @@ void GpuDetector::CreatePipelines() {
   // variant views extents_buf_ again at binding 4 as uint64_t words.
   const bool extents_atomic64 = !subgroup && ctx_.caps().has_int64_atomics;
   extents_atomic64_ = extents_atomic64;
-  // The atomic variants take 4 points per thread; APRILTAG_VK_REDUCE_X4=0 keeps one.
+  // The atomic variants take 4 points per thread.
   reduce_x4_ = !subgroup;
-  if (const char *v = std::getenv("APRILTAG_VK_REDUCE_X4")) {
-    reduce_x4_ = reduce_x4_ && v[0] != '0';
-  }
   // Binding 4 is bound for all three variants so binding 5 (boundary-point count) keeps its index.
   std::vector<VkBuffer> reduce_extents_buffers{qbp_compacted_buf_.get(), point_slot_buf_.get(),
                                                slot_dense_buf_.get(),   extents_buf_.get(),
@@ -742,10 +715,8 @@ void GpuDetector::CreatePipelines() {
   reduce_extents_hash_pl_ = vk::ComputePipeline(
       ctx_,
       ShaderPath(subgroup ? "reduce_extents_hash_subgroup"
-                 : reduce_x4_ ? (extents_atomic64 ? "reduce_extents_hash_atomic64_x4"
-                                                  : "reduce_extents_hash_x4")
-                              : (extents_atomic64 ? "reduce_extents_hash_atomic64"
-                                                  : "reduce_extents_hash")),
+                              : (extents_atomic64 ? "reduce_extents_hash_atomic64_x4"
+                                                  : "reduce_extents_hash_x4")),
       reduce_extents_buffers, 12, wg1d_);
   scatter_index_points_pl_ = vk::ComputePipeline(
       ctx_, ShaderPath("scatter_index_points"),
