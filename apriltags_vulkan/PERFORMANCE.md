@@ -3208,6 +3208,37 @@ pay for the extra pass: blur +19 to +22%, motion-blur +21 to +22%, fast-1tag-128
 and 0.412 to 0.420 ms (+2.1%). `underexposed` at decimation 1 is +5% (same binary, `PROFILE_FEATURES` 15 against
 31: 0.356 to 0.377 ms): its quads trigger the contrast check.
 
+### 8be. Early reject with grey margin on
+
+`TagDecoder::Decode` refined every candidate before rejecting it, because the border pre-check and the dark
+reject were skipped whenever grey margin was on (default). Tracing (decimation 2, 300 frames) showed refine is
+about 80% of the per-quad time spent on rejected quads (clutter-only 252 of 318 ms; jpeg 669 of 961 ms), the
+grey margin retry and the third-bit lookup about 5 to 10% each.
+
+**Change** (`APRILTAG_VK_EARLY_REJECT`, default on, 0 restores the previous output): with grey margin on, the
+two checks run on the unrefined quad; a quad failing them is also sampled as its inner W cells and rejected
+only if that fails too. A quad whose shortest side is under 1.5 pixels per cell (12 px for tag36h11), a coarse
+box, and a quad the small rescue would refit are never rejected early.
+
+**Why the exemptions.** The bare rule (outer and inner both fail) lost 2 tags in `range` at decimation 2:
+7 to 8 px quads whose unrefined sample is too coarse. Minimum-side sweep, tags found against the base
+(decimation 2 | 1): 8 px -1 | 0; 10, 12 and 16 px 0 | 0. With the small rescue the coarse boxes lost 3
+tags more until exempted. Ideas that did not work: a threshold on the unrefined Hamming distance (accepted
+quads span distances 0 to 10, as many rejects: no cut), and sharing the third-bit sample (about 3 us per
+undecoded quad, not done).
+
+**Accuracy** (whole corpus, base `0fd3384` against this change): tags found identical at decimation 1 (7129)
+and 2 (7146), also with `SMALL_RESCUE=1 HULL_QUAD=1` (7233 | 7228) and with `POLISH=1` added; corner error
+medians and p95 unchanged; false detections 0 | 3 become 0 | 1 (`tag16h5`, clutter that decoded by chance
+is now rejected). The ten sequences score identically. `golden_test.py` passes without regenerating goldens.
+
+**Time** (desktop, ABBA, 50 iterations, medians of `cpu` | `total`, ms, decimation 2 | 1):
+clutter-only 0.199 to 0.154 (-22%) | 0.166 to 0.133 (-20%), total -6% | -4%; busy-background -18% | -9%
+(total -7% | -4%); jpeg -17% | -5% (total -6% | -2%); decoys +2% | +5%, noise +2% | 0, one-tag +3% | +3%,
+many-tags +3% | -1%, grey-margin 0 | +3%, low-contrast +2% | +3%; dense-tags +6% | +4% (+0.016 and +0.007 ms
+cpu, total +3% | +4%): a real tag pays one extra sample and border read (about 4 us). Scenarios with real tags
+move within about 5%, the run spread.
+
 ## 9. Measuring
 
 ```

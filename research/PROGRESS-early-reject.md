@@ -27,3 +27,18 @@ side, about 0.9 px per cell: the unrefined sample is too coarse and refinement i
 decode; the border check rejects both outer and inner). Rejecting only quads with side >= 1.5 px per
 cell (12 px for tag36h11) lost none. Minimum-side sweep (found tags vs base, decimation 2 | 1):
 8 px: -1 | 0; 10, 12, 16 px: 0 | 0. The sweep also shows tag16h5 false detections 3 -> 0/1/1/2.
+
+## 3. Other ideas
+- Third-bit resample: needs the margin and code from `quad_decode_index` (a patch change to libapriltag);
+  about 3 us per undecoded quad (traced), now rarer after the early reject. Not done.
+- Unrefined Hamming distance gate: `APRILTAG_VK_PROBE_STATS` shows accepted quads at distance 0 to 10 and rejects
+  at 5 to 10; no safe cut. Null result.
+- Surviving quads: 76% of clutter-only quads still refine (they look like tags on both checks).
+
+## 4. Gate results (commands: runall.sh, cmp.py, idcmp.py, timing.py, score_seq.py in $S/early-reject)
+- Corpus found tags (d1 | d2): base 7129 | 7146; on identical. rescue+hull: 7233 | 7228 identical; +polish identical.
+  False: d2 3 -> 1 (family16h5), rescue variants 2 -> 0. p95 and median unchanged.
+- EARLY_REJECT=0 against base build: ids and structure identical, coordinates within 5e-4 px (same as base vs base).
+- Sequences (ten, decimation 2): score_seq output identical.
+- ctest: unit tests pass; golden_test.py all five profiles 0 differing frames.
+- Time: see PERFORMANCE.md 8be (t_final.txt). dense-tags +6% | +4% cpu is the one scenario slower than noise.
