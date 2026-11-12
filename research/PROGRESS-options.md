@@ -151,3 +151,40 @@ Dump comparison: `bash $S/options/gate.sh LABEL CORPUS DEC [VAR=val ...]` runs b
 dump files; `bash $S/options/battery.sh` runs the single-switch list over the committed subset.
 
 ## Steps
+
+## Gate results (desktop, RX 9060 XT, shared GPU)
+- `ctest` on the branch build: 7 of 7 pass (unit_decode, geometry, edges, quadfit, options; golden_detections; options_lint)
+  with the goldens untouched.
+- Full corpus (26 scenarios), dump files compared with `cmp` against a build of 545bc4d (`gate.sh`):
+  d2: base vs base 1 file differs (noise), base vs this branch 0 files differ.
+  d1: base vs base 5 files differ, base vs this branch 5 files differ (one or two dump lines each, corner changes of 1e-3 px
+  in the last digits). Repeating base six times on dark-background and overexposed, and this branch six times on
+  dark-background, showed the same flip between two values in both builds, so these are the known run-to-run noise.
+- Single switches over the committed subset (10 scenarios x 5 frames), this branch against the base with the same switch,
+  52 configurations, all 0 differing files: the four FORCE_NO_*, FUSE_SUBMITS=0, SMALL_RESCUE, HULL_QUAD, POLISH,
+  PROFILE_FEATURES=15, EARLY_REJECT=0, GREY_MARGIN=0, KEEPALIVE_MS=1, CPU_THREADS=1, CPU_BIG_CORES=0, QUADFIT=peaks,
+  REFINE=exact, BOX_DECIMATE=0, SPARSE=0, MERGE_X4=1, COUNT_RUNS=1, LEAN_TAIL=3, UF_VERIFY=1, PRERECORD=0, FUSED_THRESHOLD=0,
+  DOT=0, MIN_TAG_PX=30, TIMESTAMPS=1, DISPATCH_TIMES=1, MIN_DIFF=9, ADAPTIVE_FLOOR=0, PROBE_MARGIN=10, SIDE_ONE_OUT=0,
+  THIRD_BIT=0, FAMILY_LIMITS=0, BORDER_PRECHECK=0, DARK_REJECT=0, UF_INIT_SCAN=0, SORT_SPLIT=64, SORT_RANK_ALL=0,
+  MERGE_BAND=2, MAX_POINTS=20000, FLAG_POLL=0, PIPELINE_CACHE=0, SPIN_WAIT=1, WG=64, WG2D=8x8, MAX_INVOCATIONS=128,
+  POLISH_N=2000, POLISH_TOL=0.01, PREWARM_LEAD_US=1000 (d2), the plain d1 pair and d1 with rescue+hull+polish.
+- Ten sequences through `track_eval` (modes full, key, async; `seq.sh`, `seqcmp.sh`): full and key modes identical in
+  detections and in the path each frame took (0 of 10 files differ, `#` timing lines ignored); async differs in 3 of 10
+  files, and base against base differs by as much (117, 10 and 40 lines against 108, 0 and 17 for this branch), because the
+  background thread's timing decides which frame a discovery lands on.
+- Timing, interleaved ABBA, 4 rounds, medians of the per-run medians (ms per frame, `timing.sh`):
+  one-tag d2 0.2429 / 0.2432, many-tags d2 0.3376 / 0.3316, clutter-only d2 0.3599 / 0.3595, busy-background d2 0.3822 /
+  0.3793, small-tags d2 0.2653 / 0.2740 (repeat with 6 rounds: 0.2889 / 0.2835; the first run had GPU-sharing outliers),
+  jpeg d2 0.6228 / 0.6141, one-tag d1 0.3357 / 0.3350, clutter-only d1 0.4476 / 0.4445 (base / branch). No cost: the
+  environment is read at construction only.
+- Small-tag rescue set in code: new `vk_eval --small-rescue` sets `DetectorConfig::small_tag_rescue` and passes it to
+  `TagDecoder`. With the environment unset its dumps equal `APRILTAG_VK_SMALL_RESCUE=1` in all 25 scenarios at d2 (the
+  scenarios where the rescue changes detections: range 74 lines, dense-tags 12, noise-free 4, others 2), and
+  `APRILTAG_VK_SMALL_RESCUE=0` with `--small-rescue` equals plain.
+
+## Not verified
+- The Pi and lavapipe (GPU files changed for the Pi check: `gpu/GpuDetector.cpp` and `.h`, `vk/Context.cpp`,
+  `vk/PipelineCache.cpp`, `vk/ComputePipeline.cpp`); gcc/clang builds (only MSVC here); `unit_options` uses `setenv`
+  on POSIX, untested there.
+- Behaviour with an empty-string value for a variable is kept per reader (the `Bool` accessor reads an empty value as on, `Flag` as
+  off, as the original code did); not exercised by the gate.
