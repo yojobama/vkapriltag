@@ -38,6 +38,9 @@ Full-corpus score against the baseline: `bash tools/eval.sh -e <vk_eval> -c <nap
 - Three repeated golden runs on the desktop (RX 9060 XT, shared GPU) were byte-identical, for all five profiles.
 - Goldens also reproduce exactly (tolerance 0.0005 px, no noise frames) with `FORCE_NO_8BIT`, `FORCE_NO_SUBGROUP`,
   `FORCE_NO_INT64_ATOMIC`, `FORCE_NO_CONDITIONAL_RENDERING` and `SPARSE=0`, i.e. through the other shader paths.
+- An unmodified build of b74718b (vk_eval from `ext/avk-compare/ours`) produces dumps byte-identical to the goldens
+  for all five profiles, so the wrappers change nothing. A clean rebuild of this branch passes all five ctest tests
+  (about 7.4 s in total, the golden test 7 s).
 - The test therefore uses: same ID multiset and Hamming per frame, corners within 0.02 px (the brief's sub-0.01 px
   cross-GPU differences with margin), and at most 2 differing frames per profile for the known one-line run-to-run
   noise of a marginal detection (the subset has 50 frames, 72 detections; border-occlusion is the marginal case).
