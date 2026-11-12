@@ -320,9 +320,10 @@ TagDecoder::~TagDecoder() {
   zarray_destroy(poly0_);
 }
 
-// What every candidate of one Decode() call shares: the frame and the switches, read once.
+// What every candidate of one Decode() call shares: the frame, the switches and the family, read once.
 struct DecodeEnv {
-  image_u8_t im;
+  apriltag_detector_t *td;
+  image_u8_t *im;
   bool reversed_border;
   bool timing;
   RefineEdgesMethod refine_method;
@@ -333,93 +334,96 @@ struct DecodeEnv {
   float probe_margin;
 };
 
-void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, size_t i, unsigned slot) {
-  image_u8_t im = env.im;
-  const uint8_t *gray_frame = im.buf;
-  const uint32_t width = static_cast<uint32_t>(im.width), height = static_cast<uint32_t>(im.height);
-  const bool reversed_border = env.reversed_border;
-  const bool timing = env.timing;
-  prof::Scope quad_scope("tag.quad");
-  SlotStats &st = slot_stats_[slot];
-  const prof::Ns t_quad = timing ? prof::NowNs() : 0;
-  prof::Ns t_mark = t_quad;
-  // Milliseconds since the previous lap; only called when `timing`.
-  auto lap = [&] {
+namespace {
+
+// Splits a candidate's time into laps; every call is a no-op unless profiling is on.
+class StepClock {
+ public:
+  explicit StepClock(bool on) : on_(on), start_(on ? prof::NowNs() : 0), mark_(start_) {}
+  // Adds the milliseconds since the previous lap to *total.
+  void Lap(double *total) {
+    if (!on_) return;
     const prof::Ns now = prof::NowNs();
-    const double ms = NsToMs(now - t_mark);
-    t_mark = now;
-    return ms;
-  };
-  // Every exit goes through here exactly once, so each quad is counted once.
-  auto finish = [&](bool decoded, double refine_ms) {
-    quad_scope.set_arg(decoded ? 1 : 0);
-    if (!timing) return;
-    ++st.quads;
-    if (decoded) ++st.decoded;
-    (decoded ? st.refine_ms_decoded : st.refine_ms_rejected) += refine_ms;
-    st.busy_ms += NsToMs(prof::NowNs() - t_quad);
-  };
-
-  OwnedQuad original_owner;
-  struct quad &quad_original = original_owner.q;
-  for (int k = 0; k < 4; ++k) {
-    quad_original.p[k][0] = static_cast<float>(q.p[k][0]);
-    quad_original.p[k][1] = static_cast<float>(q.p[k][1]);
+    *total += NsToMs(now - mark_);
+    mark_ = now;
   }
-  quad_original.reversed_border = reversed_border;
+  double SinceStartMs() const { return on_ ? NsToMs(prof::NowNs() - start_) : 0.0; }
 
-  if (q.coarse) {
+ private:
+  bool on_;
+  prof::Ns start_, mark_;
+};
+
+// One quad candidate and the state its steps share.
+struct Candidate {
+  Candidate(const DecodeEnv &env, const DetectedQuad &input, zarray_t *found, zarray_t *probe)
+      : input(input), found(found), probe(probe), clock(env.timing) {
+    for (int k = 0; k < 4; ++k) {
+      quad.q.p[k][0] = static_cast<float>(input.p[k][0]);
+      quad.q.p[k][1] = static_cast<float>(input.p[k][1]);
+    }
+    quad.q.reversed_border = env.reversed_border;
+  }
+
+  const DetectedQuad &input;
+  OwnedQuad quad;  // refined in place; owns the homographies quad_decode_index allocates
+  zarray_t *found;  // this candidate's detections, owned by detections_ once merged
+  zarray_t *probe;  // the thread's scratch for trial decodes
+  int probe_bin = -1;
+  float probe_margin = 0.0f;
+  StepClock clock;
+  double probe_ms = 0.0, refine_ms = 0.0, decode_ms = 0.0;
+};
+
+// How RunSteps ended; only kFinished candidates reach the probe statistics.
+enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
+
+Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
+  if (c.input.coarse) {
     double fitted[4][2];
-    const double xlo = std::min(q.p[0][0], q.p[2][0]), xhi = std::max(q.p[0][0], q.p[2][0]);
-    const double ylo = std::min(q.p[0][1], q.p[2][1]), yhi = std::max(q.p[0][1], q.p[2][1]);
-    if (!env.small_rescue || !FitSmallQuad(gray_frame, static_cast<int>(width), static_cast<int>(height), xlo, ylo, xhi, yhi, fitted)) {
-      finish(false, 0.0);
-      return;
+    const double xlo = std::min(c.input.p[0][0], c.input.p[2][0]), xhi = std::max(c.input.p[0][0], c.input.p[2][0]);
+    const double ylo = std::min(c.input.p[0][1], c.input.p[2][1]), yhi = std::max(c.input.p[0][1], c.input.p[2][1]);
+    if (!env.small_rescue || !FitSmallQuad(env.im->buf, env.im->width, env.im->height, xlo, ylo, xhi, yhi, fitted)) {
+      return Outcome::kDropped;
     }
     for (int k = 0; k < 4; ++k) {
-      quad_original.p[k][0] = static_cast<float>(fitted[k][0]);
-      quad_original.p[k][1] = static_cast<float>(fitted[k][1]);
+      c.quad.q.p[k][0] = static_cast<float>(fitted[k][0]);
+      c.quad.q.p[k][1] = static_cast<float>(fitted[k][1]);
     }
   }
 
   // Margin gate and probe statistics: sample the unrefined quad.
-  int probe_bin = -1;
-  float probe_margin = 0.0f;
-  // The gate reads the first family only, so it needs exactly one registered.
-  const bool gate = env.probe_margin > 0.0f && zarray_size(td_->tag_families) == 1;
-  if ((env.collect_probe || gate) && td_->refine_edges) {
-    OwnedQuad unrefined(quad_original);
+    // The gate reads the first family only, so it needs exactly one registered.
+  const bool gate = env.probe_margin > 0.0f && zarray_size(env.td->tag_families) == 1;
+  if ((env.collect_probe || gate) && env.td->refine_edges) {
+    OwnedQuad unrefined(c.quad.q);
     uint64_t rcode = 0;
-    const float margin = quad_sample_code(td_, &unrefined.q, &im, &rcode);
-    probe_margin = margin;
+    const float margin = quad_sample_code(env.td, &unrefined.q, env.im, &rcode);
+    c.probe_margin = margin;
     // The nearest-code distance is only needed for the statistics.
-    probe_bin = margin < 0.0f ? 16
-                : env.collect_probe ? std::min(15, apriltag_min_hamming(td_, rcode))
+    c.probe_bin = margin < 0.0f ? 16
+                : env.collect_probe ? std::min(15, apriltag_min_hamming(env.td, rcode))
                                  : 0;
     unrefined.Free();
-    if (timing) st.probe_ms += lap();
-    if (gate && margin < env.probe_margin) {
-      if (env.collect_probe) slot_probe_[slot].rejected[probe_bin]++;
-      finish(false, 0.0);
-      return;
-    }
+    c.clock.Lap(&c.probe_ms);
+    if (gate && margin < env.probe_margin) return Outcome::kMarginGate;
   }
 
   // The border and dark checks on the unrefined quad. With grey margin on (see env.early_reject), a quad
   // is rejected only if its inner W cells also fail them, as that is what the grey margin retry decodes.
-  const bool single_family = zarray_size(td_->tag_families) == 1;
+  const bool single_family = zarray_size(env.td->tag_families) == 1;
   const bool check_border = env.border_precheck && single_family;
-  const bool check_dark = env.dark_reject && !reversed_border && single_family;
+  const bool check_dark = env.dark_reject && !env.reversed_border && single_family;
   apriltag_family_t *family = nullptr;
-  if (single_family) zarray_get(td_->tag_families, 0, &family);
+  if (single_family) zarray_get(env.td->tag_families, 0, &family);
   // Under grey margin a coarse box or a quad under 1.5 pixels per cell is not rejected: its unrefined sample is too coarse.
   bool large_enough = true;
   if (env.grey_margin && family) {
-    const double min_side = geom::MinSide(quad_original.p);
-    large_enough = !q.coarse && min_side >= 1.5 * family->width_at_border;
+    const double min_side = geom::MinSide(c.quad.q.p);
+    large_enough = !c.input.coarse && min_side >= 1.5 * family->width_at_border;
     // A quad the small rescue would refit when it fails to decode is kept.
-    if (env.small_rescue && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f) {
-      const geom::Bounds box = geom::QuadBounds(q.p);
+    if (env.small_rescue && env.td->quad_decimate > 1 && !c.input.coarse && c.input.gradient >= 60.0f) {
+      const geom::Bounds box = geom::QuadBounds(c.input.p);
       if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0) large_enough = false;
     }
   }
@@ -429,11 +433,11 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
     auto cannot_decode = [&](const struct quad &quad, matd_t **keep_h) {
       OwnedQuad candidate(quad);
       uint64_t rcode = 0;
-      quad_sample_code(td_, &candidate.q, &im, &rcode);
+      quad_sample_code(env.td, &candidate.q, env.im, &rcode);
       bool bad = false;
       if (check_border) {
         BorderLevels border;
-        const bool read = candidate.q.H && ReadBorder(candidate.q.H, &im, family->width_at_border, &border);
+        const bool read = candidate.q.H && ReadBorder(candidate.q.H, env.im, family->width_at_border, &border);
         bad = read && border.dark * 28 < 22 * border.cells;
       }
       if (check_dark && !bad) bad = std::popcount(rcode) + 2 < env.min_white_cells;
@@ -441,69 +445,65 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
       return bad;
     };
     matd_t *outer_h = nullptr;
-    bool reject = cannot_decode(quad_original, env.grey_margin ? &outer_h : nullptr);
+    bool reject = cannot_decode(c.quad.q, env.grey_margin ? &outer_h : nullptr);
     if (reject && env.grey_margin) {
       reject = false;
       if (outer_h) {
         struct quad inner;
-        InnerQuad(outer_h, family->width_at_border, reversed_border, &inner);
+        InnerQuad(outer_h, family->width_at_border, env.reversed_border, &inner);
         reject = cannot_decode(inner, nullptr);
       }
     }
     if (outer_h) matd_destroy(outer_h);
-    if (timing) st.probe_ms += lap();
-    if (reject) {
-      finish(false, 0.0);
-      return;
-    }
+    c.clock.Lap(&c.probe_ms);
+    if (reject) return Outcome::kPreCheck;
   }
 
   // Refine (if enabled) before decode; both are safe to run concurrently across quads.
-  double refine_ms = 0.0;
-  if (td_->refine_edges) {
+  if (env.td->refine_edges) {
     VKA_PROF_SCOPE("tag.refine");
-    RefineEdges(env.refine_method, td_, &im, &quad_original);
-    if (timing) refine_ms = lap();
+    RefineEdges(env.refine_method, env.td, env.im, &c.quad.q);
+    c.clock.Lap(&c.refine_ms);
   }
 
-  // quad_decode_index appends decodes to per_quad_[i] and allocates quad->H/Hinv.
+  // quad_decode_index appends decodes to c.found and allocates quad->H/Hinv.
   {
     VKA_PROF_SCOPE("tag.decode");
-    quad_decode_index(td_, &quad_original, &im, /*im_samples=*/nullptr, per_quad_[i]);
+    quad_decode_index(env.td, &c.quad.q, env.im, /*im_samples=*/nullptr, c.found);
   }
 
   // A grey quiet zone on a bright wall makes the quiet zone's outline the dark blob, so the quad is
   // the (W + 2) cell square: if it did not decode, try its inner W cells, once that decodes unrefined.
-  if (env.grey_margin && td_->refine_edges && zarray_size(per_quad_[i]) == 0 && quad_original.H &&
-      zarray_size(td_->tag_families) > 0) {
+  if (env.grey_margin && env.td->refine_edges && zarray_size(c.found) == 0 && c.quad.q.H &&
+      zarray_size(env.td->tag_families) > 0) {
     VKA_PROF_SCOPE("tag.inner");
     apriltag_family_t *family = nullptr;
-    zarray_get(td_->tag_families, 0, &family);
+    zarray_get(env.td->tag_families, 0, &family);
     OwnedQuad inner;
-    InnerQuad(quad_original.H, family->width_at_border, reversed_border, &inner.q);
-    zarray_t *probe = probe_[slot];
+    InnerQuad(c.quad.q.H, family->width_at_border, env.reversed_border, &inner.q);
+    zarray_t *probe = c.probe;
     zarray_truncate(probe, 0);
-    quad_decode_index(td_, &inner.q, &im, /*im_samples=*/nullptr, probe);
+    quad_decode_index(env.td, &inner.q, env.im, /*im_samples=*/nullptr, probe);
     const bool decodes = zarray_size(probe) > 0;
     ClearDetections(probe);
     inner.Free();
     if (decodes) {
-      RefineEdges(env.refine_method, td_, &im, &inner.q);
-      quad_decode_index(td_, &inner.q, &im, /*im_samples=*/nullptr, per_quad_[i]);
+      RefineEdges(env.refine_method, env.td, env.im, &inner.q);
+      quad_decode_index(env.td, &inner.q, env.im, /*im_samples=*/nullptr, c.found);
     }
   }
 
   // A side whose border cells read white was fitted on the quiet zone's outer edge, one cell too far
   // out (the payload still decodes through error correction). Move it in a cell, refit, and keep the
   // result if it decodes the same tag with a darker border.
-  if (env.side_one_out && quad_original.H && zarray_size(per_quad_[i]) == 1 &&
-      zarray_size(td_->tag_families) > 0) {
+  if (env.side_one_out && c.quad.q.H && zarray_size(c.found) == 1 &&
+      zarray_size(env.td->tag_families) > 0) {
     apriltag_family_t *family = nullptr;
-    zarray_get(td_->tag_families, 0, &family);
+    zarray_get(env.td->tag_families, 0, &family);
     const int w = family->width_at_border;
     BorderLevels before;
     int bad = 0;
-    if (ReadBorder(quad_original.H, &im, w, &before)) {
+    if (ReadBorder(c.quad.q.H, env.im, w, &before)) {
       for (int k = 0; k < 4; ++k) bad |= (before.side_level[k] > 0.3) << k;
     }
     if (bad != 0 && bad != 15) {
@@ -513,26 +513,26 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
       const double v0 = (bad & 1) ? -1 + one : -1, v1 = (bad & 4) ? 1 - one : 1;
       const double us[4] = {u0, u1, u1, u0}, vs[4] = {v0, v0, v1, v1};
       OwnedQuad moved;
-      QuadFromHomography(quad_original.H, us, vs, reversed_border, &moved.q);
-      RefineEdges(env.refine_method, td_, &im, &moved.q);
-      zarray_t *probe = probe_[slot];
+      QuadFromHomography(c.quad.q.H, us, vs, env.reversed_border, &moved.q);
+      RefineEdges(env.refine_method, env.td, env.im, &moved.q);
+      zarray_t *probe = c.probe;
       zarray_truncate(probe, 0);
-      quad_decode_index(td_, &moved.q, &im, /*im_samples=*/nullptr, probe);
+      quad_decode_index(env.td, &moved.q, env.im, /*im_samples=*/nullptr, probe);
       bool keep = false;
       if (zarray_size(probe) == 1 && moved.q.H) {
         apriltag_detection_t *old_det = nullptr, *new_det = nullptr;
-        zarray_get(per_quad_[i], 0, &old_det);
+        zarray_get(c.found, 0, &old_det);
         zarray_get(probe, 0, &new_det);
         BorderLevels after;
-        if (new_det->id == old_det->id && ReadBorder(moved.q.H, &im, w, &after)) {
+        if (new_det->id == old_det->id && ReadBorder(moved.q.H, env.im, w, &after)) {
           double level_before = 0, level_after = 0;
           for (int k = 0; k < 4; ++k) level_before += before.side_level[k], level_after += after.side_level[k];
           keep = level_after < level_before - 0.2;
         }
         if (keep) {
           apriltag_detection_destroy(old_det);
-          zarray_set(per_quad_[i], 0, &new_det, nullptr);
-          zarray_truncate(probe, 0);  // the detection now belongs to per_quad_[i]
+          zarray_set(c.found, 0, &new_det, nullptr);
+          zarray_truncate(probe, 0);  // the detection now belongs to c.found
         }
       }
       if (!keep) ClearDetections(probe);
@@ -541,13 +541,13 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
 
   // A third corrected bit, accepted only when the three wrong cells touch: damage such as a finger
   // or glare is coherent, a chance match is scattered.
-  if (env.third_bit && td_->refine_edges && zarray_size(per_quad_[i]) == 0 && AllowsThirdBit(td_)) {
+  if (env.third_bit && env.td->refine_edges && zarray_size(c.found) == 0 && AllowsThirdBit(env.td)) {
     VKA_PROF_SCOPE("tag.thirdbit");
     apriltag_family_t *family = nullptr;
-    zarray_get(td_->tag_families, 0, &family);
-    OwnedQuad sampled(quad_original);
+    zarray_get(env.td->tag_families, 0, &family);
+    OwnedQuad sampled(c.quad.q);
     uint64_t rcode = 0;
-    const float margin = quad_sample_code(td_, &sampled.q, &im, &rcode);
+    const float margin = quad_sample_code(env.td, &sampled.q, env.im, &rcode);
     int id = 0, rotation = 0;
     if (margin >= 0 && sampled.q.H && MatchThreeTouchingBits(*env.third_index, rcode, &id, &rotation)) {
       apriltag_detection_t *det = static_cast<apriltag_detection_t *>(calloc(1, sizeof(apriltag_detection_t)));
@@ -568,55 +568,65 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
       for (int k = 0; k < 4; ++k) {  // counter-clockwise from (-1, -1), as quad_decode_index
         homography_project(det->H, (k == 1 || k == 2) ? 1 : -1, (k < 2) ? 1 : -1, &det->p[k][0], &det->p[k][1]);
       }
-      zarray_add(per_quad_[i], &det);
+      zarray_add(c.found, &det);
     }
   }
 
   // A small quad that did not decode: refit it from the full-resolution image and try again.
-  if (env.small_rescue && td_->quad_decimate > 1 && !q.coarse && q.gradient >= 60.0f && td_->refine_edges && zarray_size(per_quad_[i]) == 0) {
-    const geom::Bounds box = geom::QuadBounds(q.p);
+  if (env.small_rescue && env.td->quad_decimate > 1 && !c.input.coarse && c.input.gradient >= 60.0f && env.td->refine_edges && zarray_size(c.found) == 0) {
+    const geom::Bounds box = geom::QuadBounds(c.input.p);
     double fitted[4][2];
     if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0 &&
-        FitSmallQuad(gray_frame, static_cast<int>(width), static_cast<int>(height), box.xlo, box.ylo, box.xhi, box.yhi, fitted)) {
+        FitSmallQuad(env.im->buf, env.im->width, env.im->height, box.xlo, box.ylo, box.xhi, box.yhi, fitted)) {
       VKA_PROF_SCOPE("tag.rescue");
       OwnedQuad refit;
       for (int k = 0; k < 4; ++k) {
         refit.q.p[k][0] = static_cast<float>(fitted[k][0]);
         refit.q.p[k][1] = static_cast<float>(fitted[k][1]);
       }
-      refit.q.reversed_border = reversed_border;
-      RefineEdges(env.refine_method, td_, &im, &refit.q);
-      quad_decode_index(td_, &refit.q, &im, /*im_samples=*/nullptr, per_quad_[i]);
+      refit.q.reversed_border = env.reversed_border;
+      RefineEdges(env.refine_method, env.td, env.im, &refit.q);
+      quad_decode_index(env.td, &refit.q, env.im, /*im_samples=*/nullptr, c.found);
     }
   }
 
   // Drop corrections beyond what the family can bear before they count as detections.
   if (env.family_limits) {
-    for (int j = zarray_size(per_quad_[i]) - 1; j >= 0; --j) {
+    for (int j = zarray_size(c.found) - 1; j >= 0; --j) {
       apriltag_detection_t *det = nullptr;
-      zarray_get(per_quad_[i], j, &det);
+      zarray_get(c.found, j, &det);
       // the third-bit match is the deliberate exception to the family limit
       if (det->hamming > MaxCorrectedBits(det->family) && !(env.third_bit && det->hamming == 3)) {
         apriltag_detection_destroy(det);
-        zarray_remove_index(per_quad_[i], j, 0);
+        zarray_remove_index(c.found, j, 0);
       }
     }
   }
 
   if (env.polish) {
     VKA_PROF_SCOPE("tag.polish");
-    for (int j = 0; j < zarray_size(per_quad_[i]); ++j) {
+    for (int j = 0; j < zarray_size(c.found); ++j) {
       apriltag_detection_t *det = nullptr;
-      zarray_get(per_quad_[i], j, &det);
-      PolishDetection(&im, det);
+      zarray_get(c.found, j, &det);
+      PolishDetection(env.im, det);
     }
-    if (timing) refine_ms += lap();
+    c.clock.Lap(&c.refine_ms);
   }
 
-  if (timing) st.decode_ms += lap();
-  if (env.collect_probe && probe_bin >= 0) {
-    const bool accepted = zarray_size(per_quad_[i]) > 0;
-    (accepted ? slot_probe_[slot].decoded : slot_probe_[slot].rejected)[probe_bin]++;
+  c.clock.Lap(&c.decode_ms);
+  return Outcome::kFinished;
+}
+
+}  // namespace
+
+void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, size_t i, unsigned slot) {
+  prof::Scope quad_scope("tag.quad");
+  Candidate c(env, q, per_quad_[i], probe_[slot]);
+  const Outcome outcome = RunSteps(env, c);
+  const bool decoded = zarray_size(c.found) > 0;
+  if (outcome == Outcome::kMarginGate && env.collect_probe) slot_probe_[slot].rejected[c.probe_bin]++;
+  if (outcome == Outcome::kFinished && env.collect_probe && c.probe_bin >= 0) {
+    (decoded ? slot_probe_[slot].decoded : slot_probe_[slot].rejected)[c.probe_bin]++;
     if (!probe_csv_.empty()) {
       float perimeter = 0.0f;
       for (int k = 0; k < 4; ++k) {
@@ -624,10 +634,18 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
         const double dy = q.p[k][1] - q.p[(k + 1) % 4][1];
         perimeter += static_cast<float>(std::sqrt(dx * dx + dy * dy));
       }
-      slot_rows_[slot].push_back({probe_bin, probe_margin, perimeter, accepted});
+      slot_rows_[slot].push_back({c.probe_bin, c.probe_margin, perimeter, decoded});
     }
   }
-  finish(zarray_size(per_quad_[i]) > 0, refine_ms);
+  quad_scope.set_arg(decoded ? 1 : 0);
+  if (!env.timing) return;
+  SlotStats &st = slot_stats_[slot];
+  ++st.quads;
+  if (decoded) ++st.decoded;
+  st.probe_ms += c.probe_ms;
+  (decoded ? st.refine_ms_decoded : st.refine_ms_rejected) += c.refine_ms;
+  st.decode_ms += c.decode_ms;
+  st.busy_ms += c.clock.SinceStartMs();
 }
 
 zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8_t *gray_frame,
@@ -669,7 +687,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
   if (timing) slot_stats_.assign(pool_->threads(), SlotStats{});
 
   const DecodeEnv env = {
-      .im = im,
+      .td = td_,
+      .im = &im,
       .reversed_border = reversed_border,
       .timing = timing,
       .refine_method = refine_method_,
