@@ -113,6 +113,9 @@ class TagDecoder {
   bool border_precheck_ = true;
   // APRILTAG_VK_DARK_REJECT=0 turns off: reject a quad whose payload has fewer white cells than any code.
   bool dark_reject_ = true;
+  // APRILTAG_VK_EARLY_REJECT=0 turns off: with grey margin on, the two checks above skip the quad.
+  // On: they reject it only if its inner W cells fail them too.
+  bool early_reject_ = true;
   zarray_t *poly0_;
   zarray_t *poly1_;
   zarray_t *detections_;
