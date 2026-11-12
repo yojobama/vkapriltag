@@ -120,3 +120,14 @@ endif()
 add_executable(track_eval track_eval/track_eval.cpp)
 target_link_libraries(track_eval PRIVATE vkapriltag::vkapriltag)
 install(TARGETS track_eval RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Evaluation harness: runs a frame list through the GPU pipeline and CPU tail and writes the detection dump
+# that napa_corpus/score_corpus.py scores. Needs no OpenCV.
+add_executable(vk_eval vk_eval/vk_eval.cpp)
+target_include_directories(vk_eval PRIVATE vk_eval)
+target_link_libraries(vk_eval PRIVATE vkapriltag::vkapriltag)
+# Windows has no rpath: put the apriltag DLL beside the executable.
+if(WIN32 AND TARGET apriltag)
+  add_custom_command(TARGET vk_eval POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:apriltag> $<TARGET_FILE_DIR:vk_eval>)
+endif()

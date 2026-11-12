@@ -1,0 +1,188 @@
+{
+ "d1": {
+  "overall": {
+   "err_median": 0.02045858120691877,
+   "err_p95": 0.11662005908077806,
+   "false": 0,
+   "found": 72,
+   "recall": 0.9473684210526315,
+   "tags": 76,
+   "time_ms": 0.3527
+  },
+  "scenarios": {
+   "blur": {
+    "err_median": 0.02360912249534194,
+    "err_p95": 0.05247593998207839,
+    "false": 0,
+    "found": 10,
+    "recall": 1.0,
+    "tags": 10
+   },
+   "border-occlusion": {
+    "err_median": 0.3150802181032606,
+    "err_p95": 1.0607575803405584,
+    "false": 0,
+    "found": 4,
+    "recall": 0.5,
+    "tags": 8
+   },
+   "clutter-only": {
+    "err_median": NaN,
+    "err_p95": NaN,
+    "false": 0,
+    "found": 0,
+    "recall": NaN,
+    "tags": 0
+   },
+   "family16h5": {
+    "err_median": 0.010128695868648075,
+    "err_p95": 0.02502681973403354,
+    "false": 0,
+    "found": 8,
+    "recall": 1.0,
+    "tags": 8
+   },
+   "grey-margin": {
+    "err_median": 0.014026187578952838,
+    "err_p95": 0.023120532455023993,
+    "false": 0,
+    "found": 11,
+    "recall": 1.0,
+    "tags": 11
+   },
+   "low-contrast": {
+    "err_median": 0.02437078630240669,
+    "err_p95": 0.06002690764979069,
+    "false": 0,
+    "found": 8,
+    "recall": 1.0,
+    "tags": 8
+   },
+   "many-tags": {
+    "err_median": 0.004614467033144066,
+    "err_p95": 0.00998378705703529,
+    "false": 0,
+    "found": 5,
+    "recall": 1.0,
+    "tags": 5
+   },
+   "motion-blur": {
+    "err_median": 0.04379692241471138,
+    "err_p95": 0.1991998619778476,
+    "false": 0,
+    "found": 9,
+    "recall": 1.0,
+    "tags": 9
+   },
+   "one-tag": {
+    "err_median": 0.010050234823128532,
+    "err_p95": 0.016844551196165302,
+    "false": 0,
+    "found": 5,
+    "recall": 1.0,
+    "tags": 5
+   },
+   "small-tags": {
+    "err_median": 0.025114203511144066,
+    "err_p95": 0.03299891945203527,
+    "false": 0,
+    "found": 12,
+    "recall": 1.0,
+    "tags": 12
+   }
+  }
+ },
+ "d2": {
+  "overall": {
+   "err_median": 0.0190709452832927,
+   "err_p95": 0.11115318734070401,
+   "false": 0,
+   "found": 72,
+   "recall": 0.9473684210526315,
+   "tags": 76,
+   "time_ms": 0.2987
+  },
+  "scenarios": {
+   "blur": {
+    "err_median": 0.022362150343846796,
+    "err_p95": 0.05449819590594011,
+    "false": 0,
+    "found": 10,
+    "recall": 1.0,
+    "tags": 10
+   },
+   "border-occlusion": {
+    "err_median": 0.3734062784957704,
+    "err_p95": 0.41402688249069064,
+    "false": 0,
+    "found": 4,
+    "recall": 0.5,
+    "tags": 8
+   },
+   "clutter-only": {
+    "err_median": NaN,
+    "err_p95": NaN,
+    "false": 0,
+    "found": 0,
+    "recall": NaN,
+    "tags": 0
+   },
+   "family16h5": {
+    "err_median": 0.008940845297846776,
+    "err_p95": 0.028169277324806175,
+    "false": 0,
+    "found": 8,
+    "recall": 1.0,
+    "tags": 8
+   },
+   "grey-margin": {
+    "err_median": 0.01297257588145602,
+    "err_p95": 0.022878476894293745,
+    "false": 0,
+    "found": 11,
+    "recall": 1.0,
+    "tags": 11
+   },
+   "low-contrast": {
+    "err_median": 0.026008345064598086,
+    "err_p95": 0.05777062770127258,
+    "false": 0,
+    "found": 8,
+    "recall": 1.0,
+    "tags": 8
+   },
+   "many-tags": {
+    "err_median": 0.003809677282905438,
+    "err_p95": 0.009952532341054093,
+    "false": 0,
+    "found": 5,
+    "recall": 1.0,
+    "tags": 5
+   },
+   "motion-blur": {
+    "err_median": 0.03127807553225239,
+    "err_p95": 0.18133539824592151,
+    "false": 0,
+    "found": 9,
+    "recall": 1.0,
+    "tags": 9
+   },
+   "one-tag": {
+    "err_median": 0.006559748775715562,
+    "err_p95": 0.01794115876971127,
+    "false": 0,
+    "found": 5,
+    "recall": 1.0,
+    "tags": 5
+   },
+   "small-tags": {
+    "err_median": 0.02243087880580563,
+    "err_p95": 0.029764895850630895,
+    "false": 0,
+    "found": 12,
+    "recall": 1.0,
+    "tags": 12
+   }
+  }
+ }
+}

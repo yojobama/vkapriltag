@@ -28,11 +28,17 @@ if(VKAPRILTAG_BUILD_APPS AND UNIX)
   add_subdirectory(apps)
 endif()
 
+option(VKAPRILTAG_BUILD_TESTS "Build and register the ctest unit and golden-detection tests" ON)
+
+enable_testing()
+
 if(VKAPRILTAG_BUILD_TOOLS)
   add_subdirectory(tools)
 endif()
 
-enable_testing()
+if(VKAPRILTAG_BUILD_TESTS)
+  add_subdirectory(tests)
+endif()
 
 # ---------------------------------------------------------------------------
 # CPack: packages the install() rules of library/CMakeLists.txt; inert unless cpack is invoked.
