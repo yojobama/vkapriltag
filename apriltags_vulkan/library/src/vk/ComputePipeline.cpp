@@ -1,5 +1,7 @@
 #include "vkapriltag/vk/ComputePipeline.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -32,7 +34,7 @@ constexpr uint32_t kProbeSlots = 256;
 }  // namespace
 
 bool DispatchProbe::Enabled() {
-  static const bool on = std::getenv("APRILTAG_VK_DISPATCH_TIMES") != nullptr;
+  static const bool on = Options::FromEnvironment().Has("APRILTAG_VK_DISPATCH_TIMES");
   return on;
 }
 
