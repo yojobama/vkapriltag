@@ -308,7 +308,6 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
       options.burst = prewarm_burst;
       if (const char *v = std::getenv("APRILTAG_VK_PREWARM_GROUPS")) options.groups = static_cast<uint32_t>(std::max(1, std::atoi(v)));
       options.burst_gap = std::chrono::microseconds(prewarm_gap_us);
-      options.on_warm = [] { WorkerPool::WarmAll(); };
       keepalive_ = std::make_unique<KeepAlive>(std::move(keepalive_lane), keepalive_pl_, options);
     }
   }
@@ -852,7 +851,6 @@ void GpuDetector::RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier) {
 void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool trailing_compress) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
-  struct { uint32_t dw, dh; } dwdh_pc{decimated_width_, decimated_height_};
 
   // Records `iterations` labelling passes, clearing the flag before the last merge.
   // Without `trailing_compress` the last merge is a verification merge with nothing after it.
@@ -1334,8 +1332,8 @@ void GpuDetector::Prewarm() {
   if (keepalive_) keepalive_->Prewarm();
 }
 
-void GpuDetector::NoteFrame(bool warm_pool) {
-  if (keepalive_) keepalive_->NoteFrame(warm_pool);
+void GpuDetector::NoteFrame() {
+  if (keepalive_) keepalive_->NoteFrame();
 }
 
 void GpuDetector::ExpectGpuFrame() {
@@ -1442,6 +1440,60 @@ void GpuDetector::DetectFused(const FrameStart &frame, uint32_t chunk) {
   last_profile_.uf_converged = converged;
 }
 
+// Reads the GPU timestamps of the frame into last_profile_ and the trace.
+void GpuDetector::CollectGpuTimings() {
+  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns, this);
+  if (timestamps_enabled_) {
+    const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
+    const double ns_per_tick = ctx_.caps().timestamp_period_ns;
+    for (uint32_t s = 0; s < kNumGpuStageSpans; ++s) {
+      const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
+      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
+      // Both ends of a span are written together, so both are available or neither.
+      if (start.available && end.available && end.ticks >= start.ticks) {
+        last_profile_.gpu_stage_ms[s] = double(end.ticks - start.ticks) * ns_per_tick / 1.0e6;
+      }
+    }
+    // Gap g is between span g's end and span g+1's start; see DetectProfile::gpu_gap_ms.
+    for (uint32_t g = 0; g + 1 < kNumGpuStageSpans; ++g) {
+      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(g))];
+      const vk::QueryPool::Result &next_start =
+          results[SpanStart(static_cast<GpuStageSpan>(g + 1))];
+      if (end.available && next_start.available && next_start.ticks >= end.ticks) {
+        last_profile_.gpu_gap_ms[g] =
+            double(next_start.ticks - end.ticks) * ns_per_tick / 1.0e6;
+      }
+    }
+    last_profile_.has_gpu_stage_breakdown = true;
+
+    // Pins the first available GPU span start to the first submission's host time; later spans keep
+    // their GPU-clock spacing.
+    if (prof::Enabled() && frame_first_submit_ns_ != 0) {
+      uint64_t base_ticks = 0;
+      bool have_base = false;
+      for (uint32_t s = 0; s < kNumGpuStageSpans && !have_base; ++s) {
+        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
+        if (start.available) {
+          base_ticks = start.ticks;
+          have_base = true;
+        }
+      }
+      auto to_host_ns = [&](uint64_t ticks) {
+        return frame_first_submit_ns_ + static_cast<prof::Ns>(double(ticks - base_ticks) * ns_per_tick);
+      };
+      for (uint32_t s = 0; s < kNumGpuStageSpans && have_base; ++s) {
+        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
+        const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
+        if (start.available && end.available && end.ticks >= start.ticks &&
+            start.ticks >= base_ticks) {
+          prof::Complete(gpu_track_, kGpuStageNames[s], to_host_ns(start.ticks),
+                         to_host_ns(end.ticks));
+        }
+      }
+    }
+  }
+}
+
 void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submitted) {
   const uint32_t oversized_sort_blobs = ReadCounterSlot(kSlotOversizedSortBlobs);
 
@@ -1503,57 +1555,7 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
   // uf_iterations and uf_converged are set by DetectFused, once any retry is resolved.
   last_profile_.submits = static_cast<uint32_t>(lane_.submit_count - frame.submits_at_start);
 
-  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns, this);
-  if (timestamps_enabled_) {
-    const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
-    const double ns_per_tick = ctx_.caps().timestamp_period_ns;
-    for (uint32_t s = 0; s < kNumGpuStageSpans; ++s) {
-      const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
-      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
-      // Both ends of a span are written together, so both are available or neither.
-      if (start.available && end.available && end.ticks >= start.ticks) {
-        last_profile_.gpu_stage_ms[s] = double(end.ticks - start.ticks) * ns_per_tick / 1.0e6;
-      }
-    }
-    // Gap g is between span g's end and span g+1's start; see DetectProfile::gpu_gap_ms.
-    for (uint32_t g = 0; g + 1 < kNumGpuStageSpans; ++g) {
-      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(g))];
-      const vk::QueryPool::Result &next_start =
-          results[SpanStart(static_cast<GpuStageSpan>(g + 1))];
-      if (end.available && next_start.available && next_start.ticks >= end.ticks) {
-        last_profile_.gpu_gap_ms[g] =
-            double(next_start.ticks - end.ticks) * ns_per_tick / 1.0e6;
-      }
-    }
-    last_profile_.has_gpu_stage_breakdown = true;
-
-    // Pins the first available GPU span start to the first submission's host time; later spans keep
-    // their GPU-clock spacing.
-    if (prof::Enabled() && frame_first_submit_ns_ != 0) {
-      uint64_t base_ticks = 0;
-      bool have_base = false;
-      for (uint32_t s = 0; s < kNumGpuStageSpans && !have_base; ++s) {
-        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
-        if (start.available) {
-          base_ticks = start.ticks;
-          have_base = true;
-        }
-      }
-      auto to_host_ns = [&](uint64_t ticks) {
-        return frame_first_submit_ns_ +
-               static_cast<prof::Ns>(double(ticks - base_ticks) * ns_per_tick);
-      };
-      for (uint32_t s = 0; s < kNumGpuStageSpans && have_base; ++s) {
-        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
-        const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
-        if (start.available && end.available && end.ticks >= start.ticks &&
-            start.ticks >= base_ticks) {
-          prof::Complete(gpu_track_, kGpuStageNames[s], to_host_ns(start.ticks),
-                         to_host_ns(end.ticks));
-        }
-      }
-    }
-  }
+  CollectGpuTimings();
 }
 
 // The flow for devices without host-visible, cached readbacks: dispatches are sized from counts
@@ -1599,14 +1601,6 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // Submit 1: decimate, adaptive threshold, and the first chunk of
   // connected-component labelling.
   // ------------------------------------------------------------------
-  // Record the frame's last three submissions as one when every dispatch in
-  // them can be sized on the device. See fused_submits_ in the header.
-  const bool fuse = false;  // this flow serves only the unfused configuration
-  if (fuse) {
-    // The tail is a single submission; only the labelling readback splits the frame.
-    last_profile_.gap_crosses_submit[kSpanBoundary] = false;   // boundary -> hash_group
-    last_profile_.gap_crosses_submit[kSpanScatter] = false;    // scatter -> sort
-  }
   VkCommandBuffer cmd = BeginTimedCommands();
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
@@ -1645,45 +1639,14 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   }
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
-  struct UfCompressPc { uint32_t dw, dh, honour_changed_flag; };
   const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
   if (!uf_init_scan_) uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
-
-  // Records `iterations` labelling passes. The flag is cleared before the last merge, so zero
-  // afterwards means converged. The last uf_compress is predicated on it when available.
-  auto record_uf_chunk = [&](VkCommandBuffer c, uint32_t iterations) {
-    for (uint32_t iter = 0; iter < iterations; ++iter) {
-      const bool last = iter + 1 == iterations;
-      const bool predicate = last && predicated_compress_;
-      if (last) {
-        // Also orders an earlier predicate read of the flag before the fill.
-        vk::ComputePipeline::Barrier(c, predicated_compress_
-                                            ? BarrierKind::ComputeTransferAndPredicate
-                                            : BarrierKind::ComputeAndTransfer);
-        uf_changed_buf_.FillZero(c);
-        vk::ComputePipeline::Barrier(c, BarrierKind::ComputeAndTransfer);
-      }
-      // The barrier makes the merge's flag write visible to the compression's guard or predicate read.
-      RecordMerge(c, predicate ? BarrierKind::ComputeAndPredicate : BarrierKind::Compute);
-      if (predicate) {
-        // Runs only when the flag is nonzero, so the guard is skipped.
-        const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
-        ctx_.CmdBeginConditionalRendering(c, uf_changed_buf_.get(), 0);
-        uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc, BarrierKind::None);
-        ctx_.CmdEndConditionalRendering(c);
-        vk::ComputePipeline::Barrier(c, BarrierKind::Compute);
-      } else {
-        const UfCompressPc compress_pc{decimated_width_, decimated_height_, 1u};
-        uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc);
-      }
-    }
-  };
 
   // Seeds the first chunk with last frame's converged iteration count.
   uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
   chunk = std::min(chunk, config_.max_uf_iterations);
   if (uf_verify_) {
-    record_uf_chunk(cmd, chunk);
+    RecordUfChunk(cmd, chunk);
   } else {
     // One merge joins every component; the compression skips its walk when it joined nothing and
     // parent[] was flat before the merge.
@@ -1701,19 +1664,34 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // Orders the compute writes before the transfer read below; the default Compute barrier does not
   // cover the transfer stage.
   vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
-  // Copies the convergence flag, read back at once (unfused) or after the fused tail returns.
+  // Copies the convergence flag, read back at once.
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
 
+  // ------------------------------------------------------------------
+  // Submit 2: reads back convergence and runs any extra labelling chunks.
+  // ------------------------------------------------------------------
   uint32_t uf_iterations = chunk;
-  bool converged = false;
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  SubmitTimedAndWait(cmd);
+  bool converged = !uf_verify_ || ReadCounterSlot(kSlotUfChanged) == 0;
+  while (!converged && uf_iterations < config_.max_uf_iterations) {
+    const uint32_t next =
+        std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
+    cmd = BeginTimedCommands();
+    RecordUfChunk(cmd, next);
+    // The default compute barrier does not cover the transfer read of this copy.
+    vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
+    RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
+    vk::ComputePipeline::HostReadBarrier(cmd);
+    SubmitTimedAndWait(cmd);
+    uf_iterations += next;
+    converged = ReadCounterSlot(kSlotUfChanged) == 0;
+  }
 
   // ------------------------------------------------------------------
-  // Submit 2 (unfused) / rest of the frame (fused): blob sizes, boundary extraction, grouping,
-  // selection, sort, line-fit and every readback. A lambda so the fused path can run it twice.
-  //
-  // Returns whether the uf_changed copy recorded before the call showed convergence. `speculative`
-  // (fused first attempt only) stops blob_diff_pl_ acting on unconverged labels.
-  auto finish_frame = [&](VkCommandBuffer cmd, bool speculative) -> bool {
+  // Submit 3: blob sizes and boundary extraction.
+  // ------------------------------------------------------------------
+  cmd = BeginTimedCommands();
   const auto t_label = Clock::now();
 
   // uf_final counts to the size floor, which must equal blob_diff's.
@@ -1727,8 +1705,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends
   // valid boundary points directly to the compacted buffer.
   struct { uint32_t w, h, capacity, honour_changed_flag, min_blob; } blobdiff_pc{
-      decimated_width_, decimated_height_, qbp_capacity_, speculative ? 1u : 0u,
-      config_.min_cluster_pixels};
+      decimated_width_, decimated_height_, qbp_capacity_, 0u, config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   if (sparse_) {
     blob_diff_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &blobdiff_pc,
@@ -1740,41 +1717,23 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
-  if (!fuse) {
-    vk::ComputePipeline::HostReadBarrier(cmd);
-    SubmitTimedAndWait(cmd);
-  }
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  SubmitTimedAndWait(cmd);
 
-  // When fusing, the count stays on the device; the host value is used only on the unfused path.
-  const uint32_t qbp_count =
-      fuse ? 0u : std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
-  // The shaders' `count`: with count_from_buffer it caps the device's counter at the capacity.
-  const uint32_t qbp_pc_count = fuse ? qbp_capacity_ : qbp_count;
+  const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
   const auto t_boundary = Clock::now();
 
   // ------------------------------------------------------------------
-  // Submit 3: group boundary points by (rep0, rep1), select plausible quads, and scatter the
+  // Submit 4: group boundary points by (rep0, rep1), select plausible quads, and scatter the
   // survivors into per-blob runs.
   // ------------------------------------------------------------------
-  if (!fuse) cmd = BeginTimedCommands();
-  // Slot 1 of the indirect args: ceil(boundary points / wg1d), for
-  // hash_group, reduce_extents_hash and scatter_index_points.
-  if (fuse) {
-    struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{wg1d_.x, 1u, 1u,
-                                                                       qbp_capacity_, 2u};
-    build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
-    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
-  }
-  if (fuse || qbp_count > 0) {
+  cmd = BeginTimedCommands();
+  if (qbp_count > 0) {
     // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
     struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
-        qbp_pc_count, hash_table_size_ - 1u, 128u, fuse ? 1u : 0u, config_.max_raw_blobs};
+        qbp_count, hash_table_size_ - 1u, 128u, 0u, config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
-    if (fuse) {
-      hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
-    } else {
-      hash_group_pl_.Dispatch1D(cmd, qbp_count, &hash_pc);
-    }
+    hash_group_pl_.Dispatch1D(cmd, qbp_count, &hash_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
     // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
@@ -1785,14 +1744,9 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
 
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
     struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{
-        qbp_pc_count, config_.max_raw_blobs, fuse ? 1u : 0u};
-    if (fuse) {
-      reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(),
-                                               reduce_x4_ ? 24 : 12, &reduce_pc);
-    } else {
-      reduce_extents_hash_pl_.Dispatch1D(cmd, reduce_x4_ ? (qbp_count + 3u) / 4u : qbp_count,
-                                         &reduce_pc);
-    }
+        qbp_count, config_.max_raw_blobs, 0u};
+    reduce_extents_hash_pl_.Dispatch1D(cmd, reduce_x4_ ? (qbp_count + 3u) / 4u : qbp_count,
+                                       &reduce_pc);
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
 
@@ -1816,15 +1770,10 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
     struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
-        qbp_pc_count, ipoint_capacity_, config_.max_raw_blobs, fuse ? 1u : 0u};
+        qbp_count, ipoint_capacity_, config_.max_raw_blobs, 0u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
-    if (fuse) {
-      scatter_index_points_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
-                                                BarrierKind::ComputeAndTransfer);
-    } else {
-      scatter_index_points_pl_.Dispatch1D(cmd, qbp_count, &scatter_pc,
-                                          BarrierKind::ComputeAndTransfer);
-    }
+    scatter_index_points_pl_.Dispatch1D(cmd, qbp_count, &scatter_pc,
+                                        BarrierKind::ComputeAndTransfer);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
 
     // The number of distinct (rep0, rep1) pairs this frame; profiling only.
@@ -1838,43 +1787,33 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
         VkDeviceSize(kSlotPointCount) * 4);
   }
   RecordCounterCopy(cmd, selected_counter_buf_, kSlotSelectedCount);
-  if (!fuse) {
-    vk::ComputePipeline::HostReadBarrier(cmd);
-    SubmitTimedAndWait(cmd);
-  }
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  SubmitTimedAndWait(cmd);
 
-  const uint32_t num_raw_blobs =
-      fuse ? 0u : ((qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0);
-  const uint32_t hash_probe_drops =
-      fuse ? 0u : ((qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0);
+  const uint32_t num_raw_blobs = (qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0;
+  const uint32_t hash_probe_drops = (qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0;
   // Blobs that passed the filters, which can exceed max_blobs; kept unclamped to report
   // selected_blob_drops.
-  const uint32_t qualifying_blobs = fuse ? 0u : ReadCounterSlot(kSlotSelectedCount);
-  const uint32_t num_selected_blobs = fuse ? 0u : std::min(qualifying_blobs, config_.max_blobs);
-  const uint32_t selected_blob_drops = fuse ? 0u : (qualifying_blobs - num_selected_blobs);
+  const uint32_t qualifying_blobs = ReadCounterSlot(kSlotSelectedCount);
+  const uint32_t num_selected_blobs = std::min(qualifying_blobs, config_.max_blobs);
+  const uint32_t selected_blob_drops = qualifying_blobs - num_selected_blobs;
   const uint32_t num_points =
-      fuse ? 0u
-           : ((qbp_count > 0) ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_) : 0);
+      (qbp_count > 0) ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_) : 0;
   const auto t_sort_group = Clock::now();
 
   // ------------------------------------------------------------------
-  // Submit 4: sort each blob's points around its perimeter, compute line-fit moments, and stage
+  // Submit 5: sort each blob's points around its perimeter, compute line-fit moments, and stage
   // both payloads for readback.
   // ------------------------------------------------------------------
-  // Staging sizes are needed only on the unfused path; the fused path reads both in place.
-  const VkDeviceSize extents_bytes =
-      fuse ? 0 : VkDeviceSize(num_selected_blobs) * sizeof(MinMaxExtentsGpu);
+  const VkDeviceSize extents_bytes = VkDeviceSize(num_selected_blobs) * sizeof(MinMaxExtentsGpu);
   const VkDeviceSize linefit_offset = (extents_bytes + 15) & ~VkDeviceSize(15);
-  const VkDeviceSize linefit_bytes =
-      fuse ? 0 : VkDeviceSize(num_points) * sizeof(RawLineFitPoint);
-  if (!fuse) EnsureReadbackCapacity(linefit_offset + linefit_bytes);
+  const VkDeviceSize linefit_bytes = VkDeviceSize(num_points) * sizeof(RawLineFitPoint);
+  EnsureReadbackCapacity(linefit_offset + linefit_bytes);
 
-  if (!fuse) cmd = BeginTimedCommands();
-  // The sort's arguments (one workgroup per selected blob) were written by scan_blob_counts.
-  if (fuse) vk::ComputePipeline::IndirectDispatchBarrier(cmd);
-  if (fuse || num_points > 0) {
+  cmd = BeginTimedCommands();
+  if (num_points > 0) {
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSort));
-    RecordSort(cmd, num_selected_blobs, fuse);
+    RecordSort(cmd, num_selected_blobs, false);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSort));
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanReadbackCopy));
@@ -1893,57 +1832,33 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   const auto t_linefit = Clock::now();
   const uint32_t oversized_sort_blobs = ReadCounterSlot(kSlotOversizedSortBlobs);
 
-  // On the fused path the counts were consumed on the device; read them now for the readback spans
-  // and the profile.
-  const uint32_t final_qbp_count =
-      fuse ? std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_) : qbp_count;
-  const uint32_t final_raw_blobs =
-      fuse ? ((final_qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0) : num_raw_blobs;
-  const uint32_t final_hash_drops =
-      fuse ? ((final_qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0) : hash_probe_drops;
-  const uint32_t final_qualifying =
-      fuse ? ReadCounterSlot(kSlotSelectedCount) : qualifying_blobs;
-  const uint32_t final_selected_blobs =
-      fuse ? std::min(final_qualifying, config_.max_blobs) : num_selected_blobs;
-  const uint32_t final_blob_drops =
-      fuse ? (final_qualifying - final_selected_blobs) : selected_blob_drops;
-  const uint32_t final_num_points =
-      fuse ? ((final_qbp_count > 0)
-                  ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_)
-                  : 0)
-           : num_points;
-  const VkDeviceSize final_extents_bytes =
-      VkDeviceSize(final_selected_blobs) * sizeof(MinMaxExtentsGpu);
-  const VkDeviceSize final_linefit_bytes =
-      VkDeviceSize(final_num_points) * sizeof(RawLineFitPoint);
-
   // ------------------------------------------------------------------
   // Host-side copies out of the persistently mapped readback buffer.
   // ------------------------------------------------------------------
-  last_selected_extents.resize(final_selected_blobs);
-  if (final_extents_bytes > 0) {
+  last_selected_extents.resize(num_selected_blobs);
+  if (extents_bytes > 0) {
     if (extents_direct_read_) {
       if (!selected_extents_buf_.coherent()) {
-        selected_extents_buf_.InvalidateRange(0, final_extents_bytes);
+        selected_extents_buf_.InvalidateRange(0, extents_bytes);
       }
       std::memcpy(last_selected_extents.data(), selected_extents_buf_.mapped(),
-                  static_cast<size_t>(final_extents_bytes));
+                  static_cast<size_t>(extents_bytes));
     } else {
-      readback_staging_.Read(last_selected_extents.data(), final_extents_bytes, 0);
+      readback_staging_.Read(last_selected_extents.data(), extents_bytes, 0);
     }
   }
   if (linefit_direct_read_) {
     // Zero-copy view of the mapping, valid until the next Detect(); invalidates first when the
     // memory is not coherent.
     if (!line_fit_points_buf_.coherent()) {
-      line_fit_points_buf_.InvalidateRange(0, final_linefit_bytes);
+      line_fit_points_buf_.InvalidateRange(0, linefit_bytes);
     }
     last_line_fit_points = std::span<const RawLineFitPoint>(
-        static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), final_num_points);
+        static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), num_points);
   } else {
-    linefit_scratch_.resize(final_num_points);
-    if (final_linefit_bytes > 0) {
-      readback_staging_.Read(linefit_scratch_.data(), final_linefit_bytes, linefit_offset);
+    linefit_scratch_.resize(num_points);
+    if (linefit_bytes > 0) {
+      readback_staging_.Read(linefit_scratch_.data(), linefit_bytes, linefit_offset);
     }
     last_line_fit_points = std::span<const RawLineFitPoint>(linefit_scratch_);
   }
@@ -1972,132 +1887,18 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   last_profile_.total_ms = MsSince(t_begin, t_end);
   last_profile_.upload_bytes = gray_bytes;
   last_profile_.readback_bytes = extents_bytes + linefit_bytes + 16;
-  last_profile_.selected_blobs = final_selected_blobs;
-  last_profile_.points = final_num_points;
-  last_profile_.boundary_points = final_qbp_count;
-  last_profile_.raw_blobs = final_raw_blobs;
-  last_profile_.hash_probe_drops = final_hash_drops;
-  last_profile_.selected_blob_drops = final_blob_drops;
+  last_profile_.selected_blobs = num_selected_blobs;
+  last_profile_.points = num_points;
+  last_profile_.boundary_points = qbp_count;
+  last_profile_.raw_blobs = num_raw_blobs;
+  last_profile_.hash_probe_drops = hash_probe_drops;
+  last_profile_.selected_blob_drops = selected_blob_drops;
   last_profile_.oversized_sort_blobs = oversized_sort_blobs;
-  // uf_iterations and uf_converged are set at the end of Detect(), once the fused retry is resolved.
+  // uf_iterations and uf_converged are set at the end of this function.
   last_profile_.submits = static_cast<uint32_t>(lane_.submit_count - submits_at_start);
 
-  vk::DispatchProbe::Collect(ctx_.device(), ctx_.caps().timestamp_period_ns, this);
-  if (timestamps_enabled_) {
-    const std::vector<vk::QueryPool::Result> results = timestamp_pool_.ReadResults();
-    const double ns_per_tick = ctx_.caps().timestamp_period_ns;
-    for (uint32_t s = 0; s < kNumGpuStageSpans; ++s) {
-      const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
-      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
-      // Both ends of a span are written together, so both are available or neither.
-      if (start.available && end.available && end.ticks >= start.ticks) {
-        last_profile_.gpu_stage_ms[s] = double(end.ticks - start.ticks) * ns_per_tick / 1.0e6;
-      }
-    }
-    // Gap g is between span g's end and span g+1's start; see DetectProfile::gpu_gap_ms.
-    for (uint32_t g = 0; g + 1 < kNumGpuStageSpans; ++g) {
-      const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(g))];
-      const vk::QueryPool::Result &next_start =
-          results[SpanStart(static_cast<GpuStageSpan>(g + 1))];
-      if (end.available && next_start.available && next_start.ticks >= end.ticks) {
-        last_profile_.gpu_gap_ms[g] =
-            double(next_start.ticks - end.ticks) * ns_per_tick / 1.0e6;
-      }
-    }
-    last_profile_.has_gpu_stage_breakdown = true;
+  CollectGpuTimings();
 
-    // Pins the first available GPU span start to the first submission's host time; later spans keep
-    // their GPU-clock spacing.
-    if (prof::Enabled() && frame_first_submit_ns_ != 0) {
-      uint64_t base_ticks = 0;
-      bool have_base = false;
-      for (uint32_t s = 0; s < kNumGpuStageSpans && !have_base; ++s) {
-        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
-        if (start.available) {
-          base_ticks = start.ticks;
-          have_base = true;
-        }
-      }
-      auto to_host_ns = [&](uint64_t ticks) {
-        return frame_first_submit_ns_ + static_cast<prof::Ns>(double(ticks - base_ticks) * ns_per_tick);
-      };
-      for (uint32_t s = 0; s < kNumGpuStageSpans && have_base; ++s) {
-        const vk::QueryPool::Result &start = results[SpanStart(static_cast<GpuStageSpan>(s))];
-        const vk::QueryPool::Result &end = results[SpanEnd(static_cast<GpuStageSpan>(s))];
-        if (start.available && end.available && end.ticks >= start.ticks &&
-            start.ticks >= base_ticks) {
-          prof::Complete(gpu_track_, kGpuStageNames[s], to_host_ns(start.ticks),
-                         to_host_ns(end.ticks));
-        }
-      }
-    }
-  }
-
-  // Quad fitting itself happens in QuadDecode (CPU tail); Detect() only runs
-  // the GPU pipeline and exposes its outputs via last_selected_extents /
-  // last_line_fit_points.
-  return !uf_verify_ || ReadCounterSlot(kSlotUfChanged) == 0;
-  };  // finish_frame
-
-  if (fuse) {
-    // Fast path: assumes `chunk` iterations converged (seeded from last frame's count) and records
-    // the whole tail into the labelling command buffer with no submit between.
-    converged = finish_frame(cmd, /*speculative=*/true);
-    if (!converged) {
-      // The chunk undershot: discards the tail's results and resumes convergence from the current
-      // parent[], which uf_merge and uf_compress can continue from.
-      while (!converged && uf_iterations < config_.max_uf_iterations) {
-        const uint32_t next =
-            std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
-        cmd = BeginTimedCommands();
-        record_uf_chunk(cmd, next);
-        // The default compute barrier does not cover the transfer read of this copy.
-        vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
-        RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
-        vk::ComputePipeline::HostReadBarrier(cmd);
-        SubmitTimedAndWait(cmd);
-        uf_iterations += next;
-        converged = ReadCounterSlot(kSlotUfChanged) == 0;
-      }
-
-      // parent[] is converged (or max_uf_iterations was hit). Re-zeroes the buffers the discarded tail
-      // dirtied (record_uf_chunk re-zeroes uf_changed_buf_) and reruns the tail. The timestamp pool
-      // is reset, so this frame has no per-span breakdown.
-      cmd = BeginTimedCommands();
-      timestamp_pool_.Reset(cmd);
-      qbp_counter_buf_.FillZero(cmd);
-      selected_counter_buf_.FillZero(cmd);
-      blob_size_buf_.FillZero(cmd);
-      hash_owner_buf_.FillZero(cmd);
-      blob_cursor_buf_.FillZero(cmd);
-      raw_blob_counter_buf_.FillZero(cmd);
-      hash_drop_counter_buf_.FillZero(cmd);
-      oversized_sort_counter_buf_.FillZero(cmd);
-      vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
-      finish_frame(cmd, /*speculative=*/false);
-    }
-  } else {
-    // Unfused: submits the labelling chunk, reads back convergence, runs any extra chunks, then
-    // submits the tail separately.
-    vk::ComputePipeline::HostReadBarrier(cmd);
-    SubmitTimedAndWait(cmd);
-    converged = !uf_verify_ || ReadCounterSlot(kSlotUfChanged) == 0;
-    while (!converged && uf_iterations < config_.max_uf_iterations) {
-      const uint32_t next =
-          std::min(config_.uf_iterations_per_chunk, config_.max_uf_iterations - uf_iterations);
-      cmd = BeginTimedCommands();
-      record_uf_chunk(cmd, next);
-      // The default compute barrier does not cover the transfer read of this copy.
-      vk::ComputePipeline::Barrier(cmd, BarrierKind::ComputeAndTransfer);
-      RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
-      vk::ComputePipeline::HostReadBarrier(cmd);
-      SubmitTimedAndWait(cmd);
-      uf_iterations += next;
-      converged = ReadCounterSlot(kSlotUfChanged) == 0;
-    }
-    cmd = BeginTimedCommands();
-    finish_frame(cmd, /*speculative=*/false);
-  }
   last_uf_iterations_ = uf_iterations;
   last_profile_.uf_iterations = uf_iterations;
   last_profile_.uf_converged = converged;

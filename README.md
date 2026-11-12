@@ -182,7 +182,7 @@ apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation);
 // Per frame:
 detector.Detect(gray_frame);  // tightly packed 8-bit grayscale, width*height bytes
 std::vector<apriltag_vulkan::DetectedQuad> quads =
-    quad_decode.Decode(detector.last_selected_extents, detector.last_line_fit_points);
+    quad_decode.Decode(detector.last_line_fit_points);
 zarray_t *detections =
     tag_decoder.Decode(quads, gray_frame, width, height, config.reversed_border);
 ```

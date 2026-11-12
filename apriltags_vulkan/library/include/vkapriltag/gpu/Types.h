@@ -69,9 +69,4 @@ struct LineFitMoments {
   int32_t N = 0;
 };
 
-// Fitted quad corners in un-decimated pixel coordinates.
-struct QuadCorners {
-  double corners[4][2] = {};
-};
-
 }  // namespace apriltag_vulkan

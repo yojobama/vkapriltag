@@ -38,29 +38,11 @@ struct TrackingConfig {
   // is too slow to settle from there); the next 1, 2, 4... frames, up to keyframe_interval, then run full.
   float max_first_shift_px = 3.0f;
   float converge_px = 0.05f;
-  // A track predicted to move more than this many pixels per frame (corner speed) is not tracked: on
-  // blurred tags the refine settles up to 2 px off. 0 = no limit. Env override: APRILTAG_VK_TRACKING_MAX_SPEED=<px>
-  float max_speed_px = 0.0f;
   uint32_t max_iterations = 3;
-  // When the predicted corners do not decode, search a region around the tag with libapriltag's quad
-  // detector before giving up. Env override: APRILTAG_VK_TRACKING_SEARCH=0|1
-  bool roi_search = false;
-  // The search region's padding: at least roi_pad_min pixels and roi_pad_frac of the tag's side.
-  float roi_pad_frac = 0.75f;
-  float roi_pad_min = 16.0f;
-  // The region is decimated until the tag's side is about this many pixels, at most 4 times.
-  float search_tag_px = 24.0f;
-  // Widens the capture range of a track that failed its first refine: tries constant-acceleration and
-  // zero-velocity starts, then refines on a box-decimated crop (by 2 to 8, from the speed) and finishes at full
-  // resolution from that result. Env override: APRILTAG_VK_TRACKING_CAPTURE=0|1
-  bool capture = false;
-  // The decimated crop's refine must settle within this many crop pixels.
-  float capture_converge_px = 0.1f;
-  // The crop's padding around the tag, as a fraction of the tag's side (at least 16 pixels).
-  float capture_pad_frac = 0.6f;
-  // A track predicted to move more than this many pixels per frame starts from a decimated refine
-  // even if its own prediction would decode (0 = only after a failure). Env override: APRILTAG_VK_TRACKING_CAPTURE_SPEED=<px>
-  float capture_speed_px = 0.0f;
+  // A background track's decimated start: the crop's padding around the tag, as a fraction of the tag's side
+  // (at least 16 pixels), and the crop pixels its refine must settle within.
+  float coarse_pad_frac = 0.6f;
+  float coarse_converge_px = 0.1f;
   // Asynchronous discovery (replaces the keyframes): the full detector runs on a background thread
   // while tracked frames return at the tracked cost; its tags join as tentative tracks that are
   // measured on the current frame before they are reported, and a lost track stays out of the output
@@ -83,13 +65,12 @@ struct TrackingConfig {
 };
 
 // Runs the full detector on keyframes and, between them, re-detects the tags of the previous frame on
-// the CPU alone, from corners predicted by constant velocity (refine, then decode); a tag that does not
-// decode is searched for in a padded region, and if any tag is still missing the frame goes to the full
-// detector. Detections have the same type as TagDecoder::Decode's. Not thread-safe: call Detect() from
+// the CPU alone, from corners predicted by constant velocity (refine, then decode); if any tag is missing
+// the frame goes to the full detector. Detections have the same type as TagDecoder::Decode's. Not thread-safe: call Detect() from
 // one thread (the asynchronous mode runs its own background thread).
 class TrackingDetector {
  public:
-  enum class Path { kFull, kTracked, kSearch, kCapture };
+  enum class Path { kFull, kTracked };
 
   // `td` must already have its tag families added and refine_edges set; it is not owned. `config`
   // is for the full detector; `decimation` of the tracked frames' refinement matches it.
@@ -123,9 +104,7 @@ class TrackingDetector {
   struct Stats {
     uint64_t frames_full = 0;
     uint64_t frames_tracked = 0;
-    uint64_t frames_search = 0;
     uint64_t tracked_attempts_failed = 0;  // tracked frames that fell through to the full detector
-    uint64_t frames_capture = 0;           // tracked frames that needed the wider capture
     uint64_t background_runs = 0;
     uint64_t tentative_accepted = 0;
     uint64_t tentative_rejected = 0;
@@ -139,9 +118,7 @@ class TrackingDetector {
     int id = 0;
     double p[4][2] = {};
     double v[4][2] = {};  // per frame
-    double a[4][2] = {};  // change of v per frame
     float margin = 0.0f;
-    bool has_v = false;
     uint32_t span = 1;  // frames since p was measured
     bool tentative = false;  // from the background detector, not yet measured on a frame
   };
@@ -153,14 +130,11 @@ class TrackingDetector {
   // succeed (nullptr if none).
   zarray_t *TrackFrame(const uint8_t *gray_frame, bool partial, Path *path);
   zarray_t *Solve(const uint8_t *gray_frame, std::vector<size_t> active, const std::vector<DetectedQuad> &start,
-                  const std::vector<char> &strict, std::vector<DetectedQuad> *cur, std::vector<char> *ok);
+                  std::vector<DetectedQuad> *cur, std::vector<char> *ok);
   void PredictQuad(const Track &t, DetectedQuad *q) const;
-  bool Accept(const apriltag_detection_t *det, const Track &t, const DetectedQuad &from,
-              bool strict) const;
-  bool SearchQuad(const uint8_t *gray_frame, const Track &t, DetectedQuad *out);
-  bool CaptureStart(const uint8_t *gray_frame, const Track &t, DetectedQuad *out);
+  bool Accept(const apriltag_detection_t *det, const Track &t, const DetectedQuad &from) const;
   bool CoarseStart(const uint8_t *gray_frame, const Track &t, int d, DetectedQuad *out);
-  void EnsureCapture();
+  void EnsureCoarse();
   void UpdateTracks(zarray_t *dets);
   void EnsureBackground();
   void StopBackground();
@@ -171,15 +145,13 @@ class TrackingDetector {
   DetectorConfig config_;
   TrackingConfig tracking_;
   apriltag_detector_t *td_;  // not owned
-  apriltag_detector_t *search_td_;
   std::unique_ptr<GpuDetector> gpu_;
   std::unique_ptr<QuadDecode> quad_decode_;
   std::unique_ptr<TagDecoder> full_decoder_;
   std::vector<Track> tracks_;
-  std::vector<uint8_t> crop_;
-  apriltag_detector_t *cap_td_ = nullptr;
-  std::unique_ptr<TagDecoder> cap_decoder_;
-  std::vector<uint8_t> cap_img_;
+  apriltag_detector_t *coarse_td_ = nullptr;
+  std::unique_ptr<TagDecoder> coarse_decoder_;
+  std::vector<uint8_t> coarse_img_;
   uint64_t frame_index_ = 0;
   uint64_t last_full_index_ = 0;
   uint64_t last_bg_start_ = 0;

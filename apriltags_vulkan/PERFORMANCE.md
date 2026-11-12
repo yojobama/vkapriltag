@@ -97,6 +97,7 @@ removed along with the radix/bitonic sorts it selected).
 | `APRILTAG_VK_PIPELINE_CACHE=0` | Disable the on-disk pipeline cache. |
 | `APRILTAG_VK_CACHE_DIR=<path>` | Where that cache lives. |
 | `APRILTAG_CPU_THREADS=<n>` | Parallelism for the CPU tail, including the calling thread. Default = `hardware_concurrency()`; 1 = serial. |
+| `APRILTAG_CPU_BIG_CORES=0` | On Linux CPUs whose cores differ in capacity, workers are pinned to the big cores and the default thread count is their number (default on); `0` turns that off. |
 
 ## 3. Measured performance
 
