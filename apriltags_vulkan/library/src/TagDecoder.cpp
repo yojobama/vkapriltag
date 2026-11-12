@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 
 #include "BorderSample.h"
@@ -329,6 +330,8 @@ struct DecodeEnv {
   RefineEdgesMethod refine_method;
   int min_white_cells;
   const ThirdBitIndex *third_index;
+  apriltag_family_t *family;  // the first registered family, null if none
+  int family_count;
   bool grey_margin, small_rescue, polish, side_one_out, third_bit, family_limits, border_precheck,
       dark_reject, early_reject, collect_probe;
   float probe_margin;
@@ -354,6 +357,18 @@ class StepClock {
   prof::Ns start_, mark_;
 };
 
+// A quad sampled as the decoder would, before it is refined: the code word read, the decision margin
+// and the homography built for it (null if the quad is degenerate).
+struct UnrefinedSample {
+  UnrefinedSample(const DecodeEnv &env, const struct quad &from) : quad(from) {
+    margin = quad_sample_code(env.td, &quad.q, env.im, &rcode);
+  }
+
+  float margin = -1.0f;
+  uint64_t rcode = 0;
+  OwnedQuad quad;
+};
+
 // One quad candidate and the state its steps share.
 struct Candidate {
   Candidate(const DecodeEnv &env, const DetectedQuad &input, zarray_t *found, zarray_t *probe)
@@ -369,6 +384,7 @@ struct Candidate {
   OwnedQuad quad;  // refined in place; owns the homographies quad_decode_index allocates
   zarray_t *found;  // this candidate's detections, owned by detections_ once merged
   zarray_t *probe;  // the thread's scratch for trial decodes
+  std::optional<UnrefinedSample> unrefined;  // taken once, shared by the early checks
   int probe_bin = -1;
   float probe_margin = 0.0f;
   StepClock clock;
@@ -392,36 +408,50 @@ bool NormaliseCandidate(const DecodeEnv &env, Candidate &c) {
   return true;
 }
 
-// How RunSteps ended; only kFinished candidates reach the probe statistics.
-enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
+// The unrefined sample of the candidate's quad, taken on first use.
+const UnrefinedSample &SharedSample(const DecodeEnv &env, Candidate &c) {
+  if (!c.unrefined) c.unrefined.emplace(env, c.quad.q);
+  return *c.unrefined;
+}
 
-Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
-  if (!NormaliseCandidate(env, c)) return Outcome::kDropped;
+// The margin gate and the probe statistics: a candidate whose unrefined decision margin is below the
+// gate is rejected.
+bool MarginGateRejects(const DecodeEnv &env, Candidate &c) {
+  // The gate reads the first family only, so it needs exactly one registered.
+  const bool gate = env.probe_margin > 0.0f && env.family_count == 1;
+  if (!((env.collect_probe || gate) && env.td->refine_edges)) return false;
+  const UnrefinedSample &sample = SharedSample(env, c);
+  c.probe_margin = sample.margin;
+  // The nearest-code distance is only needed for the statistics.
+  c.probe_bin = sample.margin < 0.0f ? 16
+                : env.collect_probe ? std::min(15, apriltag_min_hamming(env.td, sample.rcode))
+                                    : 0;
+  c.clock.Lap(&c.probe_ms);
+  return gate && sample.margin < env.probe_margin;
+}
 
-  // Margin gate and probe statistics: sample the unrefined quad.
-    // The gate reads the first family only, so it needs exactly one registered.
-  const bool gate = env.probe_margin > 0.0f && zarray_size(env.td->tag_families) == 1;
-  if ((env.collect_probe || gate) && env.td->refine_edges) {
-    OwnedQuad unrefined(c.quad.q);
-    uint64_t rcode = 0;
-    const float margin = quad_sample_code(env.td, &unrefined.q, env.im, &rcode);
-    c.probe_margin = margin;
-    // The nearest-code distance is only needed for the statistics.
-    c.probe_bin = margin < 0.0f ? 16
-                : env.collect_probe ? std::min(15, apriltag_min_hamming(env.td, rcode))
-                                 : 0;
-    unrefined.Free();
-    c.clock.Lap(&c.probe_ms);
-    if (gate && margin < env.probe_margin) return Outcome::kMarginGate;
+// A border read below 22 of 28 dark cells, or fewer white payload cells than the sparsest code has
+// (less two cells of error correction), cannot be a tag. Unreadable quads are kept.
+bool SampleCannotDecode(const DecodeEnv &env, const UnrefinedSample &sample) {
+  const bool single_family = env.family_count == 1;
+  bool bad = false;
+  if (env.border_precheck && single_family) {
+    BorderLevels border;
+    const bool read = sample.quad.q.H && ReadBorder(sample.quad.q.H, env.im, env.family->width_at_border, &border);
+    bad = read && border.dark * 28 < 22 * border.cells;
   }
+  const bool check_dark = env.dark_reject && !env.reversed_border && single_family;
+  if (check_dark && !bad) bad = std::popcount(sample.rcode) + 2 < env.min_white_cells;
+  return bad;
+}
 
-  // The border and dark checks on the unrefined quad. With grey margin on (see env.early_reject), a quad
-  // is rejected only if its inner W cells also fail them, as that is what the grey margin retry decodes.
-  const bool single_family = zarray_size(env.td->tag_families) == 1;
+// The border and dark checks on the unrefined quad. With grey margin on (see early_reject), a quad is
+// rejected only if its inner W cells also fail them, as that is what the grey margin retry decodes.
+bool PreRefineRejects(const DecodeEnv &env, Candidate &c) {
+  const bool single_family = env.family_count == 1;
   const bool check_border = env.border_precheck && single_family;
   const bool check_dark = env.dark_reject && !env.reversed_border && single_family;
-  apriltag_family_t *family = nullptr;
-  if (single_family) zarray_get(env.td->tag_families, 0, &family);
+  apriltag_family_t *family = single_family ? env.family : nullptr;
   // Under grey margin a coarse box or a quad under 1.5 pixels per cell is not rejected: its unrefined sample is too coarse.
   bool large_enough = true;
   if (env.grey_margin && family) {
@@ -433,37 +463,30 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
       if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0) large_enough = false;
     }
   }
-  if ((!env.grey_margin || (env.early_reject && large_enough)) && (check_border || check_dark)) {
-    // A border read below 22 of 28 dark cells, or fewer white payload cells than the sparsest code
-    // has (less two cells of error correction), cannot be a tag. Unreadable quads are kept.
-    auto cannot_decode = [&](const struct quad &quad, matd_t **keep_h) {
-      OwnedQuad candidate(quad);
-      uint64_t rcode = 0;
-      quad_sample_code(env.td, &candidate.q, env.im, &rcode);
-      bool bad = false;
-      if (check_border) {
-        BorderLevels border;
-        const bool read = candidate.q.H && ReadBorder(candidate.q.H, env.im, family->width_at_border, &border);
-        bad = read && border.dark * 28 < 22 * border.cells;
-      }
-      if (check_dark && !bad) bad = std::popcount(rcode) + 2 < env.min_white_cells;
-      if (keep_h) *keep_h = candidate.ReleaseH();
-      return bad;
-    };
-    matd_t *outer_h = nullptr;
-    bool reject = cannot_decode(c.quad.q, env.grey_margin ? &outer_h : nullptr);
-    if (reject && env.grey_margin) {
-      reject = false;
-      if (outer_h) {
-        struct quad inner;
-        InnerQuad(outer_h, family->width_at_border, env.reversed_border, &inner);
-        reject = cannot_decode(inner, nullptr);
-      }
+  if (!((!env.grey_margin || (env.early_reject && large_enough)) && (check_border || check_dark))) return false;
+  const UnrefinedSample &outer = SharedSample(env, c);
+  bool reject = SampleCannotDecode(env, outer);
+  if (reject && env.grey_margin) {
+    reject = false;
+    if (outer.quad.q.H) {
+      struct quad inner;
+      InnerQuad(outer.quad.q.H, family->width_at_border, env.reversed_border, &inner);
+      reject = SampleCannotDecode(env, UnrefinedSample(env, inner));
     }
-    if (outer_h) matd_destroy(outer_h);
-    c.clock.Lap(&c.probe_ms);
-    if (reject) return Outcome::kPreCheck;
   }
+  c.clock.Lap(&c.probe_ms);
+  return reject;
+}
+
+// How RunSteps ended; only kFinished candidates reach the probe statistics.
+enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
+
+Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
+  if (!NormaliseCandidate(env, c)) return Outcome::kDropped;
+
+  if (MarginGateRejects(env, c)) return Outcome::kMarginGate;
+  if (PreRefineRejects(env, c)) return Outcome::kPreCheck;
+  c.unrefined.reset();
 
   // Refine (if enabled) before decode; both are safe to run concurrently across quads.
   if (env.td->refine_edges) {
@@ -670,10 +693,12 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     zarray_get(td_->tag_families, 0, &family);
     if (third_index_.family != family) BuildThirdBitIndex(family, &third_index_);
   }
+  const int family_count = zarray_size(td_->tag_families);
+  apriltag_family_t *first_family = nullptr;
+  if (family_count > 0) zarray_get(td_->tag_families, 0, &first_family);
   int min_white_cells = 0;
-  if (dark_reject_ && zarray_size(td_->tag_families) == 1) {
-    apriltag_family_t *family = nullptr;
-    zarray_get(td_->tag_families, 0, &family);
+  if (dark_reject_ && family_count == 1) {
+    apriltag_family_t *family = first_family;
     min_white_cells = family->nbits;
     for (uint32_t k = 0; k < family->ncodes; ++k) {
       min_white_cells = std::min(min_white_cells, std::popcount(family->codes[k]));
@@ -700,6 +725,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       .refine_method = refine_method_,
       .min_white_cells = min_white_cells,
       .third_index = &third_index_,
+      .family = family_count > 0 ? first_family : nullptr,
+      .family_count = family_count,
       .grey_margin = grey_margin_,
       .small_rescue = small_rescue_,
       .polish = polish_,
