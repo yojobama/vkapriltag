@@ -552,6 +552,37 @@ void TrySideOneOut(const DecodeEnv &env, Candidate &c) {
   if (!keep) ClearDetections(c.probe);
 }
 
+// A third corrected bit, accepted only when the three wrong cells touch: damage such as a finger
+// or glare is coherent, a chance match is scattered.
+void TryThirdBit(const DecodeEnv &env, Candidate &c) {
+  if (!(env.third_bit && env.td->refine_edges && zarray_size(c.found) == 0 && AllowsThirdBit(env.td))) return;
+  VKA_PROF_SCOPE("tag.thirdbit");
+  OwnedQuad sampled(c.quad.q);
+  uint64_t rcode = 0;
+  const float margin = quad_sample_code(env.td, &sampled.q, env.im, &rcode);
+  int id = 0, rotation = 0;
+  if (!(margin >= 0 && sampled.q.H && MatchThreeTouchingBits(*env.third_index, rcode, &id, &rotation))) return;
+  apriltag_detection_t *det = static_cast<apriltag_detection_t *>(calloc(1, sizeof(apriltag_detection_t)));
+  det->family = env.family;
+  det->id = id;
+  det->hamming = 3;
+  det->decision_margin = margin;
+  const double theta = rotation * 1.5707963267948966;
+  matd_t *R = matd_create(3, 3);
+  MATD_EL(R, 0, 0) = std::cos(theta);
+  MATD_EL(R, 0, 1) = -std::sin(theta);
+  MATD_EL(R, 1, 0) = std::sin(theta);
+  MATD_EL(R, 1, 1) = std::cos(theta);
+  MATD_EL(R, 2, 2) = 1;
+  det->H = matd_op("M*M", sampled.q.H, R);
+  matd_destroy(R);
+  homography_project(det->H, 0, 0, &det->c[0], &det->c[1]);
+  for (int k = 0; k < 4; ++k) {  // counter-clockwise from (-1, -1), as quad_decode_index
+    homography_project(det->H, (k == 1 || k == 2) ? 1 : -1, (k < 2) ? 1 : -1, &det->p[k][0], &det->p[k][1]);
+  }
+  zarray_add(c.found, &det);
+}
+
 // How RunSteps ended; only kFinished candidates reach the probe statistics.
 enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 
@@ -569,38 +600,7 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
 
   TrySideOneOut(env, c);
 
-  // A third corrected bit, accepted only when the three wrong cells touch: damage such as a finger
-  // or glare is coherent, a chance match is scattered.
-  if (env.third_bit && env.td->refine_edges && zarray_size(c.found) == 0 && AllowsThirdBit(env.td)) {
-    VKA_PROF_SCOPE("tag.thirdbit");
-    apriltag_family_t *family = nullptr;
-    zarray_get(env.td->tag_families, 0, &family);
-    OwnedQuad sampled(c.quad.q);
-    uint64_t rcode = 0;
-    const float margin = quad_sample_code(env.td, &sampled.q, env.im, &rcode);
-    int id = 0, rotation = 0;
-    if (margin >= 0 && sampled.q.H && MatchThreeTouchingBits(*env.third_index, rcode, &id, &rotation)) {
-      apriltag_detection_t *det = static_cast<apriltag_detection_t *>(calloc(1, sizeof(apriltag_detection_t)));
-      det->family = family;
-      det->id = id;
-      det->hamming = 3;
-      det->decision_margin = margin;
-      const double theta = rotation * 1.5707963267948966;
-      matd_t *R = matd_create(3, 3);
-      MATD_EL(R, 0, 0) = std::cos(theta);
-      MATD_EL(R, 0, 1) = -std::sin(theta);
-      MATD_EL(R, 1, 0) = std::sin(theta);
-      MATD_EL(R, 1, 1) = std::cos(theta);
-      MATD_EL(R, 2, 2) = 1;
-      det->H = matd_op("M*M", sampled.q.H, R);
-      matd_destroy(R);
-      homography_project(det->H, 0, 0, &det->c[0], &det->c[1]);
-      for (int k = 0; k < 4; ++k) {  // counter-clockwise from (-1, -1), as quad_decode_index
-        homography_project(det->H, (k == 1 || k == 2) ? 1 : -1, (k < 2) ? 1 : -1, &det->p[k][0], &det->p[k][1]);
-      }
-      zarray_add(c.found, &det);
-    }
-  }
+  TryThirdBit(env, c);
 
   // A small quad that did not decode: refit it from the full-resolution image and try again.
   if (env.small_rescue && env.td->quad_decimate > 1 && !c.input.coarse && c.input.gradient >= 60.0f && env.td->refine_edges && zarray_size(c.found) == 0) {
