@@ -124,5 +124,30 @@ Categories: F feature (changes detections), T tuning (same detections), D diagno
 5. Statics: `ProfileFeatures()`, `DevFlags()`, `MaxPixels()`, `kKnobs`, `WaitFence` spin, `DispatchProbe::Enabled()`
    keep read-once-per-process semantics, through the registry.
 
+## What was built
+- `library/include/vkapriltag/common/Options.h`, `library/src/common/Options.cpp`: `OptionTable()` (82 rows: 79 APRILTAG
+  variables plus the three platform variables the cache directory reads), each with type, default text, category,
+  precedence, configuration field and a one-line doc; `Options::FromEnvironment()` copies every registered variable once;
+  accessors keep the parsing each reader had (`Bool` = first character not `0`, `Flag` = strict, `Int` = atoi,
+  `Long`/`ULong`, `Float`, `StrictInt` throws as before, `WxH`, `Choice`, `String`, `Has`). An unregistered name throws.
+- Resolution points: `Context::Init`, `GpuDetector` (member `env_`, one snapshot per detector), `QuadDecode` and
+  `TagDecoder` constructors, `TrackingDetector::ApplyEnv`, `ResolveThreadCount`, `ResolveWorkerPoolOptions`,
+  `ResolveRefineEdgesMethod`, `CacheDirectory`, `EnableFromEnv`. Process-wide statics (`ProfileFeatures`, `DevFlags`,
+  `MaxPixels`, `kKnobs`, `WaitFence` spin, `DispatchProbe::Enabled`) take one snapshot at first use, as before.
+- `ResolveThreadCount` moved from an inline in `WorkerPool.h` to `WorkerPool.cpp` (public header no longer uses getenv).
+- `TagDecoder` gained a trailing constructor argument `small_tag_rescue` (the configured value); `TrackingDetector` passes
+  `config_.small_tag_rescue` to its three decoders. Library callers that never set the field behave as before.
+- `vk_eval --list-options` (markdown) and `--list-option-names`; `PERFORMANCE.md` section 2 is the generated output between
+  `<!-- options:begin -->` markers.
+- ctest: `unit_options` (table checks, parsing, the `ResolveSmallTagRescue` and `cpu_threads` precedence) and
+  `options_lint` (`tests/options_lint.py`: no getenv of APRILTAG_ outside Options.cpp, no getenv at all in the library, every
+  APRILTAG_VK_/CPU_ name in the sources is registered, PERFORMANCE.md equals `--list-options`).
+
+## Commands
+Builds (wrappers in `$S/options/`, S = scratchpad): `cfg-cur.bat`, `build-cur.bat`, `ctest-cur.bat` for this branch
+(`ext/avk-compare/build-options`) and `cfg-base.bat`, `build-base.bat` for the base, which is `git archive 545bc4d`
+extracted to `ext/avk-compare/src-options-base` and built in `ext/avk-compare/build-options-base`.
+Dump comparison: `bash $S/options/gate.sh LABEL CORPUS DEC [VAR=val ...]` runs base, current and base again and `cmp`s the
+dump files; `bash $S/options/battery.sh` runs the single-switch list over the committed subset.
+
 ## Steps
-(log below)
