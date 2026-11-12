@@ -607,6 +607,32 @@ void TrySmallRescue(const DecodeEnv &env, Candidate &c) {
   quad_decode_index(env.td, &refit.q, env.im, /*im_samples=*/nullptr, c.found);
 }
 
+// Drops corrections beyond what the family can bear before they count as detections.
+void ApplyFamilyLimits(const DecodeEnv &env, Candidate &c) {
+  if (!env.family_limits) return;
+  for (int j = zarray_size(c.found) - 1; j >= 0; --j) {
+    apriltag_detection_t *det = nullptr;
+    zarray_get(c.found, j, &det);
+    // the third-bit match is the deliberate exception to the family limit
+    if (det->hamming > MaxCorrectedBits(det->family) && !(env.third_bit && det->hamming == 3)) {
+      apriltag_detection_destroy(det);
+      zarray_remove_index(c.found, j, 0);
+    }
+  }
+}
+
+// Refits each detection's homography to every cell edge of its code.
+void PolishFound(const DecodeEnv &env, Candidate &c) {
+  if (!env.polish) return;
+  VKA_PROF_SCOPE("tag.polish");
+  for (int j = 0; j < zarray_size(c.found); ++j) {
+    apriltag_detection_t *det = nullptr;
+    zarray_get(c.found, j, &det);
+    PolishDetection(env.im, det);
+  }
+  c.clock.Lap(&c.refine_ms);
+}
+
 // How RunSteps ended; only kFinished candidates reach the probe statistics.
 enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 
@@ -628,29 +654,8 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
 
   TrySmallRescue(env, c);
 
-  // Drop corrections beyond what the family can bear before they count as detections.
-  if (env.family_limits) {
-    for (int j = zarray_size(c.found) - 1; j >= 0; --j) {
-      apriltag_detection_t *det = nullptr;
-      zarray_get(c.found, j, &det);
-      // the third-bit match is the deliberate exception to the family limit
-      if (det->hamming > MaxCorrectedBits(det->family) && !(env.third_bit && det->hamming == 3)) {
-        apriltag_detection_destroy(det);
-        zarray_remove_index(c.found, j, 0);
-      }
-    }
-  }
-
-  if (env.polish) {
-    VKA_PROF_SCOPE("tag.polish");
-    for (int j = 0; j < zarray_size(c.found); ++j) {
-      apriltag_detection_t *det = nullptr;
-      zarray_get(c.found, j, &det);
-      PolishDetection(env.im, det);
-    }
-    c.clock.Lap(&c.refine_ms);
-  }
-
+  ApplyFamilyLimits(env, c);
+  PolishFound(env, c);
   c.clock.Lap(&c.decode_ms);
   return Outcome::kFinished;
 }
