@@ -67,6 +67,13 @@ jobs:
           set -o pipefail
           ./build/tools/apriltag_synth_ground_truth | tee gate_output.txt
 
+      - name: Run CPU unit tests
+        run: ctest --test-dir build -R '^unit_' --output-on-failure
+
+      - name: Run golden detection test on the corpus subset
+        # Same IDs and corners within 0.02 px of the goldens made on a desktop GPU (tests/golden_test.py).
+        run: ctest --test-dir build -R '^golden_' --output-on-failure
+
       - name: Publish results to job summary
         if: always()
         run: |

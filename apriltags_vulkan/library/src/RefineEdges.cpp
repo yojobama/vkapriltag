@@ -1,5 +1,7 @@
 #include "vkapriltag/RefineEdges.h"
 
+#include "TestHooks.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -837,6 +839,16 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
 }
 
 }  // namespace
+
+namespace testing {
+
+void IntersectLines(const double lines[4][4], struct quad *quad) { apriltag_vulkan::IntersectLines(lines, quad); }
+void FitSide(double *bxs, double *bys, double *ws, int used, double range, double *mx, double *my,
+             double *normal_theta) {
+  apriltag_vulkan::FitSide(bxs, bys, ws, used, range, mx, my, normal_theta);
+}
+
+}  // namespace testing
 
 RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured) {
   if (const char *m = std::getenv("APRILTAG_VK_REFINE")) {

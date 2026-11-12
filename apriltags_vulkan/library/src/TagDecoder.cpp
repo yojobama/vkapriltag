@@ -10,6 +10,7 @@
 
 #include "BorderSample.h"
 #include "SmallQuad.h"
+#include "TestHooks.h"
 #include "vkapriltag/PolishFit.h"
 #include "vkapriltag/common/Profiler.h"
 
@@ -697,5 +698,17 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
   }
   return detections_;
 }
+
+namespace testing {
+
+uint64_t Rotate90(uint64_t w, int nbits) { return apriltag_vulkan::Rotate90(w, nbits); }
+bool ErrorsConnected(const apriltag_family_t *f, uint64_t diff) { return apriltag_vulkan::ErrorsConnected(f, diff); }
+void BuildThirdBitIndex(const apriltag_family_t *f, ThirdBitIndex *index) { apriltag_vulkan::BuildThirdBitIndex(f, index); }
+bool MatchThreeTouchingBits(const ThirdBitIndex &index, uint64_t rcode, int *id, int *rotation) {
+  return apriltag_vulkan::MatchThreeTouchingBits(index, rcode, id, rotation);
+}
+int MaxCorrectedBits(const apriltag_family_t *f) { return apriltag_vulkan::MaxCorrectedBits(f); }
+
+}  // namespace testing
 
 }  // namespace apriltag_vulkan
