@@ -37,6 +37,21 @@ inline bool SampleEdge(const Img *im, double x, double y, double *out) {
   return true;
 }
 
+// The tap at distance u along the normal (nx, ny) from (x0, y0), in pixel-edge coordinates: its pixel
+// (xi, yi) and fractions (fx, fy), taken from the truncated or the floored position as the caller needs.
+// Results go through pointers so that a loop of taps stays vectorisable.
+template <typename S, bool kTruncate>
+inline void TapAlong(S x0, S y0, S u, S nx, S ny, int *xi, int *yi, S *fx, S *fy) {
+  const S x = x0 + u * nx - S(0.5);
+  const S y = y0 + u * ny - S(0.5);
+  const S xt = kTruncate ? std::trunc(x) : std::floor(x);
+  const S yt = kTruncate ? std::trunc(y) : std::floor(y);
+  *xi = static_cast<int>(xt);
+  *yi = static_cast<int>(yt);
+  *fx = x - xt;
+  *fy = y - yt;
+}
+
 // Median (the element at n / 2 once sorted) of v[0..n), which is reordered.
 template <typename T>
 inline T MedianInPlace(T *v, size_t n) {
