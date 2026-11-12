@@ -375,22 +375,28 @@ struct Candidate {
   double probe_ms = 0.0, refine_ms = 0.0, decode_ms = 0.0;
 };
 
+// A coarse box is refitted to a quad from the full-resolution frame; false if it cannot be (or the
+// small tag rescue is off), which drops the candidate.
+bool NormaliseCandidate(const DecodeEnv &env, Candidate &c) {
+  if (!c.input.coarse) return true;
+  double fitted[4][2];
+  const double xlo = std::min(c.input.p[0][0], c.input.p[2][0]), xhi = std::max(c.input.p[0][0], c.input.p[2][0]);
+  const double ylo = std::min(c.input.p[0][1], c.input.p[2][1]), yhi = std::max(c.input.p[0][1], c.input.p[2][1]);
+  if (!env.small_rescue || !FitSmallQuad(env.im->buf, env.im->width, env.im->height, xlo, ylo, xhi, yhi, fitted)) {
+    return false;
+  }
+  for (int k = 0; k < 4; ++k) {
+    c.quad.q.p[k][0] = static_cast<float>(fitted[k][0]);
+    c.quad.q.p[k][1] = static_cast<float>(fitted[k][1]);
+  }
+  return true;
+}
+
 // How RunSteps ended; only kFinished candidates reach the probe statistics.
 enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 
 Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
-  if (c.input.coarse) {
-    double fitted[4][2];
-    const double xlo = std::min(c.input.p[0][0], c.input.p[2][0]), xhi = std::max(c.input.p[0][0], c.input.p[2][0]);
-    const double ylo = std::min(c.input.p[0][1], c.input.p[2][1]), yhi = std::max(c.input.p[0][1], c.input.p[2][1]);
-    if (!env.small_rescue || !FitSmallQuad(env.im->buf, env.im->width, env.im->height, xlo, ylo, xhi, yhi, fitted)) {
-      return Outcome::kDropped;
-    }
-    for (int k = 0; k < 4; ++k) {
-      c.quad.q.p[k][0] = static_cast<float>(fitted[k][0]);
-      c.quad.q.p[k][1] = static_cast<float>(fitted[k][1]);
-    }
-  }
+  if (!NormaliseCandidate(env, c)) return Outcome::kDropped;
 
   // Margin gate and probe statistics: sample the unrefined quad.
     // The gate reads the first family only, so it needs exactly one registered.
