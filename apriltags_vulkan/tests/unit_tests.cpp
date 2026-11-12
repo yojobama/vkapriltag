@@ -1,5 +1,5 @@
 // CPU-only unit tests of the pure helpers and the CPU stages; no Vulkan device is used.
-// usage: unit_tests [decode|geometry|edges|quadfit|options]   (no argument runs all)
+// usage: unit_tests [decode|geometry|geom|edges|quadfit|options]   (no argument runs all)
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "Geometry.h"
 #include "TestHooks.h"
 #include "test_check.h"
 #include "vkapriltag/RefineEdges.h"
@@ -251,6 +252,34 @@ void TestFitSide() {
 void TestGeometry() {
   TestIntersectLines();
   TestFitSide();
+}
+
+// ---------------------------------------------------------------- shared geometry helpers (Geometry.h)
+
+namespace geo = apriltag_vulkan::geom;
+
+void TestBilinearAndMedian() {
+  // A 4 x 3 image with two bytes of row padding.
+  uint8_t buf[6 * 3] = {0, 100, 8, 8, 0, 0, 200, 40, 8, 8, 0, 0, 16, 32, 64, 128, 0, 0};
+  image_u8_t im = {4, 3, 6, buf};
+  CHECK_NEAR(geo::BilinearAt<double>(&im, 0, 0, 0.25, 0.5), 92.5, 0.0);
+  CHECK_NEAR(geo::BilinearAt<float>(&im, 0, 0, 0.25f, 0.5f), 92.5, 0.0);
+  CHECK_NEAR(geo::BilinearAt<double>(&im, 2, 1, 1.0, 1.0), 128.0, 0.0);
+
+  double v = -1;
+  // Pixel centres are at i + 0.5 in pixel-edge coordinates.
+  CHECK(geo::SampleEdge<double>(&im, 0.5, 0.5, &v) && v == 0.0);
+  CHECK(geo::SampleEdge<float>(&im, 1.5, 0.5, &v) && v == 100.0);
+  CHECK(geo::SampleEdge<double>(&im, 0.75, 1.0, &v) && v == 92.5);
+  CHECK(!geo::SampleEdge<double>(&im, 0.25, 0.5, &v));   // left of the first pixel centre
+  CHECK(!geo::SampleEdge<double>(&im, 0.5, 2.75, &v));   // below the last row's centre
+  CHECK(!geo::SampleEdge<float>(&im, 3.5, 0.5, &v));     // right of the last pixel centre
+  CHECK(geo::SampleEdge<float>(&im, 3.25, 1.5, &v));
+
+  double five[5] = {5, 1, 9, 3, 7};
+  CHECK(geo::MedianInPlace(five, 5) == 5.0);
+  float four[4] = {4, 1, 3, 2};
+  CHECK(geo::MedianInPlace(four, 4) == 3.0f);
 }
 
 // ---------------------------------------------------------------- edge locators on rendered edges
@@ -572,6 +601,7 @@ int main(int argc, char **argv) {
   bool ran = false;
   if (all || !std::strcmp(which, "decode")) TestDecode(), ran = true;
   if (all || !std::strcmp(which, "geometry")) TestGeometry(), ran = true;
+  if (all || !std::strcmp(which, "geom")) TestBilinearAndMedian(), ran = true;
   if (all || !std::strcmp(which, "edges")) TestEdges(), ran = true;
   if (all || !std::strcmp(which, "quadfit")) TestQuadFit(), ran = true;
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;

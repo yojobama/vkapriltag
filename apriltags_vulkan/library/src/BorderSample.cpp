@@ -1,5 +1,7 @@
 #include "BorderSample.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -8,27 +10,6 @@ extern "C" {
 }
 
 namespace apriltag_vulkan {
-namespace {
-
-// Bilinear sample at pixel-edge coordinates; false outside the image.
-bool Sample(const image_u8_t *im, double x, double y, double *out) {
-  const double fx = x - 0.5, fy = y - 0.5;
-  const double xt = std::floor(fx), yt = std::floor(fy);
-  const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
-  if (xi < 0 || xi + 1 >= im->width || yi < 0 || yi + 1 >= im->height) return false;
-  const double ax = fx - xt, ay = fy - yt;
-  const uint8_t *r0 = im->buf + yi * im->stride + xi;
-  const uint8_t *r1 = r0 + im->stride;
-  *out = (1 - ax) * (1 - ay) * r0[0] + ax * (1 - ay) * r0[1] + (1 - ax) * ay * r1[0] + ax * ay * r1[1];
-  return true;
-}
-
-double Median(double *v, int n) {
-  std::nth_element(v, v + n / 2, v + n);
-  return v[n / 2];
-}
-
-}  // namespace
 
 bool ReadBorder(const matd_t *H, const image_u8_t *im, int width_cells, BorderLevels *out) {
   const int w = width_cells;
@@ -38,7 +19,7 @@ bool ReadBorder(const matd_t *H, const image_u8_t *im, int width_cells, BorderLe
   auto at = [&](double cu, double cv, double *value) {
     double x, y;
     homography_project(H, -1.0 + 2.0 * cu / cells, -1.0 + 2.0 * cv / cells, &x, &y);
-    return Sample(im, x, y, value);
+    return geom::SampleEdge<double>(im, x, y, value);
   };
   double border[64], ring[80];
   int nb = 0, nr = 0;
@@ -72,8 +53,8 @@ bool ReadBorder(const matd_t *H, const image_u8_t *im, int width_cells, BorderLe
   }
   double sorted[64];
   std::copy(border, border + nb, sorted);
-  out->black = Median(sorted, nb);
-  out->white = Median(ring, nr);
+  out->black = geom::MedianInPlace(sorted, nb);
+  out->white = geom::MedianInPlace(ring, nr);
   out->cells = nb;
   if (out->white <= out->black) return false;
   const double mid = 0.5 * (out->black + out->white);

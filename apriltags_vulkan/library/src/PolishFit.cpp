@@ -2,6 +2,8 @@
 
 #include "vkapriltag/common/Options.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -756,8 +758,7 @@ double MedianAbsResidual(const Fit &f, const Params &p) {
     res.push_back(static_cast<float>(std::fabs(f.obs[idx] - gain * (p.lev[0] * f.A[idx] + p.lev[1] * f.B[idx] + p.lev[2] * f.C[idx]))));
   }
   if (res.empty()) return 0;
-  std::nth_element(res.begin(), res.begin() + res.size() / 2, res.end());
-  return res[res.size() / 2];
+  return geom::MedianInPlace(res.data(), res.size());
 }
 
 struct Accum {

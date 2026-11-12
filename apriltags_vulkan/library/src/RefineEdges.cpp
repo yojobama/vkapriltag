@@ -2,6 +2,7 @@
 
 #include "vkapriltag/common/Options.h"
 
+#include "Geometry.h"
 #include "TestHooks.h"
 
 #include <algorithm>
@@ -13,14 +14,7 @@
 namespace apriltag_vulkan {
 namespace {
 
-// The four-tap bilinear order is upstream's verbatim; reassociating it breaks kExact's bit-identity.
-template <typename S>
-inline S BilinearAt(const image_u8_t *im, int xi, int yi, S fx, S fy) {
-  const uint8_t *row0 = im->buf + yi * im->stride + xi;
-  const uint8_t *row1 = row0 + im->stride;
-  return (1 - fx) * (1 - fy) * row0[0] + fx * (1 - fy) * row0[1] + (1 - fx) * fy * row1[0] +
-         fx * fy * row1[1];
-}
+using geom::BilinearAt;
 
 // Moves each corner to the intersection of its two adjacent fitted lines.
 void IntersectLines(const double lines[4][4], struct quad *quad) {
@@ -181,16 +175,6 @@ constexpr double kLevelSpacing = 1.5;  // pixels between its profiles along a si
 constexpr int kMaxProfileTaps = 96;
 constexpr double kCrossingCells = 0.6;  // ramps wider than this many cells use the halfway crossing
 
-// Bilinear sample of the image at pixel-edge coordinates (x, y); false outside it.
-bool SampleAt(const image_u8_t *im, double x, double y, double *out) {
-  const float fx = static_cast<float>(x) - 0.5f, fy = static_cast<float>(y) - 0.5f;
-  const float xt = std::floor(fx), yt = std::floor(fy);
-  const int xi = static_cast<int>(xt), yi = static_cast<int>(yt);
-  if (xi < 0 || xi + 1 >= im->width || yi < 0 || yi + 1 >= im->height) return false;
-  *out = BilinearAt<float>(im, xi, yi, fx - xt, fy - yt);
-  return true;
-}
-
 // Weighted total-least-squares line through the points (relative to the side's midpoint): its centre
 // and normal angle. With kDropOutliers, points far from the line are dropped and the line refitted.
 void FitSide(double *bxs, double *bys, double *ws, int used, double range, double *mx, double *my,
@@ -323,8 +307,8 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
         for (int iter = 0; iter < 3; ++iter) {
           const double pos = -range - kProfileStep + kProfileStep * cj;
           double white, black;
-          if (!SampleAt(im, x0 + (pos - half) * nx, y0 + (pos - half) * ny, &white) ||
-              !SampleAt(im, x0 + (pos + half) * nx, y0 + (pos + half) * ny, &black)) {
+          if (!geom::SampleEdge<float>(im, x0 + (pos - half) * nx, y0 + (pos - half) * ny, &white) ||
+              !geom::SampleEdge<float>(im, x0 + (pos + half) * nx, y0 + (pos + half) * ny, &black)) {
             break;
           }
           const double mid = 0.5 * (white + black);  // along +n the image goes from black to white
@@ -452,11 +436,9 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
     if (count >= 3) {
       double tmp[kMaxProfilePoints];
       std::copy(outer, outer + count, tmp);
-      std::nth_element(tmp, tmp + count / 2, tmp + count);
-      const double white = tmp[count / 2];
+      const double white = geom::MedianInPlace(tmp, count);
       std::copy(inner, inner + count, tmp);
-      std::nth_element(tmp, tmp + count / 2, tmp + count);
-      const double black = tmp[count / 2];
+      const double black = geom::MedianInPlace(tmp, count);
       if (white - black >= kMinLevelContrast) {
         const double mid = 0.5 * (white + black), margin = 0.25 * (white - black);
         for (int i = 0; i < count; ++i) {
@@ -500,8 +482,7 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
   }
   if (!any) return false;
   if (ramp != nullptr && nwidths > 0) {
-    std::nth_element(widths, widths + nwidths / 2, widths + nwidths);
-    *ramp = widths[nwidths / 2];
+    *ramp = geom::MedianInPlace(widths, nwidths);
   }
   IntersectLines(lines, quad);
   return true;
@@ -559,7 +540,7 @@ double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
   auto at = [&](double u, double v, double *out) {
     double x, y;
     SquareToQuad(q, u, v, &x, &y);
-    return SampleAt(im, x, y, out);
+    return geom::SampleEdge<float>(im, x, y, out);
   };
   for (int i = 0; i < width_cells && nb < 62; ++i) {  // border cells along the top and bottom
     double v;
@@ -572,9 +553,7 @@ double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
     if (at((i + 0.5) / cells, (cells + 0.5) / cells, &v)) white_v[nw++] = v;
   }
   if (nb < 4 || nw < 4) return 0;
-  std::nth_element(black_v, black_v + nb / 2, black_v + nb);
-  std::nth_element(white_v, white_v + nw / 2, white_v + nw);
-  const double black = black_v[nb / 2], white = white_v[nw / 2];
+  const double black = geom::MedianInPlace(black_v, nb), white = geom::MedianInPlace(white_v, nw);
   if (white < 250 && black > 4) return 0;
   const double mid = 0.5 * (black + white);
 
@@ -598,7 +577,7 @@ double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
       for (int j = 0; j < kN && ok; ++j) {
         uv(-0.5 + 2.0 * j / (kN - 1), &u, &v);
         SquareToQuad(q, u, v, &px[j], &py[j]);
-        ok = SampleAt(im, px[j], py[j], &prof[j]);
+        ok = geom::SampleEdge<float>(im, px[j], py[j], &prof[j]);
       }
       if (!ok) continue;
       const double jo = LobeCentroid(prof, 1, kN / 2 - 1, true);

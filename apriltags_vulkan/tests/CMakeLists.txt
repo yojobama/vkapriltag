@@ -6,7 +6,7 @@ add_executable(unit_tests unit_tests.cpp)
 target_include_directories(unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/library/src)
 target_link_libraries(unit_tests PRIVATE vkapriltag::vkapriltag)
 
-foreach(group decode geometry edges quadfit options)
+foreach(group decode geometry geom edges quadfit options)
   add_test(NAME unit_${group} COMMAND unit_tests ${group})
 endforeach()
 
