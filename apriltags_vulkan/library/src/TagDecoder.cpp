@@ -639,6 +639,7 @@ enum class Outcome { kDropped, kMarginGate, kPreCheck, kFinished };
 Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
   if (!NormaliseCandidate(env, c)) return Outcome::kDropped;
 
+  // Checks on the unrefined quad.
   if (MarginGateRejects(env, c)) return Outcome::kMarginGate;
   if (PreRefineRejects(env, c)) return Outcome::kPreCheck;
   c.unrefined.reset();
@@ -646,12 +647,10 @@ Outcome RunSteps(const DecodeEnv &env, Candidate &c) {
   RefineCandidate(env, c);
   DecodeCandidate(env, c);
 
+  // Recoveries for a quad that did not decode, or decoded with a side one cell out.
   TryInnerSquare(env, c);
-
   TrySideOneOut(env, c);
-
   TryThirdBit(env, c);
-
   TrySmallRescue(env, c);
 
   ApplyFamilyLimits(env, c);
@@ -691,17 +690,7 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
   st.busy_ms += c.clock.SinceStartMs();
 }
 
-zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8_t *gray_frame,
-                             uint32_t width, uint32_t height, bool reversed_border) {
-  ClearDetections(detections_);
-
-  image_u8_t im{
-      .width = static_cast<int32_t>(width),
-      .height = static_cast<int32_t>(height),
-      .stride = static_cast<int32_t>(width),
-      .buf = const_cast<uint8_t *>(gray_frame),
-  };
-
+DecodeEnv TagDecoder::MakeEnv(image_u8_t *im, bool reversed_border, bool timing) {
   if (third_bit_ && zarray_size(td_->tag_families) > 0) {
     apriltag_family_t *family = nullptr;
     zarray_get(td_->tag_families, 0, &family);
@@ -718,22 +707,9 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       min_white_cells = std::min(min_white_cells, std::popcount(family->codes[k]));
     }
   }
-
-  // One scratch zarray per quad, so tasks share no mutable state beyond td_->mutex.
-  while (per_quad_.size() < quads.size()) {
-    per_quad_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
-  }
-  // Only [0, quads.size()): entries beyond hold stale pointers from earlier frames.
-  for (size_t i = 0; i < quads.size(); ++i) ResetScratch(per_quad_[i]);
-
-  VKA_PROF_SCOPE("tag.decode_all");
-  const bool timing = prof::Enabled();
-  const prof::Ns wall0 = timing ? prof::NowNs() : 0;
-  if (timing) slot_stats_.assign(pool_->threads(), SlotStats{});
-
-  const DecodeEnv env = {
+  return {
       .td = td_,
-      .im = &im,
+      .im = im,
       .reversed_border = reversed_border,
       .timing = timing,
       .refine_method = refine_method_,
@@ -753,8 +729,9 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
       .collect_probe = collect_probe_,
       .probe_margin = probe_margin_,
   };
-  pool_->ParallelFor(quads.size(), [&](size_t i, unsigned slot) { ProcessCandidate(env, quads[i], i, slot); });
+}
 
+void TagDecoder::MergeSlotRecords() {
   for (ProbeHistogram &sp : slot_probe_) {
     for (int b = 0; b < 17; ++b) {
       probe_hist_.decoded[b] += sp.decoded[b];
@@ -766,6 +743,56 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
     rows_.insert(rows_.end(), r.begin(), r.end());
     r.clear();
   }
+}
+
+TagDecoder::Stats TagDecoder::SumSlotStats() const {
+  Stats stats;
+  unsigned active = 0;
+  double busy_sum = 0.0;
+  for (const SlotStats &st : slot_stats_) {
+    stats.quads += st.quads;
+    stats.decoded += st.decoded;
+    stats.probe_ms += st.probe_ms;
+    stats.refine_ms_decoded += st.refine_ms_decoded;
+    stats.refine_ms_rejected += st.refine_ms_rejected;
+    stats.decode_ms += st.decode_ms;
+    stats.busy_ms_max = std::max(stats.busy_ms_max, st.busy_ms);
+    if (st.busy_ms > 0.0) {
+      ++active;
+      busy_sum += st.busy_ms;
+    }
+  }
+  stats.busy_ms_mean = active > 0 ? busy_sum / active : 0.0;
+  return stats;
+}
+
+zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8_t *gray_frame,
+                             uint32_t width, uint32_t height, bool reversed_border) {
+  ClearDetections(detections_);
+
+  image_u8_t im{
+      .width = static_cast<int32_t>(width),
+      .height = static_cast<int32_t>(height),
+      .stride = static_cast<int32_t>(width),
+      .buf = const_cast<uint8_t *>(gray_frame),
+  };
+
+  // One scratch zarray per quad, so tasks share no mutable state beyond td_->mutex.
+  while (per_quad_.size() < quads.size()) {
+    per_quad_.push_back(zarray_create(sizeof(apriltag_detection_t *)));
+  }
+  // Only [0, quads.size()): entries beyond hold stale pointers from earlier frames.
+  for (size_t i = 0; i < quads.size(); ++i) ResetScratch(per_quad_[i]);
+
+  VKA_PROF_SCOPE("tag.decode_all");
+  const bool timing = prof::Enabled();
+  const prof::Ns wall0 = timing ? prof::NowNs() : 0;
+  if (timing) slot_stats_.assign(pool_->threads(), SlotStats{});
+
+  const DecodeEnv env = MakeEnv(&im, reversed_border, timing);
+  pool_->ParallelFor(quads.size(), [&](size_t i, unsigned slot) { ProcessCandidate(env, quads[i], i, slot); });
+
+  MergeSlotRecords();
 
   // Merge in quad order over [0, quads.size()), as in the reset loop above.
   for (size_t i = 0; i < quads.size(); ++i) {
@@ -781,25 +808,8 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
   zarray_sort(detections_, DetectionCompare);
 
   if (timing) {
-    Stats stats;
-    stats.wall_ms = NsToMs(prof::NowNs() - wall0);
-    unsigned active = 0;
-    double busy_sum = 0.0;
-    for (const SlotStats &st : slot_stats_) {
-      stats.quads += st.quads;
-      stats.decoded += st.decoded;
-      stats.probe_ms += st.probe_ms;
-      stats.refine_ms_decoded += st.refine_ms_decoded;
-      stats.refine_ms_rejected += st.refine_ms_rejected;
-      stats.decode_ms += st.decode_ms;
-      stats.busy_ms_max = std::max(stats.busy_ms_max, st.busy_ms);
-      if (st.busy_ms > 0.0) {
-        ++active;
-        busy_sum += st.busy_ms;
-      }
-    }
-    stats.busy_ms_mean = active > 0 ? busy_sum / active : 0.0;
-    last_stats_ = stats;
+    last_stats_ = SumSlotStats();
+    last_stats_.wall_ms = NsToMs(prof::NowNs() - wall0);
   }
   return detections_;
 }

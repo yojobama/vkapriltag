@@ -97,6 +97,12 @@ class TagDecoder {
  private:
   // Runs the decode steps on quads[i] on thread `slot`; the detections go to per_quad_[i].
   void ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, size_t i, unsigned slot);
+  // The per-frame inputs and switches of a Decode() call; builds the third-bit index if it is stale.
+  DecodeEnv MakeEnv(image_u8_t *im, bool reversed_border, bool timing);
+  // Folds the per-thread probe histograms and rows into probe_hist_ and rows_.
+  void MergeSlotRecords();
+  // Sums the per-thread accumulators; wall_ms is left for the caller.
+  Stats SumSlotStats() const;
 
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
