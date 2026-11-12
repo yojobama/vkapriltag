@@ -193,19 +193,9 @@ inline void Project(const Mapping &m, double x, double y, double *u, double *v, 
 }
 
 bool Invert3(const double a[9], double out[9]) {
-  const double c00 = a[4] * a[8] - a[5] * a[7], c01 = a[5] * a[6] - a[3] * a[8], c02 = a[3] * a[7] - a[4] * a[6];
-  const double det = a[0] * c00 + a[1] * c01 + a[2] * c02;
+  const double det = geom::Det3(a);
   if (std::fabs(det) < 1e-300) return false;
-  const double id = 1.0 / det;
-  out[0] = c00 * id;
-  out[1] = (a[2] * a[7] - a[1] * a[8]) * id;
-  out[2] = (a[1] * a[5] - a[2] * a[4]) * id;
-  out[3] = c01 * id;
-  out[4] = (a[0] * a[8] - a[2] * a[6]) * id;
-  out[5] = (a[2] * a[3] - a[0] * a[5]) * id;
-  out[6] = c02 * id;
-  out[7] = (a[1] * a[6] - a[0] * a[7]) * id;
-  out[8] = (a[0] * a[4] - a[1] * a[3]) * id;
+  geom::Adjugate3(a, 1.0 / det, out);
   return true;
 }
 
@@ -688,33 +678,6 @@ inline void RunModel(Fit *f, const Params &p, bool deriv) {
   }
 }
 
-// Solves (A) x = b by Gaussian elimination with partial pivoting; false if singular.
-bool Solve(int N, double a[kMaxT][kMaxT], double b[kMaxT], double x[kMaxT]) {
-  for (int c = 0; c < N; ++c) {
-    int piv = c;
-    for (int r = c + 1; r < N; ++r) {
-      if (std::fabs(a[r][c]) > std::fabs(a[piv][c])) piv = r;
-    }
-    if (std::fabs(a[piv][c]) < 1e-18) return false;
-    if (piv != c) {
-      for (int k = 0; k < N; ++k) std::swap(a[c][k], a[piv][k]);
-      std::swap(b[c], b[piv]);
-    }
-    for (int r = c + 1; r < N; ++r) {
-      const double m = a[r][c] / a[c][c];
-      if (m == 0.0) continue;
-      for (int k = c; k < N; ++k) a[r][k] -= m * a[c][k];
-      b[r] -= m * b[c];
-    }
-  }
-  for (int r = N - 1; r >= 0; --r) {
-    double s = b[r];
-    for (int k = r + 1; k < N; ++k) s -= a[r][k] * x[k];
-    x[r] = s / a[r][r];
-  }
-  return true;
-}
-
 // Linear least squares for the three levels at fixed mapping and blur, from the model pass. Returns the SSE.
 bool FitLevels(const Fit &f, Params *p, double *sse = nullptr) {
   double ata[3][3] = {}, atb[3] = {}, yy = 0;
@@ -919,7 +882,7 @@ bool SolveStep(const Accum &cur, bool box, double lambda, double *delta) {
     a[r][r] += lambda * diag;
     b[r] = cur.jtr[r];
   }
-  return Solve(nt, a, b, delta);
+  return geom::SolveGauss(nt, a, b, delta);
 }
 
 // Levenberg-Marquardt over the geometry and blur; returns the final cost and leaves the best

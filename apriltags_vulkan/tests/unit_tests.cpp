@@ -325,10 +325,43 @@ void TestProjectHomography() {
   }
 }
 
+void TestSmallSolvers() {
+  const double diag[9] = {2, 0, 0, 0, 4, 0, 0, 0, 5};
+  CHECK(geo::Det3(diag) == 40.0);
+  double inv[9];
+  geo::Adjugate3(diag, 1.0 / 40.0, inv);
+  const double want_diag[9] = {0.5, 0, 0, 0, 0.25, 0, 0, 0, 0.2};
+  for (int i = 0; i < 9; ++i) CHECK_NEAR(inv[i], want_diag[i], 1e-15);
+
+  // det = 1; the inverse is integral.
+  const double m[9] = {1, 2, 3, 0, 1, 4, 5, 6, 0};
+  CHECK(geo::Det3(m) == 1.0);
+  geo::Adjugate3(m, 1.0, inv);
+  const double want[9] = {-24, 18, 5, 20, -15, -4, -5, 4, 1};
+  for (int i = 0; i < 9; ++i) CHECK(inv[i] == want[i]);
+
+  // A system that needs a row swap: x = (2, 3, -1).
+  double a[4][4] = {{2, 1, -1, 0}, {-3, -1, 2, 0}, {-2, 1, 2, 0}, {0, 0, 0, 1}};
+  double b[4] = {8, -11, -3, 7}, x[4] = {};
+  CHECK(geo::SolveGauss(3, a, b, x));
+  CHECK_NEAR(x[0], 2.0, 1e-12);
+  CHECK_NEAR(x[1], 3.0, 1e-12);
+  CHECK_NEAR(x[2], -1.0, 1e-12);
+  // A zero leading entry is pivoted away; a singular matrix is refused.
+  double p[4][4] = {{0, 1, 0, 0}, {1, 0, 0, 0}, {0, 0, 2, 0}, {0, 0, 0, 1}};
+  double pb[4] = {3, 4, 6, 0};
+  CHECK(geo::SolveGauss(3, p, pb, x));
+  CHECK(x[0] == 4.0 && x[1] == 3.0 && x[2] == 3.0);
+  double sing[4][4] = {{1, 2, 0, 0}, {2, 4, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+  double sb[4] = {1, 2, 3, 0};
+  CHECK(!geo::SolveGauss(3, sing, sb, x));
+}
+
 void TestGeom() {
   TestBilinearAndMedian();
   TestLineCorners();
   TestProjectHomography();
+  TestSmallSolvers();
 }
 
 // ---------------------------------------------------------------- edge locators on rendered edges

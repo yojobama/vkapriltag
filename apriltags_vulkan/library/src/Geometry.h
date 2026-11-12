@@ -84,4 +84,53 @@ inline void ProjectHomography(const double h[9], double x, double y, double *u, 
   ProjectHomography(h, h[8], x, y, u, v, &w);
 }
 
+// Determinant of a row-major 3x3 matrix, by cofactors of the first row.
+inline double Det3(const double a[9]) {
+  const double c00 = a[4] * a[8] - a[5] * a[7], c01 = a[5] * a[6] - a[3] * a[8], c02 = a[3] * a[7] - a[4] * a[6];
+  return a[0] * c00 + a[1] * c01 + a[2] * c02;
+}
+
+// The inverse of a row-major 3x3 matrix whose determinant is 1 / inv_det: the adjugate scaled by inv_det.
+inline void Adjugate3(const double a[9], double inv_det, double out[9]) {
+  const double c00 = a[4] * a[8] - a[5] * a[7], c01 = a[5] * a[6] - a[3] * a[8], c02 = a[3] * a[7] - a[4] * a[6];
+  out[0] = c00 * inv_det;
+  out[1] = (a[2] * a[7] - a[1] * a[8]) * inv_det;
+  out[2] = (a[1] * a[5] - a[2] * a[4]) * inv_det;
+  out[3] = c01 * inv_det;
+  out[4] = (a[0] * a[8] - a[2] * a[6]) * inv_det;
+  out[5] = (a[2] * a[3] - a[0] * a[5]) * inv_det;
+  out[6] = c02 * inv_det;
+  out[7] = (a[1] * a[6] - a[0] * a[7]) * inv_det;
+  out[8] = (a[0] * a[4] - a[1] * a[3]) * inv_det;
+}
+
+// Solves A x = b for the leading n x n block of a (rows kStride apart) by Gaussian elimination with
+// partial pivoting, destroying a and b; false if a pivot is below 1e-18.
+template <int kStride>
+bool SolveGauss(int n, double a[][kStride], double b[], double x[]) {
+  for (int c = 0; c < n; ++c) {
+    int piv = c;
+    for (int r = c + 1; r < n; ++r) {
+      if (std::fabs(a[r][c]) > std::fabs(a[piv][c])) piv = r;
+    }
+    if (std::fabs(a[piv][c]) < 1e-18) return false;
+    if (piv != c) {
+      for (int k = 0; k < n; ++k) std::swap(a[c][k], a[piv][k]);
+      std::swap(b[c], b[piv]);
+    }
+    for (int r = c + 1; r < n; ++r) {
+      const double m = a[r][c] / a[c][c];
+      if (m == 0.0) continue;
+      for (int k = c; k < n; ++k) a[r][k] -= m * a[c][k];
+      b[r] -= m * b[c];
+    }
+  }
+  for (int r = n - 1; r >= 0; --r) {
+    double s = b[r];
+    for (int k = r + 1; k < n; ++k) s -= a[r][k] * x[k];
+    x[r] = s / a[r][r];
+  }
+  return true;
+}
+
 }  // namespace apriltag_vulkan::geom
