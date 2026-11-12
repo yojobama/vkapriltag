@@ -1,18 +1,24 @@
 // CPU-only unit tests of the pure helpers and the CPU stages; no Vulkan device is used.
-// usage: unit_tests [decode|geometry|edges|quadfit]   (no argument runs all)
+// usage: unit_tests [decode|geometry|edges|quadfit|options]   (no argument runs all)
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <random>
+#include <set>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "TestHooks.h"
 #include "test_check.h"
 #include "vkapriltag/RefineEdges.h"
 #include "vkapriltag/apriltag_family.h"
+#include "vkapriltag/common/Options.h"
+#include "vkapriltag/common/WorkerPool.h"
 #include "vkapriltag/gpu/QuadDecode.h"
 
 extern "C" {
@@ -481,6 +487,83 @@ void TestQuadFit() {
   }
 }
 
+// ---------------------------------------------------------------- options registry
+
+void SetEnv(const char *name, const char *value) {
+#ifdef _WIN32
+  _putenv_s(name, value != nullptr ? value : "");
+#else
+  if (value != nullptr) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+
+void TestOptions() {
+  std::set<std::string> names;
+  for (const av::OptionDescriptor &d : av::OptionTable()) {
+    CHECK(names.insert(d.name).second);
+    CHECK(d.doc != nullptr && d.doc[0] != '\0');
+    CHECK(d.default_text != nullptr && d.default_text[0] != '\0');
+    CHECK(d.config != nullptr);
+    if (d.precedence == av::OptionPrecedence::kEnvWins || d.precedence == av::OptionPrecedence::kConfigWins) {
+      CHECK(d.config[0] != '\0');
+    }
+    if (d.category != av::OptionCategory::kPlatform) CHECK(std::strncmp(d.name, "APRILTAG_", 9) == 0);
+  }
+  CHECK(av::OptionTable().size() > 80);
+
+  const char *kVar = "APRILTAG_VK_SMALL_RESCUE";
+  SetEnv(kVar, nullptr);
+  CHECK(!av::Options::FromEnvironment().Has(kVar));
+  CHECK(av::ResolveSmallTagRescue(av::Options::FromEnvironment(), true));
+  CHECK(!av::ResolveSmallTagRescue(av::Options::FromEnvironment(), false));
+  SetEnv(kVar, "0");
+  CHECK(!av::ResolveSmallTagRescue(av::Options::FromEnvironment(), true));
+  SetEnv(kVar, "1");
+  CHECK(av::ResolveSmallTagRescue(av::Options::FromEnvironment(), false));
+  SetEnv(kVar, nullptr);
+
+  // The accessors keep the parsing the library had before the registry.
+  SetEnv("APRILTAG_VK_MERGE_BAND", "12abc");
+  SetEnv("APRILTAG_VK_WG2D", "32x8");
+  SetEnv("APRILTAG_VK_DEVICE", "x");
+  SetEnv("APRILTAG_VK_QUADFIT", "peaks");
+  SetEnv("APRILTAG_VK_SPIN_WAIT", "0");
+  SetEnv("APRILTAG_VK_ADAPTIVE_FLOOR", "1.5");
+  const av::Options env = av::Options::FromEnvironment();
+  CHECK(env.ULong("APRILTAG_VK_MERGE_BAND").value_or(0) == 12);
+  CHECK(env.WxH("APRILTAG_VK_WG2D").value() == std::make_pair(32u, 8u));
+  CHECK(env.Choice("APRILTAG_VK_QUADFIT", {"dp", "peaks"}) == 1);
+  CHECK(!env.Flag("APRILTAG_VK_SPIN_WAIT"));
+  CHECK(env.Has("APRILTAG_VK_SPIN_WAIT"));
+  CHECK_NEAR(env.Float("APRILTAG_VK_ADAPTIVE_FLOOR", 2.0), 1.5, 1e-12);
+  CHECK_NEAR(env.Float("APRILTAG_VK_TRACKING_CONVERGE", 0.05), 0.05, 1e-12);
+  bool threw = false;
+  try {
+    env.StrictInt("APRILTAG_VK_DEVICE");
+  } catch (const std::runtime_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    env.Has("APRILTAG_VK_NO_SUCH_SWITCH");
+  } catch (const std::logic_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  for (const char *n : {"APRILTAG_VK_MERGE_BAND", "APRILTAG_VK_WG2D", "APRILTAG_VK_DEVICE", "APRILTAG_VK_QUADFIT",
+                        "APRILTAG_VK_SPIN_WAIT", "APRILTAG_VK_ADAPTIVE_FLOOR"}) {
+    SetEnv(n, nullptr);
+  }
+
+  // The one setting where the configuration beats the environment.
+  SetEnv("APRILTAG_CPU_THREADS", "3");
+  CHECK(av::ResolveThreadCount(5) == 5);
+  CHECK(av::ResolveThreadCount(0) == 3);
+  SetEnv("APRILTAG_CPU_THREADS", nullptr);
+  CHECK(av::ResolveThreadCount(0) == 0);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -491,6 +574,7 @@ int main(int argc, char **argv) {
   if (all || !std::strcmp(which, "geometry")) TestGeometry(), ran = true;
   if (all || !std::strcmp(which, "edges")) TestEdges(), ran = true;
   if (all || !std::strcmp(which, "quadfit")) TestQuadFit(), ran = true;
+  if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;
   if (!ran) {
     std::printf("unknown test group %s\n", which);
     return 2;

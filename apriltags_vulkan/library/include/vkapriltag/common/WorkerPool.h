@@ -71,15 +71,8 @@ class WorkerPool {
   std::exception_ptr error_;  // the batch's first exception
 };
 
-// Thread count for the CPU tail: explicit config value, else APRILTAG_CPU_THREADS, else 0
-// (WorkerPool default).
-inline unsigned ResolveThreadCount(uint32_t configured) {
-  if (configured > 0) return configured;
-  if (const char *t = std::getenv("APRILTAG_CPU_THREADS")) {
-    const long parsed = std::strtol(t, nullptr, 10);
-    if (parsed > 0) return static_cast<unsigned>(parsed < 65536 ? parsed : 65536);  // WorkerPool clamps further
-  }
-  return 0;
-}
+// Thread count for the CPU tail: a non-zero configured value wins (the one setting where the
+// configuration beats the environment), else APRILTAG_CPU_THREADS, else 0 (WorkerPool default).
+unsigned ResolveThreadCount(uint32_t configured);
 
 }  // namespace apriltag_vulkan

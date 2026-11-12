@@ -164,6 +164,7 @@ add_library(vkapriltag STATIC
   src/common/pgm_io.cpp
   src/common/WorkerPool.cpp
   src/common/Profiler.cpp
+  src/common/Options.cpp
 )
 add_library(vkapriltag::vkapriltag ALIAS vkapriltag)
 

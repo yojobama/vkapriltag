@@ -64,8 +64,20 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
   post-processing in the unfused GPU flow (the flow itself stays, as the fallback for devices without
   host-cached memory).
 
+### Changed
+
+- **One options registry.** Every `APRILTAG_*` variable is a row of `library/src/common/Options.cpp` and is read
+  once, where the detector, decoder or context is constructed; the switch reference in `PERFORMANCE.md` is
+  generated from it (`vk_eval --list-options`) and a test fails if the library reads the environment elsewhere.
+  Precedence is one rule, the environment overrides the configuration, with `cpu_threads` (a configured value
+  wins) and the switches that can only enable or only disable listed in the table. No behaviour changes with
+  the environment as it was.
+
 ### Fixed
 
+- **Setting `DetectorConfig::small_tag_rescue` in code enables the whole rescue.** `TagDecoder` had no
+  configuration input for it and discarded the boxes; it now takes the configured value through a new
+  trailing constructor argument (`TrackingDetector` passes it; other callers construct `TagDecoder` as before).
 - **The keep-alive works on Windows.** Its wait rounded up to the 15.6 ms timer tick; it now uses a
   high-resolution waitable timer, so `APRILTAG_VK_KEEPALIVE_MS=1` to `4` keeps a discrete GPU awake.
 

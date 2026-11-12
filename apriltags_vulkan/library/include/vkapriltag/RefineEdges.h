@@ -15,8 +15,7 @@ enum class RefineEdgesMethod {
   kProfile,
 };
 
-// Resolves the method: an explicit argument wins, then APRILTAG_VK_REFINE ("exact", "profile"),
-// then `configured`.
+// Resolves the method: APRILTAG_VK_REFINE ("exact" or "profile") overrides `configured`.
 RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured);
 
 // Refines `quad`'s corners in place against the full-resolution image `im`; `td` supplies the decimation.

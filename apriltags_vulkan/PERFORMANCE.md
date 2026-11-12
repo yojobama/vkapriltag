@@ -56,48 +56,126 @@ a working `/dev/dri`.
 
 ## 2. Environment knobs
 
-All are optional; defaults are chosen from device limits. This table lists
-every variable the library actually reads — if a knob is not here, it does not
-exist (`APRILTAG_VK_SORT`, documented in older revisions of this file, was
-removed along with the radix/bitonic sorts it selected).
+All are optional; defaults are chosen from device limits. Every variable the library reads is a row of
+the registry in `library/src/common/Options.cpp`, and the tables below are generated from it
+(`vk_eval --list-options`); the `options_lint` test fails if they drift or if the library reads the
+environment anywhere else. Each variable is read once, when the object it configures is constructed
+(a detector, a decoder, the Vulkan context), or once per process for the few process-wide ones.
 
-| Variable | Effect |
-| --- | --- |
-| `APRILTAG_VK_ALLOW_CPU=1` | Permit a software Vulkan device (benchmarking/CI only). |
-| `APRILTAG_VK_DEVICE=<n>` | Pick a physical device by index instead of by score. |
-| `APRILTAG_VK_VALIDATION=1` | Enable `VK_LAYER_KHRONOS_validation` if installed. |
-| `APRILTAG_VK_WG=<n>` | Override the 1D workgroup size (power of two, clamped to limits). |
-| `APRILTAG_VK_MAX_INVOCATIONS=<n>` | Pretend the device caps workgroups at `n`. Testing aid: reproduces a constrained part's launch geometry on desktop hardware. |
-| `APRILTAG_VK_MAX_POINTS=<n>` | Cap boundary points per frame. The main device-memory lever - see below. |
-| `APRILTAG_VK_UF_CHUNK=<n>` | Labelling iterations issued per convergence check (default 2); only with `APRILTAG_VK_UF_VERIFY=1`. |
-| `APRILTAG_VK_UF_VERIFY=1` | Run a second `uf_merge` that checks the labelling converged, with the retry path, as in 1.8.0 (one merge joins every component, so it is off by default). See section 8t. |
-| `APRILTAG_VK_UF_INIT_SCAN=0` | Initialise `parent[]` with `uf_init` and a compression instead of `uf_init_scan`'s workgroup max-scan. See section 8t. |
-| `APRILTAG_VK_FUSED_THRESHOLD=0` | Keep decimation, block min/max, block filter and threshold as separate passes. See section 8t. |
-| `APRILTAG_VK_MERGE_X4=0\|1` | `uf_merge` with 4 pixels per thread (default: on integrated GPUs only). See section 8t. |
-| `APRILTAG_VK_DISPATCH_TIMES=1` | Print the median GPU time of every dispatch when the detector is destroyed (one detector per process). See section 9. |
-| `APRILTAG_VK_MERGE_BAND=<n>` | Merge rows in bands of `n` (a power of two) before the band boundaries; `0` merges in one pass (default: 8 on discrete GPUs, 0 on integrated). See section 8u. |
-| `APRILTAG_VK_SORT_RANK_ALL=<n>` | Blobs of at most `n` points are sorted by ranking every key in one pass (default 256; `0` disables). See section 8u. |
-| `APRILTAG_VK_COUNT_RUNS=0\|1` | Count blob sizes per run piece and find roots in two hops (default: integrated GPUs). See section 8u. |
-| `APRILTAG_VK_MIN_TAG_PX=<n>` | Geometric prefilter: minimum tag size in pixels. |
-| `APRILTAG_VK_PRERECORD=0` | Pre-recorded command buffers are on by default for the fused single-submission frame; `0` records every frame instead. See sections 8f and 8g. |
-| `APRILTAG_VK_SORT_WG=<n>` | Workgroup size of the point sort (default: the device maximum, at most 256 on integrated GPUs and 1,024 on others). See section 8w. |
-| `APRILTAG_VK_SORT_SPLIT=<n>` | Blobs of more than `n` points are sorted in runs of `n` by several workgroups and merged (a power of two; default 1,024 at decimation 1, off otherwise; `8192` turns it off). See section 8r. |
-| `APRILTAG_VK_PROBE_MARGIN=<grey levels>` | Margin gate before edge refinement (default off); overrides `TagDecoder`'s `probe_margin`. See section 8l. |
-| `APRILTAG_VK_PROBE_STATS=1`, `APRILTAG_VK_PROBE_CSV=<file>` | Per-quad probe histograms and one CSV row per quad (analysis aid). |
-| `APRILTAG_VK_TRACE=<file>` | Write a Chrome-trace JSON of the CPU and GPU spans. See section 9. |
-| `APRILTAG_VK_QUADFIT=dp\|peaks` | Corner-seeding method. `dp` is the default. |
-| `APRILTAG_VK_REFINE=exact\|profile` | Edge-refinement implementation (`profile` is the default); only consulted when the caller sets `td->refine_edges`. The `fast`, `ultrafast` and `upstream` methods described in section 4 have been removed. |
-| `APRILTAG_VK_FORCE_NO_SUBGROUP=1` | Force the scalar shader variants even where subgroup ops are available. |
-| `APRILTAG_VK_FORCE_NO_8BIT=1` | Force the 32-bit-per-pixel shader variants even where `VK_KHR_8bit_storage` is available. |
-| `APRILTAG_VK_FORCE_NO_INT64_ATOMIC=1` | Force the 32-bit-atomic extents reduction even where `VK_KHR_shader_atomic_int64` is available. See section 3b. |
-| `APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING=1` | Skip converged `uf_compress` passes with the in-shader guard even where `VK_EXT_conditional_rendering` is available. See section 6c. |
-| `APRILTAG_VK_FUSE_SUBMITS=0` | Keep the four-submit frame even where the tail could be recorded as one. See section 3c. |
-| `APRILTAG_VK_WG2D=<w>x<h>` | Override the 2D workgroup size. |
-| `APRILTAG_VK_TIMESTAMPS=1` | Emit the per-dispatch GPU timestamp-span breakdown. |
-| `APRILTAG_VK_PIPELINE_CACHE=0` | Disable the on-disk pipeline cache. |
-| `APRILTAG_VK_CACHE_DIR=<path>` | Where that cache lives. |
-| `APRILTAG_CPU_THREADS=<n>` | Parallelism for the CPU tail, including the calling thread. Default = `hardware_concurrency()`; 1 = serial. |
-| `APRILTAG_CPU_BIG_CORES=0` | On Linux CPUs whose cores differ in capacity, workers are pinned to the big cores and the default thread count is their number (default on); `0` turns that off. |
+Precedence: an environment variable overrides the configuration field it matches. The Precedence
+column names the exceptions: `APRILTAG_CPU_THREADS` is used only when `cpu_threads` is 0; switches marked
+"can only enable" or "can only disable" never reverse a configured value; and
+variables with no configuration field are environment only. For the reasoning behind a switch, search
+this file and `DESIGN.md` for its name.
+
+<!-- options:begin -->
+### Features (change what is detected)
+
+| Variable | Type | Default | Configuration field | Precedence | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `APRILTAG_VK_SMALL_RESCUE` | bool | off | `DetectorConfig::small_tag_rescue` | environment wins | Rescue small tags: label small blobs, fit boxes, refit from the full-resolution image. |
+| `APRILTAG_VK_HULL_QUAD` | bool | off | `DetectorConfig::hull_quad` | environment wins | Retry a failed quad fit on the convex hull of the blob (partly covered border). |
+| `APRILTAG_VK_QUADFIT` | enum | dp | `DetectorConfig::quad_fit_method` | environment wins | Corner seeding: dp or peaks (other values are ignored). |
+| `APRILTAG_VK_REFINE` | enum | profile | `TagDecoder refine_method` | environment wins | Edge refinement: exact or profile (other values are ignored); used when td->refine_edges is set. |
+| `APRILTAG_VK_POLISH` | bool | off | `TagDecoder::SetPolish` | environment wins | Whole-tag photometric polish of decoded tags. |
+| `APRILTAG_VK_PROFILE_FEATURES` | bit mask | 31 |  | environment only | Bit mask of the profile fit's refinements: 1 outliers, 2 coarse to fine, 4 halfway crossing, 8 clip bias, 16 widen blur. |
+| `APRILTAG_VK_GREY_MARGIN` | bool | on |  | environment only | Retry an undecoded quad as its inner square (grey margin). |
+| `APRILTAG_VK_SIDE_ONE_OUT` | bool | on |  | environment only | Refit a side whose border cells read white, one cell further in. |
+| `APRILTAG_VK_THIRD_BIT` | bool | on |  | environment only | Accept a third corrected bit when the three wrong cells touch. |
+| `APRILTAG_VK_FAMILY_LIMITS` | bool | on |  | environment only | Reject detections that needed more corrected bits than their family can bear. |
+| `APRILTAG_VK_BORDER_PRECHECK` | bool | on |  | environment only | Reject a quad whose border cells are not mostly dark before refining. |
+| `APRILTAG_VK_DARK_REJECT` | bool | on |  | environment only | Reject a quad whose payload has fewer white cells than any code. |
+| `APRILTAG_VK_EARLY_REJECT` | bool | on |  | environment only | With grey margin on, the border and dark checks reject a quad only if its inner cells fail them too. |
+| `APRILTAG_VK_PROBE_MARGIN` | float | 0 (constructor argument) | `TagDecoder probe_margin` | environment wins | Margin gate in grey levels before edge refinement; 0 is off. |
+| `APRILTAG_VK_MIN_DIFF` | int | 5 | `DetectorConfig::min_white_black_diff` | environment wins | Minimum white-black difference for a block to be labelled. |
+| `APRILTAG_VK_MIN_TAG_PX` | int | 0 | `DetectorConfig::min_tag_pixels` | environment wins | Smallest tag side in full-resolution pixels; raises the minimum cluster size. |
+| `APRILTAG_VK_BOX_DECIMATE` | bool | on | `DetectorConfig::box_decimate` | environment wins | Average each decimation block instead of copying its top-left pixel. |
+| `APRILTAG_VK_ADAPTIVE_FLOOR` | float | 2.0 | `DetectorConfig::adaptive_floor_scale` | environment wins | Contrast floor as a multiple of the frame's median block range; 0 keeps the fixed floor. |
+| `APRILTAG_VK_TRACKING` | bool | off | `TrackingConfig::enabled` | environment wins | Track tags between keyframes instead of running the full detector every frame. |
+| `APRILTAG_VK_TRACKING_KEYFRAME` | int | 8 | `TrackingConfig::keyframe_interval` | environment wins | At most this many consecutive frames skip the GPU (at least 1). |
+| `APRILTAG_VK_TRACKING_MIN_MARGIN` | float | 10 | `TrackingConfig::min_margin` | environment wins | Smallest decision margin for a tracked tag. |
+| `APRILTAG_VK_TRACKING_CONVERGE` | float | 0.05 | `TrackingConfig::converge_px` | environment wins | Corner movement in pixels below which a tracked tag has settled. |
+| `APRILTAG_VK_TRACKING_ITERATIONS` | int | 3 | `TrackingConfig::max_iterations` | environment wins | Most decodes per tracked tag (at least 1). |
+| `APRILTAG_VK_TRACKING_ASYNC` | bool | off | `TrackingConfig::async` | environment wins | Run the full detector on a background thread while tracked frames return at the tracked cost. |
+| `APRILTAG_VK_TRACKING_ASYNC_INTERVAL` | int | 1 | `TrackingConfig::async_interval` | environment wins | The background detector starts at most every this many frames (at least 1). |
+| `APRILTAG_VK_TRACKING_ASYNC_COPY` | bool | on | `TrackingConfig::async_copy` | environment wins | Copy each frame for the background detector. |
+| `APRILTAG_VK_TRACKING_ASYNC_DROP` | bool | on | `TrackingConfig::async_drop_lost` | environment wins | A lost track stays out of the output until a background result finds it again. |
+
+### Tuning (same detections, different cost)
+
+| Variable | Type | Default | Configuration field | Precedence | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `APRILTAG_VK_WG` | int | device | `ContextOptions::workgroup_size_override` | environment wins | 1D workgroup size (power of two, clamped to limits); must be positive. |
+| `APRILTAG_VK_WG2D` | WxH | device | `ContextOptions::workgroup_size_2d_x/y` | environment wins | 2D workgroup size as <w>x<h>. |
+| `APRILTAG_VK_PIPELINE_CACHE` | bool | on | `ContextOptions::use_pipeline_cache` | environment can only disable | Any value other than a non-zero one disables the on-disk pipeline cache. |
+| `APRILTAG_VK_CACHE_DIR` | string | platform cache directory |  | environment only | Directory of the on-disk pipeline cache. |
+| `APRILTAG_VK_SPIN_WAIT` | bool | off |  | environment only | Poll a fence for up to 2 ms before sleeping in the driver (read once per process). |
+| `APRILTAG_CPU_THREADS` | int | 0 (hardware concurrency) | `DetectorConfig::cpu_threads` | configuration wins | Parallelism of the CPU tail, including the calling thread; used only when the configured value is 0. |
+| `APRILTAG_CPU_BIG_CORES` | bool | on | `DetectorConfig::cpu_big_cores` | environment wins | Pin workers to the big cores where core capacities differ. |
+| `APRILTAG_VK_MAX_POINTS` | int | 0 (dense worst case) | `DetectorConfig::max_boundary_points` | environment wins | Cap on boundary points per frame; must be positive. |
+| `APRILTAG_VK_UF_CHUNK` | int | 2 | `DetectorConfig::uf_iterations_per_chunk` | environment wins | Labelling iterations issued per convergence check; must be positive. |
+| `APRILTAG_VK_SORT_WG` | int | device maximum (256 integrated, 1024 other) |  | environment only | Workgroup size of the point sort. |
+| `APRILTAG_VK_SORT_SPLIT` | int | 1024 (bounded by shared memory) |  | environment only | Blobs above this many points are sorted in runs of this length (power of two). |
+| `APRILTAG_VK_SORT_RANK_ALL` | int | 256 |  | environment only | Blobs of at most this many points are sorted by ranking every key; 0 disables. |
+| `APRILTAG_VK_FLAG_POLL` | bool | on with device-coherent host memory |  | environment only | Detect completion by polling a flag instead of waiting on a fence. |
+| `APRILTAG_VK_KEEPALIVE_MS` | int | -1 (6 integrated, 0 other) | `DetectorConfig::keepalive_ms` | environment wins | Milliseconds between keep-alive dispatches; 0 disables. |
+| `APRILTAG_VK_PREWARM_LEAD_US` | int | -1 (3000) | `DetectorConfig::prewarm_lead_us` | environment wins | Microseconds before the next frame is due that a pre-warm burst starts; 0 disables. |
+| `APRILTAG_VK_PREWARM_BURST` | int | 2 | `DetectorConfig::prewarm_burst` | environment wins | Dispatches per pre-warm burst (at least 1). |
+| `APRILTAG_VK_PREWARM_GAP_US` | int | 1000 | `DetectorConfig::prewarm_gap_us` | environment wins | Microseconds between the dispatches of a burst. |
+| `APRILTAG_VK_PREWARM_GROUPS` | int | keep-alive default |  | environment only | Workgroups per pre-warm dispatch (at least 1). |
+| `APRILTAG_VK_FUSE_SUBMITS` | bool | on when the readbacks are direct |  | environment can only disable | Record the last three submissions of a frame as one; 0 keeps the unfused flow. |
+| `APRILTAG_VK_UF_VERIFY` | bool | off |  | environment only | Run a second merge that checks the labelling converged, with a retry path. |
+| `APRILTAG_VK_PRERECORD` | bool | on when fused without a transfer lane |  | environment can only disable | Replay pre-recorded command buffers; 0 records every frame. |
+| `APRILTAG_VK_DOT` | bool | on where supported |  | environment can only disable | Integer dot product box decimation; 0 uses the plain shader. |
+| `APRILTAG_VK_FUSED_THRESHOLD` | bool | on with 8-bit storage |  | environment can only disable | Fused block min/max and threshold; 0 keeps the separate passes. |
+| `APRILTAG_VK_UF_INIT_SCAN` | bool | on where supported |  | environment can only disable | Initialise the labelling with a workgroup scan; 0 uses uf_init and a compression. |
+| `APRILTAG_VK_COUNT_RUNS` | bool | on for integrated GPUs |  | environment only | Count blob sizes per run piece (needs the init scan). |
+| `APRILTAG_VK_SPARSE` | bool | on | `DetectorConfig::sparse_labelling` | environment wins | Dispatch the labelling over the cells that hold contrast only (needs fused threshold, init scan, count runs). |
+| `APRILTAG_VK_MERGE_X4` | bool | on for integrated GPUs |  | environment only | Merge four pixels per thread (needs 8-bit storage and a width divisible by 4). |
+| `APRILTAG_VK_MERGE_BAND` | int | 8 discrete, 0 integrated or sparse |  | environment only | Rows merged in bands of this many (power of two) before the band boundaries; 0 is one pass. |
+| `APRILTAG_VK_LEAN_TAIL` | bit mask | 3 integrated, 0 other |  | environment only | Leaner tail: bit 1 fixed-grid kernels, bit 2 offsets from select. |
+| `APRILTAG_VK_TRACKING_ASYNC_THREADS` | int | 1 | `TrackingConfig::async_threads` | environment wins | Threads of the background decoder; 0 is all cores. |
+| `APRILTAG_VK_POLISH_N` | int | 8000 |  | environment only | Most pixels the polish fit uses per tag (read once per process). |
+| `APRILTAG_VK_POLISH_BLUREXTRA` | float | 2.0 |  | environment only | Polish: extra blur width, in pixels, added to the window (read once per process). |
+| `APRILTAG_VK_POLISH_WINMULT` | float | 0.8 |  | environment only | Polish: window size as a multiple of the blur width. |
+| `APRILTAG_VK_POLISH_MINWIN` | float | 0.5 |  | environment only | Polish: smallest window, in pixels. |
+| `APRILTAG_VK_POLISH_SMAXM` | float | 1.3 |  | environment only | Polish: largest blur width as a multiple of the starting estimate. |
+| `APRILTAG_VK_POLISH_TOL` | float | 0.004 |  | environment only | Polish: convergence tolerance of the parameter step. |
+| `APRILTAG_VK_POLISH_ITERS` | float | 6 |  | environment only | Polish: most iterations. |
+| `APRILTAG_VK_POLISH_REACH` | float | 1.6 |  | environment only | Polish: how far from the edge, in blur widths, pixels still count. |
+
+### Device forcing
+
+| Variable | Type | Default | Configuration field | Precedence | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `APRILTAG_VK_ALLOW_CPU` | bool | off | `ContextOptions::allow_cpu_device` | environment can only enable | Permit a software Vulkan device (benchmarking and CI only). |
+| `APRILTAG_VK_DEVICE` | int | -1 (best score) | `ContextOptions::device_index` | environment wins | Pick a physical device by index. |
+| `APRILTAG_VK_FORCE_NO_8BIT` | bool | off | `ContextOptions::force_no_8bit_storage` | environment can only enable | Use the 32-bit-per-pixel shader family even where 8-bit storage exists. |
+| `APRILTAG_VK_FORCE_NO_SUBGROUP` | bool | off | `ContextOptions::force_no_subgroup` | environment can only enable | Use the scalar shader variants even where subgroup operations exist. |
+| `APRILTAG_VK_FORCE_NO_INT64_ATOMIC` | bool | off | `ContextOptions::force_no_int64_atomics` | environment can only enable | Use the 32-bit atomic extents reduction. |
+| `APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING` | bool | off | `ContextOptions::force_no_conditional_rendering` | environment can only enable | Skip converged compression passes with the in-shader guard. |
+| `APRILTAG_VK_MAX_INVOCATIONS` | int | device | `ContextOptions::max_invocations_override` | environment wins | Pretend the device caps workgroups at this many invocations; must be positive. |
+
+### Diagnostics
+
+| Variable | Type | Default | Configuration field | Precedence | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `APRILTAG_VK_VALIDATION` | bool | off | `ContextOptions::enable_validation` | environment can only enable | Enable the Khronos validation layer if installed. |
+| `APRILTAG_VK_TIMESTAMPS` | int | off |  | environment only | Non-zero emits the per-dispatch GPU timestamp breakdown (tracing also enables it). |
+| `APRILTAG_VK_TRACE` | string | off |  | environment only | Write a Chrome-trace JSON of the CPU and GPU spans to this file. |
+| `APRILTAG_VK_DISPATCH_TIMES` | bool | off |  | environment only | When set to any value, print the median GPU time of every dispatch at exit (read once per process). |
+| `APRILTAG_VK_PROBE_STATS` | bool | off |  | environment only | Histogram each unrefined quad's Hamming distance by outcome. |
+| `APRILTAG_VK_PROBE_CSV` | string | off |  | environment only | Append one CSV row per quad to this file (also turns on the probe statistics). |
+| `APRILTAG_VK_POLISH_DEV` | bit mask | 0 |  | environment only | Development bit mask of the polish fit (read once per process). |
+
+### Platform variables read
+
+| Variable | Type | Default | Configuration field | Precedence | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `LOCALAPPDATA` | string | unset |  | fallback | Windows: the pipeline cache is kept under %LOCALAPPDATA%\vkapriltag. |
+| `XDG_CACHE_HOME` | string | unset |  | fallback | Elsewhere: the pipeline cache is kept under $XDG_CACHE_HOME/vkapriltag. |
+| `HOME` | string | unset |  | fallback | Elsewhere, without XDG_CACHE_HOME: the cache is kept under $HOME/.cache/vkapriltag. |
+<!-- options:end -->
 
 ## 3. Measured performance
 

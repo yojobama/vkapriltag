@@ -6,7 +6,7 @@ add_executable(unit_tests unit_tests.cpp)
 target_include_directories(unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/library/src)
 target_link_libraries(unit_tests PRIVATE vkapriltag::vkapriltag)
 
-foreach(group decode geometry edges quadfit)
+foreach(group decode geometry edges quadfit options)
   add_test(NAME unit_${group} COMMAND unit_tests ${group})
 endforeach()
 
@@ -17,6 +17,9 @@ if(TARGET vk_eval AND Python3_FOUND)
             --corpus ${CMAKE_CURRENT_SOURCE_DIR}/corpus
             --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden)
   set_tests_properties(golden_detections PROPERTIES TIMEOUT 600)
+  add_test(NAME options_lint
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/options_lint.py
+            --root ${PROJECT_SOURCE_DIR} --vk-eval $<TARGET_FILE:vk_eval>)
 else()
   message(STATUS "golden_detections test skipped: needs the vk_eval tool and Python 3")
 endif()

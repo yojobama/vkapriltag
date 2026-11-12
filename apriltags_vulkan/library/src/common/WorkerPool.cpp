@@ -1,5 +1,7 @@
 #include "vkapriltag/common/WorkerPool.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -64,8 +66,15 @@ void PinThread(const std::vector<int> &cpus) {
 
 WorkerPoolOptions ResolveWorkerPoolOptions(const WorkerPoolOptions &configured) {
   WorkerPoolOptions o = configured;
-  if (const char *v = std::getenv("APRILTAG_CPU_BIG_CORES")) o.big_cores = v[0] != '0';
+  o.big_cores = Options::FromEnvironment().Bool("APRILTAG_CPU_BIG_CORES", o.big_cores);
   return o;
+}
+
+unsigned ResolveThreadCount(uint32_t configured) {
+  if (configured > 0) return configured;
+  const std::optional<long> parsed = Options::FromEnvironment().Long("APRILTAG_CPU_THREADS");
+  if (parsed && *parsed > 0) return static_cast<unsigned>(*parsed < 65536 ? *parsed : 65536);  // WorkerPool clamps further
+  return 0;
 }
 
 WorkerPool::WorkerPool(unsigned threads, const char *name, const WorkerPoolOptions &options)

@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "vkapriltag/TagDecoder.h"
+#include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/Profiler.h"
 #include "vkapriltag/apriltag_family.h"
 #include "vkapriltag/gpu/GpuDetector.h"
@@ -49,6 +50,7 @@ int main(int argc, char **argv) {
   int iterations = 1, warmup = 0;
   uint32_t decimation = 1, threads = 0;
   bool ref = false;
+  bool small_rescue_config = false;  // sets DetectorConfig::small_tag_rescue in code instead of the environment
   std::string family = "tag36h11";
   std::string levels_arg;  // "4b:28:0,2b:14:40,1:8:20": decimation[b]:min tag px:max tag px per level
   for (int i = 1; i < argc; i++) {
@@ -64,11 +66,18 @@ int main(int argc, char **argv) {
     else if (a == "--decimation") decimation = uint32_t(std::max(1, std::stoi(next())));
     else if (a == "--threads") threads = uint32_t(std::max(0, std::stoi(next())));
     else if (a == "--ref") ref = true;
+    else if (a == "--small-rescue") small_rescue_config = true;
     else if (a == "--family") family = next();
     else if (a == "--levels") levels_arg = next();
-    else {
+    else if (a == "--list-options") {
+      std::fputs(apriltag_vulkan::OptionsMarkdown().c_str(), stdout);
+      return 0;
+    } else if (a == "--list-option-names") {
+      for (const auto &d : apriltag_vulkan::OptionTable()) std::printf("%s\n", d.name);
+      return 0;
+    } else {
       std::cerr << "usage: vk_eval --list files.txt [--out dets.txt] [--iterations N] [--warmup N] "
-                   "[--decimation N] [--threads N] [--ref]\n";
+                   "[--decimation N] [--threads N] [--ref] [--small-rescue] | --list-options | --list-option-names\n";
       return 2;
     }
   }
@@ -151,6 +160,7 @@ int main(int argc, char **argv) {
           config.width = uint32_t(im.width);
           config.height = uint32_t(im.height);
           config.decimation = decimation;
+          config.small_tag_rescue = small_rescue_config;
           config.tag_width = uint32_t(tf->width_at_border);
           config.reversed_border = tf->reversed_border;
           config.normal_border = !tf->reversed_border;
@@ -160,7 +170,9 @@ int main(int argc, char **argv) {
             detector = std::make_unique<apriltag_vulkan::GpuDetector>(ctx, config);
             quad_decode = std::make_unique<apriltag_vulkan::QuadDecode>(config);
           }
-          tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(td, decimation, threads);
+          tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(
+              td, decimation, threads, apriltag_vulkan::RefineEdgesMethod::kProfile, 0.0f,
+              apriltag_vulkan::WorkerPoolOptions(), false, config.small_tag_rescue);
         }
         eval::Timings t;
         zarray_t *dets = nullptr;
