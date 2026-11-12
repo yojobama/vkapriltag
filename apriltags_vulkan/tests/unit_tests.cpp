@@ -732,6 +732,211 @@ void TestOptions() {
   CHECK(av::ResolveThreadCount(0) == 0);
 }
 
+// ---------------------------------------------------------------- decode steps on one quad
+
+struct Detector {
+  apriltag_detector_t *td;
+  explicit Detector(apriltag_family_t *f) : td(apriltag_detector_create()) {
+    apriltag_detector_add_family(td, f);
+    td->quad_decimate = 1;
+    td->refine_edges = true;
+  }
+  ~Detector() { apriltag_detector_destroy(td); }
+};
+
+// A tag drawn on a white canvas, kCell pixels per cell. The family image has a one-cell quiet ring
+// that is white by default; `ring_grey` replaces it, and `flips` inverts the listed payload cells.
+class TagScene {
+ public:
+  static constexpr int kCell = 8, kSize = 160, kOrigin = 40;
+
+  TagScene(const apriltag_family_t *f, int id, int ring_grey = 255, const std::vector<int> &flips = {})
+      : f_(f), pix_(size_t(kSize) * kSize, 255) {
+    apriltag_family_t *mutable_family = const_cast<apriltag_family_t *>(f);
+    image_u8_t *tag = apriltag_to_image(mutable_family, uint32_t(id));
+    const int tw = f->total_width, start = (tw - int(f->width_at_border)) / 2;
+    std::vector<uint8_t> cells(size_t(tw) * tw);
+    for (int y = 0; y < tw; ++y) {
+      for (int x = 0; x < tw; ++x) cells[size_t(y) * tw + x] = tag->buf[y * tag->stride + x];
+    }
+    image_u8_destroy(tag);
+    for (int y = 0; y < tw; ++y) {
+      for (int x = 0; x < tw; ++x) {
+        if (x == 0 || y == 0 || x == tw - 1 || y == tw - 1) cells[size_t(y) * tw + x] = uint8_t(ring_grey);
+      }
+    }
+    for (int k : flips) {
+      uint8_t &c = cells[size_t(f->bit_y[k] + start) * tw + f->bit_x[k] + start];
+      c = c ? 0 : 255;
+    }
+    for (int y = 0; y < tw * kCell; ++y) {
+      for (int x = 0; x < tw * kCell; ++x) pix_[size_t(kOrigin + y) * kSize + kOrigin + x] = cells[size_t(y / kCell) * tw + x / kCell];
+    }
+    im_.reset(new image_u8_t{kSize, kSize, kSize, pix_.data()});
+  }
+
+  image_u8_t *image() { return im_.get(); }
+  void Fill(int x0, int y0, int x1, int y1, uint8_t v) {
+    for (int y = y0; y < y1; ++y) std::fill_n(pix_.begin() + size_t(y) * kSize + x0, x1 - x0, v);
+  }
+  // The corners of the square spanning cells [first, last) on both axes.
+  static void Square(int first, int last, double corners[4][2]) {
+    const double lo = kOrigin + first * kCell, hi = kOrigin + last * kCell;
+    const double c[4][2] = {{lo, lo}, {hi, lo}, {hi, hi}, {lo, hi}};
+    std::memcpy(corners, c, sizeof(c));
+  }
+  // The black border square: all but the quiet ring.
+  void Border(double corners[4][2]) const {
+    const int start = (f_->total_width - int(f_->width_at_border)) / 2;
+    Square(start, f_->total_width - start, corners);
+  }
+
+ private:
+  const apriltag_family_t *f_;
+  std::vector<uint8_t> pix_;
+  std::unique_ptr<image_u8_t> im_;
+};
+
+// Payload cells that touch cell `a`, nearest first.
+std::vector<int> Neighbours(const apriltag_family_t *f, int a) {
+  std::vector<int> out;
+  for (int b = 0; b < int(f->nbits); ++b) {
+    if (Adjacent(f, a, b)) out.push_back(b);
+  }
+  return out;
+}
+
+void TestPreRefineChecks() {
+  Family fam("tag36h11");
+  Detector det(fam.f);
+  const av::DecodeSwitches on;
+  av::DecodeSwitches grey_off = on;
+  grey_off.grey_margin = false;
+
+  TagScene tag(fam.f, 7);
+  double border[4][2];
+  tag.Border(border);
+  CHECK(!tst::PreRefineRejects(det.td, tag.image(), border, false, on));
+  CHECK(!tst::PreRefineRejects(det.td, tag.image(), border, false, grey_off));
+
+  // A solid black square has the border of a tag but fewer white payload cells than any code.
+  std::vector<uint8_t> black(size_t(TagScene::kSize) * TagScene::kSize, 255);
+  for (int y = 48; y < 112; ++y) std::fill_n(black.begin() + y * TagScene::kSize + 48, 64, uint8_t{0});
+  image_u8_t black_im = {TagScene::kSize, TagScene::kSize, TagScene::kSize, black.data()};
+  const double square[4][2] = {{48, 48}, {112, 48}, {112, 112}, {48, 112}};
+  CHECK(tst::PreRefineRejects(det.td, &black_im, square, false, on));
+  CHECK(tst::PreRefineRejects(det.td, &black_im, square, false, grey_off));
+  av::DecodeSwitches dark_off = on;
+  dark_off.dark_reject = false;
+  CHECK(!tst::PreRefineRejects(det.td, &black_im, square, false, dark_off));
+
+  // Quads over uniform noise: almost all fail the border or the payload check.
+  std::mt19937 rng(7);
+  std::vector<uint8_t> noise(size_t(TagScene::kSize) * TagScene::kSize);
+  for (uint8_t &v : noise) v = uint8_t(rng() & 255);
+  image_u8_t noise_im = {TagScene::kSize, TagScene::kSize, TagScene::kSize, noise.data()};
+  int rejected = 0;
+  for (int i = 0; i < 40; ++i) {
+    const double x = 20 + (i % 8) * 8.0, y = 20 + (i / 8) * 8.0;
+    const double quad[4][2] = {{x, y}, {x + 70, y}, {x + 70, y + 70}, {x, y + 70}};
+    rejected += tst::PreRefineRejects(det.td, &noise_im, quad, false, on);
+  }
+  std::printf("  noise quads rejected before refining: %d of 40\n", rejected);
+  CHECK(rejected >= 20);
+
+  // A grey ring around the tag makes its outline one cell too big; the grey margin retry covers it.
+  TagScene grey(fam.f, 7, 128);
+  double outline[4][2];
+  TagScene::Square(0, fam.f->total_width, outline);
+  CHECK(!tst::PreRefineRejects(det.td, grey.image(), outline, false, on));
+}
+
+void TestRecoverySteps() {
+  Family fam("tag36h11");
+  Detector det(fam.f);
+  const av::DecodeSwitches on;
+  const int id = 7;
+
+  // A decodable tag runs to the end and finds itself.
+  TagScene tag(fam.f, id);
+  double border[4][2];
+  tag.Border(border);
+  tst::StepResult r = tst::RunCandidateSteps(det.td, tag.image(), border, false, on);
+  CHECK(r.outcome == 3 && r.count == 1 && r.id == id && r.hamming == 0);
+
+  // Grey quiet ring: the quad is the ring's outline; only the inner retry decodes it.
+  TagScene grey(fam.f, id, 128);
+  double outline[4][2];
+  TagScene::Square(0, fam.f->total_width, outline);
+  r = tst::RunCandidateSteps(det.td, grey.image(), outline, false, on);
+  CHECK(r.count == 1 && r.id == id);
+  av::DecodeSwitches grey_off = on;
+  grey_off.grey_margin = false;
+  r = tst::RunCandidateSteps(det.td, grey.image(), outline, false, grey_off);
+  CHECK(r.count == 0);
+
+  // Three touching payload cells wrong: only the third-bit match recovers the tag.
+  std::vector<int> flips;
+  for (int a = 0; a < int(fam.f->nbits) && flips.empty(); ++a) {
+    const std::vector<int> n = Neighbours(fam.f, a);
+    if (n.size() >= 2) flips = {a, n[0], n[1]};
+  }
+  TagScene damaged(fam.f, id, 255, flips);
+  damaged.Border(border);
+  r = tst::RunCandidateSteps(det.td, damaged.image(), border, false, on);
+  std::printf("  three touching bits wrong: count %d id %d hamming %d\n", r.count, r.id, r.hamming);
+  CHECK(r.count == 1 && r.id == id && r.hamming == 3);
+  av::DecodeSwitches third_off = on;
+  third_off.third_bit = false;
+  r = tst::RunCandidateSteps(det.td, damaged.image(), border, false, third_off);
+  CHECK(r.count == 0);
+
+  // A dark line one cell above the tag puts the top side out; the side-one-out step moves it back.
+  TagScene lined(fam.f, id);
+  lined.Fill(48, 41, 112, 43, 0);
+  const double out[4][2] = {{48, 41}, {112, 41}, {112, 112}, {48, 112}};
+  av::DecodeSwitches side_off = on;
+  side_off.side_one_out = false;
+  r = tst::RunCandidateSteps(det.td, lined.image(), out, false, side_off);
+  CHECK(r.count == 1 && r.id == id && r.hamming == 2);
+  CHECK_NEAR(r.corners[2][1], 41.0, 0.5);
+  r = tst::RunCandidateSteps(det.td, lined.image(), out, false, on);
+  CHECK(r.count == 1 && r.id == id && r.hamming == 0);
+  CHECK_NEAR(r.corners[2][1], 48.0, 0.5);
+
+  // Three scattered wrong cells are not recovered.
+  TagScene scattered(fam.f, id, 255, {0, 17, 33});
+  scattered.Border(border);
+  r = tst::RunCandidateSteps(det.td, scattered.image(), border, false, on);
+  CHECK(r.count == 0);
+}
+
+void TestFamilyLimits() {
+  Family fam("tag16h5");
+  Detector det(fam.f);
+  const av::DecodeSwitches on;
+  av::DecodeSwitches limits_off = on;
+  limits_off.family_limits = false;
+  TagScene one_wrong(fam.f, 3, 255, {5});
+  double border[4][2];
+  one_wrong.Border(border);
+  // One corrected bit is more than tag16h5's codes can bear.
+  tst::StepResult r = tst::RunCandidateSteps(det.td, one_wrong.image(), border, false, limits_off);
+  CHECK(r.count == 1 && r.id == 3 && r.hamming == 1);
+  r = tst::RunCandidateSteps(det.td, one_wrong.image(), border, false, on);
+  CHECK(r.count == 0);
+  TagScene exact(fam.f, 3);
+  exact.Border(border);
+  r = tst::RunCandidateSteps(det.td, exact.image(), border, false, on);
+  CHECK(r.count == 1 && r.id == 3 && r.hamming == 0);
+}
+
+void TestSteps() {
+  TestPreRefineChecks();
+  TestRecoverySteps();
+  TestFamilyLimits();
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -744,6 +949,7 @@ int main(int argc, char **argv) {
   if (all || !std::strcmp(which, "edges")) TestEdges(), ran = true;
   if (all || !std::strcmp(which, "quadfit")) TestQuadFit(), ran = true;
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;
+  if (all || !std::strcmp(which, "steps")) TestSteps(), ran = true;
   if (!ran) {
     std::printf("unknown test group %s\n", which);
     return 2;
