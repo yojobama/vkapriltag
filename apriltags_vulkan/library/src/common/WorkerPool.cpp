@@ -21,22 +21,6 @@ namespace apriltag_vulkan {
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
-
-int64_t NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
-
-inline void CpuRelax() {
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-  _mm_pause();
-#elif defined(__x86_64__) || defined(__i386__)
-  __builtin_ia32_pause();
-#elif defined(__aarch64__)
-  asm volatile("isb" ::: "memory");
-#else
-  std::this_thread::yield();
-#endif
-}
-
 // Indices of the cores with the highest cpu_capacity when capacities differ; empty otherwise.
 std::vector<int> BigCpus() {
   std::vector<int> big;
@@ -76,27 +60,11 @@ void PinThread(const std::vector<int> &cpus) {
 #endif
 }
 
-std::mutex &RegistryMutex() {
-  static std::mutex m;
-  return m;
-}
-
-std::vector<WorkerPool *> &Registry() {
-  static std::vector<WorkerPool *> r;
-  return r;
-}
-
 }  // namespace
 
 WorkerPoolOptions ResolveWorkerPoolOptions(const WorkerPoolOptions &configured) {
   WorkerPoolOptions o = configured;
-  if (const char *v = std::getenv("APRILTAG_CPU_SPIN_US")) o.spin_us = std::atoi(v);
-  if (const char *v = std::getenv("APRILTAG_CPU_INLINE")) o.inline_max = std::atoi(v);
-  if (const char *v = std::getenv("APRILTAG_CPU_INLINE_IDLE_US")) o.inline_idle_us = std::atoi(v);
   if (const char *v = std::getenv("APRILTAG_CPU_BIG_CORES")) o.big_cores = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_CPU_SPIN_YIELD")) o.spin_yield = v[0] != '0';
-  if (const char *v = std::getenv("APRILTAG_CPU_SPIN_WORKERS")) o.spin_workers = std::atoi(v);
-  if (const char *v = std::getenv("APRILTAG_CPU_PIN_CALLER")) o.pin_caller = v[0] != '0';
   return o;
 }
 
@@ -119,31 +87,10 @@ WorkerPool::WorkerPool(unsigned threads, const char *name, const WorkerPoolOptio
     StopWorkers();
     throw;
   }
-  std::lock_guard<std::mutex> lock(RegistryMutex());
-  Registry().push_back(this);
 }
 
 WorkerPool::~WorkerPool() {
-  {
-    std::lock_guard<std::mutex> lock(RegistryMutex());
-    auto &r = Registry();
-    r.erase(std::remove(r.begin(), r.end(), this), r.end());
-  }
   StopWorkers();
-}
-
-void WorkerPool::Warm() {
-  if (options_.spin_us <= 0 || workers_.empty()) return;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    warm_epoch_.fetch_add(1, std::memory_order_release);
-  }
-  batch_ready_.notify_all();
-}
-
-void WorkerPool::WarmAll() {
-  std::lock_guard<std::mutex> lock(RegistryMutex());
-  for (WorkerPool *pool : Registry()) pool->Warm();
 }
 
 void WorkerPool::StopWorkers() {
@@ -182,47 +129,19 @@ void WorkerPool::DrainBatch(unsigned slot) {
   drain.set_arg(claimed);
 }
 
-void WorkerPool::SpinForWork(uint64_t seen) {
-  const int64_t deadline = NowNs() + static_cast<int64_t>(options_.spin_us) * 1000;
-  for (unsigned n = 0;; ++n) {
-    if (generation_.load(std::memory_order_acquire) != seen || stop_.load(std::memory_order_acquire)) return;
-    if (options_.spin_yield) std::this_thread::yield(); else CpuRelax();
-    if ((n & 31) == 31 && NowNs() >= deadline) return;
-  }
-}
-
-bool WorkerPool::ShouldSpin(unsigned slot) const {
-  return options_.spin_us > 0 && (options_.spin_workers <= 0 || slot <= static_cast<unsigned>(options_.spin_workers));
-}
-
 void WorkerPool::WorkerMain(unsigned slot) {
   prof::SetThreadName((name_ + " " + std::to_string(slot)).c_str());
   PinThread(big_cpus_);
   uint64_t seen = 0;
-  uint64_t seen_warm = 0;
-  bool spin = false;
   for (;;) {
-    if (spin && ShouldSpin(slot)) SpinForWork(seen);
-    bool batch = false;
-    if (spin && generation_.load(std::memory_order_acquire) != seen && !stop_.load(std::memory_order_acquire)) {
-      seen = generation_.load(std::memory_order_acquire);  // a spinning worker takes the batch without the lock
-      batch = true;
-    } else {
+    {
       std::unique_lock<std::mutex> lock(mutex_);
-      batch_ready_.wait(lock, [this, &seen, &seen_warm] {
-        return stop_.load(std::memory_order_relaxed) || generation_.load(std::memory_order_relaxed) != seen ||
-               warm_epoch_.load(std::memory_order_relaxed) != seen_warm;
+      batch_ready_.wait(lock, [this, &seen] {
+        return stop_.load(std::memory_order_relaxed) || generation_.load(std::memory_order_relaxed) != seen;
       });
       if (stop_.load(std::memory_order_relaxed)) return;
-      if (generation_.load(std::memory_order_relaxed) != seen) {
-        seen = generation_.load(std::memory_order_relaxed);
-        batch = true;
-      } else {
-        seen_warm = warm_epoch_.load(std::memory_order_relaxed);
-      }
+      seen = generation_.load(std::memory_order_relaxed);
     }
-    spin = true;
-    if (!batch) continue;
 
     DrainBatch(slot);
 
@@ -233,33 +152,14 @@ void WorkerPool::WorkerMain(unsigned slot) {
   }
 }
 
-void WorkerPool::PinCaller() {
-  const size_t id = std::hash<std::thread::id>()(std::this_thread::get_id()) | 1;
-  if (pinned_caller_.load(std::memory_order_relaxed) == id) return;
-  PinThread(big_cpus_);
-  pinned_caller_.store(id, std::memory_order_relaxed);
-}
-
 void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn) {
   if (count == 0) return;
   std::lock_guard<std::mutex> call_lock(call_mutex_);
 
   // A single item (or a single-threaded pool) runs inline on the calling thread as slot 0.
-  if (options_.pin_caller && !big_cpus_.empty()) PinCaller();
   if (workers_.empty() || count == 1) {
     for (size_t i = 0; i < count; ++i) fn(i, 0);
     return;
-  }
-
-  // A small batch on a pool that has been idle runs here instead of waking the workers.
-  if (options_.inline_max > 0 && count <= static_cast<size_t>(options_.inline_max)) {
-    const int64_t now = NowNs();
-    const bool cold = now - last_end_ns_.load(std::memory_order_relaxed) > static_cast<int64_t>(options_.inline_idle_us) * 1000;
-    if (cold) {
-      for (size_t i = 0; i < count; ++i) fn(i, 0);
-      last_end_ns_.store(NowNs(), std::memory_order_relaxed);
-      return;
-    }
   }
 
   {
@@ -286,7 +186,6 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
     count_ = 0;
     error = std::exchange(error_, nullptr);
   }
-  if (options_.inline_max > 0) last_end_ns_.store(NowNs(), std::memory_order_relaxed);
   if (error) std::rethrow_exception(error);
 }
 

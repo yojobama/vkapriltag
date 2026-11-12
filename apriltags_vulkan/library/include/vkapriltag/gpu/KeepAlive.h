@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <functional>
 #include <thread>
 
 #include "vkapriltag/vk/ComputePipeline.h"
@@ -30,8 +29,6 @@ class KeepAlive {
     unsigned burst = 3;
     uint32_t groups = 1;
     std::chrono::microseconds burst_gap{300};
-    // Called when a burst starts and, for NoteFrame(true), shortly before the next frame is due.
-    std::function<void()> on_warm;
   };
 
   // `lane` is a lane of its own on the detector's queue; `pipeline` binds one scratch buffer.
@@ -45,7 +42,7 @@ class KeepAlive {
   // A frame that uses the GPU is starting; `expect_next` arms the predictive burst for the next one.
   void Touch(bool expect_next = true);
   // A frame arrived that does not use the GPU (cadence only).
-  void NoteFrame(bool warm_pool = false);
+  void NoteFrame();
   // The frame after the last one noted will use the GPU: arms the predictive burst.
   void ExpectGpuFrame();
   // Submits a burst now.
@@ -75,7 +72,6 @@ class KeepAlive {
   bool stop_ = false;
   bool kick_ = false;
   bool armed_ = false;
-  bool armed_pool_ = false;
   Clock::time_point last_arrival_{};
   std::array<int64_t, kIntervals> intervals_ns_{};
   size_t interval_count_ = 0;

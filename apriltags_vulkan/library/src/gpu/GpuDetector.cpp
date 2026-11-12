@@ -308,7 +308,6 @@ GpuDetector::GpuDetector(vk::Context &ctx, vk::Lane &lane, vk::Lane *transfer_la
       options.burst = prewarm_burst;
       if (const char *v = std::getenv("APRILTAG_VK_PREWARM_GROUPS")) options.groups = static_cast<uint32_t>(std::max(1, std::atoi(v)));
       options.burst_gap = std::chrono::microseconds(prewarm_gap_us);
-      options.on_warm = [] { WorkerPool::WarmAll(); };
       keepalive_ = std::make_unique<KeepAlive>(std::move(keepalive_lane), keepalive_pl_, options);
     }
   }
@@ -1334,8 +1333,8 @@ void GpuDetector::Prewarm() {
   if (keepalive_) keepalive_->Prewarm();
 }
 
-void GpuDetector::NoteFrame(bool warm_pool) {
-  if (keepalive_) keepalive_->NoteFrame(warm_pool);
+void GpuDetector::NoteFrame() {
+  if (keepalive_) keepalive_->NoteFrame();
 }
 
 void GpuDetector::ExpectGpuFrame() {

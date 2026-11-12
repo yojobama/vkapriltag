@@ -135,7 +135,7 @@ zarray_t *TrackingDetector::Detect(const uint8_t *gray_frame) {
     Path path = Path::kTracked;
     if (zarray_t *dets = TrackFrame(gray_frame, false, &path)) {
       ++tracked_run_;
-      gpu_->NoteFrame(true);
+      gpu_->NoteFrame();
       if (tracked_run_ + 1 >= tracking_.keyframe_interval) gpu_->ExpectGpuFrame();
       backoff_ = 1;
       last_path_ = path;

@@ -140,15 +140,10 @@ void KeepAlive::Touch(bool expect_next) {
   if (signal) Signal();
 }
 
-void KeepAlive::NoteFrame(bool warm_pool) {
+void KeepAlive::NoteFrame() {
   if (options_.lead.count() == 0) return;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    RecordArrivalLocked(Clock::now());
-    if (!warm_pool || !options_.on_warm) return;
-    armed_pool_ = true;
-  }
-  Signal();
+  std::lock_guard<std::mutex> lock(mutex_);
+  RecordArrivalLocked(Clock::now());
 }
 
 void KeepAlive::ExpectGpuFrame() {
@@ -220,26 +215,6 @@ void KeepAlive::Run() {
       }
     }
 
-    bool warm_only = false;
-    if (lead.count() > 0 && armed_pool_) {
-      const Clock::time_point next = NextFrameLocked();
-      if (next.time_since_epoch().count() == 0 || now >= next || next - last_arrival_ <= lead + std::chrono::microseconds(500)) {
-        armed_pool_ = false;
-      } else if (next - lead <= now) {
-        warm_only = !burst;
-        burst = true;
-        armed_pool_ = false;
-      } else {
-        deadline = std::min(deadline, next - lead);
-      }
-    }
-
-    if (burst && options_.on_warm) {
-      lock.unlock();
-      options_.on_warm();
-      lock.lock();
-    }
-    if (warm_only) continue;
     if (burst) {
       for (unsigned i = 0; i < std::max(1u, options_.burst) && !stop_; ++i) {
         lock.unlock();

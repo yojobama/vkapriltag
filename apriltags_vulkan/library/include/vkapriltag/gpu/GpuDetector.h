@@ -129,22 +129,12 @@ struct DetectorConfig {
   // Env override: APRILTAG_CPU_THREADS=<n>
   uint32_t cpu_threads = 0;
 
-  // CPU tail worker pool options (see WorkerPoolOptions); only cpu_big_cores is on by default.
-  // Env override: APRILTAG_CPU_SPIN_US, APRILTAG_CPU_INLINE, APRILTAG_CPU_INLINE_IDLE_US,
-  // APRILTAG_CPU_BIG_CORES, APRILTAG_CPU_PIN_CALLER
-  int cpu_spin_us = 0;
-  int cpu_inline_max = 0;
-  int cpu_inline_idle_us = 1000;
+  // CPU tail worker pool options (see WorkerPoolOptions). Env override: APRILTAG_CPU_BIG_CORES
   bool cpu_big_cores = true;
-  bool cpu_pin_caller = false;
 
   WorkerPoolOptions PoolOptions() const {
     WorkerPoolOptions o;
-    o.spin_us = cpu_spin_us;
-    o.inline_max = cpu_inline_max;
-    o.inline_idle_us = cpu_inline_idle_us;
     o.big_cores = cpu_big_cores;
-    o.pin_caller = cpu_pin_caller;
     return o;
   }
 };
@@ -274,8 +264,7 @@ class GpuDetector {
   // For callers that skip Detect() on some frames (see TrackingDetector): NoteFrame() records the
   // arrival of a frame that does not use the GPU, ExpectGpuFrame() arms the predictive burst for the
   // next frame, and SetAutoPrewarm(false) stops Detect() arming it.
-  // `warm_pool` also wakes the CPU worker pools shortly before the next frame is due.
-  void NoteFrame(bool warm_pool = false);
+  void NoteFrame();
   void ExpectGpuFrame();
   void SetAutoPrewarm(bool enabled) { auto_prewarm_.store(enabled, std::memory_order_relaxed); }
 

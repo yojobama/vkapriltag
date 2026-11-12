@@ -173,7 +173,7 @@ namespace {
 // A decoder used from a background thread never pins threads.
 WorkerPoolOptions ResolvePoolOptions(const WorkerPoolOptions &configured, bool background_thread) {
   WorkerPoolOptions o = ResolveWorkerPoolOptions(configured);
-  if (background_thread) o.big_cores = o.pin_caller = false;
+  if (background_thread) o.big_cores = false;
   return o;
 }
 
