@@ -109,7 +109,8 @@ Pi is the Orange Pi 5 / 5 Plus (Mali-G610).
 | Separate `VkDevice` per stream; queue per stream | measured | | RX 4 streams alternating 2.7x; Pi almost none; one queue per stream slightly worse on the Mali | P §8b, §8c | `expected_streams` |
 | `expected_streams` / `StreamSlot` | opt-in | queues on both compute families | desktop +82% / +84% at 4 / 8 streams; Mali no change | P §8j | none |
 | `MultiLevelDetector` | opt-in, kept as a class | per-level decimation and tag size band | Pi 2.4-3.4 ms against 1.7-2.2 ms for decimation 1; recall lower (low-contrast 98 to 84%, grey-margin 88 to 22%); "a level only pays if restricted to a region" | P §8ac, CL 1.10.0 | open |
-| CPU-only or hybrid front end; CPU tail for sparse frames; ROI processing | not tried | | the documents only analyse why NAPA wins on small frames (Pi 5-6x, desktop 3.6x faster at decimation 2); "the GPU pays off only where per-pixel work dominates"; deferred in the 2026-11 plan | P §8ar, §8at, §8as, RR 6.8-6.9 | open |
+| CPU tail for frames with few boundary points (`APRILTAG_VK_CPU_TAIL`) | opt-in, off | head and `blob_diff` on the GPU, then group, select, scatter and sort on the host when the previous frame had at most 10,000 points | Pi decimation 2 back to back: gpu 0.585->0.530 ms (-9%), one-tag -105 us; decimation 1 flat; 16 ms gaps +82 us (worse); mispredicted frame +140 us; desktop within noise (-10 us at 3,000 points, +19 us at 10,000); detections identical | research/PROGRESS-cpu-tail.md | none |
+| CPU-only or hybrid front end; ROI processing | not tried | | the documents only analyse why NAPA wins on small frames (Pi 5-6x, desktop 3.6x faster at decimation 2); "the GPU pays off only where per-pixel work dominates"; deferred in the 2026-11 plan | P §8ar, §8at, §8as, RR 6.8-6.9 | open |
 | Adaptive decimation | not tried | | decimation 4 is "2.1x faster" than 2 | `survey` C2, P §3 (old) | open |
 
 ## 6. CPU: refinement, decode and the accuracy features
