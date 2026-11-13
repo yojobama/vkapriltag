@@ -116,6 +116,7 @@ add_library(vkapriltag STATIC
   src/vk/PipelineCache.cpp
   src/vk/QueryPool.cpp
   src/gpu/GpuDetector.cpp
+  src/gpu/PipelinePlan.cpp
   src/gpu/QuadDecode.cpp
   src/gpu/MultiLevelDetector.cpp
   src/gpu/KeepAlive.cpp

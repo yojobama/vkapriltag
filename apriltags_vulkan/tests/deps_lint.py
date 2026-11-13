@@ -35,18 +35,23 @@ SUFFIXES = {".h", ".hpp", ".cpp", ".cc", ".c"}
 FETCH = re.compile(r"FetchContent_(Declare|MakeAvailable|Populate)\(\s*apriltag\b|AprilRobotics/apriltag|find_(package|dependency)\(\s*apriltag\b", re.I)
 
 
+def walk(base, pattern):
+    """Files under base matching pattern, skipping untracked top-level build and out directories."""
+    return [p for p in base.rglob(pattern) if p.is_file() and p.relative_to(base).parts[:1] not in (("build",), ("out",))]
+
+
 def check_cmake(root):
     """The default configure must not reach upstream."""
     failures = []
     allowed = {"tools/upstream/CMakeLists.txt"}
-    for path in list(root.rglob("CMakeLists.txt")) + list(root.rglob("*.cmake")) + list(root.rglob("*.cmake.in")):
+    for path in list(walk(root, "CMakeLists.txt")) + list(walk(root, "*.cmake")) + list(walk(root, "*.cmake.in")):
         rel = path.relative_to(root).as_posix()
         if rel in allowed or "tests/corpus" in rel:
             continue
         for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if FETCH.search(line):
                 failures.append(f"{rel}:{n}: fetches or finds upstream apriltag outside tools/upstream: {line.strip()}")
-    for path in root.rglob("*.patch"):
+    for path in walk(root, "*.patch"):
         rel = path.relative_to(root).as_posix()
         if not rel.startswith("tools/upstream/patches/"):
             failures.append(f"{rel}: patch files belong under tools/upstream/patches")
@@ -56,7 +61,7 @@ def check_cmake(root):
     tools = (root / "tools" / "CMakeLists.txt").read_text(encoding="utf-8")
     if not re.search(r"if\(VKAPRILTAG_UPSTREAM_VALIDATION\)\s*add_subdirectory\(upstream\)\s*endif\(\)", tools):
         failures.append("tools/CMakeLists.txt: add_subdirectory(upstream) must sit directly under if(VKAPRILTAG_UPSTREAM_VALIDATION)")
-    for path in root.rglob("*"):
+    for path in walk(root, "*"):
         if path.is_file() and path.name == "CMakeLists.txt" and "tests/corpus" not in path.as_posix():
             text = path.read_text(encoding="utf-8", errors="replace")
             if path.relative_to(root).as_posix() != "tools/upstream/CMakeLists.txt" and re.search(r"ApplyPatches|PATCH_COMMAND", text):
@@ -72,7 +77,7 @@ def main():
     failures = []
     checked = 0
     for d in ("library", "apps", "tests", "tools"):
-        for path in (root / d).rglob("*"):
+        for path in walk(root / d, "*"):
             if path.suffix not in SUFFIXES or "stb_image" in path.name:
                 continue
             rel = path.relative_to(root).as_posix()

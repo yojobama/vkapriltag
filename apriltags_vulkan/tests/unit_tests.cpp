@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <memory>
 #include <random>
 #include <set>
@@ -22,7 +24,9 @@
 #include "vkapriltag/Family.h"
 #include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/WorkerPool.h"
+#include "vkapriltag/gpu/PipelinePlan.h"
 #include "vkapriltag/gpu/QuadDecode.h"
+#include "vkapriltag/vk/Context.h"
 
 namespace av = apriltag_vulkan;
 namespace tst = apriltag_vulkan::testing;
@@ -989,6 +993,115 @@ void TestPool() {
   CHECK(total == 2 * 200 * 16);
 }
 
+av::vk::DeviceCaps DiscreteCaps() {
+  av::vk::DeviceCaps c;
+  c.name = "discrete";
+  c.type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+  c.max_workgroup_invocations = 1024;
+  c.max_shared_memory_bytes = 32768;
+  c.has_8bit_storage = c.has_int64_atomics = c.has_conditional_rendering = c.has_device_coherent_memory = true;
+  c.has_integer_dot_product = c.has_subgroup_ballot = c.has_subgroup_arithmetic = c.has_subgroup_shuffle = true;
+  c.has_host_cached = true;
+  c.subgroup_size = 64;
+  c.wg1d = 256;
+  c.wg2d_x = c.wg2d_y = 16;
+  c.scan_wg = 1024;
+  return c;
+}
+
+av::vk::DeviceCaps IntegratedCaps() {
+  av::vk::DeviceCaps c = DiscreteCaps();
+  c.name = "integrated";
+  c.type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+  c.has_conditional_rendering = c.has_device_coherent_memory = false;
+  c.unified_memory = true;
+  c.subgroup_size = 16;
+  c.wg1d = 128;
+  c.wg2d_x = c.wg2d_y = 8;
+  return c;
+}
+
+std::string ReadWholeFile(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+// The resolved plan of each device class and variation, compared with tests/plan/<class>.txt
+// (GPU_TRACE_UPDATE=1 rewrites the files).
+void TestPlan(const char *golden_dir) {
+  struct Case {
+    const char *name;
+    int decimation;
+    void (*tweak)(av::vk::DeviceCaps &);
+    std::vector<std::pair<const char *, const char *>> env;
+    bool readback_direct = true;
+  };
+  const std::vector<Case> cases = {
+      {"default_d2", 2, nullptr, {}},
+      {"default_d1", 1, nullptr, {}},
+      {"default_d4", 4, nullptr, {}},
+      {"no_subgroup", 2, [](av::vk::DeviceCaps &c) { c.has_subgroup_ballot = c.has_subgroup_arithmetic = c.has_subgroup_shuffle = false; }, {}},
+      {"no_int64_atomic", 2, [](av::vk::DeviceCaps &c) { c.has_int64_atomics = false; }, {}},
+      {"no_subgroup_no_int64", 2, [](av::vk::DeviceCaps &c) { c.has_subgroup_ballot = c.has_subgroup_arithmetic = c.has_subgroup_shuffle = c.has_int64_atomics = false; }, {}},
+      {"no_8bit", 2, [](av::vk::DeviceCaps &c) { c.has_8bit_storage = false; }, {}},
+      {"no_conditional_rendering", 2, [](av::vk::DeviceCaps &c) { c.has_conditional_rendering = false; }, {}},
+      {"box_decimate_off", 2, nullptr, {{"APRILTAG_VK_BOX_DECIMATE", "0"}}},
+      {"adaptive_floor_off", 2, nullptr, {{"APRILTAG_VK_ADAPTIVE_FLOOR", "0"}}},
+      {"fused_threshold_off", 2, nullptr, {{"APRILTAG_VK_FUSED_THRESHOLD", "0"}}},
+      {"uf_init_scan_off", 2, nullptr, {{"APRILTAG_VK_UF_INIT_SCAN", "0"}}},
+      {"uf_verify", 2, nullptr, {{"APRILTAG_VK_UF_VERIFY", "1"}}},
+      {"sparse_off", 2, nullptr, {{"APRILTAG_VK_SPARSE", "0"}}},
+      {"merge_x4_on", 2, nullptr, {{"APRILTAG_VK_MERGE_X4", "1"}}},
+      {"merge_band_16", 2, nullptr, {{"APRILTAG_VK_MERGE_BAND", "16"}}},
+      {"lean_tail_0", 2, nullptr, {{"APRILTAG_VK_LEAN_TAIL", "0"}}},
+      {"lean_tail_3", 2, nullptr, {{"APRILTAG_VK_LEAN_TAIL", "3"}}},
+      {"fuse_submits_off", 2, nullptr, {{"APRILTAG_VK_FUSE_SUBMITS", "0"}}},
+      {"no_host_cached_readback", 2, nullptr, {}, false},
+      {"prerecord_off", 2, nullptr, {{"APRILTAG_VK_PRERECORD", "0"}}},
+      {"sort_wg_128", 2, nullptr, {{"APRILTAG_VK_SORT_WG", "128"}, {"APRILTAG_VK_SORT_SPLIT", "512"}}},
+      {"small_shared_memory", 2, [](av::vk::DeviceCaps &c) { c.max_shared_memory_bytes = 16384; }, {}},
+  };
+  const av::vk::DeviceCaps classes[2] = {DiscreteCaps(), IntegratedCaps()};
+  const char *const names[2] = {"discrete", "integrated"};
+  for (int k = 0; k < 2; ++k) {
+    std::string text;
+    for (const Case &cs : cases) {
+      av::vk::DeviceCaps caps = classes[k];
+      if (cs.tweak != nullptr) cs.tweak(caps);
+      for (const auto &e : cs.env) SetEnv(e.first, e.second);
+      const av::Options env = av::Options::FromEnvironment();
+      av::DetectorConfig config;
+      config.width = 640;
+      config.height = 480;
+      config.decimation = static_cast<uint32_t>(cs.decimation);
+      av::PipelinePlan plan = av::ResolvePlan(caps, config, env);
+      av::FinalisePlan(plan, caps, env, false, av::BufferOutcome{true, cs.readback_direct, cs.readback_direct});
+      for (const auto &e : cs.env) SetEnv(e.first, nullptr);
+      text += std::string("# ") + cs.name + "\n" + plan.Describe();
+    }
+    const std::string path = std::string(golden_dir) + "/" + names[k] + ".txt";
+    if (std::getenv("GPU_TRACE_UPDATE") != nullptr) {
+      std::ofstream(path, std::ios::binary) << text;
+      continue;
+    }
+    const std::string want = ReadWholeFile(path);
+    if (want != text) {
+      std::printf("plan of the %s class differs from %s\n", names[k], path.c_str());
+      std::istringstream a(want), b(text);
+      std::string la, lb;
+      for (int n = 1; std::getline(a, la) && std::getline(b, lb); ++n) {
+        if (la != lb) {
+          std::printf("  line %d: golden '%s' now '%s'\n", n, la.c_str(), lb.c_str());
+          break;
+        }
+      }
+    }
+    CHECK(want == text);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1003,6 +1116,7 @@ int main(int argc, char **argv) {
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;
   if (all || !std::strcmp(which, "steps")) TestSteps(), ran = true;
   if (all || !std::strcmp(which, "pool")) TestPool(), ran = true;
+  if (!std::strcmp(which, "plan")) TestPlan(argc > 2 ? argv[2] : "tests/plan"), ran = true;
   if (!ran) {
     std::printf("unknown test group %s\n", which);
     return 2;

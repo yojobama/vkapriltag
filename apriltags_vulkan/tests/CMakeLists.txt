@@ -54,6 +54,8 @@ add_gpu_trace(prerecord_off_d2 2 "APRILTAG_VK_PRERECORD=0")
 foreach(group decode geometry geom edges quadfit options steps pool)
   add_test(NAME unit_${group} COMMAND unit_tests ${group})
 endforeach()
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/plan)
+add_test(NAME unit_plan COMMAND unit_tests plan ${CMAKE_CURRENT_SOURCE_DIR}/plan)
 
 if(TARGET vk_eval AND Python3_FOUND)
   add_test(NAME golden_detections
