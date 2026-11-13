@@ -224,34 +224,21 @@ struct FitQuadResult {
 };
 
 // Index of the largest value(i) over [begin, end), the lowest such index on ties, folded into
-// (best, best_idx) with ties again going to the lower index. Four lanes run independently.
+// (best, best_idx) with ties again going to the lower index: a vectorisable maximum pass, then a
+// search for its first position.
 template <typename T, typename F>
 inline void ArgMax(size_t begin, size_t end, F value, T &best, size_t &best_idx) {
-  T lane_best[4] = {T(-1), T(-1), T(-1), T(-1)};
-  size_t lane_idx[4] = {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
-  size_t i = begin;
-  for (; i + 4 <= end; i += 4) {
-    for (int k = 0; k < 4; ++k) {
-      const T v = value(i + k);
-      if (v > lane_best[k]) {
-        lane_best[k] = v;
-        lane_idx[k] = i + k;
-      }
-    }
-  }
-  for (; i < end; ++i) {
+  if (begin >= end) return;
+  T top = T(-1);
+  for (size_t i = begin; i < end; ++i) {
     const T v = value(i);
-    if (v > lane_best[0]) {
-      lane_best[0] = v;
-      lane_idx[0] = i;
-    }
+    top = v > top ? v : top;
   }
-  for (int k = 0; k < 4; ++k) {
-    if (lane_best[k] > best || (lane_best[k] == best && lane_idx[k] < best_idx)) {
-      best = lane_best[k];
-      best_idx = lane_idx[k];
-    }
-  }
+  if (top < best || (top == best && begin > best_idx)) return;
+  size_t i = begin;
+  while (value(i) != top) ++i;
+  best = top;
+  best_idx = i;
 }
 
 // A blob's points unpacked into separate arrays.
