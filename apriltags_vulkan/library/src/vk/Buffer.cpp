@@ -45,11 +45,6 @@ MemoryRequest RequestFor(const Context &ctx, MemoryKind kind) {
 #else
       return {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, true};
 #endif
-    case MemoryKind::DeviceLocalReadback:
-      // Shader-written memory the host reads; the caller must check host_cached() and keep a
-      // staging path.
-      return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-              static_cast<VkMemoryPropertyFlags>(VK_MEMORY_PROPERTY_HOST_CACHED_BIT), true};
   }
   return {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, false};
 }
@@ -87,7 +82,7 @@ Buffer::Buffer(const Context &ctx, VkDeviceSize size, VkBufferUsageFlags usage, 
 
   // Best-effort: falls back to plain device-local, and the caller stages via a host buffer.
   if (type_index == UINT32_MAX &&
-      (kind == MemoryKind::DeviceLocalMapped || kind == MemoryKind::DeviceLocalReadback)) {
+      kind == MemoryKind::DeviceLocalMapped) {
     request = RequestFor(ctx, MemoryKind::DeviceLocal);
     type_index = ctx.FindMemoryType(mem_reqs.memoryTypeBits, request.required, request.preferred);
   }

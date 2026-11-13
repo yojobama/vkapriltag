@@ -184,7 +184,7 @@ family is exercised only through `FORCE_NO_8BIT`.
 | indirect-argument buffers | `DeviceLocal` with the indirect usage | 12 to 36 bytes |
 | completion flag | `DeviceCoherentHost` (else `HostVisible`) | one word |
 
-`MemoryKind::DeviceLocalReadback` exists in `Buffer.h` but `GpuDetector` does not use it. `GpuDetector::device_bytes()` and
+`GpuDetector::device_bytes()` and
 `DescribeSizing()` report the total. Frames must be tightly packed; a stride is supported in the CPU stages
 (`Image`) but not in the GPU upload or the tracking crops.
 

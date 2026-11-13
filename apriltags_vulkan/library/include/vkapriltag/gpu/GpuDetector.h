@@ -390,6 +390,10 @@ class GpuDetector {
   void RecordUfChunk(VkCommandBuffer cmd, uint32_t iterations, bool trailing_compress = true);
   // The fused tail: blob sizes through line-fit moments; `speculative` stops blob_diff acting on
   // unconverged labels.
+  // How the group, extents, select and scatter dispatches are sized: fixed grids, indirect from device counts,
+  // or by the host from the boundary-point count.
+  enum class TailGrid { kLean, kIndirect, kHost };
+  void RecordGroupSelectScatter(VkCommandBuffer cmd, TailGrid grid, uint32_t qbp_count);
   void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
   void RecordLeanOffsetsClear(VkCommandBuffer cmd);
   void RecordFlatten(VkCommandBuffer cmd);

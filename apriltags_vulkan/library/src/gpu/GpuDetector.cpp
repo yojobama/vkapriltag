@@ -753,6 +753,101 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
 }
 
+// Groups the boundary points by (rep0, rep1), reduces the extents, selects the blobs, assigns the
+// point offsets and scatters the points. The grids are fixed (lean), indirect from device counts, or
+// sized by the host from qbp_count (the unfused flow).
+void GpuDetector::RecordGroupSelectScatter(VkCommandBuffer cmd, TailGrid grid, uint32_t qbp_count) {
+  using vk::BarrierKind;
+  const bool host = grid == TailGrid::kHost;
+  const bool lean_grid = grid == TailGrid::kLean;
+  const uint32_t count = host ? qbp_count : qbp_capacity_;
+  const uint32_t count_from_buffer = host ? 0u : 1u;
+
+  // Slot 1 of the indirect args: ceil(boundary points / wg1d), for hash_group, reduce_extents_hash
+  // and scatter_index_points. The counts stay on the device.
+  struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{plan_.wg1d.x, 1u, 1u,
+                                                                       qbp_capacity_, 2u};
+  if (grid == TailGrid::kIndirect) {
+    Pl(Stage::kBuildQbpArgs).DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
+    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+  }
+
+  // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
+  // With count_from_buffer, `count` caps the device's counter at the buffer capacity.
+  struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
+      count, hash_table_size_ - 1u, 128u, count_from_buffer, config_.max_raw_blobs};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
+  if (lean_grid) {
+    Pl(Stage::kHashGroup).DispatchRaw(cmd, lean_point_groups_, 1, 1, &hash_pc);
+  } else if (host) {
+    Pl(Stage::kHashGroup).Dispatch1D(cmd, qbp_count, &hash_pc);
+  } else {
+    Pl(Stage::kHashGroup).DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
+  }
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
+
+  // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
+  // bounds-checks against max_raw_blobs. reduce_extents_hash does not read them.
+  struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
+      plan_.wg1d.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
+  if (!lean_grid) {
+    Pl(Stage::kBuildBlobArgs).DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
+  }
+
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
+  struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{count, config_.max_raw_blobs,
+                                                                         count_from_buffer};
+  if (lean_grid) {
+    Pl(Stage::kReduceExtents).DispatchRaw(cmd, lean_point_groups_, 1, 1, &reduce_pc);
+  } else {
+    if (host) {
+      Pl(Stage::kReduceExtents).Dispatch1D(cmd, plan_.reduce_x4 ? (qbp_count + 3u) / 4u : qbp_count, &reduce_pc);
+    } else {
+      Pl(Stage::kReduceExtents).DispatchIndirect(cmd, indirect_args_buf_.get(), plan_.reduce_x4 ? 24 : 12,
+                                               &reduce_pc);
+    }
+    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
+  }
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
+
+  struct {
+    uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal,
+        gx_gy_biased;
+    float aspect_max, fill_min, fill_max;
+  } select_pc{config_.max_raw_blobs,      config_.max_blobs,
+              config_.tag_width,          config_.min_cluster_pixels,
+              config_.max_cluster_pixels, config_.reversed_border ? 1u : 0u,
+              config_.normal_border ? 1u : 0u, plan_.extents_atomic64 ? 1u : 0u,
+              config_.aspect_max,         config_.fill_min,
+              config_.fill_max};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
+  if (lean_grid) {
+    Pl(Stage::kSelectBlobs).DispatchRaw(cmd, lean_select_groups_, 1, 1, &select_pc);
+  } else {
+    Pl(Stage::kSelectBlobs).DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
+  }
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
+
+  struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
+  if ((plan_.lean_tail & 2u) == 0) Pl(Stage::kScanBlobCounts).DispatchRaw(cmd, 1, 1, 1, &scan_pc);
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
+
+  struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
+      count, ipoint_capacity_, config_.max_raw_blobs, count_from_buffer};
+  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
+  if (lean_grid) {
+    Pl(Stage::kScatterIndexPoints).DispatchRaw(cmd, lean_point_groups_, 1, 1, &scatter_pc,
+                                         BarrierKind::ComputeAndTransfer);
+  } else if (host) {
+    Pl(Stage::kScatterIndexPoints).Dispatch1D(cmd, qbp_count, &scatter_pc, BarrierKind::ComputeAndTransfer);
+  } else {
+    Pl(Stage::kScatterIndexPoints).DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
+                                              BarrierKind::ComputeAndTransfer);
+  }
+  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
+}
+
 void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
@@ -783,82 +878,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
 
-  // Slot 1 of the indirect args: ceil(boundary points / wg1d), for hash_group, reduce_extents_hash
-  // and scatter_index_points. The counts stay on the device.
-  const bool lean_grid = (plan_.lean_tail & 1u) != 0;
-  struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{plan_.wg1d.x, 1u, 1u,
-                                                                       qbp_capacity_, 2u};
-  if (!lean_grid) {
-    Pl(Stage::kBuildQbpArgs).DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
-    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
-  }
-
-  // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
-  // With count_from_buffer, `count` caps the device's counter at the buffer capacity.
-  struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
-      qbp_capacity_, hash_table_size_ - 1u, 128u, 1u, config_.max_raw_blobs};
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
-  if (lean_grid) {
-    Pl(Stage::kHashGroup).DispatchRaw(cmd, lean_point_groups_, 1, 1, &hash_pc);
-  } else {
-    Pl(Stage::kHashGroup).DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
-  }
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
-
-  // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
-  // bounds-checks against max_raw_blobs. reduce_extents_hash does not read them.
-  struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
-      plan_.wg1d.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
-  if (!lean_grid) {
-    Pl(Stage::kBuildBlobArgs).DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
-  }
-
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
-  struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{qbp_capacity_,
-                                                                         config_.max_raw_blobs, 1u};
-  if (lean_grid) {
-    Pl(Stage::kReduceExtents).DispatchRaw(cmd, lean_point_groups_, 1, 1, &reduce_pc);
-  } else {
-    Pl(Stage::kReduceExtents).DispatchIndirect(cmd, indirect_args_buf_.get(), plan_.reduce_x4 ? 24 : 12,
-                                             &reduce_pc);
-    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
-  }
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
-
-  struct {
-    uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal,
-        gx_gy_biased;
-    float aspect_max, fill_min, fill_max;
-  } select_pc{config_.max_raw_blobs,      config_.max_blobs,
-              config_.tag_width,          config_.min_cluster_pixels,
-              config_.max_cluster_pixels, config_.reversed_border ? 1u : 0u,
-              config_.normal_border ? 1u : 0u, plan_.extents_atomic64 ? 1u : 0u,
-              config_.aspect_max,         config_.fill_min,
-              config_.fill_max};
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
-  if (lean_grid) {
-    Pl(Stage::kSelectBlobs).DispatchRaw(cmd, lean_select_groups_, 1, 1, &select_pc);
-  } else {
-    Pl(Stage::kSelectBlobs).DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
-  }
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
-
-  struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
-  if ((plan_.lean_tail & 2u) == 0) Pl(Stage::kScanBlobCounts).DispatchRaw(cmd, 1, 1, 1, &scan_pc);
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
-
-  struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
-      qbp_capacity_, ipoint_capacity_, config_.max_raw_blobs, 1u};
-  timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
-  if (lean_grid) {
-    Pl(Stage::kScatterIndexPoints).DispatchRaw(cmd, lean_point_groups_, 1, 1, &scatter_pc,
-                                         BarrierKind::ComputeAndTransfer);
-  } else {
-    Pl(Stage::kScatterIndexPoints).DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
-                                              BarrierKind::ComputeAndTransfer);
-  }
-  timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
+  RecordGroupSelectScatter(cmd, (plan_.lean_tail & 1u) != 0 ? TailGrid::kLean : TailGrid::kIndirect, 0);
 
   // The number of distinct (rep0, rep1) pairs this frame; profiling only.
   RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
@@ -1404,7 +1424,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   RecordCounterCopy(cmd, uf_changed_buf_, kSlotUfChanged);
 
   // ------------------------------------------------------------------
-  // Submit 2: reads back convergence and runs any extra labelling chunks.
+  // Submit 1 ends here: reads back convergence and, with UF_VERIFY, runs any extra labelling chunks.
   // ------------------------------------------------------------------
   uint32_t uf_iterations = chunk;
   vk::ComputePipeline::HostReadBarrier(cmd);
@@ -1425,7 +1445,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   }
 
   // ------------------------------------------------------------------
-  // Submit 3: blob sizes and boundary extraction.
+  // Submit 2: blob sizes and boundary extraction.
   // ------------------------------------------------------------------
   cmd = BeginTimedCommands();
   const auto t_label = Clock::now();
@@ -1460,57 +1480,12 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   const auto t_boundary = Clock::now();
 
   // ------------------------------------------------------------------
-  // Submit 4: group boundary points by (rep0, rep1), select plausible quads, and scatter the
+  // Submit 3: group boundary points by (rep0, rep1), select plausible quads, and scatter the
   // survivors into per-blob runs.
   // ------------------------------------------------------------------
   cmd = BeginTimedCommands();
   if (qbp_count > 0) {
-    // Groups the boundary points by (rep0, rep1) with a hash table; see hash_group.comp.
-    struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
-        qbp_count, hash_table_size_ - 1u, 128u, 0u, config_.max_raw_blobs};
-    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
-    Pl(Stage::kHashGroup).Dispatch1D(cmd, qbp_count, &hash_pc);
-    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
-
-    // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
-    // bounds-checks against max_raw_blobs.
-    struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
-        plan_.wg1d.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
-    Pl(Stage::kBuildBlobArgs).DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
-
-    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
-    struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{
-        qbp_count, config_.max_raw_blobs, 0u};
-    Pl(Stage::kReduceExtents).Dispatch1D(cmd, plan_.reduce_x4 ? (qbp_count + 3u) / 4u : qbp_count,
-                                       &reduce_pc);
-    vk::ComputePipeline::IndirectDispatchBarrier(cmd);
-    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
-
-    struct {
-      uint32_t max_raw_blobs, max_blobs, tag_width, min_cluster, max_cluster, reversed, normal,
-          gx_gy_biased;
-      float aspect_max, fill_min, fill_max;
-    } select_pc{config_.max_raw_blobs,      config_.max_blobs,
-                config_.tag_width,          config_.min_cluster_pixels,
-                config_.max_cluster_pixels, config_.reversed_border ? 1u : 0u,
-                config_.normal_border ? 1u : 0u, plan_.extents_atomic64 ? 1u : 0u,
-                config_.aspect_max,         config_.fill_min,
-                config_.fill_max};
-    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
-    Pl(Stage::kSelectBlobs).DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
-    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
-
-    struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
-    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
-    Pl(Stage::kScanBlobCounts).DispatchRaw(cmd, 1, 1, 1, &scan_pc);
-    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
-
-    struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
-        qbp_count, ipoint_capacity_, config_.max_raw_blobs, 0u};
-    timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
-    Pl(Stage::kScatterIndexPoints).Dispatch1D(cmd, qbp_count, &scatter_pc,
-                                        BarrierKind::ComputeAndTransfer);
-    timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
+    RecordGroupSelectScatter(cmd, TailGrid::kHost, qbp_count);
 
     // The number of distinct (rep0, rep1) pairs this frame; profiling only.
     RecordCounterCopy(cmd, raw_blob_counter_buf_, kSlotRawBlobs);
@@ -1538,7 +1513,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   const auto t_sort_group = Clock::now();
 
   // ------------------------------------------------------------------
-  // Submit 5: sort each blob's points around its perimeter, compute line-fit moments, and stage
+  // Submit 4: sort each blob's points around its perimeter, compute line-fit moments, and stage
   // both payloads for readback.
   // ------------------------------------------------------------------
   const VkDeviceSize extents_bytes = VkDeviceSize(num_selected_blobs) * sizeof(MinMaxExtentsGpu);
