@@ -316,10 +316,24 @@ void GpuDetector::CreateBuffers() {
   }
 
   // QBPoint is packed into one uint32 on the GPU (see common.glsl); there is no host mirror.
-  qbp_compacted_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * sizeof(uint32_t));
+  // Host-readable (cached) on unified memory when the CPU tail is wanted.
+  auto boundary_ssbo = [&](VkDeviceSize bytes) {
+    if (!(plan_.cpu_tail_want && ctx_.caps().unified_memory)) return ssbo(bytes);
+    vk::Buffer b(ctx_, std::max<VkDeviceSize>(bytes, 4), kSsboUsage, vk::MemoryKind::HostVisibleCached);
+    device_bytes_ += b.size();
+    return b;
+  };
+  qbp_compacted_buf_ = boundary_ssbo(VkDeviceSize(qbp_capacity_) * sizeof(uint32_t));
   qbp_counter_buf_ = ssbo(4);
   // Sized to the point capacity; one interleaved (rep0, rep1) uvec2 key per point.
-  qbp_keys_buf_ = ssbo(VkDeviceSize(qbp_capacity_) * 8);
+  qbp_keys_buf_ = boundary_ssbo(VkDeviceSize(qbp_capacity_) * 8);
+  const bool qbp_direct = qbp_compacted_buf_.host_visible() && qbp_compacted_buf_.host_cached() &&
+                          qbp_keys_buf_.host_visible() && qbp_keys_buf_.host_cached();
+  if (plan_.cpu_tail_want && !qbp_direct) {
+    qbp_host_points_ = std::min(plan_.cpu_tail_max_points, qbp_capacity_);
+    qbp_host_buf_ = vk::Buffer(ctx_, VkDeviceSize(std::max(qbp_host_points_, 1u)) * 12,
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::MemoryKind::HostVisibleCached);
+  }
 
   extents_buf_ = ssbo(VkDeviceSize(ExtentsSlotCount(config_.max_raw_blobs)) *
                       sizeof(MinMaxExtentsGpu));
@@ -350,7 +364,26 @@ void GpuDetector::CreateBuffers() {
   plan_.linefit_direct_read = line_fit_points_buf_.host_visible() && line_fit_points_buf_.host_cached();
 
   FinalisePlan(plan_, ctx_.caps(), env_, transfer_lane_ != nullptr,
-               BufferOutcome{plan_.gray_direct_write, plan_.linefit_direct_read, plan_.extents_direct_read});
+               BufferOutcome{plan_.gray_direct_write, plan_.linefit_direct_read, plan_.extents_direct_read,
+                             qbp_direct || (qbp_host_buf_.host_visible() && qbp_host_buf_.host_cached())});
+  if (plan_.cpu_tail) {
+    CpuTailConfig tc;
+    tc.width = config_.width;
+    tc.height = config_.height;
+    tc.decimation = config_.decimation;
+    tc.box_decimate = plan_.box_decimate;
+    tc.max_raw_blobs = config_.max_raw_blobs;
+    tc.max_blobs = config_.max_blobs;
+    tc.point_capacity = ipoint_capacity_;
+    tc.min_cluster_pixels = config_.min_cluster_pixels;
+    tc.max_cluster_pixels = config_.max_cluster_pixels;
+    tc.reversed_border = config_.reversed_border;
+    tc.normal_border = config_.normal_border;
+    tc.aspect_max = config_.aspect_max;
+    tc.fill_min = config_.fill_min;
+    tc.fill_max = config_.fill_max;
+    cpu_tail_ = std::make_unique<CpuTail>(tc);
+  }
 
   // Open-addressing table for the (rep0, rep1) grouping, sized to max_raw_blobs; hash_group.comp
   // drops points beyond its probe cap.
@@ -849,6 +882,16 @@ void GpuDetector::RecordGroupSelectScatter(VkCommandBuffer cmd, TailGrid grid, u
 }
 
 void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
+  RecordBoundary(cmd, speculative);
+  RecordTailRest(cmd);
+}
+
+void GpuDetector::RecordHostReady(VkCommandBuffer cmd) {
+  vk::ComputePipeline::HostReadBarrier(cmd);
+  if (completion_flag_) completion_flag_->RecordSet(cmd);
+}
+
+void GpuDetector::RecordBoundary(VkCommandBuffer cmd, bool speculative) {
   using vk::BarrierKind;
   const uint32_t pixels = decimated_width_ * decimated_height_;
 
@@ -877,7 +920,9 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
 
   RecordCounterCopy(cmd, qbp_counter_buf_, kSlotQbpCount);
+}
 
+void GpuDetector::RecordTailRest(VkCommandBuffer cmd) {
   RecordGroupSelectScatter(cmd, (plan_.lean_tail & 1u) != 0 ? TailGrid::kLean : TailGrid::kIndirect, 0);
 
   // The number of distinct (rep0, rep1) pairs this frame; profiling only.
@@ -909,8 +954,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanReadbackCopy));
   // Counted by sort_points_local, so this is the first submit that can carry it back.
   RecordCounterCopy(cmd, oversized_sort_counter_buf_, kSlotOversizedSortBlobs);
-  vk::ComputePipeline::HostReadBarrier(cmd);
-  if (completion_flag_) completion_flag_->RecordSet(cmd);
+  RecordHostReady(cmd);
 }
 
 namespace {
@@ -1027,6 +1071,64 @@ GpuDetector::Submission GpuDetector::FirstAttempt(const ImportedFrame *imported,
   return {cmd, false};
 }
 
+GpuDetector::Submission GpuDetector::HeadOnly(const ImportedFrame *imported, uint32_t chunk) {
+  const uint8_t *key = imported != nullptr ? imported->key : nullptr;
+  auto record = [&](VkCommandBuffer c) {
+    RecordFrameHead(c, imported, chunk);
+    RecordBoundary(c, /*speculative=*/true);
+    if (qbp_host_points_ > 0) {
+      vk::ComputePipeline::Barrier(c, vk::BarrierKind::ComputeAndTransfer);
+      qbp_compacted_buf_.RecordCopyTo(c, qbp_host_buf_, VkDeviceSize(qbp_host_points_) * 4, 0, 0);
+      qbp_keys_buf_.RecordCopyTo(c, qbp_host_buf_, VkDeviceSize(qbp_host_points_) * 8, 0,
+                                 VkDeviceSize(qbp_host_points_) * 4);
+    }
+    RecordHostReady(c);
+  };
+  if (plan_.prerecord) {
+    if (VkCommandBuffer cached = FindRecorded(RecordingKind::kHeadOnly, key, chunk)) {
+      return {cached, true, completion_flag_ != nullptr};
+    }
+    recorded_this_frame_ = true;
+    VkCommandBuffer cmd = RecordPersistent(record);
+    recorded_frames_.push_back({RecordingKind::kHeadOnly, key, chunk, cmd});
+    return {cmd, true, completion_flag_ != nullptr};
+  }
+  recorded_this_frame_ = true;
+  VkCommandBuffer cmd = BeginTimedCommands();
+  record(cmd);
+  return {cmd, false};
+}
+
+GpuDetector::Submission GpuDetector::TailRest() {
+  if (plan_.prerecord) {
+    if (VkCommandBuffer cached = FindRecorded(RecordingKind::kTailRest, nullptr, 0)) {
+      return {cached, true, completion_flag_ != nullptr};
+    }
+    recorded_this_frame_ = true;
+    VkCommandBuffer cmd = RecordPersistent([&](VkCommandBuffer c) { RecordTailRest(c); });
+    recorded_frames_.push_back({RecordingKind::kTailRest, nullptr, 0, cmd});
+    return {cmd, true, completion_flag_ != nullptr};
+  }
+  recorded_this_frame_ = true;
+  VkCommandBuffer cmd = BeginTimedCommands();
+  RecordTailRest(cmd);
+  return {cmd, false};
+}
+
+void GpuDetector::RunCpuTail(uint32_t qbp_count) {
+  VKA_PROF_SCOPE("gpu.cpu_tail");
+  if (qbp_host_points_ > 0) {
+    const uint32_t *words = static_cast<const uint32_t *>(qbp_host_buf_.mapped());
+    if (!qbp_host_buf_.coherent()) qbp_host_buf_.InvalidateRange(0, VkDeviceSize(qbp_host_points_) * 12);
+    cpu_tail_->Run(words, words + qbp_host_points_, qbp_count, cpu_tail_gray_);
+    return;
+  }
+  if (!qbp_compacted_buf_.coherent()) qbp_compacted_buf_.InvalidateRange(0, VkDeviceSize(qbp_count) * 4);
+  if (!qbp_keys_buf_.coherent()) qbp_keys_buf_.InvalidateRange(0, VkDeviceSize(qbp_count) * 8);
+  cpu_tail_->Run(static_cast<const uint32_t *>(qbp_compacted_buf_.mapped()),
+                 static_cast<const uint32_t *>(qbp_keys_buf_.mapped()), qbp_count, cpu_tail_gray_);
+}
+
 GpuDetector::Submission GpuDetector::Continuation(uint32_t iterations) {
   if (plan_.prerecord) {
     if (VkCommandBuffer cached = FindRecorded(RecordingKind::kContinuation, nullptr, iterations)) {
@@ -1076,6 +1178,7 @@ void GpuDetector::SubmitTimed(const Submission &s) {
 
 void GpuDetector::Detect(const uint8_t *gray_frame) {
   if (keepalive_) keepalive_->Touch(auto_prewarm_.load(std::memory_order_relaxed));
+  cpu_tail_gray_ = gray_frame;
   try {
     DetectFrame(gray_frame);
   } catch (...) {
@@ -1169,7 +1272,28 @@ void GpuDetector::DetectFused(const FrameStart &frame, uint32_t chunk) {
   // First attempt: assumes `chunk` labelling iterations converged and runs the whole frame as one
   // submission. Only if the convergence flag says otherwise is there more to do.
   uint32_t uf_iterations = chunk;
-  SubmitTimed(timed([&] { return FirstAttempt(frame.imported, chunk); }));
+  if (cpu_tail_ != nullptr && frame.imported == nullptr && last_qbp_count_ <= plan_.cpu_tail_max_points) {
+    // Head only; the tail runs on the host when the frame has few enough boundary points.
+    SubmitTimed(timed([&] { return HeadOnly(frame.imported, chunk); }));
+    const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
+    last_qbp_count_ = qbp_count;
+    if (qbp_count <= plan_.cpu_tail_max_points) {
+      RunCpuTail(qbp_count);
+      ++cpu_tail_frames_;
+      const auto t_done = Clock::now();
+      last_profile_.record_ms = record_ms;
+      last_profile_.replayed = !recorded_this_frame_;
+      FinishFused(frame, t_done, /*cpu_tail=*/true);
+      last_uf_iterations_ = uf_iterations;
+      last_profile_.uf_iterations = uf_iterations;
+      last_profile_.uf_converged = true;
+      return;
+    }
+    ++cpu_tail_mispredicts_;
+    SubmitTimed(timed([&] { return TailRest(); }));
+  } else {
+    SubmitTimed(timed([&] { return FirstAttempt(frame.imported, chunk); }));
+  }
   bool converged = !plan_.uf_verify || ReadCounterSlot(kSlotUfChanged) == 0;
 
   if (!converged) {
@@ -1190,6 +1314,7 @@ void GpuDetector::DetectFused(const FrameStart &frame, uint32_t chunk) {
   last_profile_.record_ms = record_ms;
   last_profile_.replayed = !recorded_this_frame_;
   FinishFused(frame, t_submitted);
+  last_qbp_count_ = last_profile_.boundary_points;
 
   last_uf_iterations_ = uf_iterations;
   last_profile_.uf_iterations = uf_iterations;
@@ -1250,18 +1375,21 @@ void GpuDetector::CollectGpuTimings() {
   }
 }
 
-void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submitted) {
-  const uint32_t oversized_sort_blobs = ReadCounterSlot(kSlotOversizedSortBlobs);
+void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submitted, bool cpu_tail) {
+  const uint32_t oversized_sort_blobs =
+      cpu_tail ? cpu_tail_->oversized_blobs() : ReadCounterSlot(kSlotOversizedSortBlobs);
 
   // The counts were consumed on the device; read them now for the profile and the host views.
   const uint32_t qbp_count = std::min(ReadCounterSlot(kSlotQbpCount), qbp_capacity_);
-  const uint32_t raw_blobs = (qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0;
-  const uint32_t hash_drops = (qbp_count > 0) ? ReadCounterSlot(kSlotHashDrops) : 0;
-  const uint32_t qualifying = ReadCounterSlot(kSlotSelectedCount);
+  const uint32_t raw_blobs =
+      cpu_tail ? cpu_tail_->raw_blobs() : (qbp_count > 0) ? ReadCounterSlot(kSlotRawBlobs) : 0;
+  const uint32_t hash_drops = (qbp_count > 0 && !cpu_tail) ? ReadCounterSlot(kSlotHashDrops) : 0;
+  const uint32_t qualifying = cpu_tail ? cpu_tail_->qualifying_blobs() : ReadCounterSlot(kSlotSelectedCount);
   const uint32_t selected_blobs = std::min(qualifying, config_.max_blobs);
   const uint32_t blob_drops = qualifying - selected_blobs;
   const uint32_t num_points =
-      (qbp_count > 0) ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_) : 0;
+      cpu_tail ? static_cast<uint32_t>(cpu_tail_->points().size())
+      : (qbp_count > 0) ? std::min(ReadCounterSlot(kSlotPointCount), ipoint_capacity_) : 0;
   const VkDeviceSize extents_bytes = VkDeviceSize(selected_blobs) * sizeof(MinMaxExtentsGpu);
   const VkDeviceSize linefit_bytes = VkDeviceSize(num_points) * sizeof(RawLineFitPoint);
 
@@ -1270,16 +1398,21 @@ void GpuDetector::FinishFused(const FrameStart &frame, Clock::time_point t_submi
   // host-visible and cached).
   // ------------------------------------------------------------------
   last_selected_extents.resize(selected_blobs);
-  if (extents_bytes > 0) {
+  if (cpu_tail) {
+    std::copy_n(cpu_tail_->extents().begin(), selected_blobs, last_selected_extents.begin());
+    last_line_fit_points = cpu_tail_->points();
+  } else if (extents_bytes > 0) {
     if (!selected_extents_buf_.coherent()) selected_extents_buf_.InvalidateRange(0, extents_bytes);
     std::memcpy(last_selected_extents.data(), selected_extents_buf_.mapped(),
                 static_cast<size_t>(extents_bytes));
   }
   // Zero-copy view of the mapping, valid until the next Detect(); invalidates first when the
   // memory is not coherent.
-  if (!line_fit_points_buf_.coherent()) line_fit_points_buf_.InvalidateRange(0, linefit_bytes);
-  last_line_fit_points = std::span<const RawLineFitPoint>(
-      static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), num_points);
+  if (!cpu_tail) {
+    if (!line_fit_points_buf_.coherent()) line_fit_points_buf_.InvalidateRange(0, linefit_bytes);
+    last_line_fit_points = std::span<const RawLineFitPoint>(
+        static_cast<const RawLineFitPoint *>(line_fit_points_buf_.mapped()), num_points);
+  }
   const auto t_end = Clock::now();
 
   // Host phases: recording time is reported as threshold_label_ms and the submission as

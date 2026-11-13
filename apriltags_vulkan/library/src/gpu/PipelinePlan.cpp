@@ -120,6 +120,10 @@ PipelinePlan ResolvePlan(const vk::DeviceCaps &caps, const DetectorConfig &confi
   // Reduction variant priority: subgroup, then 64-bit atomic, then plain 32-bit; the atomic variants take 4 points per thread.
   p.extents_atomic64 = !p.subgroup && caps.has_int64_atomics;
   p.reduce_x4 = !p.subgroup;
+
+  p.cpu_tail_want = env.Bool("APRILTAG_VK_CPU_TAIL", false);
+  p.cpu_tail_max_points = 10000;
+  if (const auto v = env.ULong("APRILTAG_VK_CPU_TAIL_MAX_POINTS")) p.cpu_tail_max_points = static_cast<uint32_t>(*v);
   return p;
 }
 
@@ -140,6 +144,9 @@ void FinalisePlan(PipelinePlan &plan, const vk::DeviceCaps &caps, const Options 
   if (env.Has("APRILTAG_VK_PRERECORD")) {
     plan.prerecord = plan.prerecord && env.Bool("APRILTAG_VK_PRERECORD", true);
   }
+
+  // Needs the single-submission flow without verification and host-readable boundary points.
+  plan.cpu_tail = plan.cpu_tail_want && plan.fused_submits && !plan.uf_verify && outcome.qbp_direct_read;
 
   // A leaner tail where a dispatch is costly (bit 1: fixed-grid kernels, bit 2: offsets from select).
   plan.lean_tail = caps.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3u : 0u;
@@ -183,6 +190,8 @@ std::string PipelinePlan::Describe() const {
   line("fused_submits", fused_submits);
   line("prerecord", prerecord);
   line("lean_tail", lean_tail);
+  line("cpu_tail", cpu_tail);
+  line("cpu_tail_max_points", cpu_tail_max_points);
   return os.str();
 }
 

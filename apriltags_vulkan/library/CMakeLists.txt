@@ -120,6 +120,7 @@ add_library(vkapriltag STATIC
   src/gpu/PipelinePlan.cpp
   src/gpu/StageTable.cpp
   src/gpu/QuadDecode.cpp
+  src/gpu/CpuTail.cpp
   src/gpu/MultiLevelDetector.cpp
   src/gpu/KeepAlive.cpp
   src/vk/CompletionFlag.cpp
@@ -191,7 +192,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(vkapriltag PRIVATE -Wall -Wextra -Wno-unused-parameter)
   # No fused multiply-adds in the quad fit: which ones GCC fuses depends on how the code is
   # arranged, so its corners would change with the code's layout rather than its arithmetic.
-  set_source_files_properties(src/gpu/QuadDecode.cpp src/OwnDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+  set_source_files_properties(src/gpu/QuadDecode.cpp src/gpu/CpuTail.cpp src/OwnDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 set_target_properties(vkapriltag PROPERTIES OUTPUT_NAME vkapriltag)

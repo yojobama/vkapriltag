@@ -14,6 +14,7 @@
 
 #include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/WorkerPool.h"
+#include "vkapriltag/gpu/CpuTail.h"
 #include "vkapriltag/gpu/DetectorConfig.h"
 #include "vkapriltag/gpu/KeepAlive.h"
 #include "vkapriltag/gpu/PipelinePlan.h"
@@ -150,6 +151,9 @@ class GpuDetector {
   // arrive. Safe to call from any thread; does nothing unless the pre-warm helper exists (see
   // prewarm_lead_us and keepalive_ms).
   void Prewarm();
+  // Frames whose tail ran on the CPU, and frames that went to the GPU tail after a head-only submission.
+  uint64_t cpu_tail_frames() const { return cpu_tail_frames_; }
+  uint64_t cpu_tail_mispredicts() const { return cpu_tail_mispredicts_; }
   // For callers that skip Detect() on some frames (see TrackingDetector): NoteFrame() records the
   // arrival of a frame that does not use the GPU, ExpectGpuFrame() arms the predictive burst for the
   // next frame, and SetAutoPrewarm(false) stops Detect() arming it.
@@ -330,6 +334,15 @@ class GpuDetector {
 
   // Seeds the first labelling chunk.
   uint32_t last_uf_iterations_ = 0;
+  // The CPU tail (plan_.cpu_tail): its state, the frame it reads, and the last frame's point count.
+  std::unique_ptr<CpuTail> cpu_tail_;
+  const uint8_t *cpu_tail_gray_ = nullptr;
+  // Without host-visible boundary buffers: the first points of both are copied here by a head-only submission.
+  vk::Buffer qbp_host_buf_;
+  uint32_t qbp_host_points_ = 0;
+  uint32_t last_qbp_count_ = 0;
+  uint64_t cpu_tail_frames_ = 0;
+  uint64_t cpu_tail_mispredicts_ = 0;
 
   // --- GPU timestamp profiling (see kGpuStageNames) ---
   // Constructed only when timestamps are supported and APRILTAG_VK_TIMESTAMPS=1; otherwise
@@ -347,6 +360,8 @@ class GpuDetector {
     kFirstAttempt,   // head + speculative tail; keyed by (input buffer, labelling chunk)
     kContinuation,   // `n` more labelling iterations plus the convergence-flag copy
     kTailRerun,      // zero the tail's counters and rerun the tail non-speculatively
+    kHeadOnly,       // head and blob_diff only, for the CPU tail
+    kTailRest,       // the tail after blob_diff, after a head-only submission
   };
   struct RecordedFrame {
     RecordingKind kind = RecordingKind::kFirstAttempt;
@@ -395,6 +410,10 @@ class GpuDetector {
   enum class TailGrid { kLean, kIndirect, kHost };
   void RecordGroupSelectScatter(VkCommandBuffer cmd, TailGrid grid, uint32_t qbp_count);
   void RecordFusedTail(VkCommandBuffer cmd, bool speculative);
+  // The first part of the tail (blob_diff and its counter copy) and the rest of it.
+  void RecordBoundary(VkCommandBuffer cmd, bool speculative);
+  void RecordTailRest(VkCommandBuffer cmd);
+  void RecordHostReady(VkCommandBuffer cmd);
   void RecordLeanOffsetsClear(VkCommandBuffer cmd);
   void RecordFlatten(VkCommandBuffer cmd);
   // Records the per-blob sort and, when split, the run sort and merge rounds for large blobs.
@@ -408,13 +427,18 @@ class GpuDetector {
   VkCommandBuffer RecordPersistent(const std::function<void(VkCommandBuffer)> &record);
   Submission Continuation(uint32_t iterations);
   Submission TailRerun();
+  Submission HeadOnly(const ImportedFrame *imported, uint32_t chunk);
+  Submission TailRest();
+  // Runs the tail on the host over the boundary points of the last head-only submission.
+  void RunCpuTail(uint32_t qbp_count);
   VkCommandBuffer FindRecorded(RecordingKind kind, const uint8_t *key, uint32_t n) const;
   // Submits and waits; adds the host-side cost to last_profile_.
   void SubmitTimed(const Submission &s);
 
   // Everything after the last submission of a fused frame: counter reads, host views of the
   // readback buffers, the profile and the GPU-timestamp spans.
-  void FinishFused(const FrameStart &frame, std::chrono::steady_clock::time_point t_submitted);
+  void FinishFused(const FrameStart &frame, std::chrono::steady_clock::time_point t_submitted,
+                   bool cpu_tail = false);
   void CollectGpuTimings();
   enum GpuStageSpan {
     kSpanClear = 0,

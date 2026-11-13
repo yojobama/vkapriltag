@@ -47,7 +47,13 @@ struct PipelinePlan {
   bool extents_atomic64 = false;
   bool reduce_x4 = false;
 
+  // The tail on the host for frames with few boundary points; wanted from the options, granted once the
+  // boundary buffers are host-readable.
+  bool cpu_tail_want = false;
+  uint32_t cpu_tail_max_points = 0;
+
   // Resolved after the buffers exist (FinalisePlan).
+  bool cpu_tail = false;
   bool gray_direct_write = false;
   bool linefit_direct_read = false;
   bool extents_direct_read = false;
@@ -67,6 +73,7 @@ struct BufferOutcome {
   bool gray_direct_write = false;
   bool linefit_direct_read = false;
   bool extents_direct_read = false;
+  bool qbp_direct_read = false;
 };
 
 // The choices that depend on the buffers: fused submits, pre-recording and the lean tail.

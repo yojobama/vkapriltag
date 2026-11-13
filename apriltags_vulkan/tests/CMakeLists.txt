@@ -51,6 +51,13 @@ add_gpu_trace(fused_threshold_off_d2 2 "APRILTAG_VK_FUSED_THRESHOLD=0")
 add_gpu_trace(uf_init_scan_off_d2 2 "APRILTAG_VK_UF_INIT_SCAN=0")
 add_gpu_trace(prerecord_off_d2 2 "APRILTAG_VK_PRERECORD=0")
 
+# The CPU tail against the GPU tail on the committed frames (skips when the device has no host-readable boundary buffers).
+add_executable(cpu_tail_test cpu_tail_test.cpp)
+target_include_directories(cpu_tail_test PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tools/vk_eval)
+target_link_libraries(cpu_tail_test PRIVATE vkapriltag::internal)
+add_test(NAME cpu_tail COMMAND cpu_tail_test --dir ${CMAKE_CURRENT_SOURCE_DIR}/corpus)
+set_tests_properties(cpu_tail PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 # The public Detector in every mode (needs a Vulkan device).
 add_executable(facade_test facade_test.cpp)
 target_include_directories(facade_test PRIVATE ${PROJECT_SOURCE_DIR}/tools/vk_eval)
