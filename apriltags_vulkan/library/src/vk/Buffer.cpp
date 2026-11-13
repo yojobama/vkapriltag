@@ -1,4 +1,5 @@
 #include "vkapriltag/vk/Buffer.h"
+#include "vkapriltag/vk/ComputePipeline.h"
 
 #include <algorithm>
 #include <cstring>
@@ -323,6 +324,10 @@ void Buffer::RecordCopyFrom(VkCommandBuffer cmd, const Buffer &src, VkDeviceSize
   region.srcOffset = src_offset;
   region.dstOffset = dst_offset;
   region.size = bytes;
+  if (DispatchTrace::Active()) {
+    DispatchTrace::Note("copy bytes=" + std::to_string(bytes) + " src_offset=" + std::to_string(src_offset) +
+                        " dst_offset=" + std::to_string(dst_offset));
+  }
   vkCmdCopyBuffer(cmd, src.buffer_, buffer_, 1, &region);
 }
 
@@ -333,10 +338,15 @@ void Buffer::RecordCopyTo(VkCommandBuffer cmd, const Buffer &dst, VkDeviceSize b
   region.srcOffset = src_offset;
   region.dstOffset = dst_offset;
   region.size = bytes;
+  if (DispatchTrace::Active()) {
+    DispatchTrace::Note("copy bytes=" + std::to_string(bytes) + " src_offset=" + std::to_string(src_offset) +
+                        " dst_offset=" + std::to_string(dst_offset));
+  }
   vkCmdCopyBuffer(cmd, buffer_, dst.buffer_, 1, &region);
 }
 
 void Buffer::FillZero(VkCommandBuffer cmd) const {
+  if (DispatchTrace::Active()) DispatchTrace::Note("fill offset=0 bytes=" + std::to_string(size_));
   vkCmdFillBuffer(cmd, buffer_, 0, size_, 0);
 }
 
@@ -348,6 +358,9 @@ void Buffer::FillZeroRange(VkCommandBuffer cmd, VkDeviceSize offset, VkDeviceSiz
   if (aligned_offset >= size_) return;
   aligned_bytes = std::min(aligned_bytes, size_ - aligned_offset);
   if (aligned_bytes == 0) return;
+  if (DispatchTrace::Active()) {
+    DispatchTrace::Note("fill offset=" + std::to_string(aligned_offset) + " bytes=" + std::to_string(aligned_bytes));
+  }
   vkCmdFillBuffer(cmd, buffer_, aligned_offset, aligned_bytes, 0);
 }
 

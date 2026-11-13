@@ -3,6 +3,7 @@
 #include "vkapriltag/common/Options.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -31,7 +32,61 @@ ProbeState &Probe() {
 }
 constexpr uint32_t kProbeSlots = 256;
 
+struct TraceState {
+  std::mutex mutex;
+  std::atomic<bool> active{false};
+  std::string text;
+};
+TraceState &Trace() {
+  static TraceState s;
+  return s;
+}
+
+std::string PushHash(const void *data, uint32_t bytes) {
+  uint64_t h = 1469598103934665603ull;
+  const unsigned char *p = static_cast<const unsigned char *>(data);
+  for (uint32_t i = 0; i < bytes; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  char buf[40];
+  std::snprintf(buf, sizeof buf, "%u:%016llx", bytes, static_cast<unsigned long long>(h));
+  return buf;
+}
+
+const char *BarrierName(BarrierKind k) {
+  switch (k) {
+    case BarrierKind::None: return "none";
+    case BarrierKind::Compute: return "compute";
+    case BarrierKind::ComputeAndTransfer: return "compute+transfer";
+    case BarrierKind::ComputeAndPredicate: return "compute+predicate";
+    case BarrierKind::ComputeTransferAndPredicate: return "compute+transfer+predicate";
+  }
+  return "?";
+}
+
 }  // namespace
+
+void DispatchTrace::Start() {
+  TraceState &t = Trace();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  t.text.clear();
+  t.active.store(true);
+}
+
+std::string DispatchTrace::Stop() {
+  TraceState &t = Trace();
+  std::lock_guard<std::mutex> lock(t.mutex);
+  t.active.store(false);
+  return std::move(t.text);
+}
+
+bool DispatchTrace::Active() { return Trace().active.load(std::memory_order_relaxed); }
+
+void DispatchTrace::Note(const std::string &line) {
+  TraceState &t = Trace();
+  if (!t.active.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> lock(t.mutex);
+  t.text += line;
+  t.text += '\n';
+}
 
 bool DispatchProbe::Enabled() {
   static const bool on = Options::FromEnvironment().Has("APRILTAG_VK_DISPATCH_TIMES");
@@ -337,6 +392,10 @@ void ComputePipeline::DispatchRaw(VkCommandBuffer cmd, uint32_t gx, uint32_t gy,
     vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        push_constant_bytes_, push_constants);
   }
+  if (DispatchTrace::Active()) {
+    DispatchTrace::Note("dispatch " + label_ + " grid=" + std::to_string(gx) + "," + std::to_string(gy) + "," +
+                        std::to_string(gz) + " push=" + PushHash(push_constants, push_constant_bytes_));
+  }
   vkCmdDispatch(cmd, gx, gy, gz);
   Barrier(cmd, barrier);
   DispatchProbe::Mark(cmd, label_.c_str());
@@ -353,6 +412,10 @@ void ComputePipeline::DispatchIndirect(VkCommandBuffer cmd, VkBuffer indirect_bu
   if (push_constant_bytes_ > 0) {
     vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        push_constant_bytes_, push_constants);
+  }
+  if (DispatchTrace::Active()) {
+    DispatchTrace::Note("dispatch_indirect " + label_ + " offset=" + std::to_string(offset) +
+                        " push=" + PushHash(push_constants, push_constant_bytes_));
   }
   vkCmdDispatchIndirect(cmd, indirect_buffer, offset);
   Barrier(cmd, barrier);
@@ -376,6 +439,7 @@ void ComputePipeline::Dispatch2D(VkCommandBuffer cmd, uint32_t width, uint32_t h
 
 void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
   if (kind == BarrierKind::None) return;
+  if (DispatchTrace::Active()) DispatchTrace::Note(std::string("barrier ") + BarrierName(kind));
 
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -402,6 +466,7 @@ void ComputePipeline::Barrier(VkCommandBuffer cmd, BarrierKind kind) {
 }
 
 void ComputePipeline::HostReadBarrier(VkCommandBuffer cmd) {
+  if (DispatchTrace::Active()) DispatchTrace::Note("barrier host_read");
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -411,6 +476,7 @@ void ComputePipeline::HostReadBarrier(VkCommandBuffer cmd) {
 }
 
 void ComputePipeline::TransferWriteBarrier(VkCommandBuffer cmd) {
+  if (DispatchTrace::Active()) DispatchTrace::Note("barrier transfer_write");
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -420,6 +486,7 @@ void ComputePipeline::TransferWriteBarrier(VkCommandBuffer cmd) {
 }
 
 void ComputePipeline::IndirectDispatchBarrier(VkCommandBuffer cmd) {
+  if (DispatchTrace::Active()) DispatchTrace::Note("barrier indirect");
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
