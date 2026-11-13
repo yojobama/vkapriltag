@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
   } else {
     paths = eval::ReadList(list);
   }
-  size_t threshold_ties = 0, frames = 0, blobs_total = 0, tie_reorders = 0, failures = 0, cpu_frames = 0, det_total = 0;
+  size_t weight_diffs = 0, threshold_ties = 0, frames = 0, blobs_total = 0, tie_reorders = 0, failures = 0, cpu_frames = 0, det_total = 0;
   double max_corner_diff = 0.0;
   for (unsigned decimation : decimations) {
     std::unique_ptr<apriltag_vulkan::GpuDetector> gpu, cpu;
@@ -233,6 +233,17 @@ int main(int argc, char **argv) {
             ok = x == y;
             tie = tie || ok;
             if (!ok) {
+              // The weight may differ by one where the device's sqrt of a perfect square is inexact.
+              std::stable_sort(x.begin(), x.end(), [](const auto &p, const auto &q) { return p.first < q.first; });
+              std::stable_sort(y.begin(), y.end(), [](const auto &p, const auto &q) { return p.first < q.first; });
+              ok = true;
+              for (size_t q = 0; q < x.size() && ok; ++q) {
+                ok = x[q].first == y[q].first &&
+                     std::abs(static_cast<int>(x[q].second) - static_cast<int>(y[q].second)) <= 1;
+              }
+              if (ok) ++weight_diffs;
+            }
+            if (!ok) {
               for (size_t q = 0; q < x.size(); ++q) {
                 if (x[q] != y[q]) {
                   std::printf("  blob %zu point %zu: gpu xy2 %08x W %u | cpu xy2 %08x W %u\n", k, q, x[q].first, x[q].second, y[q].first, y[q].second);
@@ -281,8 +292,8 @@ int main(int argc, char **argv) {
     }
     std::printf("decimation %u: cpu tail frames so far %zu of %zu\n", decimation, cpu_frames, frames);
   }
-  std::printf("frames %zu, blobs %zu, detections %zu, tie reorders %zu, threshold ties %zu, failures %zu, max corner difference %.3g px\n",
-              frames, blobs_total, det_total, tie_reorders, threshold_ties, failures, max_corner_diff);
+  std::printf("frames %zu, blobs %zu, detections %zu, tie reorders %zu, threshold ties %zu, blobs with weight differences of 1 %zu, failures %zu, max corner difference %.3g px\n",
+              frames, blobs_total, det_total, tie_reorders, threshold_ties, weight_diffs, failures, max_corner_diff);
   if (cpu_frames == 0) {
     std::printf("the CPU tail never ran (device without host-readable boundary buffers): skipped\n");
     return 77;
