@@ -1,0 +1,572 @@
+> Frozen copy of the root README as of 1.10.1 (links adjusted). Its tables and refinement names are out of date; see ../../README.md.
+
+# vkapriltag
+
+A Vulkan-compute reimplementation of the [AprilTag](https://github.com/AprilRobotics/apriltag)
+detection pipeline, built for embedded and mobile GPUs. Developed and tuned
+against an ARM Mali-G610 (Orange Pi 5, RK3588), and verified functionally
+identical (against unmodified upstream `apriltag`, tag-for-tag and
+corner-for-corner) on a discrete AMD GPU as well.
+
+## What this is
+
+Detection is split across three stages, composed by the caller, plus an
+optional fourth for pose:
+
+1. **`GpuDetector`** — the Vulkan compute pipeline. Decimates the input
+   frame, thresholds it, runs connected-component labelling, extracts and
+   compacts boundary points, groups them into blobs, selects plausible tag
+   candidates, and computes per-point line-fit moments. Everything here runs
+   on the GPU. On parts where the readback memory is host-cached the whole
+   frame is one pre-recorded command buffer and one queue submission, with a
+   retry path (recorded the same way) for the rare frame whose labelling has
+   not converged; otherwise the counts that size the next dispatch are read
+   back mid-frame. `vk::Context` can also create queues on both compute
+   families of a device and hand each of several streams a slot
+   (`ContextOptions::expected_streams`, `Context::StreamSlot`).
+2. **`QuadDecode`** — a CPU tail that turns `GpuDetector`'s per-blob boundary
+   points into fitted quad corners. Two corner-seeding methods are available
+   (`DetectorConfig::quad_fit_method`): `kDp` (default) seeds corners
+   geometrically — mutually-farthest boundary points, then maximum
+   perpendicular deviation on each arc — falling back per-blob to `kPeaks`,
+   the original windowed line-fit error + peak detection + small
+   combinatorial search, whenever DP doesn't cleanly yield 4 valid corners
+   (measured ~8% of blobs). Deliberately CPU: this only ever touches a few
+   thousand candidate values per frame, and is far simpler to get right as
+   scalar C++ than as compute shaders.
+3. **`TagDecoder`** — the in-house port of the `apriltag` library's per-family
+   bit-sampling and hamming decode, fed the quads from step 2.
+   Optionally (`TagDecoderConfig::refine_edges`) also runs
+   gradient-based corner refinement on each quad first, in the same per-quad
+   task and the same order `apriltag_detector_detect()` uses internally.
+   Which implementation runs is `APRILTAG_VK_REFINE`'s choice: `profile` (the
+   default) fits dense edge profiles; `exact` is bit-identical to upstream *by
+   construction* but drops the libm `modf()` call from the inner loop, worth 25%
+   of this stage on ARM. An opt-in
+   margin gate (`probe_margin`, see [Performance](#performance)) skips the
+   refinement of quads whose unrefined decision margin shows they cannot be
+   tags.
+
+Optionally, a fourth stage:
+
+4. **`PoseEstimator`** — 6-DoF tag pose from the four decoded corners, given
+   camera intrinsics and the physical tag size. A rewrite of upstream's
+   `apriltag_pose.c` (homography seed, orthogonal iteration, planar-pose
+   ambiguity search) in allocation-free fixed-size arithmetic: same
+   algorithm, but ~60x faster, because upstream's version is built on
+   `matd_op()`, a runtime string-expression interpreter that heap-allocates
+   its way through ~1600 parsed expressions per pose.
+   Verified against upstream at every stage of the algorithm — see
+   [Verifying correctness](#verifying-correctness).
+
+For continuous capture there is also **`FramePipeline`**, which composes the
+three detection stages and overlaps frame N's GPU pass with frame N-1's CPU
+tail, making a frame cost `max(GPU, CPU)` instead of the sum. It is a
+throughput optimization, not a latency one — detections arrive one `Push()`
+later, and it needs two frame buffers — so the stages stay independently
+usable for callers that must act on the newest frame immediately. Given a
+second `GpuDetector` (with its own `vk::Lane`) it keeps two frames on the GPU,
+so the GPU never waits for the host: more throughput again, for a second set
+of device buffers and one more frame of latency. See
+[Performance](#performance).
+
+This is a port of [frc971's CUDA `GpuDetector`](https://github.com/Team766/apriltags_cuda)
+(itself built on AprilRobotics' `apriltag`) to Vulkan compute, so it runs
+on hardware without CUDA — the actual target being ARM Mali. Every stage's
+output has been checked against unmodified upstream `apriltag` throughout
+development, not just at the end: see [Verifying correctness](#verifying-correctness).
+
+## Scope reductions
+
+This port intentionally does less than the CUDA original and upstream
+`apriltag`:
+
+- **No lens-distortion handling.** Intrinsics are assumed pinhole, so a
+  caller with a wide-angle lens should undistort the detection's corners
+  before estimating pose. The CUDA original's `UnDistort` path is not
+  ported either.
+- **Pose estimation needs calibration data.** `PoseEstimator` is available
+  but is not part of `Detect`: it requires camera intrinsics and the
+  physical tag size, which only the caller has. Note that translation
+  scales linearly with the tag size, so a 1% error there is a 1% range
+  error — larger than every other error source in the solver combined.
+- **Decimation must be set at detector creation.** `DetectorConfig::decimation`
+  accepts any factor that divides the frame evenly (1, 2, 4, ...; default 2),
+  but it is a specialization constant baked into the pipelines, so it is fixed
+  for a detector's lifetime — changing it means constructing a new detector,
+  unlike the CUDA original's per-call `quad_decimate`.
+- **Single border polarity per run.** `reversed_border` must match across
+  every tag family added to the detector in one run — mixing normal- and
+  reversed-border families in a single pass is not supported.
+- **The contrast floor follows the frame's noise.** `DetectorConfig::adaptive_floor_scale`
+  (default 2; `APRILTAG_VK_ADAPTIVE_FLOOR=0` or `0` in the config turns it off) raises the
+  4x4-block contrast floor above `min_white_black_diff` to that many times the frame's median block
+  range, so sensor noise is not labelled; on noisy 1280x720 frames this halves the frame time on
+  both test machines. A tag whose edges have less than about twice the noise's block range is
+  lost (1 to 3 of about 700 degraded tags in the harshest synthetic sets, none in the real
+  images). It needs 8-bit storage; without it the fixed floor applies and detections can differ.
+- **Decimation averages each block.** At decimation 2 and above `DetectorConfig::box_decimate`
+  (default on; `APRILTAG_VK_BOX_DECIMATE=0` or `false` in the config restores the top-left pixel)
+  averages each decimation block instead of copying one pixel. On the corpus it finds as many tags or
+  more in every scenario (small tags at decimation 4: 71.8% to 84.2%) and cuts the corner error under
+  blur, and with the integer dot product it is also faster on the Mali. The cost is more wrong IDs in a
+  tag16h5 scene (97 to 146 at decimation 2 in the corpus set), where `APRILTAG_VK_FAMILY_LIMITS=1` is the
+  remedy; decimation 1 is unchanged.
+- **Corners and decoding use the accurate set.** The edge refinement fits dense profiles across each
+  side (`APRILTAG_VK_REFINE=exact` restores the previous refinement), and the decoder retries a quad whose
+  border sits in a grey margin or one cell out, accepts a third corrected bit only when the wrong cells
+  touch, and applies per-family correction limits (each `APRILTAG_VK_GREY_MARGIN`, `SIDE_ONE_OUT`,
+  `THIRD_BIT`, `FAMILY_LIMITS`, `BORDER_PRECHECK`, `DARK_REJECT` set to `0` turns one off). On the corpus
+  this raises the tags found at decimation 2 from 94.2% to 97.3% and halves the median corner error, at
+  a cost of 0.04 ms per frame on the desktop and none on the Orange Pi.
+
+## Requirements
+
+- A Vulkan 1.1+ compute-capable GPU and driver. No optional feature is
+  required: 8-bit storage, 64-bit atomics, subgroup operations, conditional
+  rendering and host-pointer import are used when the device has them, and
+  every one has a fallback path that gives identical detections (each can be
+  forced off with an `APRILTAG_VK_FORCE_NO_*` variable, listed in
+  `apriltags_vulkan/PERFORMANCE.md`). It has been run on an AMD RX 9060 XT and
+  an ARM Mali-G610, and earlier revisions on an Intel iGPU and an NVIDIA
+  MX230; other vendors are untested at this revision.
+- CMake 3.16+, a C++20 compiler. Nothing is fetched at configure time and no AprilTag library is needed.
+- `glslangValidator` (Vulkan SDK or `glslang-tools`) to compile the shaders. The integer dot product
+  decimation shader needs glslang 15.2 or later; with an older one it is left out of the build (the
+  plain shader runs instead, with identical detections) and CMake says so. `-DVKAPRILTAG_DOT_SHADER=ON`
+  makes that an error, `=OFF` leaves it out.
+- [OpenCV](https://opencv.org/) — optional. `tools/` builds a richer
+  validation tool against arbitrary image formats when OpenCV is found, and
+  falls back to a PGM-only tool without it.
+- V4L2 (Linux only) — only needed for the interactive sample app.
+
+## Build
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+Relevant options (all in `apriltags_vulkan/CMakeLists.txt` /
+`library/CMakeLists.txt`):
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `VKAPRILTAG_BUILD_APPS` | `ON` | Build the V4L2 camera sample app (Linux only, regardless of this flag). |
+| `VKAPRILTAG_BUILD_TOOLS` | `ON` | Build the evaluation, benchmark and validation tools. |
+| `VKAPRILTAG_UPSTREAM_VALIDATION` | `OFF` | Fetch stock upstream libapriltag (needs the network) and build the reference validation tools that compare against it (`apriltag_vulkan_validate`, the pose and synthetic ground-truth tools, `vk_eval --ref`). The library, the tests and the packages never use it. |
+| `VKAPRILTAG_REGEN_VECTORS` | `OFF` | With the option above: patch upstream and build `gen_decode_vectors`, which records `tests/own_decode_vectors.bin`. |
+| `VKAPRILTAG_EMBED_SHADERS` | `ON` | Compile the SPIR-V shader corpus into the library binary, so a deployed build needs nothing on disk beside it (important for e.g. a JNI `.so` extracted from a jar at runtime). Off falls back to loading `.spv` files from an install-relative `SHADER_DIR`. |
+
+## Quick start
+
+```cpp
+#include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/QuadDecode.h"
+#include "vkapriltag/TagDecoder.h"
+#include "vkapriltag/vk/Context.h"
+
+apriltag_vulkan::vk::Context ctx;
+
+apriltag_vulkan::DetectorConfig config;
+config.width = width;
+config.height = height;
+// tf: const apriltag_vulkan::Family*, e.g. Family::ByName("tag36h11")
+config.tag_width = tf->width_at_border;
+config.reversed_border = tf->reversed_border;
+config.normal_border = !tf->reversed_border;
+
+apriltag_vulkan::GpuDetector detector(ctx, config);
+apriltag_vulkan::QuadDecode quad_decode(config);
+// The decimation argument must match config.decimation (it sets the edge
+// refinement's search radius); refinement runs only if refine_edges is set.
+apriltag_vulkan::TagDecoderConfig decoder_config;
+decoder_config.families = {tf};
+decoder_config.refine_edges = false;
+apriltag_vulkan::TagDecoder tag_decoder(decoder_config, config.decimation);
+
+// Per frame:
+detector.Detect(gray_frame);  // tightly packed 8-bit grayscale, width*height bytes
+std::vector<apriltag_vulkan::DetectedQuad> quads =
+    quad_decode.Decode(detector.last_line_fit_points);
+const apriltag_vulkan::DetectionList &detections =
+    tag_decoder.Decode(quads, gray_frame, width, height, config.reversed_border);  // valid until the next Decode
+```
+
+For pose, additionally (once, at setup):
+
+```cpp
+#include "vkapriltag/PoseEstimator.h"
+
+apriltag_vulkan::PoseEstimator pose_estimator(
+    {.fx = fx, .fy = fy, .cx = cx, .cy = cy},  // pixels, from calibration
+    0.1651);                                    // tag border width, metres
+
+// Per frame, after tag_decoder.Decode:
+std::vector<apriltag_vulkan::TagPose> poses;
+pose_estimator.EstimateAll(detections, poses);  // threaded across detections
+```
+
+See `apps/apriltag_vulkan/main.cpp` for a complete example driving this from
+a V4L2 camera, and `library/include/vkapriltag/gpu/GpuDetector.h` for the
+rest of `DetectorConfig` (cluster-size floors, aspect/fill-ratio filters,
+capacity caps, etc. — all have working defaults).
+
+## Verifying correctness
+
+The default `ctest` needs no upstream libapriltag: it compares the in-house decode bit for bit with upstream's
+results recorded in `tests/own_decode_vectors.bin`, and runs the golden-detection and unit tests. The tools below
+compare against live upstream and are built with `-DVKAPRILTAG_UPSTREAM_VALIDATION=ON`.
+
+```sh
+build/tools/apriltag_vulkan_validate --data path/to/your/images --family tag36h11
+```
+
+`--data` accepts either a single image or a directory, in whatever format
+OpenCV can load (falls back to PGM-only without OpenCV — see Requirements).
+No test images ship with the repo: supply your own, or generate a
+resolution-swept set from one source image with `tools/make_corpus`
+(`corpus/` itself is gitignored, since it's local/machine-specific — see
+`apriltags_vulkan/.gitignore`). For every image, the tool runs this pipeline
+and the unmodified upstream `apriltag_detector_detect()` side by side and
+compares **both** the decoded tag ID set and the corner positions (RMS pixel
+error) between the two — not a visual/manual check. Pass `--iterations N` to
+additionally report steady-state timing (see below); a single iteration is
+dominated by cold-start costs (page faults, pipeline warm-up) and says
+little about per-frame throughput.
+
+`--dump-quads <file>` writes the canonical candidate quads, and `--dump-detections <file>` the
+decoded tags after refinement at full precision, so two builds or two configurations can be
+compared byte for byte; `--stress <noise|snake|checker|rings>`
+runs deliberately hostile frames and `--max-uf <n>` caps the labelling
+iterations to force the retry path. `--profile` and `--trace <file>` print and
+record the per-stage timing. The same dumps are identical across every
+fallback path and workgroup configuration on both development machines.
+
+Two further tools go beyond per-detection corner/ID agreement to the actual
+6-DoF pose:
+
+- **`apriltag_pose_e2e_validate --data <dir-or-file>`** runs stock
+  libapriltag (detect + `estimate_tag_pose`) and this port (full pipeline +
+  `PoseEstimator`) independently end to end on the same image — real
+  detection differences (corner localization) flow into the comparison, not
+  just the pose solver in isolation. `--ref-refine-edges` / `--our-refine-edges`
+  toggle `refine_edges` on either side, so the cost of leaving it off
+  asymmetrically (or the effect of turning it on for both) can be measured
+  rather than assumed.
+- **`apriltag_synth_ground_truth`** (`--refine-edges`, `--contrast <f>`) renders a tag at a *chosen, known* 6-DoF
+  pose — built from the tag family's own bit tables, so the render is
+  exactly what the decoder itself checks, not a guessed printed-tag
+  convention — and compares both pipelines against that known pose, not just
+  against each other. This is what can actually say *which* side (if either)
+  is closer to correct when the two disagree, which a real photograph (no
+  known true pose) cannot.
+
+Pose is verified by a second tool, against upstream `apriltag_pose.c`:
+
+```sh
+build/tools/apriltag_pose_validate                        # synthetic + degenerate
+build/tools/apriltag_pose_validate --data colorImage.pgm  # + real detections, + timing
+```
+
+(`colorImage.pgm` here and below names the specific real single-tag capture
+these numbers were measured against on the two development machines — it
+isn't shipped with the repo; substitute your own PGM.)
+
+Upstream exposes every stage of its pose algorithm publicly, so this
+compares at four levels rather than only the final answer — homography
+seed, orthogonal-iteration solution 1, the ambiguity-search solution 2,
+and the error-ranked pick — over a 420-case synthetic sweep (distance,
+tilt, in-plane rotation, off-axis translation) that also carries **known
+ground truth**, plus 8 deliberately degenerate geometries, plus real
+detections when `--data` is given. It exits non-zero on failure, so it
+works as a regression gate.
+
+Measured agreement with upstream: rotation within **5.2e-7 degrees**,
+translation within **3.8e-10** relative after refinement, and zero
+disagreements over which ambiguity branch wins. On the real
+`colorImage.pgm` detection it is tighter still — 1.9e-13 deg and 2.7e-16.
+Absolute accuracy against the synthetic ground truth is *identical* to
+upstream's (≤ 0.0032 deg), i.e. the rewrite tracks upstream some four
+orders of magnitude more closely than either tracks reality. The one
+deliberate divergence is precision in the seed's scale factor, where
+upstream uses single-precision `sqrtf`; that shows up as ~1.4e-7 at the
+seed and is washed out by iteration.
+
+Iteration is also stopped once the pose stops moving, which upstream never
+does — it computes a per-step error and then never compares it.
+`DetectorConfig`-style tuning lives on the estimator itself: the default
+`convergence_tol` of 1e-8 is the loosest value measured to leave
+ground-truth accuracy *identical* to running all 50 iterations, and it
+takes **52–54% of the wall clock** off across the synthetic sweep. Setting
+it to 0 restores exact upstream iteration counts, which is the
+configuration the ladder above is verified against. The saving is
+scene-dependent: near-fronto-parallel tags are ill-conditioned enough that
+the iteration keeps twitching below the tolerance and still hits the
+50-iteration cap, saving nothing — including on `colorImage.pgm` itself.
+
+## Performance
+
+Measured on the two development targets with the 1280x800 corpus image (`tools/make_corpus` output,
+one tag in view, 75 candidate quads), decimation 2, medians over 300 to 600 frames. **Every stage
+below is labelled with the processor it runs on**: the pipeline is not GPU-only, and the CPU tail
+and pose estimation are CPU work.
+
+- **Orange Pi 5** — ARM Mali-G610 MP4 GPU, Rockchip RK3588 CPU (4x Cortex-A76 + 4x Cortex-A55),
+  `Release` build, CPU and GPU governors on `performance`.
+- **Desktop** — AMD Radeon RX 9060 XT GPU, AMD Ryzen 5 5600X CPU (6 cores), `RelWithDebInfo` build.
+  The card alternates between two clock states between processes, so its GPU rows are quoted as a
+  range.
+
+**Orange Pi: set the CPU governor.** The board boots with `ondemand` on all clusters, which adds
+3 to 4 ms to every frame at camera rates (the cores are idle between frames and ramp up slowly) and
+costs 10% of free-running throughput; `schedutil` is worse (11 to 17 ms). Set the A76 clusters
+(`policy4`, `policy6`) to `performance`, or at least a 1.4 GHz floor, in whatever launches the
+detector. Other settings (CPU idle states, GPU interrupt affinity, Mali power policy) made no
+difference at 30 and 60 fps. `apriltags_vulkan/PERFORMANCE.md` section 8i has the comparison.
+
+### Where a frame goes
+
+| Stage | Runs on | Orange Pi 5 | Desktop |
+| --- | --- | --- | --- |
+| clear (per-frame buffer zeroing) | GPU | 0.048 ms | ~0 ms |
+| threshold + decimate | GPU | 0.138 ms | 0.012 ms |
+| labelling (includes the blob-size count) | GPU | 0.685 ms | 0.124 ms |
+| label finalise (only when a frame retries) | GPU | 0.004 ms | ~0 ms |
+| boundary extraction | GPU | 0.275 ms | 0.015 ms |
+| hash grouping | GPU | 0.055 ms | 0.011 ms |
+| extents | GPU | 0.170 ms | 0.019 ms |
+| select + blob scan | GPU | 0.064 ms | 0.012 ms |
+| scatter | GPU | 0.068 ms | 0.008 ms |
+| sort + line-fit moments | GPU | 0.233 ms | 0.045 ms |
+| readback copy | GPU | 0.003 ms | ~0 ms |
+| **sum of GPU stages** | **GPU** | **1.74 ms** | **0.25 ms** |
+
+The stage rows are one instrumented frame (`APRILTAG_VK_TIMESTAMPS=1`, which itself costs about 9%
+on the Mali). The totals below are without instrumentation:
+
+| | Runs on | Orange Pi 5 | Desktop |
+| --- | --- | --- | --- |
+| `GpuDetector::Detect()` | GPU | 2.04 ms | 0.38 to 0.55 ms |
+| `quad_decode` (DP corner seeding) | **CPU** | 0.19 ms | 0.11 ms |
+| `tag_decode` (edge refinement, bit sampling, Hamming) | **CPU** | 0.63 ms | 0.22 ms |
+| **Pipeline total, serial** | GPU + CPU | **2.87 ms** | **0.77 to 0.91 ms** |
+| **Pipeline total, `FramePipeline`** | GPU \|\| CPU | **2.2 ms** | **0.40 to 0.46 ms** |
+
+`Detect()` also includes the unspanned time (submit, fence wait, host-side readback) that no GPU
+timestamp covers. It is small: an empty `vkQueueSubmit` + `vkWaitForFences` round trip measures
+19 us on the Mali and 42 us on the RX 9060 XT, and on parts with host-cached readback memory the whole frame
+is recorded once and submitted once. Decimation is the largest single lever on the GPU side: `--decimation
+4` is about 2x faster than 2 on the Pi at the cost of detection range.
+
+### Throughput
+
+`bench_multiqueue`, frames per second with every stream on the same device, `ultrafast` refinement
+(GPU-limited) and `exact` refinement (CPU-tail-limited). "Gate 4" is the margin gate described below.
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| 1 stream, `ultrafast` | 452 fps | 3,424 fps |
+| 4 streams, `ultrafast`, one queue | 533 fps | 5,370 fps |
+| 4 streams, `ultrafast`, queues spread over both compute families | | 9,192 fps |
+| 1 stream, `exact` | 458 fps | 2,791 fps |
+| 4 streams, `exact` | 532 fps | 3,735 fps |
+| 1 stream, `exact`, gate 4 | 479 fps | 3,352 fps |
+| 4 streams, `exact`, gate 4 | 530 fps | 5,330 fps |
+
+One stream with `FramePipeline` given a second detector (two frames in flight), against one detector:
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| decimation 1, `ultrafast`, gate 4 | 215 -> 233 fps | 2,183 -> 2,843 fps |
+| decimation 2, `exact` | 479 -> 555 fps | 2,413 -> 2,630 fps |
+| decimation 2, `ultrafast`, gate 4 | 435 -> 555 fps | 2,604 -> 4,480 fps |
+
+Spreading streams over queue families (`ContextOptions::expected_streams`, `Context::StreamSlot`)
+helps only where the device has two compute families (the desktop: +82% at four streams over one
+queue); on the Mali one queue shared by all streams is faster, and the helper then changes nothing.
+
+### What changed in 1.10.0 (against 1.9.0)
+
+Output changes at the defaults (see [CHANGELOG.md](../../CHANGELOG.md) for the full list and the environment
+switch that restores each behaviour). On the 24-scenario corpus (`tools/napa_corpus`), at the defaults:
+
+| | 1.9.0 | 1.10.0 |
+| --- | --- | --- |
+| tags found, decimation 1 / 2 | 94.4% / 92.5% | 97.0% / 97.3% |
+| median / 95th percentile corner error, decimation 1 | 0.041 / 0.187 px | 0.018 / 0.115 px |
+| wrong IDs in the tag16h5 set, decimation 1 / 2 | 1,739 / 779 | 0 / 3 |
+| median frame total, RX 9060 XT, decimation 1 / 2 | 0.923 / 0.556 ms | 0.356 / 0.299 ms |
+| median frame total, Orange Pi 5 Plus, decimation 1 / 2 | 2.549 / 1.230 ms | 1.058 / 0.743 ms |
+
+- **Accuracy:** a profile-fit edge refinement, a decoder that retries grey-margin quads and ones fitted a
+  cell too far out and accepts a third corrected bit when the wrong cells touch, per-family correction
+  limits, early rejection of dark or border-less quads, block-averaging decimation and a noise-adaptive
+  contrast floor.
+- **Speed:** compacted labelling, a leaner tail, a keep-alive and flag polling where they help, an integer
+  dot product in decimation, and a faster decode. JPEG-like, candidate-rich frames at decimation 2 are the
+  exception: 8 to 14% slower than 1.9.0 on the RX 9060 XT at equal refinement settings (PERFORMANCE.md
+  section 8ba).
+- **Fixes:** an edge-case audit (large blobs, odd frame sizes, pose input checks, the worker pool,
+  resource release on errors).
+
+### What changed in 1.9.0 (against 1.8.0)
+
+Same output: the 15 canonical quad dumps match, and quad dumps and detections are byte-identical to
+1.8.0's in 95 configurations on each machine (seven images, decimations 1, 2 and 4, plain and four
+stress frames), 42 record paths and 84 fallback configurations; the synthetic sweeps give the same
+CSVs. Both versions built the same way and run alternately (`apriltags_vulkan/PERFORMANCE.md` section
+8x):
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| `Detect()`, decimation 1 (1280x720, `ultrafast`, gate 4) | 4.49 -> 3.23 ms (-28%) | 0.60 -> 0.47 ms (-21%) |
+| `pipeline_total`, decimation 1 | 5.09 -> 3.86 ms (-24%) | 0.91 -> 0.78 ms (-14%) |
+| `Detect()`, decimation 2, `exact` | 2.00 -> 1.58 ms (-21%) | 0.46 -> 0.35 ms (-24%) |
+| `pipeline_total`, decimation 2, `exact` | 2.84 -> 2.41 ms (-15%) | 0.79 -> 0.70 ms (-11%) |
+| 1 stream, decimation 1 | 213 -> 300 fps (+41%) | 2,086 -> 2,305 fps (+11%) |
+| 1 stream, decimation 1, depth 2 | 233 -> 329 fps (+41%) | |
+| 1 stream, decimation 2, `exact`, depth 2 | 556 -> 716 fps (+29%) | |
+| 4 streams, one queue, decimation 1 | 230 -> 326 fps (+42%) | 3,141 -> 4,145 fps (+32%) |
+| 4 streams, one queue, decimation 2, `exact` | 534 -> 692 fps (+30%) | 3,525 -> 3,451 fps (-2%) |
+| 4 streams, one queue, decimation 2, `ultrafast`, gate 4 | 533 -> 693 fps (+30%) | 4,944 -> 8,344 fps (+69%) |
+
+With `exact` refinement at decimation 2 the desktop is limited by the CPU tail, so the GPU savings do
+not show in its throughput there.
+
+- **Labelling:** one `uf_merge` pass (the verification merge never found a change and is off;
+  `APRILTAG_VK_UF_VERIFY=1` restores it); each pixel starts pointing at its run start, found with a
+  subgroup scan, so no compression precedes the merge. Integrated GPUs merge 4 pixels per thread and
+  count blob sizes per run piece; discrete GPUs merge in 8-row bands, then across them.
+- **Fewer and wider passes:** six fewer dispatches, two threshold passes instead of four, word-wide
+  loads and stores, 4 boundary points per thread in the atomic extents reductions, blobs of up to 256
+  points sorted by ranking every key in one pass, and sort workgroups of up to 1,024 threads on
+  discrete GPUs.
+- **Discrete GPUs:** frames are written straight into device memory the host can map, removing a
+  38 us copy per frame (devices without a mappable window keep the staging copy).
+- **Fixes:** the validation layer's synchronisation checks now also cover compute shaders' buffer
+  accesses (`syncval_shader_accesses_heuristic`); the three reports it then raised (on disjoint byte
+  ranges, one also present in 1.8.0) are gone, with no extra barriers. AddressSanitizer, UBSan, LeakSanitizer and ThreadSanitizer are clean on the Orange
+  Pi and AddressSanitizer on the desktop.
+- **Tooling:** `APRILTAG_VK_DISPATCH_TIMES=1` prints every dispatch's median GPU time;
+  `apriltag_vulkan_validate --renderdoc-capture` and `tools/renderdoc/rdoc_counters.py` capture a frame
+  and read AMD's counters per command.
+
+### What changed in 1.8.0 (against 1.7.0)
+
+Same output: the quad dumps are byte-identical to 1.7.0's in 60 configurations on each machine
+(decimations 1, 2 and 4, with and without stress frames) and the 15 canonical dumps match. Both
+versions built the same way and run alternately (`apriltags_vulkan/PERFORMANCE.md` section 8s):
+
+| | Orange Pi 5 | RX 9060 XT |
+| --- | --- | --- |
+| `Detect()`, decimation 1 (1280x720, `ultrafast`, gate 4) | 5.19 -> 4.51 ms (-13%) | 0.67 -> 0.59 ms (-13%) |
+| `pipeline_total`, decimation 1 | 6.00 -> 5.09 ms (-15%) | 1.00 -> 0.88 ms (-12%) |
+| `pipeline_total`, decimation 2, `exact` | 3.13 -> 2.83 ms (-9%) | 0.85 -> 0.79 ms (-8%) |
+| 1 stream, decimation 1 | 187 -> 216 fps (+15%) | 2,041 -> 2,151 fps (+5%) |
+| 1 stream, decimation 1, depth 2 | 233 fps (+25%) | 2,893 fps (+42%) |
+| 1 stream, decimation 2, `exact`, depth 2 | 430 -> 556 fps (+29%) | 2,179 -> 2,601 fps (+19%) |
+| 4 streams, one queue, decimation 2, `exact` | 523 -> 554 fps (+6%) | 2,942 -> 3,544 fps (+20%) |
+
+- **CPU tail** (`quad_decode` -32% to -34% on the Orange Pi): `hypotf` replaced by a double-precision
+  form with identical results, the prefix sums kept in registers, each segment fitted once in the
+  combinatorial search, and the DP corner search's argmax passes run as independent chains. `exact`
+  refinement reuses each bilinear tap (`tag_decode` -12% on the Orange Pi, -16% on the desktop).
+- **GPU stages:** `uf_init` and `threshold` cover 4 pixels per thread; at decimation 1 the threshold
+  and sort read the grey buffer directly instead of a copy.
+- **The sort's largest blob:** blobs of more than 1,024 points are sorted in runs by several
+  workgroups and merged by whole-GPU rounds, on by default at decimation 1. With streams spread over
+  both compute families of a discrete GPU it costs 4% to 10%; set `APRILTAG_VK_SORT_SPLIT=8192` there.
+- **`FramePipeline` depth 2 (opt-in):** given a second `GpuDetector` with its own `vk::Lane`, it keeps
+  two frames on the GPU. It costs a second set of device buffers and one more frame of latency
+  (12.9 ms against 9.3 ms at full rate on the Orange Pi at decimation 1).
+- **Fixes:** uploads through a transfer lane now wait for the previous frame's copy into the grey
+  buffer (a write-after-write hazard under synchronisation validation); the validate, pose
+  end-to-end, synthetic sweep and dma-buf test tools no longer leak; `bench_multiqueue --import`
+  warns and continues on devices without host-pointer import. AddressSanitizer, UBSan,
+  LeakSanitizer and ThreadSanitizer are clean on the Orange Pi and AddressSanitizer on the desktop.
+- **Tooling:** `hwcnt_run` and `hwcnt_timeline` (Mali hardware counters), `bench_multiqueue --depth`,
+  `apriltag_vulkan_validate --pipeline-depth`, and quad and detection dumps from the pipelined path.
+
+### The margin gate
+
+With `refine_edges` on, 97% of the CPU refinement time goes to quads that never decode.
+`TagDecoder`'s `probe_margin` (a constructor argument, `SetProbeMargin()`, or
+`APRILTAG_VK_PROBE_MARGIN`; grey levels, 0 = off, the default) samples each quad's unrefined bits
+first and skips refinement when the decision margin is below the gate or the border polarity is
+wrong. On the synthetic sweep the gated and ungated runs are byte-identical at gates 4 and 8, at
+contrast 1.0, 0.25 and 0.12 and noise sigma 3 and 8; junk quads sit at margin 4 or below and real
+tags well above it. It applies only with exactly one tag family, and refinement on. The risk is a real tag whose unrefined margin is under the gate, so it
+stays opt-in. On the Orange Pi it takes `pipeline_total` from 2.89 to 2.49 ms. A Hamming-distance
+probe was measured and rejected: it loses 9 to 20% of the tags that only decode after refinement.
+
+### Pose and pipelining
+
+Pose is measured separately, since it is per detected tag rather than per frame. **It runs
+entirely on the CPU** — `library/include/vkapriltag/PoseEstimator.h` records why the GPU would be
+slower for this computation:
+
+| Stage | Runs on | Orange Pi 5 | Desktop |
+| --- | --- | --- | --- |
+| upstream `estimate_tag_pose`, per tag | CPU | 0.916 ms | 0.616 ms |
+| **`PoseEstimator`, per tag** | **CPU** | **0.016 ms** | **0.013 ms** |
+| speedup | | **58x** | **48x** |
+
+`FramePipeline` overlaps the GPU row with the CPU rows instead of running them in sequence (the
+last row of the totals table). It raises throughput, not latency: a frame's result arrives one
+`Push()` later. The gain depends on resolution; at 640x400 on the Pi it measures neutral, because
+the two sides are close in size and the overlap is cancelled by contention for the shared LPDDR
+bus. Re-measure at your deployment resolution rather than assuming.
+
+The CPU tails and pose all run on the same `WorkerPool`, sized by `DetectorConfig::cpu_threads` /
+`APRILTAG_CPU_THREADS`, so on the Orange Pi they spread across all 8 RK3588 cores by default
+(measured 5.4x scaling for `quad_decode`). Results are written by index rather than completion
+order, which is what makes that safe (see `TagDecoder`'s class comment).
+
+`apriltag_vulkan_validate` compares against upstream's actual default configuration. That
+comparison is not guaranteed to match on every image: a quad this port's corner fitting proposes
+but upstream's differently designed quad finder never generates has nothing on the reference side,
+which shows up as an ID-set "mismatch" even when every tag both sides find agrees to sub-pixel
+precision.
+
+### Tracing and further reading
+
+`apriltag_vulkan_validate --profile` prints the per-stage GPU spans, the CPU-tail split and
+blob-size histograms; `--trace out.json` writes a Chrome trace of the CPU and GPU spans. On Mali,
+`hwcnt_run` and `hwcnt_timeline` (`-DVKAPRILTAG_BUILD_MALI_COUNTERS=ON`, Linux) read the GPU's
+hardware counters through Arm's libGPUCounters.
+`apriltags_vulkan/PERFORMANCE.md` covers configuration, per-device guidance and how to measure
+fairly; `apriltags_vulkan/OPTIMIZATION_NOTES.md` is the record of what each optimisation did and of
+everything measured and rejected, including two Mali-specific results (shared-memory tiling and
+subgroup-aggregated atomics are both slower on Valhall, which has no dedicated shared-memory
+hardware, though both help on the discrete card).
+
+## Project layout
+
+```
+apriltags_vulkan/
+  library/     the Vulkan compute pipeline + CPU tail (GpuDetector, QuadDecode,
+               TagDecoder, the optional PoseEstimator, and FramePipeline for
+               overlapping the GPU pass with the previous frame's CPU tail)
+    shaders/   GLSL compute shaders, compiled to SPIR-V at build time
+    include/   public headers (vkapriltag::vkapriltag target)
+  apps/        interactive V4L2 sample app (Linux)
+  tools/       validation tools (ID/corner, end-to-end pose, synthetic
+               ground truth, pose solver), the corpus generator, and the
+               benchmarks (bench_multiqueue for several streams, bench_barrier
+               for the cost of a barrier), and the Mali counter tools
+               (hwcnt_run, hwcnt_timeline)
+  cmake/       the shader compilation and embedding machinery
+  OPTIMIZATION_NOTES.md   detailed performance history and rejected approaches
+  PERFORMANCE.md          how to configure, run and measure it per device
+```
+
+## License
+
+Licensed under the [Apache License 2.0](../../LICENSE). See [NOTICE](../../NOTICE) for
+attribution: this project is based on frc971's `apriltags_cuda` and
+contains code derived from AprilRobotics' `apriltag` (BSD-2-Clause): the tag
+family code tables and the decode (`library/src/OwnDecode.*`). It does not
+link, fetch or install upstream `apriltag`; upstream is used only by the
+optional validation tools (`VKAPRILTAG_UPSTREAM_VALIDATION`), and its licence
+text is reproduced in NOTICE.
