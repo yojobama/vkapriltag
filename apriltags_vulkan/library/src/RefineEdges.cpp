@@ -21,7 +21,7 @@ thread_local bool g_stop = false;
 // From APRILTAG_VK_REFINE_ABORT (read once): the usable fraction of a side's profiles below which the first
 // pass gives the quad up; negative switches it off.
 double RefineAbortFraction() {
-  static const double fraction = Options::FromEnvironment().Float("APRILTAG_VK_REFINE_ABORT", 0.25);
+  static const double fraction = Options::FromEnvironment().Float("APRILTAG_VK_REFINE_ABORT", -1.0);
   return fraction;
 }
 

@@ -91,6 +91,11 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ### Performance
 
+- **Profile refinement samples four taps at once.** `ProfilePass` blends and differences its taps with SSE2 (x86-64) and NEON (aarch64)
+  kernels in `TapKernels.h` (scalar fallback unchanged). Output is bit-identical on x86; on aarch64 the blend uses fused
+  multiply-add as gcc already did, so corners may move by about 1e-5 px. Orange Pi 5 Plus `perf`: `ProfilePass` events -13% (one-tag),
+  -19% (many-tags), -20% (dense-tags); CPU part of the corpus median 0.148 -> 0.129 ms. New option `APRILTAG_VK_REFINE_ABORT`
+  (off by default) gives up a quad whose first pass finds too few usable profiles.
 - **Early reject of non-tag candidates with grey margin on.** The border pre-check and the dark reject were
   skipped whenever grey margin was on (the default), so every candidate was refined. They now run on the
   unrefined quad and reject it only if its inner W cells (what the grey margin retry decodes) fail them too;

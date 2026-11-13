@@ -30,7 +30,7 @@ const OptionDescriptor kTable[] = {
      "Whole-tag photometric polish of decoded tags."},
     {"APRILTAG_VK_PROFILE_FEATURES", T::kMask, "31", C::kFeature, P::kEnvOnly, "",
      "Bit mask of the profile fit's refinements: 1 outliers, 2 coarse to fine, 4 halfway crossing, 8 clip bias, 16 widen blur."},
-    {"APRILTAG_VK_REFINE_ABORT", T::kFloat, "0.25", C::kFeature, P::kEnvOnly, "",
+    {"APRILTAG_VK_REFINE_ABORT", T::kFloat, "-1", C::kFeature, P::kEnvOnly, "",
      "Profile refinement gives a quad up unrefined when a side's usable profile fraction in the first pass is below this; negative: off."},
     {"APRILTAG_VK_GREY_MARGIN", T::kBool, "on", C::kFeature, P::kEnvOnly, "",
      "Retry an undecoded quad as its inner square (grey margin)."},
