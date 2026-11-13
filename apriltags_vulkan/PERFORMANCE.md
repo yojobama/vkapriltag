@@ -82,6 +82,7 @@ variables with no configuration field are environment only. For the reasoning be
 | `APRILTAG_VK_REFINE` | enum | profile | `TagDecoder refine_method` | environment wins | Edge refinement: exact or profile (other values are ignored); used when TagDecoderConfig::refine_edges is set. |
 | `APRILTAG_VK_POLISH` | bool | off | `TagDecoder::SetPolish` | environment wins | Whole-tag photometric polish of decoded tags. |
 | `APRILTAG_VK_PROFILE_FEATURES` | bit mask | 31 |  | environment only | Bit mask of the profile fit's refinements: 1 outliers, 2 coarse to fine, 4 halfway crossing, 8 clip bias, 16 widen blur. |
+| `APRILTAG_VK_REFINE_ABORT` | float | -1 |  | environment only | Profile refinement gives a quad up unrefined when a side's usable profile fraction in the first pass is below this; negative: off. |
 | `APRILTAG_VK_GREY_MARGIN` | bool | on |  | environment only | Retry an undecoded quad as its inner square (grey margin). |
 | `APRILTAG_VK_SIDE_ONE_OUT` | bool | on |  | environment only | Refit a side whose border cells read white, one cell further in. |
 | `APRILTAG_VK_THIRD_BIT` | bool | on |  | environment only | Accept a third corrected bit when the three wrong cells touch. |

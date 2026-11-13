@@ -3,6 +3,7 @@
 #include "vkapriltag/common/Options.h"
 
 #include "Geometry.h"
+#include "TapKernels.h"
 #include "TestHooks.h"
 
 #include <algorithm>
@@ -13,6 +14,16 @@
 
 namespace apriltag_vulkan {
 namespace {
+
+// Set by the first profile pass when it gives the quad up unrefined.
+thread_local bool g_stop = false;
+
+// From APRILTAG_VK_REFINE_ABORT (read once): the usable fraction of a side's profiles below which the first
+// pass gives the quad up; negative switches it off.
+double RefineAbortFraction() {
+  static const double fraction = Options::FromEnvironment().Float("APRILTAG_VK_REFINE_ABORT", -1.0);
+  return fraction;
+}
 
 using geom::BilinearAt;
 
@@ -259,6 +270,7 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
   double width_sum = 0;
   int width_n = 0, touching = 0;
   double lines[4][4];
+  const double abort_below = truncated != nullptr ? RefineAbortFraction() : -1.0;
 
   for (int edge = 0; edge < 4; edge++) {
     const SideSampler side(quad, edge);
@@ -270,6 +282,13 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
     int used = 0;
 
     for (int s = 0; s < np; s++) {
+      // First pass only: half way along a side with too few usable profiles, give the quad up unrefined.
+      if (abort_below >= 0 && s == np / 2 && s >= 8 && used < abort_below * s) {
+        g_stop = true;
+        *edge_width = 0;
+        *truncated = 0;
+        return true;
+      }
       const double alpha = (1.0 + s) / (np + 1);
       double x0, y0;
       side.PointAt(alpha, &x0, &y0);
@@ -284,19 +303,13 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
       }
       if (!geom::BlockInside(im, xis[0], yis[0]) || !geom::BlockInside(im, xis[taps - 1], yis[taps - 1])) continue;
       float prof[kMaxTaps];
-      for (int m = 0; m < taps; ++m) prof[m] = BilinearAt<float>(im, xis[m], yis[m], fxs[m], fys[m]);
+      geom::BlendTaps(im, xis, yis, fxs, fys, taps, prof);
 
       // Gradient along the normal (outside brighter than inside for a normal border).
       float g[kMaxTaps];
-      float best = 0;
-      int bj = -1;
-      for (int j = 1; j < taps - 1; ++j) {
-        g[j] = prof[j + 1] - prof[j - 1];
-        if (g[j] > best) {
-          best = g[j];
-          bj = j;
-        }
-      }
+      float best;
+      int bj;
+      geom::GradientPeak(prof, taps, g, &best, &bj);
       if (bj < 0 || best < kMinStep) continue;
       int jl = bj, jr = bj;
       while (jl > 1 && g[jl - 1] > kLobeCut * best) jl--;
@@ -342,6 +355,14 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
       bys[used] = y0 + n0 * ny - ym;
       ws[used] = best;
       used++;
+    }
+    {
+      if (abort_below >= 0 && (used < 3 || used < abort_below * np)) {
+        g_stop = true;
+        *edge_width = 0;
+        *truncated = 0;
+        return true;
+      }
     }
     if (used < 3) {
       // Too few usable profiles: keep this side where it was.
@@ -634,6 +655,10 @@ void RefineEdgesProfile(int quad_decimate, int width_at_border, const Image *im,
   double truncated = 0;
   if (!ProfilePass(reach, cell, im, quad, &edge_width, &truncated)) {
     RefineEdgesT<double>(quad_decimate, im, quad);
+    return;
+  }
+  if (g_stop) {
+    g_stop = false;
     return;
   }
   if (cell <= 0) return;
