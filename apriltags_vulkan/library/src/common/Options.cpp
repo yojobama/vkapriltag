@@ -52,6 +52,8 @@ const OptionDescriptor kTable[] = {
      "Smallest tag side in full-resolution pixels; raises the minimum cluster size."},
     {"APRILTAG_VK_BOX_DECIMATE", T::kBool, "on", C::kFeature, P::kEnvWins, "DetectorConfig::box_decimate",
      "Average each decimation block instead of copying its top-left pixel."},
+    {"APRILTAG_VK_CPU_DECIMATE", T::kBool, "on", C::kFeature, P::kEnvOnly, "",
+     "Decimate on the CPU into a mapped buffer while uploading, instead of uploading the frame and decimating on the GPU."},
     {"APRILTAG_VK_ADAPTIVE_FLOOR", T::kFloat, "2.0", C::kFeature, P::kEnvWins, "DetectorConfig::adaptive_floor_scale",
      "Contrast floor as a multiple of the frame's median block range; 0 keeps the fixed floor."},
     {"APRILTAG_VK_TRACKING", T::kBool, "off", C::kFeature, P::kEnvWins, "TrackingConfig::enabled",

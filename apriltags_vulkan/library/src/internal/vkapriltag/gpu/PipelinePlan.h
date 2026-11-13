@@ -29,6 +29,7 @@ struct PipelinePlan {
   bool box_dot = false;
   bool threshold_block = false;
   bool minmax_decimate = false;
+  bool want_cpu_decimate = false;
   bool adaptive_floor = false;
   uint32_t floor_scale_tenths = 0;
 
@@ -49,6 +50,7 @@ struct PipelinePlan {
 
   // Resolved after the buffers exist (FinalisePlan).
   bool gray_direct_write = false;
+  bool cpu_decimate = false;
   bool linefit_direct_read = false;
   bool extents_direct_read = false;
   bool fused_submits = false;
@@ -67,6 +69,7 @@ struct BufferOutcome {
   bool gray_direct_write = false;
   bool linefit_direct_read = false;
   bool extents_direct_read = false;
+  bool decimated_direct_write = false;
 };
 
 // The choices that depend on the buffers: fused submits, pre-recording and the lean tail.

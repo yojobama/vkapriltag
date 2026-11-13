@@ -1049,6 +1049,7 @@ void TestPlan(const char *golden_dir) {
       {"no_8bit", 2, [](av::vk::DeviceCaps &c) { c.has_8bit_storage = false; }, {}},
       {"no_conditional_rendering", 2, [](av::vk::DeviceCaps &c) { c.has_conditional_rendering = false; }, {}},
       {"box_decimate_off", 2, nullptr, {{"APRILTAG_VK_BOX_DECIMATE", "0"}}},
+      {"cpu_decimate_off", 2, nullptr, {{"APRILTAG_VK_CPU_DECIMATE", "0"}}},
       {"adaptive_floor_off", 2, nullptr, {{"APRILTAG_VK_ADAPTIVE_FLOOR", "0"}}},
       {"fused_threshold_off", 2, nullptr, {{"APRILTAG_VK_FUSED_THRESHOLD", "0"}}},
       {"uf_init_scan_off", 2, nullptr, {{"APRILTAG_VK_UF_INIT_SCAN", "0"}}},
@@ -1083,7 +1084,7 @@ void TestPlan(const char *golden_dir) {
       config.height = 480;
       config.decimation = static_cast<uint32_t>(cs.decimation);
       av::PipelinePlan plan = av::ResolvePlan(caps, config, env);
-      av::FinalisePlan(plan, caps, env, false, av::BufferOutcome{true, cs.readback_direct, cs.readback_direct});
+      av::FinalisePlan(plan, caps, env, false, av::BufferOutcome{true, cs.readback_direct, cs.readback_direct, true});
       for (const auto &e : cs.env) SetEnv(e.first, nullptr);
       text += std::string("# ") + cs.name + "\n" + plan.Describe();
     }
