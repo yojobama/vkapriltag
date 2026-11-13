@@ -14,19 +14,9 @@
 #include <limits>
 #include <span>
 #include <string>
-#include <chrono>
-#include <atomic>
-#include <cstdio>
 
 namespace apriltag_vulkan {
 namespace {
-// QFSTAT
-std::atomic<uint64_t> g_ns[8], g_cnt[8], g_pts[8];
-inline uint64_t NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-struct QfPrint { ~QfPrint() { const char *n[8] = {"dp_try","peaks_prefix","peaks_err","peaks_filter_peaks","peaks_seglines","peaks_search","fitline_calls","blobs_total"};
-  for (int i = 0; i < 8; ++i) std::fprintf(stderr, "QFSTAT %-20s ns=%llu cnt=%llu pts=%llu\n", n[i], (unsigned long long)g_ns[i], (unsigned long long)g_cnt[i], (unsigned long long)g_pts[i]); } } g_qfprint;
-#define QF_T0(i) const uint64_t qf_t##i = NowNs()
-#define QF_T1(i, np) do { g_ns[i] += NowNs() - qf_t##i; g_cnt[i]++; g_pts[i] += (np); } while (0)
 
 // Gaussian filter taps applied to the windowed error.
 constexpr std::array<double, 7> kFilterCoefficients = {
@@ -377,9 +367,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
       scratch.pw[k] = p.W();
     }
     const UnpackedPoints unpacked{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
-    QF_T0(0);
     FitQuadResult dp_result = TryDpQuad(config, unpacked, total_points);
-    QF_T1(0, total_points);
     if (dp_result.valid) {
       dp_result.dp_attempted = true;
       dp_result.dp_used = true;
@@ -398,7 +386,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   filtered.resize(total_points);
   peaks.clear();
 
-  QF_T0(1);
   const int32_t x0 = points[begin].x2(), y0 = points[begin].y2();
   result.x0 = x0;
   result.y0 = y0;
@@ -428,8 +415,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     }
   }
 
-  QF_T1(1, total_points);
-  QF_T0(2);
   const int ksz = std::min<int>(20, static_cast<int>(total_points / 12));
 
   // Windowed error per point. Windows that do not wrap are evaluated in two vectorisable stages;
@@ -488,8 +473,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     }
   }
 
-  QF_T1(2, total_points);
-  QF_T0(3);
   // 7-tap Gaussian filter, applied circularly, over the errors padded with their wrap-around.
   constexpr size_t kHalf = kFilterCoefficients.size() / 2;  // 3
   std::vector<double> &padded = scratch.padded;
@@ -533,8 +516,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   for (size_t k = 0; k < K; ++k) point_indices[k] = peaks[k].second;
   std::sort(point_indices.begin(), point_indices.begin() + K);
 
-  QF_T1(3, total_points);
-  QF_T0(4);
   // Line fit of the segment between every ordered pair of peaks; (b, a) with b > a closes the quad.
   double seg_err[kNMaxima][kNMaxima];
   double seg_mse[kNMaxima][kNMaxima];
@@ -554,8 +535,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
               nullptr, &seg_err[b][a], &seg_mse[b][a]);
     }
   };
-  QF_T1(4, K * (K - 1));
-  QF_T0(5);
   const double max_mse = config.max_line_fit_mse;
 
   // Brute force all C(10, 4) = 210 combinations, keeping the minimum total error.
@@ -597,7 +576,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     }
   }
 
-  QF_T1(5, K);
   if (best_error == std::numeric_limits<double>::max()) return result;
   if (!(best_error < config.max_line_fit_mse * total_points)) return result;
 
@@ -1015,15 +993,11 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
     FitQuadResult fq;
     if (!(rescue && n_points < config_.min_cluster_pixels)) {
-      QF_T0(7);
       fq = FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
-      QF_T1(7, n_points);
     }
     r.dp_attempted = fq.dp_attempted;
     r.dp_used = fq.dp_used;
-    QF_T0(6);
     r.has_quad = fq.valid && UpdateFitQuad(config_, fq, &r.quad);
-    QF_T1(6, fq.valid);
     r.quad.gradient = static_cast<float>(mean_w);
     const double d = 0.5 * config_.decimation;
     if (rescue && !r.has_quad && mean_w >= kMinRescueGradient && (xhi - xlo) * d <= kMaxRescueBox &&
