@@ -115,6 +115,7 @@ add_library(vkapriltag STATIC
   src/vk/ComputePipeline.cpp
   src/vk/PipelineCache.cpp
   src/vk/QueryPool.cpp
+  src/Detector.cpp
   src/gpu/GpuDetector.cpp
   src/gpu/PipelinePlan.cpp
   src/gpu/StageTable.cpp

@@ -51,6 +51,15 @@ add_gpu_trace(fused_threshold_off_d2 2 "APRILTAG_VK_FUSED_THRESHOLD=0")
 add_gpu_trace(uf_init_scan_off_d2 2 "APRILTAG_VK_UF_INIT_SCAN=0")
 add_gpu_trace(prerecord_off_d2 2 "APRILTAG_VK_PRERECORD=0")
 
+# The public Detector in every mode (needs a Vulkan device).
+add_executable(facade_test facade_test.cpp)
+target_include_directories(facade_test PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tools/vk_eval)
+target_link_libraries(facade_test PRIVATE vkapriltag::vkapriltag)
+foreach(group sync pipelined tracking levels pose stride device errors)
+  add_test(NAME facade_${group} COMMAND facade_test ${CMAKE_CURRENT_SOURCE_DIR}/corpus ${group})
+  set_tests_properties(facade_${group} PROPERTIES TIMEOUT 300)
+endforeach()
+
 foreach(group decode geometry geom edges quadfit options steps pool)
   add_test(NAME unit_${group} COMMAND unit_tests ${group})
 endforeach()
@@ -64,6 +73,13 @@ if(TARGET vk_eval AND Python3_FOUND)
             --corpus ${CMAKE_CURRENT_SOURCE_DIR}/corpus
             --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden)
   set_tests_properties(golden_detections PROPERTIES TIMEOUT 600)
+  add_test(NAME golden_detections_facade
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/golden_test.py
+            --vk-eval $<TARGET_FILE:vk_eval>
+            --corpus ${CMAKE_CURRENT_SOURCE_DIR}/corpus
+            --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden
+            --vk-eval-arg=--facade)
+  set_tests_properties(golden_detections_facade PROPERTIES TIMEOUT 600)
   add_test(NAME options_lint
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/options_lint.py
             --root ${PROJECT_SOURCE_DIR} --vk-eval $<TARGET_FILE:vk_eval>)

@@ -13,6 +13,7 @@
 #include <memory>
 #include <thread>
 
+#include "vkapriltag/Detector.h"
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/Profiler.h"
@@ -48,6 +49,7 @@ int main(int argc, char **argv) {
   int iterations = 1, warmup = 0;
   uint32_t decimation = 1, threads = 0;
   bool ref = false;
+  bool facade = false;  // runs the public Detector instead of composing the stages
   bool small_rescue_config = false;  // sets DetectorConfig::small_tag_rescue in code instead of the environment
   std::string family = "tag36h11";
   std::string levels_arg;  // "4b:28:0,2b:14:40,1:8:20": decimation[b]:min tag px:max tag px per level
@@ -64,6 +66,7 @@ int main(int argc, char **argv) {
     else if (a == "--decimation") decimation = uint32_t(std::max(1, std::stoi(next())));
     else if (a == "--threads") threads = uint32_t(std::max(0, std::stoi(next())));
     else if (a == "--ref") ref = true;
+    else if (a == "--facade") facade = true;
     else if (a == "--small-rescue") small_rescue_config = true;
     else if (a == "--family") family = next();
     else if (a == "--levels") levels_arg = next();
@@ -75,7 +78,7 @@ int main(int argc, char **argv) {
       return 0;
     } else {
       std::cerr << "usage: vk_eval --list files.txt [--out dets.txt] [--iterations N] [--warmup N] "
-                   "[--decimation N] [--threads N] [--ref] [--small-rescue] | --list-options | --list-option-names\n";
+                   "[--decimation N] [--threads N] [--ref] [--facade] [--small-rescue] | --list-options | --list-option-names\n";
       return 2;
     }
   }
@@ -95,6 +98,37 @@ int main(int argc, char **argv) {
 #else
       throw std::runtime_error("--ref needs a build with VKAPRILTAG_UPSTREAM_VALIDATION=ON");
 #endif
+    } else if (facade) {
+      if (!levels_arg.empty()) throw std::runtime_error("--facade does not take --levels");
+      std::unique_ptr<apriltag_vulkan::Detector> detector;
+      apriltag_vulkan::DetectorOptions options;
+      options.families = {family};
+      options.decimation = decimation;
+      options.cpu_threads = threads;
+      options.small_tag_rescue = small_rescue_config;
+      std::printf("vkapriltag facade, decimation %u, cpu threads %u (0 = all)\n", decimation, threads);
+      for (size_t n = 0; n < paths.size(); n++) {
+        eval::Image im = eval::LoadGrey(paths[n]);
+        if (!detector || options.width != uint32_t(im.width) || options.height != uint32_t(im.height)) {
+          detector.reset();
+          options.width = uint32_t(im.width);
+          options.height = uint32_t(im.height);
+          detector = std::make_unique<apriltag_vulkan::Detector>(options);
+        }
+        eval::Timings t;
+        size_t candidates = 0;
+        std::vector<eval::Det> dets;
+        for (int it = 0; it < warmup + iterations; it++) {
+          if (const char *g = std::getenv("VK_EVAL_GAP_MS")) std::this_thread::sleep_for(std::chrono::microseconds(int(std::atof(g) * 1000)));
+          const apriltag_vulkan::Result &r = detector->Detect(im.grey.data());
+          candidates = r.timing.candidates;
+          dets = ToDets(r.detections);
+          if (it >= warmup) t.Add(r.timing.gpu_ms, r.timing.quad_ms + r.timing.decode_ms);
+        }
+        if (iterations > 1) eval::PrintTimings(paths[n], t, candidates, dets.size());
+        all_total.push_back(eval::Median(t.total));
+        if (out.is_open()) eval::WriteDets(out, int(n), dets);
+      }
     } else {
       apriltag_vulkan::vk::Context ctx;
       apriltag_vulkan::TagDecoderConfig decoder_config;
