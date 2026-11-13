@@ -10,6 +10,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 include(GNUInstallDirs)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildTuning.cmake)
 
 if(WIN32)
   # Stop <windows.h> defining min()/max() macros and pulling in winsock; set before add_subdirectory.

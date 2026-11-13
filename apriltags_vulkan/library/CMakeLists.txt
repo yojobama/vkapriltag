@@ -194,6 +194,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   set_source_files_properties(src/gpu/QuadDecode.cpp src/OwnDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
+vkapriltag_tune_target(vkapriltag)
+
 set_target_properties(vkapriltag PROPERTIES OUTPUT_NAME vkapriltag)
 
 # ---------------------------------------------------------------------------
