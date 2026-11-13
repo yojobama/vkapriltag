@@ -11,6 +11,7 @@ target_include_directories(own_decode_test PRIVATE ${PROJECT_SOURCE_DIR}/library
 target_link_libraries(own_decode_test PRIVATE vkapriltag::vkapriltag)
 add_test(NAME own_decode_random COMMAND own_decode_test random)
 add_test(NAME own_decode_reconcile COMMAND own_decode_test reconcile)
+add_test(NAME families_match_upstream COMMAND own_decode_test families)
 add_test(NAME own_decode_corpus
   COMMAND own_decode_test corpus ${CMAKE_CURRENT_SOURCE_DIR}/corpus ${CMAKE_CURRENT_SOURCE_DIR}/own_decode_quads.txt)
 add_test(NAME own_decode_comparison_can_fail COMMAND own_decode_test random "" "" tag16h5)

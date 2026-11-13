@@ -19,6 +19,7 @@
 
 #include "OwnDecode.h"
 #include "test_check.h"
+#include "vkapriltag/Family.h"
 #include "vkapriltag/apriltag_family.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -669,6 +670,35 @@ void Bench(const std::string &corpus, const std::string &quads_file) {
   for (Frame &f : frames) stbi_image_free(f.pixels);
 }
 
+// ---------------------------------------------------------------- family tables
+
+// Every built-in family equals the table libapriltag builds for the same name.
+void TestFamilies() {
+  long checked = 0;
+  for (const char *name : kFamilies) {
+    apriltag_family_t *up = nullptr;
+    setup_tag_family(&up, name);
+    const apriltag_vulkan::Family *own_family = apriltag_vulkan::Family::ByName(name);
+    CHECK(up != nullptr && own_family != nullptr);
+    if (!up || !own_family) continue;
+    bool same = std::strcmp(own_family->name, up->name) == 0 && own_family->ncodes == up->ncodes &&
+                own_family->nbits == up->nbits && own_family->width_at_border == up->width_at_border &&
+                own_family->total_width == up->total_width && own_family->reversed_border == up->reversed_border &&
+                own_family->h == up->h && own_family->max_hamming == 2;
+    for (uint32_t i = 0; same && i < up->ncodes; ++i) same = own_family->codes[i] == up->codes[i];
+    for (uint32_t i = 0; same && i < up->nbits; ++i) {
+      same = own_family->bit_x[i] == up->bit_x[i] && own_family->bit_y[i] == up->bit_y[i];
+    }
+    if (!same) std::printf("MISMATCH family %s\n", name);
+    CHECK(same);
+    checked += up->ncodes;
+    teardown_tag_family(&up, name);
+  }
+  CHECK(apriltag_vulkan::Family::ByName("tag99h99") == nullptr);
+  CHECK(apriltag_vulkan::Family::All().size() == std::size(kFamilies));
+  std::printf("families: %zu families, %ld codes compared\n", std::size(kFamilies), checked);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -678,10 +708,11 @@ int main(int argc, char **argv) {
   bool ran = false;
   if (which == "all" || which == "random") TestRandom(argc > 4 ? argv[4] : nullptr), ran = true;
   if (which == "all" || which == "reconcile") TestReconcile(), ran = true;
+  if (which == "all" || which == "families") TestFamilies(), ran = true;
   if ((which == "all" || which == "corpus") && !corpus.empty()) TestCorpus(corpus, quads), ran = true;
   if (which == "bench") Bench(corpus, quads), ran = true;
   if (!ran) {
-    std::printf("usage: own_decode_test <random|reconcile|corpus|bench> [corpus-dir quads-file]\n");
+    std::printf("usage: own_decode_test <random|reconcile|families|corpus|bench> [corpus-dir quads-file]\n");
     return 2;
   }
   if (testcheck::Failures() != 0) {

@@ -157,6 +157,15 @@ add_library(vkapriltag STATIC
   src/gpu/KeepAlive.cpp
   src/vk/CompletionFlag.cpp
   src/apriltag_family.cpp
+  src/Family.cpp
+  src/families/tag36h11.cpp
+  src/families/tag25h9.cpp
+  src/families/tag16h5.cpp
+  src/families/tagCircle21h7.cpp
+  src/families/tagCircle49h12.cpp
+  src/families/tagStandard41h12.cpp
+  src/families/tagStandard52h13.cpp
+  src/families/tagCustom48h12.cpp
   src/TagDecoder.cpp
   src/OwnDecode.cpp
   src/TrackingDetector.cpp
