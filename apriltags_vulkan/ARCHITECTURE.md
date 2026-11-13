@@ -113,6 +113,13 @@ exist; the large-blob ones are indirect and run zero groups when no blob exceeds
   extra labelling chunks if verifying, then blob sizes and boundary extraction (reads the boundary point count), (3)
   hash group, extents, select, scan and scatter (reads the blob and point counts that size the readback), (4) sort and the
   staging copies. It records the same stages with host-sized dispatches.
+- **CPU tail (opt-in, `APRILTAG_VK_CPU_TAIL`).** For frames whose previous frame had at most `APRILTAG_VK_CPU_TAIL_MAX_POINTS` boundary
+  points (default 10,000), `DetectFused` submits the head and `blob_diff` only (`HeadOnly`), reads the boundary-point count and, if it is
+  within the threshold, runs `CpuTail` (`gpu/CpuTail.cpp`: hash grouping, extents, `select_blobs`, scatter and the angle sort, with the
+  gradient weight recomputed from the caller's frame) over the boundary buffers; otherwise it submits the rest of the tail (`TailRest`) and the
+  next frame takes the full path. It needs the fused flow without `UF_VERIFY`, a frame uploaded by `Detect(gray)` (not an imported one), and
+  host-readable boundary points: the buffers are host-cached on unified memory, else the first `max_points` entries are copied to a staging buffer.
+  Blobs are numbered by first boundary point, so their order differs from the GPU's; per-blob points and extents are the same (`tests/cpu_tail_test.cpp`).
 - **Transfer-queue upload.** With a second `vk::Lane` (a transfer-only queue), the staged frame is copied there and the
   first compute submission waits on a semaphore (`upload_semaphore_`); this path does not pre-record.
 - **Extra submissions.** The pre-warm and keep-alive helper (section 8.3) submits trivial dispatches on a sibling lane

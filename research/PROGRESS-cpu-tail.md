@@ -111,3 +111,10 @@ Pi (Mali-G610), stage 1 (`ct_pi_stage1.sh`):
   tests: pipeline-cache state, not investigated further).
 - Sanitisers (ASan+UBSan and TSan builds, `APRILTAG_VK_CPU_TAIL=1`): `vk_eval` on the committed subset at decimation 2 and 1, `facade_test` sync and pipelined,
   `track_eval` full,key on 60 frames of medium-2tag-640: 0 sanitiser reports in all 14 runs.
+
+Pi, stage 2 (`ct_pi_stage2.sh`) so far:
+- `cpu_tail_test` (committed frames, d2 and d1): 0 failures, 895 blobs, 128 detections, 35 blobs with a gradient weight differing by 1, corners within 0.00131 px.
+- Mispredicted frame (`cpu_tail_test --mispredict`, one-tag frame (868 points) alternating with clutter-only (6,660 points), threshold 3,764, so every
+  clutter frame runs the head, waits, reads the count and submits the rest): gpu phase of the clutter frame 0.5375 ms off, 0.6778 ms on: a misprediction costs +140 us on the Pi.
+  The one-tag frames on the full path are unchanged (0.3993 / 0.4010).
+- Desktop track_eval (full,key, ten sequences, off against on, `score_seq.py`): recall 100% everywhere, false detections, wrong ids, corner errors and path shares identical.
