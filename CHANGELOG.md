@@ -1,10 +1,19 @@
 # Changelog
 
 All notable changes to vkapriltag. Per-version detail with measurements for 1.8.0 and 1.9.0 is in the
-"What changed" sections of [README.md](README.md); the measurements behind every change are in
-[apriltags_vulkan/PERFORMANCE.md](apriltags_vulkan/PERFORMANCE.md).
+"What changed" sections of the old README ([archive](apriltags_vulkan/archive/README-1.10-history.md)); the current
+measurements are in [apriltags_vulkan/PERFORMANCE.md](apriltags_vulkan/PERFORMANCE.md), and the measurements behind older
+changes (sections such as 8ac or 8bb cited below) are in
+[apriltags_vulkan/archive/PERFORMANCE-history.md](apriltags_vulkan/archive/PERFORMANCE-history.md). The decision log is
+[apriltags_vulkan/DECISIONS.md](apriltags_vulkan/DECISIONS.md).
 
 ## Unreleased
+
+### Documentation
+
+- `ARCHITECTURE.md` and `DECISIONS.md` added; `DESIGN.md` is now a short rationale page; `OPTIMIZATION_NOTES.md`, the two root idea
+  files, the chronological sections of `PERFORMANCE.md` and the old `DESIGN.md` and README moved unchanged to `apriltags_vulkan/archive/`;
+  `tools/check_links.py` checks the Markdown links.
 
 ### Changed (API)
 

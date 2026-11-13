@@ -1,3 +1,5 @@
+> Frozen copy of the root README as of 1.10.1 (links adjusted). Its tables and refinement names are out of date; see ../../README.md.
+
 # vkapriltag
 
 A Vulkan-compute reimplementation of the [AprilTag](https://github.com/AprilRobotics/apriltag)
@@ -386,7 +388,7 @@ queue); on the Mali one queue shared by all streams is faster, and the helper th
 
 ### What changed in 1.10.0 (against 1.9.0)
 
-Output changes at the defaults (see [CHANGELOG.md](CHANGELOG.md) for the full list and the environment
+Output changes at the defaults (see [CHANGELOG.md](../../CHANGELOG.md) for the full list and the environment
 switch that restores each behaviour). On the 24-scenario corpus (`tools/napa_corpus`), at the defaults:
 
 | | 1.9.0 | 1.10.0 |
@@ -561,7 +563,7 @@ apriltags_vulkan/
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for
+Licensed under the [Apache License 2.0](../../LICENSE). See [NOTICE](../../NOTICE) for
 attribution: this project is based on frc971's `apriltags_cuda` and
 contains code derived from AprilRobotics' `apriltag` (BSD-2-Clause): the tag
 family code tables and the decode (`library/src/OwnDecode.*`). It does not
