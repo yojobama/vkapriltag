@@ -108,7 +108,7 @@ bool Singular3(const double *a) {
 }
 
 // Bilinear grey value at the pixel-edge coordinates (px, py); -1 if the 2x2 neighbourhood leaves the image.
-inline double ValueForPixel(const image_u8_t *im, double px, double py) {
+inline double ValueForPixel(const Image *im, double px, double py) {
   const double fx = px - 0.5, fy = py - 0.5;
   int x1, x2, y1, y2;
   if (fx > -2147483648.0 && fx < 2147483647.0 && fy > -2147483648.0 && fy < 2147483647.0) {
@@ -126,8 +126,8 @@ inline double ValueForPixel(const image_u8_t *im, double px, double py) {
   const double x = fx - x1;
   const double y = fy - y1;
   if (x1 < 0 || x2 >= im->width || y1 < 0 || y2 >= im->height) return -1;
-  return im->buf[y1 * im->stride + x1] * (1 - x) * (1 - y) + im->buf[y1 * im->stride + x2] * x * (1 - y) +
-         im->buf[y2 * im->stride + x1] * (1 - x) * y + im->buf[y2 * im->stride + x2] * x * y;
+  return im->data[y1 * im->stride + x1] * (1 - x) * (1 - y) + im->data[y1 * im->stride + x2] * x * (1 - y) +
+         im->data[y2 * im->stride + x1] * (1 - x) * y + im->data[y2 * im->stride + x2] * x * y;
 }
 
 // The number of rotations tried by the code lookup.
@@ -291,7 +291,7 @@ bool InferMaxHamming(const apriltag_family_t *f, int *max_hamming) {
 
 // Reads the border and payload cells of a quad with homography h; the code word goes to *rcode.
 // Returns the decision margin, or -1 (with *rcode 0) if the polarity is wrong.
-float SampleFamily(const FamilyTables &f, double sharpening, const image_u8_t *im, const double *h,
+float SampleFamily(const FamilyTables &f, double sharpening, const Image *im, const double *h,
                    uint64_t *rcode_out) {
   *rcode_out = 0;
   const int w = f.w;
@@ -314,7 +314,7 @@ float SampleFamily(const FamilyTables &f, double sharpening, const image_u8_t *i
         continue;
       }
       read[n] = 1;
-      const double v = im->buf[iy * im->stride + ix];
+      const double v = im->data[iy * im->stride + ix];
       B[m][0] += tagx * v;
       B[m][1] += tagy * v;
       B[m][2] += v;
@@ -520,7 +520,7 @@ bool Decoder::Refresh(const apriltag_detector_t *td) {
   return true;
 }
 
-bool Decoder::SampleCode(const float p[4][2], bool reversed_border, const image_u8_t *im, Homography *h,
+bool Decoder::SampleCode(const float p[4][2], bool reversed_border, const Image *im, Homography *h,
                          RawSample *raw) const {
   if (!ComputeHomography(p, h)) return false;
   *raw = RawSample{};
@@ -558,7 +558,7 @@ void Decoder::FillTag(const apriltag_family_t *family, int id, int hamming, int 
   }
 }
 
-int Decoder::Decode(const float p[4][2], bool reversed_border, const image_u8_t *im, Homography *h_out,
+int Decoder::Decode(const float p[4][2], bool reversed_border, const Image *im, Homography *h_out,
                     RawSample *first, DecodedTag *out) const {
   Homography local;
   Homography *h = h_out ? h_out : &local;

@@ -23,12 +23,12 @@ struct StepResult {
   int hamming = -1;
   double corners[4][2] = {};  // the first detection's corners
 };
-bool PreRefineRejects(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2], bool reversed_border,
+bool PreRefineRejects(apriltag_detector_t *td, const Image *im, const double corners[4][2], bool reversed_border,
                       const DecodeSwitches &switches);
-StepResult RunCandidateSteps(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2],
+StepResult RunCandidateSteps(apriltag_detector_t *td, const Image *im, const double corners[4][2],
                              bool reversed_border, const DecodeSwitches &switches);
 
-void IntersectLines(const double lines[4][4], struct quad *quad);
+void IntersectLines(const double lines[4][4], Quad *quad);
 void FitSide(double *bxs, double *bys, double *ws, int used, double range, double *mx, double *my,
              double *normal_theta);
 

@@ -247,7 +247,7 @@ struct BoxInfo {
   int thin = 1;
 };
 
-void ComputeBox(const Fit &f, const Mapping &map, int limit, const image_u8_t *im, BoxInfo *b) {
+void ComputeBox(const Fit &f, const Mapping &map, int limit, const Image *im, BoxInfo *b) {
   const int W = f.width;
   double inv[9];
   CellToNormalised(map, inv);
@@ -278,7 +278,7 @@ void ComputeBox(const Fit &f, const Mapping &map, int limit, const image_u8_t *i
 }
 
 // A sparse sample of pixels beside the class-changing cell edges, for the blur scan.
-void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, const image_u8_t *im) {
+void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, const Image *im) {
   const int W = f.width;
   scan->Clear();
   double inv[9];
@@ -297,7 +297,7 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
     LocalScale(map, xn, yn, f.scale, &u2, &v2, &gu, &gv);
     scan->x.push_back(static_cast<float>(xn));
     scan->y.push_back(static_cast<float>(yn));
-    scan->obs.push_back(static_cast<float>(im->buf[static_cast<size_t>(py) * im->stride + px]));
+    scan->obs.push_back(static_cast<float>(im->data[static_cast<size_t>(py) * im->stride + px]));
     scan->u0.push_back(static_cast<float>(u2));
     scan->v0.push_back(static_cast<float>(v2));
     scan->gu.push_back(static_cast<float>(gu));
@@ -330,7 +330,7 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
 
 // The working set directly: pixels whose window (half_window_px) touches more than one known cell class and no
 // unknown cell, on the lattice of `box.thin`, with the cell window of each pixel frozen for reach_px.
-void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px, const BoxInfo &box, const image_u8_t *im) {
+void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px, const BoxInfo &box, const Image *im) {
   const int W = f->width;
   f->n = 0;
   if (box.x1 < box.x0 || box.y1 < box.y0) return;
@@ -371,7 +371,7 @@ void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px
   grow(f->C);
   size_t out = 0;
   for (int py = box.y0; py <= box.y1; ++py) {
-    const uint8_t *row = im->buf + static_cast<size_t>(py) * im->stride;
+    const uint8_t *row = im->data + static_cast<size_t>(py) * im->stride;
     const float y = (static_cast<float>(py) + 0.5f - cyf) * inv_scale;
     const float a0 = g1 * y + g2, b0 = g4 * y + g5, c0 = g7 * y + 1.0f;
     const int off = ((-(py * lr)) % k + k) % k;
@@ -933,7 +933,7 @@ double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int wi
 
 }  // namespace
 
-bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
+bool PolishDetection(const Image *im, apriltag_detection_t *det) {
   const apriltag_family_t *fam = det->family;
   if (fam == nullptr || fam->reversed_border) return false;
   const int W = static_cast<int>(fam->width_at_border);
@@ -1037,7 +1037,7 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
           const int ix = static_cast<int>(px), iy = static_cast<int>(py);
           if (ix < 0 || iy < 0 || ix >= im->width || iy >= im->height) continue;
           const double expected = fit.cls[j + 1][i + 1] ? p.lev[1] : p.lev[0];
-          if (std::fabs(im->buf[iy * im->stride + ix] - expected) > 0.3 * range) marked[j][i] = 1;
+          if (std::fabs(im->data[iy * im->stride + ix] - expected) > 0.3 * range) marked[j][i] = 1;
         }
       }
       for (int j = 0; j < W; ++j) {

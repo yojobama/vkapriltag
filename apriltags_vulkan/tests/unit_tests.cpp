@@ -173,7 +173,7 @@ void TestDecode() {
 void TestIntersectLines() {
   // A line is [Ex Ey nx ny]: a point on it and a normal, with the direction (ny, -nx).
   const double square[4][4] = {{10, 10, 0, 1}, {20, 10, -1, 0}, {20, 20, 0, -1}, {10, 20, 1, 0}};
-  struct quad q = {};
+  av::Quad q = {};
   av::testing::IntersectLines(square, &q);
   const double want[4][2] = {{10, 10}, {20, 10}, {20, 20}, {10, 20}};
   for (int i = 0; i < 4; ++i) {
@@ -192,7 +192,7 @@ void TestIntersectLines() {
     lines[i][2] = -dy / len;
     lines[i][3] = dx / len;
   }
-  struct quad r = {};
+  av::Quad r = {};
   av::testing::IntersectLines(lines, &r);
   for (int i = 0; i < 4; ++i) {
     CHECK_NEAR(r.p[i][0], corner[i][0], 1e-4);
@@ -204,7 +204,7 @@ void TestIntersectLines() {
   std::memcpy(par, square, sizeof par);
   par[1][2] = 0;
   par[1][3] = 1;
-  struct quad k = {};
+  av::Quad k = {};
   for (int i = 0; i < 4; ++i) k.p[i][0] = k.p[i][1] = -7.0f;
   av::testing::IntersectLines(par, &k);
   CHECK(k.p[1][0] == -7.0f && k.p[1][1] == -7.0f);
@@ -263,7 +263,7 @@ namespace geo = apriltag_vulkan::geom;
 void TestBilinearAndMedian() {
   // A 4 x 3 image with two bytes of row padding.
   uint8_t buf[6 * 3] = {0, 100, 8, 8, 0, 0, 200, 40, 8, 8, 0, 0, 16, 32, 64, 128, 0, 0};
-  image_u8_t im = {4, 3, 6, buf};
+  av::Image im = {buf, 4, 3, 6};
   CHECK_NEAR(geo::BilinearAt<double>(&im, 0, 0, 0.25, 0.5), 92.5, 0.0);
   CHECK_NEAR(geo::BilinearAt<float>(&im, 0, 0, 0.25f, 0.5f), 92.5, 0.0);
   CHECK_NEAR(geo::BilinearAt<double>(&im, 2, 1, 1.0, 1.0), 128.0, 0.0);
@@ -489,7 +489,7 @@ double RefineError(av::RefineEdgesMethod method, const EdgeCase &c, double *sign
     truth[k][1] = cy + x * std::sin(a) + y * std::cos(a);
   }
   std::vector<uint8_t> pix = RenderQuad(W, H, truth, c.sigma);
-  image_u8_t im = {W, H, W, pix.data()};
+  av::Image im = {pix.data(), W, H, W};
 
   Family fam("tag36h11");
   apriltag_detector_t *td = apriltag_detector_create();
@@ -497,13 +497,13 @@ double RefineError(av::RefineEdgesMethod method, const EdgeCase &c, double *sign
   td->quad_decimate = 1;
   td->refine_edges = true;
   const double nudge[4][2] = {{0.8, -0.6}, {-0.7, 0.9}, {0.6, 0.7}, {-0.9, -0.5}};
-  struct quad q = {};
+  av::Quad q = {};
   for (int k = 0; k < 4; ++k) {
     q.p[k][0] = float(truth[k][0] + nudge[k][0]);
     q.p[k][1] = float(truth[k][1] + nudge[k][1]);
   }
   q.reversed_border = false;
-  av::RefineEdges(method, td, &im, &q);
+  av::RefineEdges(method, 1, int(fam.f->width_at_border), &im, &q);
   double worst = 0, sx = 0, sy = 0;
   for (int k = 0; k < 4; ++k) {
     worst = std::max(worst, std::hypot(q.p[k][0] - truth[k][0], q.p[k][1] - truth[k][1]));
@@ -774,10 +774,10 @@ class TagScene {
     for (int y = 0; y < tw * kCell; ++y) {
       for (int x = 0; x < tw * kCell; ++x) pix_[size_t(kOrigin + y) * kSize + kOrigin + x] = cells[size_t(y / kCell) * tw + x / kCell];
     }
-    im_.reset(new image_u8_t{kSize, kSize, kSize, pix_.data()});
+    im_.reset(new av::Image{pix_.data(), kSize, kSize, kSize});
   }
 
-  image_u8_t *image() { return im_.get(); }
+  const av::Image *image() { return im_.get(); }
   void Fill(int x0, int y0, int x1, int y1, uint8_t v) {
     for (int y = y0; y < y1; ++y) std::fill_n(pix_.begin() + size_t(y) * kSize + x0, x1 - x0, v);
   }
@@ -796,7 +796,7 @@ class TagScene {
  private:
   const apriltag_family_t *f_;
   std::vector<uint8_t> pix_;
-  std::unique_ptr<image_u8_t> im_;
+  std::unique_ptr<av::Image> im_;
 };
 
 // Payload cells that touch cell `a`, nearest first.
@@ -824,7 +824,7 @@ void TestPreRefineChecks() {
   // A solid black square has the border of a tag but fewer white payload cells than any code.
   std::vector<uint8_t> black(size_t(TagScene::kSize) * TagScene::kSize, 255);
   for (int y = 48; y < 112; ++y) std::fill_n(black.begin() + y * TagScene::kSize + 48, 64, uint8_t{0});
-  image_u8_t black_im = {TagScene::kSize, TagScene::kSize, TagScene::kSize, black.data()};
+  av::Image black_im = {black.data(), TagScene::kSize, TagScene::kSize, TagScene::kSize};
   const double square[4][2] = {{48, 48}, {112, 48}, {112, 112}, {48, 112}};
   CHECK(tst::PreRefineRejects(det.td, &black_im, square, false, on));
   CHECK(tst::PreRefineRejects(det.td, &black_im, square, false, grey_off));
@@ -836,7 +836,7 @@ void TestPreRefineChecks() {
   std::mt19937 rng(7);
   std::vector<uint8_t> noise(size_t(TagScene::kSize) * TagScene::kSize);
   for (uint8_t &v : noise) v = uint8_t(rng() & 255);
-  image_u8_t noise_im = {TagScene::kSize, TagScene::kSize, TagScene::kSize, noise.data()};
+  av::Image noise_im = {noise.data(), TagScene::kSize, TagScene::kSize, TagScene::kSize};
   int rejected = 0;
   for (int i = 0; i < 40; ++i) {
     const double x = 20 + (i % 8) * 8.0, y = 20 + (i / 8) * 8.0;

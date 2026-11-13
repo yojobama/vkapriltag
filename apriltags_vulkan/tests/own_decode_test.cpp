@@ -40,6 +40,8 @@ namespace own = apriltag_vulkan::own;
 
 namespace {
 
+apriltag_vulkan::Image ToImage(const image_u8_t *im) { return {im->buf, im->width, im->height, im->stride}; }
+
 uint64_t Bits(double v) {
   uint64_t b;
   std::memcpy(&b, &v, sizeof(b));
@@ -111,6 +113,7 @@ bool SameHomography(const double *a, const double *b) {
 // Compares upstream's and the own decode of one quad (and their raw samples); counts mismatches.
 void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, Counters *c, const char *what) {
   ++c->quads;
+  const apriltag_vulkan::Image oim = ToImage(im);
   struct quad up = {};
   std::memcpy(up.p, p, sizeof(up.p));
   up.reversed_border = reversed;
@@ -120,7 +123,7 @@ void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, C
   own::Homography h = {};
   own::RawSample first;
   own::DecodedTag tags[own::Decoder::kMaxFamilies];
-  const int n = rig.decoder.Decode(p, reversed, im, &h, &first, tags);
+  const int n = rig.decoder.Decode(p, reversed, &oim, &h, &first, tags);
 
   bool ok = true;
   const char *why = "";
@@ -160,7 +163,7 @@ void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, C
   const float up_margin = quad_sample_code(rig.td, &probe, im, &up_code);
   own::Homography sh = {};
   own::RawSample raw;
-  const bool sample_h = rig.decoder.SampleCode(p, reversed, im, &sh, &raw);
+  const bool sample_h = rig.decoder.SampleCode(p, reversed, &oim, &sh, &raw);
   ++c->samples_compared;
   const float own_margin = raw.valid ? raw.margin : -1.0f;
   if (sample_h != (probe.H != nullptr)) ok = false, why = "sample homography validity";
@@ -635,11 +638,11 @@ void Bench(const std::string &corpus, const std::string &quads_file) {
     const double t_up = Seconds() - t0;
     t0 = Seconds();
     for (const Frame &f : frames) {
-      image_u8_t im{f.w, f.h, f.w, f.pixels};
+      const apriltag_vulkan::Image oim{f.pixels, f.w, f.h, f.w};
       for (const RecordedQuad &q : f.quads) {
         own::DecodedTag tags[own::Decoder::kMaxFamilies];
         own::Homography h;
-        const int n = rig.decoder.Decode(q.p, q.reversed, &im, &h, nullptr, tags);
+        const int n = rig.decoder.Decode(q.p, q.reversed, &oim, &h, nullptr, tags);
         sink += std::max(n, 0);
       }
     }
@@ -654,11 +657,11 @@ void Bench(const std::string &corpus, const std::string &quads_file) {
     const double t_hom = Seconds() - t0;
     t0 = Seconds();
     for (const Frame &f : frames) {
-      image_u8_t im{f.w, f.h, f.w, f.pixels};
+      const apriltag_vulkan::Image oim{f.pixels, f.w, f.h, f.w};
       for (const RecordedQuad &q : f.quads) {
         own::Homography h;
         own::RawSample raw;
-        sink += rig.decoder.SampleCode(q.p, q.reversed, &im, &h, &raw);
+        sink += rig.decoder.SampleCode(q.p, q.reversed, &oim, &h, &raw);
       }
     }
     const double t_sample = Seconds() - t0;

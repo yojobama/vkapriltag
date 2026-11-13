@@ -4,9 +4,10 @@
 #include <memory>
 #include <vector>
 
+#include "vkapriltag/Types.h"
+
 extern "C" {
 #include "apriltag.h"
-#include "common/image_u8.h"
 #include "common/zarray.h"
 }
 
@@ -65,14 +66,14 @@ class Decoder {
 
   // Samples the quad with the first family of its border polarity (libapriltag's quad_sample_code).
   // Returns false, with the homography invalid, if the quad is degenerate; *h is then unset.
-  bool SampleCode(const float p[4][2], bool reversed_border, const image_u8_t *im, Homography *h,
+  bool SampleCode(const float p[4][2], bool reversed_border, const Image *im, Homography *h,
                   RawSample *raw) const;
 
   // Decodes the quad against every family of its border polarity (libapriltag's quad_decode_index)
   // into out[0, count); `h` receives the quad's homography and `first` the first family's raw sample
   // (either may be null). Returns the count, or -1 if the quad is degenerate.
   static constexpr int kMaxFamilies = 8;
-  int Decode(const float p[4][2], bool reversed_border, const image_u8_t *im, Homography *h, RawSample *first,
+  int Decode(const float p[4][2], bool reversed_border, const Image *im, Homography *h, RawSample *first,
              DecodedTag *out) const;
 
   // The smallest Hamming distance from rcode to any code of the first family, over four rotations.

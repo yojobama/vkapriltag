@@ -134,24 +134,21 @@ int MaxCorrectedBits(const apriltag_family_t *f) {
   return best;
 }
 
-// A struct quad with the homography of its corners; has_h is false if they are degenerate or the
+// A Quad with the homography of its corners; has_h is false if they are degenerate or the
 // quad has not been decoded or sampled yet.
 struct OwnedQuad {
   OwnedQuad() = default;
   // A copy of `from` without a homography.
-  explicit OwnedQuad(const struct quad &from) : q(from) {
-    q.H = nullptr;
-    q.Hinv = nullptr;
-  }
+  explicit OwnedQuad(const Quad &from) : q(from) {}
 
-  struct quad q = {};
+  Quad q = {};
   own::Homography h = {};
   bool has_h = false;
 };
 
 // The quad whose corners are the tag-coordinate points (us[k], vs[k]) projected through `h`.
 void QuadFromHomography(const double *h, const double us[4], const double vs[4], bool reversed_border,
-                        struct quad *out) {
+                        Quad *out) {
   for (int k = 0; k < 4; ++k) {
     double x, y;
     own::Project(h, us[k], vs[k], &x, &y);
@@ -159,12 +156,10 @@ void QuadFromHomography(const double *h, const double us[4], const double vs[4],
     out->p[k][1] = static_cast<float>(y);
   }
   out->reversed_border = reversed_border;
-  out->H = nullptr;
-  out->Hinv = nullptr;
 }
 
 // The inner `width_cells` cells of a (width_cells + 2)-cell square whose homography is `h`.
-void InnerQuad(const double *h, int width_cells, bool reversed_border, struct quad *out) {
+void InnerQuad(const double *h, int width_cells, bool reversed_border, Quad *out) {
   const double r = static_cast<double>(width_cells) / (width_cells + 2);
   const double us[4] = {-r, r, r, -r}, vs[4] = {-r, -r, r, r};  // quad_update_homographies' corners
   QuadFromHomography(h, us, vs, reversed_border, out);
@@ -206,8 +201,8 @@ TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cp
                  : std::make_shared<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker",
                                                 ResolvePoolOptions(pool_options, background_thread))),
       refine_method_(ResolveRefineEdgesMethod(refine_method)),
+      decimation_(static_cast<int>(decimation)),
       probe_margin_(probe_margin) {
-  // refine_edges() reads td_->quad_decimate for its search radius.
   td_->quad_decimate = static_cast<float>(decimation);
   detections_ = zarray_create(sizeof(apriltag_detection_t *));
   own_decoder_ = std::make_unique<own::Decoder>();
@@ -285,13 +280,15 @@ TagDecoder::~TagDecoder() {
 // What every candidate of one Decode() call shares: the frame, the switches and the family, read once.
 struct DecodeEnv : DecodeSwitches {
   apriltag_detector_t *td = nullptr;
-  image_u8_t *im = nullptr;
+  const Image *im = nullptr;
   bool reversed_border = false;
   bool timing = false;
   RefineEdgesMethod refine_method = RefineEdgesMethod::kProfile;
   int min_white_cells = 0;
   const ThirdBitIndex *third_index = nullptr;
   apriltag_family_t *family = nullptr;  // the first registered family, null if none
+  int decimation = 1;
+  int width_at_border = 0;  // the first family's, 0 if none
   int family_count = 0;
   const own::Decoder *own = nullptr;
 };
@@ -332,7 +329,7 @@ int DecodeQuad(const DecodeEnv &env, OwnedQuad &quad, zarray_t *found, own::RawS
 // A quad sampled as the decoder would, before it is refined: the code word read, the decision margin
 // and the homography built for it (null if the quad is degenerate).
 struct UnrefinedSample {
-  UnrefinedSample(const DecodeEnv &env, const struct quad &from) : quad(from) {
+  UnrefinedSample(const DecodeEnv &env, const Quad &from) : quad(from) {
     own::RawSample raw;
     quad.has_h = env.own->SampleCode(quad.q.p, quad.q.reversed_border, env.im, &quad.h, &raw);
     margin = raw.valid ? raw.margin : -1.0f;
@@ -374,7 +371,7 @@ bool NormaliseCandidate(const DecodeEnv &env, Candidate &c) {
   double fitted[4][2];
   const double xlo = std::min(c.input.p[0][0], c.input.p[2][0]), xhi = std::max(c.input.p[0][0], c.input.p[2][0]);
   const double ylo = std::min(c.input.p[0][1], c.input.p[2][1]), yhi = std::max(c.input.p[0][1], c.input.p[2][1]);
-  if (!env.small_rescue || !FitSmallQuad(env.im->buf, env.im->width, env.im->height, xlo, ylo, xhi, yhi, fitted)) {
+  if (!env.small_rescue || !FitSmallQuad(env.im->data, env.im->width, env.im->height, env.im->stride, xlo, ylo, xhi, yhi, fitted)) {
     return false;
   }
   for (int k = 0; k < 4; ++k) {
@@ -434,7 +431,7 @@ bool PreRefineRejects(const DecodeEnv &env, Candidate &c) {
     const double min_side = geom::MinSide(c.quad.q.p);
     large_enough = !c.input.coarse && min_side >= 1.5 * family->width_at_border;
     // A quad the small rescue would refit when it fails to decode is kept.
-    if (env.small_rescue && env.td->quad_decimate > 1 && !c.input.coarse && c.input.gradient >= 60.0f) {
+    if (env.small_rescue && env.decimation > 1 && !c.input.coarse && c.input.gradient >= 60.0f) {
       const geom::Bounds box = geom::QuadBounds(c.input.p);
       if (box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0) large_enough = false;
     }
@@ -445,7 +442,7 @@ bool PreRefineRejects(const DecodeEnv &env, Candidate &c) {
   if (reject && env.grey_margin) {
     reject = false;
     if (outer.quad.has_h) {
-      struct quad inner;
+      Quad inner;
       InnerQuad(outer.quad.h.h, family->width_at_border, env.reversed_border, &inner);
       reject = SampleCannotDecode(env, UnrefinedSample(env, inner));
     }
@@ -458,7 +455,7 @@ bool PreRefineRejects(const DecodeEnv &env, Candidate &c) {
 void RefineCandidate(const DecodeEnv &env, Candidate &c) {
   if (!env.td->refine_edges) return;
   VKA_PROF_SCOPE("tag.refine");
-  RefineEdges(env.refine_method, env.td, env.im, &c.quad.q);
+  RefineEdges(env.refine_method, env.decimation, env.width_at_border, env.im, &c.quad.q);
   c.clock.Lap(&c.refine_ms);
 }
 
@@ -478,7 +475,7 @@ void TryInnerSquare(const DecodeEnv &env, Candidate &c) {
   OwnedQuad inner;
   InnerQuad(c.quad.h.h, env.family->width_at_border, env.reversed_border, &inner.q);
   if (DecodeQuad(env, inner, nullptr) == 0) return;
-  RefineEdges(env.refine_method, env.td, env.im, &inner.q);
+  RefineEdges(env.refine_method, env.decimation, env.width_at_border, env.im, &inner.q);
   DecodeQuad(env, inner, c.found);
 }
 
@@ -500,7 +497,7 @@ void TrySideOneOut(const DecodeEnv &env, Candidate &c) {
   const double us[4] = {u0, u1, u1, u0}, vs[4] = {v0, v0, v1, v1};
   OwnedQuad moved;
   QuadFromHomography(c.quad.h.h, us, vs, env.reversed_border, &moved.q);
-  RefineEdges(env.refine_method, env.td, env.im, &moved.q);
+  RefineEdges(env.refine_method, env.decimation, env.width_at_border, env.im, &moved.q);
   zarray_truncate(c.probe, 0);
   DecodeQuad(env, moved, c.probe);
   bool keep = false;
@@ -543,14 +540,14 @@ void TryThirdBit(const DecodeEnv &env, Candidate &c) {
 // A small quad that did not decode: refit it from the full-resolution image and try again.
 void TrySmallRescue(const DecodeEnv &env, Candidate &c) {
   const DetectedQuad &in = c.input;
-  if (!(env.small_rescue && env.td->quad_decimate > 1 && !in.coarse && in.gradient >= 60.0f && env.td->refine_edges &&
+  if (!(env.small_rescue && env.decimation > 1 && !in.coarse && in.gradient >= 60.0f && env.td->refine_edges &&
         zarray_size(c.found) == 0)) {
     return;
   }
   const geom::Bounds box = geom::QuadBounds(in.p);
   double fitted[4][2];
   if (!(box.xhi - box.xlo <= 40.0 && box.yhi - box.ylo <= 40.0 &&
-        FitSmallQuad(env.im->buf, env.im->width, env.im->height, box.xlo, box.ylo, box.xhi, box.yhi, fitted))) {
+        FitSmallQuad(env.im->data, env.im->width, env.im->height, env.im->stride, box.xlo, box.ylo, box.xhi, box.yhi, fitted))) {
     return;
   }
   VKA_PROF_SCOPE("tag.rescue");
@@ -560,7 +557,7 @@ void TrySmallRescue(const DecodeEnv &env, Candidate &c) {
     refit.q.p[k][1] = static_cast<float>(fitted[k][1]);
   }
   refit.q.reversed_border = env.reversed_border;
-  RefineEdges(env.refine_method, env.td, env.im, &refit.q);
+  RefineEdges(env.refine_method, env.decimation, env.width_at_border, env.im, &refit.q);
   DecodeQuad(env, refit, c.found);
 }
 
@@ -649,13 +646,14 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
 
 namespace {
 
-DecodeEnv MakeDecodeEnv(apriltag_detector_t *td, image_u8_t *im, bool reversed_border, bool timing,
+DecodeEnv MakeDecodeEnv(apriltag_detector_t *td, int decimation, const Image *im, bool reversed_border, bool timing,
                         RefineEdgesMethod refine_method, const ThirdBitIndex *third_index,
                         const DecodeSwitches &switches, const own::Decoder *own_decoder) {
   DecodeEnv env;
   env.own = own_decoder;
   static_cast<DecodeSwitches &>(env) = switches;
   env.td = td;
+  env.decimation = decimation;
   env.im = im;
   env.reversed_border = reversed_border;
   env.timing = timing;
@@ -663,6 +661,7 @@ DecodeEnv MakeDecodeEnv(apriltag_detector_t *td, image_u8_t *im, bool reversed_b
   env.third_index = third_index;
   env.family_count = zarray_size(td->tag_families);
   if (env.family_count > 0) zarray_get(td->tag_families, 0, &env.family);
+  if (env.family) env.width_at_border = env.family->width_at_border;
   if (switches.dark_reject && env.family_count == 1) {
     env.min_white_cells = env.family->nbits;
     for (uint32_t k = 0; k < env.family->ncodes; ++k) {
@@ -674,7 +673,7 @@ DecodeEnv MakeDecodeEnv(apriltag_detector_t *td, image_u8_t *im, bool reversed_b
 
 }  // namespace
 
-DecodeEnv TagDecoder::MakeEnv(image_u8_t *im, bool reversed_border, bool timing) {
+DecodeEnv TagDecoder::MakeEnv(const Image *im, bool reversed_border, bool timing) {
   if (third_bit_ && zarray_size(td_->tag_families) > 0) {
     apriltag_family_t *family = nullptr;
     zarray_get(td_->tag_families, 0, &family);
@@ -693,7 +692,7 @@ DecodeEnv TagDecoder::MakeEnv(image_u8_t *im, bool reversed_border, bool timing)
   switches.collect_probe = collect_probe_;
   switches.probe_margin = probe_margin_;
   if (!own_decoder_->Refresh(td_)) throw std::invalid_argument("TagDecoder: unsupported tag family");
-  return MakeDecodeEnv(td_, im, reversed_border, timing, refine_method_, &third_index_, switches, own_decoder_.get());
+  return MakeDecodeEnv(td_, decimation_, im, reversed_border, timing, refine_method_, &third_index_, switches, own_decoder_.get());
 }
 
 void TagDecoder::MergeSlotRecords() {
@@ -735,11 +734,11 @@ zarray_t *TagDecoder::Decode(const std::vector<DetectedQuad> &quads, const uint8
                              uint32_t width, uint32_t height, bool reversed_border) {
   ClearDetections(detections_);
 
-  image_u8_t im{
+  const Image im{
+      .data = gray_frame,
       .width = static_cast<int32_t>(width),
       .height = static_cast<int32_t>(height),
       .stride = static_cast<int32_t>(width),
-      .buf = const_cast<uint8_t *>(gray_frame),
   };
 
   // One scratch zarray per quad, so tasks share no mutable state beyond td_->mutex.
@@ -793,7 +792,7 @@ namespace {
 
 // A candidate over the quad with the given corners, with its own scratch arrays.
 struct TestRun {
-  TestRun(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2], bool reversed_border,
+  TestRun(apriltag_detector_t *td, const Image *im, const double corners[4][2], bool reversed_border,
           const DecodeSwitches &switches)
       : found(zarray_create(sizeof(apriltag_detection_t *))),
         probe(zarray_create(sizeof(apriltag_detection_t *))) {
@@ -803,7 +802,7 @@ struct TestRun {
       input.p[k][0] = corners[k][0];
       input.p[k][1] = corners[k][1];
     }
-    env = MakeDecodeEnv(td, im, reversed_border, false, RefineEdgesMethod::kProfile, &third_index, switches,
+    env = MakeDecodeEnv(td, static_cast<int>(td->quad_decimate), im, reversed_border, false, RefineEdgesMethod::kProfile, &third_index, switches,
                         &own_decoder);
     candidate.emplace(env, input, found, probe);
   }
@@ -829,13 +828,13 @@ struct TestRun {
 
 }  // namespace
 
-bool PreRefineRejects(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2], bool reversed_border,
+bool PreRefineRejects(apriltag_detector_t *td, const Image *im, const double corners[4][2], bool reversed_border,
                       const DecodeSwitches &switches) {
   TestRun run(td, im, corners, reversed_border, switches);
   return apriltag_vulkan::PreRefineRejects(run.env, *run.candidate);
 }
 
-StepResult RunCandidateSteps(apriltag_detector_t *td, image_u8_t *im, const double corners[4][2],
+StepResult RunCandidateSteps(apriltag_detector_t *td, const Image *im, const double corners[4][2],
                              bool reversed_border, const DecodeSwitches &switches) {
   TestRun run(td, im, corners, reversed_border, switches);
   StepResult result;
