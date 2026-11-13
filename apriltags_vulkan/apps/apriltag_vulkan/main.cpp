@@ -8,12 +8,8 @@
 #include <string>
 #include <vector>
 
-#include "vkapriltag/TagDecoder.h"
-#include "vkapriltag/apriltag_family.h"
 #include "v4l2_capture.h"
-#include "vkapriltag/gpu/GpuDetector.h"
-#include "vkapriltag/gpu/QuadDecode.h"
-#include "vkapriltag/vk/Context.h"
+#include "vkapriltag/Detector.h"
 
 namespace {
 
@@ -86,16 +82,6 @@ int main(int argc, char **argv) {
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
 
-  const apriltag_vulkan::Family *tf = nullptr;
-  if (!setup_tag_family(&tf, family_name.c_str())) {
-    return 1;
-  }
-
-  // Tag decode on the CPU (no pose estimation).
-  apriltag_vulkan::TagDecoderConfig decoder_config;
-  decoder_config.families = {tf};
-  decoder_config.refine_edges = false;  // Set to true to enable edge refinement.
-
   try {
     // The camera first: the detector is built for the size the driver actually negotiated.
     apriltag_vulkan::V4l2Capture capture(device, width, height);
@@ -103,26 +89,15 @@ int main(int argc, char **argv) {
       std::cerr << "Requested " << width << "x" << height << " but device negotiated "
                << capture.width() << "x" << capture.height() << "; adjust --width/--height."
                << std::endl;
-      teardown_tag_family(&tf, family_name.c_str());
       return 1;
     }
 
-    apriltag_vulkan::vk::Context ctx;
-
-    apriltag_vulkan::DetectorConfig config;
-    config.width = width;
-    config.height = height;
-    config.tag_width = static_cast<uint32_t>(tf->width_at_border);
-    config.reversed_border = tf->reversed_border;
-    config.normal_border = !tf->reversed_border;
-
-    // decimation must match config.decimation, so this is built after config.
-    const auto pool = apriltag_vulkan::MakeWorkerPool(config);
-    apriltag_vulkan::TagDecoder tag_decoder(decoder_config, config.decimation, 0, apriltag_vulkan::RefineEdgesMethod::kProfile,
-                                            0.0f, apriltag_vulkan::WorkerPoolOptions(), false, false, pool);
-
-    apriltag_vulkan::GpuDetector detector(ctx, config);
-    apriltag_vulkan::QuadDecode quad_decode(config, pool);
+    apriltag_vulkan::DetectorOptions options;
+    options.width = width;
+    options.height = height;
+    options.families = {family_name};
+    options.refine_edges = false;  // Set to true to refine each quad's corners before decoding.
+    apriltag_vulkan::Detector detector(options);
 
     std::vector<uint8_t> gray;
     uint64_t frame_index = 0;
@@ -134,35 +109,17 @@ int main(int argc, char **argv) {
       // A short timeout keeps Ctrl+C responsive when the stream stalls.
       if (!capture.CaptureGrayFrame(gray, 200)) continue;
 
-      detector.Detect(gray.data());
-      const auto &profile = detector.last_profile();
+      const apriltag_vulkan::Result &result = detector.Detect(gray.data());
+      const apriltag_vulkan::Timing &timing = result.timing;
 
-      const auto t0 = std::chrono::steady_clock::now();
-      std::vector<apriltag_vulkan::DetectedQuad> quads =
-          quad_decode.Decode(detector.last_line_fit_points);
-      const auto t1 = std::chrono::steady_clock::now();
-
-      const auto &detections = tag_decoder.Decode(quads, gray.data(), width, height, config.reversed_border);
-      const auto t2 = std::chrono::steady_clock::now();
-
-      const double quaddecode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-      const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-
-      std::cout << "Frame " << frame_index << ": " << quads.size() << " candidate quad(s), "
-           << detections.size() << " decoded tag(s). "
-           << "GPU(total=" << profile.total_ms << " ms, upload=" << profile.upload_ms
-           << ", label=" << profile.threshold_label_ms << ", boundary=" << profile.boundary_ms
-           << ", sort=" << profile.sort_group_ms << ", linefit=" << profile.linefit_ms
-           << ", readback=" << profile.readback_ms << " ms; uf_iters="
-           << profile.uf_iterations << (profile.uf_converged ? "" : "!")
-           << ", raw_blobs=" << profile.raw_blobs
-           << ", submits=" << profile.submits
-           << ", blobs=" << profile.selected_blobs << ", points=" << profile.points
-           << "), CPU(quad_decode=" << quaddecode_ms << " ms, decode=" << decode_ms << " ms)"
-               << std::endl;
-      print_detections(detections);
-
-      // Pose estimation is not wired up here; see README.md.
+      std::cout << "Frame " << frame_index << ": " << timing.candidates << " candidate quad(s), "
+                << result.detections.size() << " decoded tag(s). GPU(total=" << timing.gpu_ms
+                << " ms, submits=" << timing.submits << "), CPU(quad_decode=" << timing.quad_ms
+                << " ms, decode=" << timing.decode_ms << " ms)" << std::endl;
+      for (const apriltag_vulkan::Detection &d : result.detections) {
+        std::cout << "  id=" << d.id << " hamming=" << d.hamming << " margin=" << d.decision_margin
+                  << " centre=(" << d.c[0] << ", " << d.c[1] << ")" << std::endl;
+      }
 
       if (!dump_path.empty() && dump_every_n_frames > 0 &&
           frame_index % dump_every_n_frames == 0) {
@@ -175,10 +132,7 @@ int main(int argc, char **argv) {
     std::cout << "Shutting down." << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "Fatal error: " << e.what() << std::endl;
-    teardown_tag_family(&tf, family_name.c_str());
     return 1;
   }
-
-  teardown_tag_family(&tf, family_name.c_str());
   return 0;
 }

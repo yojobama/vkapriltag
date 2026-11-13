@@ -40,6 +40,33 @@ def walk(base, pattern):
     return [p for p in base.rglob(pattern) if p.is_file() and p.relative_to(base).parts[:1] not in (("build",), ("out",))]
 
 
+PUBLIC = {"Detector.h", "Detection.h", "Family.h", "Pose.h", "Version.h"}
+PUBLIC_INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]')
+
+
+def check_public_headers(root):
+    """The installed headers are the facade set, and include nothing but each other and the standard library."""
+    failures = []
+    inc = root / "library" / "include" / "vkapriltag"
+    for path in sorted(inc.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(inc).as_posix()
+        if rel not in PUBLIC:
+            failures.append(f"library/include/vkapriltag/{rel}: only {sorted(PUBLIC)} are installed headers")
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            m = PUBLIC_INCLUDE.match(line)
+            if not m:
+                continue
+            kind, target = m.groups()
+            if kind == '"' and target.removeprefix("vkapriltag/") not in PUBLIC:
+                failures.append(f"{rel}:{n}: an installed header includes {target}")
+            if kind == "<" and (target.startswith("vulkan") or "." in target):
+                failures.append(f"{rel}:{n}: an installed header includes {target}")
+    return failures
+
+
 def check_cmake(root):
     """The default configure must not reach upstream."""
     failures = []
@@ -92,6 +119,7 @@ def main():
         if re.search(r"\bapriltag\b", block.group(0).replace("vkapriltag", "")):
             failures.append("library/CMakeLists.txt: the vkapriltag target links apriltag")
     failures += check_cmake(root)
+    failures += check_public_headers(root)
     for f in sorted(set(failures)):
         print("FAIL", f)
     print(f"checked {checked} files outside the upstream-comparing set ({len(ALLOWED)} files)")
