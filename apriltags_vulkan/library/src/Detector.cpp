@@ -69,7 +69,7 @@ struct Detector::Impl {
   std::vector<const Family *> families;
   DetectorConfig config;
   std::shared_ptr<WorkerPool> pool;
-  std::unique_ptr<vk::Lane> lane;
+  std::unique_ptr<vk::Lane> lane, lane_second;
   std::unique_ptr<GpuDetector> gpu, gpu_second;
   std::unique_ptr<QuadDecode> quad;
   std::unique_ptr<TagDecoder> decoder;
@@ -161,7 +161,10 @@ struct Detector::Impl {
         quad = std::make_unique<QuadDecode>(config, pool);
         if (options.mode == Mode::kPipelined) {
           if (options.pipeline_depth == 2) {
-            gpu_second = std::make_unique<GpuDetector>(ctx, *lane_ptr, config);
+            // A lane is used by one thread at a time, so the second detector gets its own lane on the same queue.
+            lane_second = ctx.CreateSiblingLane(*lane_ptr);
+            if (!lane_second) Fail(ErrorCode::kUnsupported, "pipeline_depth 2 needs a second lane");
+            gpu_second = std::make_unique<GpuDetector>(ctx, *lane_second, config);
             pipeline = std::make_unique<FramePipeline>(*gpu, *gpu_second, *quad, *decoder);
           } else {
             pipeline = std::make_unique<FramePipeline>(*gpu, *quad, *decoder);
