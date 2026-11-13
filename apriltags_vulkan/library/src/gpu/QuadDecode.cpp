@@ -214,51 +214,41 @@ struct FitQuadResult {
 };
 
 // Index of the largest value(i) over [begin, end), the lowest such index on ties, folded into
-// (best, best_idx) with ties again going to the lower index. Four lanes run independently.
+// (best, best_idx) with ties again going to the lower index: a vectorisable maximum pass, then a
+// search for its first position.
 template <typename T, typename F>
 inline void ArgMax(size_t begin, size_t end, F value, T &best, size_t &best_idx) {
-  T lane_best[4] = {T(-1), T(-1), T(-1), T(-1)};
-  size_t lane_idx[4] = {SIZE_MAX, SIZE_MAX, SIZE_MAX, SIZE_MAX};
-  size_t i = begin;
-  for (; i + 4 <= end; i += 4) {
-    for (int k = 0; k < 4; ++k) {
-      const T v = value(i + k);
-      if (v > lane_best[k]) {
-        lane_best[k] = v;
-        lane_idx[k] = i + k;
-      }
-    }
-  }
-  for (; i < end; ++i) {
+  if (begin >= end) return;
+  T top = T(-1);
+  for (size_t i = begin; i < end; ++i) {
     const T v = value(i);
-    if (v > lane_best[0]) {
-      lane_best[0] = v;
-      lane_idx[0] = i;
-    }
+    top = v > top ? v : top;
   }
-  for (int k = 0; k < 4; ++k) {
-    if (lane_best[k] > best || (lane_best[k] == best && lane_idx[k] < best_idx)) {
-      best = lane_best[k];
-      best_idx = lane_idx[k];
-    }
-  }
+  if (top < best || (top == best && begin > best_idx)) return;
+  size_t i = begin;
+  while (value(i) != top) ++i;
+  best = top;
+  best_idx = i;
 }
+
+// A blob's points unpacked into separate arrays.
+struct UnpackedPoints {
+  const int32_t *x, *y, *w;
+};
 
 // Seeds 4 corner indices: the two mutually-farthest points (2-pass approximation), then the
 // point of maximum perpendicular deviation on each arc. Returns false if the blob does not look
 // like a clean quad (too few points, degenerate diameter, empty arc, or no real deviation).
-bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, size_t n,
-                         uint32_t out_indices[4]) {
+// Coordinates are below 2^14, so squared distances and cross products fit in int32.
+bool FindDpCornerIndices(const UnpackedPoints &pts, size_t n, uint32_t out_indices[4]) {
   if (n < 8) return false;
 
-  const RawLineFitPoint *pts = points.data() + begin;
-  // Squared distance between two points, exact in int64.
-  auto sq_dist = [pts](size_t a, size_t b) {
-    const int64_t dx = pts[a].x2() - pts[b].x2(), dy = pts[a].y2() - pts[b].y2();
+  auto sq_dist = [&pts](size_t a, size_t b) {
+    const int32_t dx = pts.x[a] - pts.x[b], dy = pts.y[a] - pts.y[b];
     return dx * dx + dy * dy;
   };
 
-  int64_t best_d = -1;
+  int32_t best_d = -1;
   size_t a_idx = 0;
   ArgMax(1, n, [&](size_t i) { return sq_dist(0, i); }, best_d, a_idx);
   best_d = -1;
@@ -270,16 +260,15 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
 
   const size_t lo = std::min(a_idx, b_idx), hi = std::max(a_idx, b_idx);
 
-  // Cross product of (b - a) and (p - a), exact in int64, squared in double.
-  const int64_t ax = pts[a_idx].x2(), ay = pts[a_idx].y2();
-  const int64_t abx = pts[b_idx].x2() - ax, aby = pts[b_idx].y2() - ay;
+  const int32_t ax = pts.x[a_idx], ay = pts.y[a_idx];
+  const int32_t abx = pts.x[b_idx] - ax, aby = pts.y[b_idx] - ay;
   auto perp = [&](size_t i) {
-    const double cross = static_cast<double>(abx * (pts[i].y2() - ay) - aby * (pts[i].x2() - ax));
-    return cross * cross;
+    const int32_t cross = abx * (pts.y[i] - ay) - aby * (pts.x[i] - ax);
+    return cross < 0 ? -cross : cross;
   };
 
   size_t c1_idx = n, c2_idx = n;  // n is not a valid index; doubles as "not found"
-  double best_perp1 = -1.0, best_perp2 = -1.0;
+  int32_t best_perp1 = -1, best_perp2 = -1;
   ArgMax(lo + 1, hi, perp, best_perp1, c1_idx);
   ArgMax(0, lo, perp, best_perp2, c2_idx);
   ArgMax(hi + 1, n, perp, best_perp2, c2_idx);
@@ -288,7 +277,8 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
   // Reject degenerate shapes: both corners must deviate from the diameter line (threshold is
   // scaled by diameter_sq^2).
   const double min_perp = 0.0001 * diameter_sq * diameter_sq;
-  if (best_perp1 < min_perp || best_perp2 < min_perp) return false;
+  const double p1 = static_cast<double>(best_perp1), p2 = static_cast<double>(best_perp2);
+  if (p1 * p1 < min_perp || p2 * p2 < min_perp) return false;
 
   // Circular order: lo -> c1 -> hi -> c2. c1 lies between lo and hi, c2 outside [lo, hi].
   out_indices[0] = static_cast<uint32_t>(lo);
@@ -300,20 +290,19 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
 
 // The moments of the circular, inclusive index range [i0, i1] of pts[0, n), relative to (x0, y0);
 // i0 >= i1 wraps, as ReadMomentsWindow. The same integers as the prefix-sum difference.
-inline LineFitMoments SumMomentsWindow(const RawLineFitPoint *pts, size_t n, size_t i0,
-                                       size_t i1, int32_t x0, int32_t y0) {
+inline LineFitMoments SumMomentsWindow(const UnpackedPoints &pts, size_t n, size_t i0, size_t i1,
+                                       int32_t x0, int32_t y0) {
   int64_t mx = 0, my = 0, w_sum = 0, mxx = 0, mxy = 0, myy = 0;
   auto add = [&](size_t from, size_t to) {
     for (size_t k = from; k < to; ++k) {
-      const int32_t x2 = pts[k].x2() - x0, y2 = pts[k].y2() - y0, w = pts[k].W();
-      const int64_t wx = static_cast<int64_t>(w) * x2;
-      const int64_t wy = static_cast<int64_t>(w) * y2;
+      const int32_t x2 = pts.x[k] - x0, y2 = pts.y[k] - y0, w = pts.w[k];
+      const int32_t wx = w * x2, wy = w * y2;
       mx += wx;
       my += wy;
       w_sum += w;
-      mxx += wx * x2;
-      mxy += wx * y2;
-      myy += wy * y2;
+      mxx += static_cast<int64_t>(wx) * x2;
+      mxy += static_cast<int64_t>(wx) * y2;
+      myy += static_cast<int64_t>(wy) * y2;
     }
   };
   if (i0 < i1) {
@@ -336,15 +325,13 @@ inline LineFitMoments SumMomentsWindow(const RawLineFitPoint *pts, size_t n, siz
 // Tries DP corner seeding for one blob, summing each segment's moments directly. Returns an
 // invalid result if seeding fails or a segment exceeds max_line_fit_mse (the caller then falls
 // back to peaks).
-FitQuadResult TryDpQuad(const DetectorConfig &config, std::span<const RawLineFitPoint> points,
-                        size_t begin, size_t total_points) {
+FitQuadResult TryDpQuad(const DetectorConfig &config, const UnpackedPoints &pts, size_t total_points) {
   FitQuadResult result;
   uint32_t idx[4];
-  if (!FindDpCornerIndices(points, begin, total_points, idx)) return result;
+  if (!FindDpCornerIndices(pts, total_points, idx)) return result;
 
-  const RawLineFitPoint *pts = points.data() + begin;
-  result.x0 = pts[0].x2();
-  result.y0 = pts[0].y2();
+  result.x0 = pts.x[0];
+  result.y0 = pts.y[0];
   for (int k = 0; k < 4; ++k) {
     result.moments[k] =
         SumMomentsWindow(pts, total_points, idx[k], idx[(k + 1) % 4], result.x0, result.y0);
@@ -370,7 +357,17 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
 
   if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
     result.dp_attempted = true;  // sticks even if we fall through to peaks below
-    FitQuadResult dp_result = TryDpQuad(config, points, begin, total_points);
+    scratch.px.resize(total_points);
+    scratch.py.resize(total_points);
+    scratch.pw.resize(total_points);
+    for (size_t k = 0; k < total_points; ++k) {
+      const RawLineFitPoint &p = points[begin + k];
+      scratch.px[k] = p.x2();
+      scratch.py[k] = p.y2();
+      scratch.pw[k] = p.W();
+    }
+    const UnpackedPoints unpacked{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
+    FitQuadResult dp_result = TryDpQuad(config, unpacked, total_points);
     if (dp_result.valid) {
       dp_result.dp_attempted = true;
       dp_result.dp_used = true;
@@ -420,26 +417,79 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
 
   const int ksz = std::min<int>(20, static_cast<int>(total_points / 12));
 
-  // Windowed error per point. Circular indices use conditional subtraction instead of `%`.
+  // Windowed error per point. Windows that do not wrap are evaluated in two vectorisable stages;
+  // the rest use circular indices with conditional subtraction instead of `%`.
   const size_t n = total_points;
   const size_t k_off = static_cast<size_t>(ksz);
-  for (size_t i = 0; i < n; ++i) {
-    const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
-    size_t i1 = i + k_off;
-    if (i1 >= n) i1 -= n;
-    error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+  if (k_off >= 1 && n > 2 * k_off + 1) {
+    const size_t first = k_off + 1, last = n - k_off - 1;  // i0 >= 1 and i1 < n inside [first, last]
+    const size_t count = last - first + 1;
+    scratch.win_diff.resize(count);
+    scratch.win_xy2.resize(count);
+    scratch.win_sum.resize(count);
+    scratch.win_w8.resize(count);
+    float *wd = scratch.win_diff.data(), *wx = scratch.win_xy2.data(), *wsum = scratch.win_sum.data(),
+          *w8 = scratch.win_w8.data();
+    const LineFitMoments *cp = cs.data();
+    for (size_t j = 0; j < count; ++j) {
+      const size_t i = first + j;
+      const LineFitMoments &hi = cp[i + k_off], &lo = cp[i - k_off - 1];
+      const int64_t W = static_cast<int32_t>(hi.W - lo.W);
+      const int32_t mx = static_cast<int32_t>(hi.Mx - lo.Mx), my = static_cast<int32_t>(hi.My - lo.My);
+      const int64_t Cxx = (hi.Mxx - lo.Mxx) * W - static_cast<int64_t>(mx) * mx;
+      const int64_t Cxy = (hi.Mxy - lo.Mxy) * W - static_cast<int64_t>(mx) * my;
+      const int64_t Cyy = (hi.Myy - lo.Myy) * W - static_cast<int64_t>(my) * my;
+      wd[j] = static_cast<float>(Cxx - Cyy);
+      wsum[j] = static_cast<float>(Cxx + Cyy);
+      wx[j] = 2 * static_cast<float>(Cxy);
+      w8[j] = static_cast<float>(static_cast<double>(W) * W * 8.0);
+    }
+    const int32_t window_n = static_cast<int32_t>(2 * k_off + 1);
+    double *err = error.data() + first;
+    for (size_t j = 0; j < count; ++j) {
+      const double dx = wd[j], dy = wx[j];
+      const float h = static_cast<float>(std::sqrt(dx * dx + dy * dy));
+      const float eig_small = (wsum[j] - h) / w8[j];
+      err[j] = window_n * eig_small;
+    }
+    for (size_t i = 0; i < first; ++i) {
+      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+      size_t i1 = i + k_off;
+      if (i1 >= n) i1 -= n;
+      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+    }
+    for (size_t i = last + 1; i < n; ++i) {
+      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+      size_t i1 = i + k_off;
+      if (i1 >= n) i1 -= n;
+      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+    }
+  } else {
+    for (size_t i = 0; i < n; ++i) {
+      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+      size_t i1 = i + k_off;
+      if (i1 >= n) i1 -= n;
+      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+    }
   }
 
-  // 7-tap Gaussian filter, applied circularly.
+  // 7-tap Gaussian filter, applied circularly, over the errors padded with their wrap-around.
   constexpr size_t kHalf = kFilterCoefficients.size() / 2;  // 3
-  for (size_t i = 0; i < n; ++i) {
-    double accumulated = 0.0;
-    size_t idx = (i >= kHalf) ? (i - kHalf) : (i + n - kHalf);
-    for (size_t j = 0; j < kFilterCoefficients.size(); ++j) {
-      accumulated += error[idx] * kFilterCoefficients[j];
-      if (++idx == n) idx = 0;
+  std::vector<double> &padded = scratch.padded;
+  padded.resize(n + 2 * kHalf);
+  for (size_t j = 0; j < kHalf; ++j) {
+    padded[j] = error[(j + n - kHalf) % n];
+    padded[n + kHalf + j] = error[j % n];
+  }
+  std::copy(error.begin(), error.begin() + static_cast<std::ptrdiff_t>(n), padded.begin() + kHalf);
+  {
+    const double *e = padded.data();
+    double *f = filtered.data();
+    for (size_t i = 0; i < n; ++i) {
+      double accumulated = 0.0;
+      for (size_t j = 0; j < kFilterCoefficients.size(); ++j) accumulated += e[i + j] * kFilterCoefficients[j];
+      f[i] = accumulated;
     }
-    filtered[i] = accumulated;
   }
 
   // Peaks are strict local maxima of the filtered error, stored negated so an ascending sort
@@ -460,8 +510,8 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   const size_t K = std::min<size_t>(peaks.size(), kNMaxima);
   if (K < 4) return result;
 
-  std::stable_sort(peaks.begin(), peaks.end(),
-                   [](const auto &a, const auto &b) { return a.first < b.first; });
+  std::partial_sort(peaks.begin(), peaks.begin() + static_cast<std::ptrdiff_t>(K), peaks.end(),
+                    [](const auto &a, const auto &b) { return a.first != b.first ? a.first < b.first : a.second < b.second; });
   std::array<uint32_t, kNMaxima> point_indices{};
   for (size_t k = 0; k < K; ++k) point_indices[k] = peaks[k].second;
   std::sort(point_indices.begin(), point_indices.begin() + K);
@@ -471,12 +521,20 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   double seg_mse[kNMaxima][kNMaxima];
   double seg_params[kNMaxima][kNMaxima][2];
   for (size_t a = 0; a < K; ++a) {
-    for (size_t b = 0; b < K; ++b) {
-      if (a == b) continue;
-      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), 0, 0,
-              nullptr, seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
+    for (size_t b = a + 1; b < K; ++b) {
+      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), 0, 0, nullptr,
+              seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
     }
   }
+  // The closing segments (b, a) are fitted when the search first needs them.
+  bool closing_done[kNMaxima][kNMaxima] = {};
+  auto closing = [&](size_t b, size_t a) {
+    if (!closing_done[b][a]) {
+      closing_done[b][a] = true;
+      FitLine(ReadMomentsWindow(cs, total_points, point_indices[b], point_indices[a]), 0, 0, nullptr,
+              nullptr, &seg_err[b][a], &seg_mse[b][a]);
+    }
+  };
   const double max_mse = config.max_line_fit_mse;
 
   // Brute force all C(10, 4) = 210 combinations, keeping the minimum total error.
@@ -502,6 +560,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
         for (uint32_t m3 = m2 + 1; m3 < kNMaxima; ++m3) {
           if (m3 >= K) break;
           if (seg_mse[m2][m3] > max_mse) continue;
+          closing(m3, m0);
           if (seg_mse[m3][m0] > max_mse) continue;
 
           const double total = errm0m1 + errm1m2 + seg_err[m2][m3] + seg_err[m3][m0];
