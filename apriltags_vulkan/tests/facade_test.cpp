@@ -82,7 +82,17 @@ void TestPipelined(uint32_t depth) {
   const av::Result &last = detector.Flush();
   if (last.ready) got.push_back(Ids(last));
   CHECK(got.size() >= frames.size() - depth);
-  for (size_t i = 0; i < got.size() && i < expected.size(); ++i) CHECK(got[i] == expected[i]);
+  for (size_t i = 0; i < got.size() && i < expected.size(); ++i) {
+    if (got[i] != expected[i]) {
+      std::printf("pipelined depth %u result %zu: ", depth, i);
+      for (int id : got[i]) std::printf("%d ", id);
+      std::printf("expected: ");
+      for (int id : expected[i]) std::printf("%d ", id);
+      std::printf("
+");
+    }
+    CHECK(got[i] == expected[i]);
+  }
 }
 
 void TestTracking(bool async) {

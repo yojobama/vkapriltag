@@ -121,7 +121,12 @@ struct Detector::Impl {
 
     vk::Lane *lane_ptr = &ctx.default_lane();
     if (options.stream > 0) {
-      lane = ctx.CreateLane(options.stream);
+      // A device with fewer queues than streams shares its first queue between them.
+      try {
+        lane = ctx.CreateLane(options.stream);
+      } catch (const std::runtime_error &) {
+        lane.reset();
+      }
       if (lane) lane_ptr = lane.get();
     }
 
