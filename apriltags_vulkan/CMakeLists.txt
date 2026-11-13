@@ -46,6 +46,12 @@ if(VKAPRILTAG_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+# Python (and, from the same interface, Java and C#) bindings of the public Detector.
+option(VKAPRILTAG_BUILD_SWIG "Build the SWIG Python bindings (needs SWIG 4.1 or later and Python development files)" OFF)
+if(VKAPRILTAG_BUILD_SWIG)
+  add_subdirectory(bindings/swig)
+endif()
+
 # ---------------------------------------------------------------------------
 # CPack: packages the install() rules of library/CMakeLists.txt; inert unless cpack is invoked.
 # ---------------------------------------------------------------------------
