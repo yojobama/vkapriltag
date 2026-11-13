@@ -6,7 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 
-// Derived from AprilRobotics apriltag v3.4.5 (apriltag.c, common/g2d.c, apriltag_math.h), BSD-2-Clause.
+// Derived from AprilRobotics apriltag v3.4.5 (apriltag.c, common/g2d.c, apriltag_math.h, common/homography.h),
+// Copyright (C) 2013-2016 The Regents of The University of Michigan, BSD-2-Clause; see NOTICE.
 namespace apriltag_vulkan::own {
 
 namespace {

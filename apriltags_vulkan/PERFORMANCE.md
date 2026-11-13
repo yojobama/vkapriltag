@@ -1499,7 +1499,8 @@ ground_truth`: 658/767 (RX 9060 XT) and 659/767 (Orange Pi), unchanged.
 sampling the unrefined quad's bits and refining only quads within a Hamming distance of a code. This
 section measures that idea with a probe built into `TagDecoder` and finds a better signal.
 
-**Tooling.** `cmake/patches/apriltag-expose-code-probe.patch` exposes `quad_sample_code()` (upstream's
+**Tooling.** `tools/upstream/patches/apriltag-expose-code-probe.patch` (moved there when the library dropped its
+libapriltag dependency; only the test-vector generator still applies it) exposes `quad_sample_code()` (upstream's
 bit sampling for a quad, up to the code lookup) and `apriltag_min_hamming()`. With
 `APRILTAG_VK_PROBE_STATS=1` `TagDecoder` histograms, for every candidate quad, the Hamming distance
 from its unrefined bits to the nearest code, split by whether the full refine + decode accepted it;
@@ -2299,8 +2300,8 @@ desktop and 600 on the Orange Pi.
   (`cortex-a76.cortex-a55` for the RK3588), `/arch:<arch>` with `/fp:contract` on MSVC (`AVX2`),
   for the library and libapriltag; `QuadDecode.cpp` keeps fusion off. The binaries then need that
   CPU. Output identical to the generic build on both machines (all 331 dump files).
-- **Item 3, allocation-free decode** (a fourth libapriltag patch; benchmarked behind a switch, now
-  unconditional): `quad_update_homographies()` keeps only
+- **Item 3, allocation-free decode** (a fourth libapriltag patch, since replaced by the in-house `OwnDecode`;
+  benchmarked behind a switch, now unconditional): `quad_update_homographies()` keeps only
   `matd_inverse()`'s singularity test instead of building the unused inverse, `quad_decode_index()`
   and `quad_sample_code()` share the quad instead of copying it and both homographies per family,
   and `quad_decode()`'s two scratch buffers live on the stack. Identical output.
