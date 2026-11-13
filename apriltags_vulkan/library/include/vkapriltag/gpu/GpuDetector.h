@@ -17,6 +17,7 @@
 #include "vkapriltag/gpu/DetectorConfig.h"
 #include "vkapriltag/gpu/KeepAlive.h"
 #include "vkapriltag/gpu/PipelinePlan.h"
+#include "vkapriltag/gpu/StageTable.h"
 #include "vkapriltag/gpu/Types.h"
 #include "vkapriltag/vk/CompletionFlag.h"
 #include "vkapriltag/vk/Buffer.h"
@@ -291,10 +292,12 @@ class GpuDetector {
   // ones in runs of this length by several workgroups, then placed by one ranking pass.
   // Rank-merge run length (a power of two) and the largest blob ranked in one pass (0 disables);
   // APRILTAG_VK_SORT_RANK_ALL overrides the latter.
-  static constexpr uint32_t kSortChunk = 16u;
 
-  // --- Pipelines ---
-  vk::ComputePipeline decimate_pl_;
+  // --- Pipelines (one per Stage, built from the stage table) ---
+  std::array<vk::ComputePipeline, kNumStages> pl_;
+  vk::ComputePipeline &Pl(Stage stage) { return pl_[static_cast<size_t>(stage)]; }
+  const vk::ComputePipeline &Pl(Stage stage) const { return pl_[static_cast<size_t>(stage)]; }
+  VkBuffer Handle(Buf role) const;
   struct ImportedFrame {
     const uint8_t *key = nullptr;
     vk::Buffer buffer;
@@ -302,18 +305,11 @@ class GpuDetector {
   };
   std::vector<ImportedFrame> imported_frames_;
   void AddImportedFrame(const uint8_t *key, vk::Buffer buffer, bool yuyv);
-  vk::ComputePipeline block_minmax_pl_;
-  vk::ComputePipeline block_filter_pl_;
-  vk::ComputePipeline threshold_pl_;
   // With 8-bit storage: decimate and block_minmax in one pass (uploaded frames, decimation above 1),
   // and block_filter and threshold in one pass.
-  vk::ComputePipeline block_minmax_decimate_pl_, threshold_block_pl_, noise_floor_pl_, cell_args_pl_;
-  vk::ComputePipeline uf_init_pl_, uf_merge_pl_, uf_compress_pl_, uf_final_pl_;
   // Run starts from a workgroup max-scan, so no compression precedes the merge (single-merge only).
-  vk::ComputePipeline uf_init_scan_pl_;
   // With count_runs_: counts blob sizes per run piece and points piece starts at their roots, in
   // place of uf_compress_count; blob_diff then finds a root in two hops.
-  vk::ComputePipeline uf_count_runs_pl_;
   // True when uf_merge_pl_ is uf_merge_x4_u8.comp (4 pixels per thread).
   // Rows per band for a two-phase merge (see RecordMerge); 0 merges in one pass.
   // Records uf_init_scan and uf_count_runs.
@@ -321,26 +317,13 @@ class GpuDetector {
   void RecordCountRuns(VkCommandBuffer cmd);
   // Records uf_merge, in one pass or in two with merge_band_.
   void RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier = vk::BarrierKind::Compute);
-  // Pixels of a row each uf_init thread initialises.
-  static constexpr uint32_t uf_init_run_ = 4;
-  // Pixels of a row each threshold thread covers.
-  static constexpr uint32_t threshold_run_ = 4;
   // Also performs the atomic compaction of boundary points.
   // uf_compress plus uf_final's count, for the last real compression of the first attempt.
-  vk::ComputePipeline uf_compress_count_pl_;
-  vk::ComputePipeline blob_diff_pl_;
-  vk::ComputePipeline build_qbp_args_pl_;
-  vk::ComputePipeline select_blobs_pl_;
   // Builds indirect_args_buf_ from raw_blob_counter_buf_.
-  vk::ComputePipeline build_indirect_args_pl_;
 
-  vk::ComputePipeline hash_group_pl_, reduce_extents_hash_pl_, scatter_index_points_pl_;
 
 
   // Per-blob point base-offset assignment and the segmented local sort.
-  vk::ComputePipeline scan_blob_counts_pl_;
-  vk::ComputePipeline sort_points_local_pl_;
-  vk::ComputePipeline sort_large_runs_pl_, sort_large_merge_pl_;
 
   DetectProfile last_profile_;
   uint64_t device_bytes_ = 0;

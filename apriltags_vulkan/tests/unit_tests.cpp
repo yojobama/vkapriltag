@@ -26,6 +26,7 @@
 #include "vkapriltag/common/WorkerPool.h"
 #include "vkapriltag/gpu/PipelinePlan.h"
 #include "vkapriltag/gpu/QuadDecode.h"
+#include "vkapriltag/gpu/StageTable.h"
 #include "vkapriltag/vk/Context.h"
 
 namespace av = apriltag_vulkan;
@@ -1063,6 +1064,11 @@ void TestPlan(const char *golden_dir) {
       {"sort_wg_128", 2, nullptr, {{"APRILTAG_VK_SORT_WG", "128"}, {"APRILTAG_VK_SORT_SPLIT", "512"}}},
       {"small_shared_memory", 2, [](av::vk::DeviceCaps &c) { c.max_shared_memory_bytes = 16384; }, {}},
   };
+  for (size_t i = 0; i < av::kNumStages; ++i) {
+    const av::StageDesc &d = av::StageInfo(static_cast<av::Stage>(i));
+    CHECK(static_cast<size_t>(d.id) == i);
+    CHECK(!d.bindings.empty());
+  }
   const av::vk::DeviceCaps classes[2] = {DiscreteCaps(), IntegratedCaps()};
   const char *const names[2] = {"discrete", "integrated"};
   for (int k = 0; k < 2; ++k) {

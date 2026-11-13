@@ -57,7 +57,6 @@ constexpr VkDeviceSize kCounterStagingBytes = 64;
 
 // Largest blob the sort orders (larger ones pass through unsorted); it also bounds mode 2's cost.
 // A tag border at the largest frame (8191 decimated pixels a side) is about 50,000 points.
-constexpr uint32_t kLargeSortCap = 65536;
 
 }  // namespace
 
@@ -372,7 +371,7 @@ void GpuDetector::CreateBuffers() {
   }
   sort_scratch_buf_ = ssbo(VkDeviceSize(ipoint_capacity_) * 4);
 
-  // VkDispatchIndirectCommands built on the device by build_indirect_args_pl_.
+  // VkDispatchIndirectCommands built on the device by Pl(Stage::kBuildBlobArgs).
   {
     // Slot 1: the boundary points, one per thread; slot 2: 4 per thread.
     vk::Buffer b(ctx_, 3 * 12, kSsboUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
@@ -409,172 +408,60 @@ void GpuDetector::EnsureReadbackCapacity(VkDeviceSize bytes) {
   readback_capacity_ = readback_staging_.size();
 }
 
+VkBuffer GpuDetector::Handle(Buf role) const {
+  switch (role) {
+    case Buf::kGray: return gray_buf_.get();
+    case Buf::kDecimated: return decimated_buf_.get();
+    case Buf::kDecimatedView: return plan_.alias_decimated ? gray_buf_.get() : decimated_buf_.get();
+    case Buf::kMinMaxUnfiltered: return minmax_unfiltered_buf_.get();
+    case Buf::kMinMaxFiltered: return minmax_filtered_buf_.get();
+    case Buf::kContrastFloor: return contrast_floor_buf_.get();
+    case Buf::kActiveCells: return active_cells_buf_.get();
+    case Buf::kCellList: return cell_list_buf_.get();
+    case Buf::kCellArgs: return cell_args_buf_.get();
+    case Buf::kThresholded: return thresholded_buf_.get();
+    case Buf::kParent: return parent_buf_.get();
+    case Buf::kBlobSize: return blob_size_buf_.get();
+    case Buf::kUfChanged: return uf_changed_buf_.get();
+    case Buf::kQbpCompacted: return qbp_compacted_buf_.get();
+    case Buf::kQbpCounter: return qbp_counter_buf_.get();
+    case Buf::kQbpKeys: return qbp_keys_buf_.get();
+    case Buf::kExtents: return extents_buf_.get();
+    case Buf::kSelectedExtents: return selected_extents_buf_.get();
+    case Buf::kSelectedCounter: return selected_counter_buf_.get();
+    case Buf::kRemap: return remap_buf_.get();
+    case Buf::kPointsTotal: return points_total_buf_.get();
+    case Buf::kIndexPoints: return index_points_buf_.get();
+    case Buf::kBlobPointOffsets: return blob_point_offsets_buf_.get();
+    case Buf::kLineFitPoints: return line_fit_points_buf_.get();
+    case Buf::kHashOwner: return hash_owner_buf_.get();
+    case Buf::kPointSlot: return point_slot_buf_.get();
+    case Buf::kSlotDense: return slot_dense_buf_.get();
+    case Buf::kBlobCursor: return blob_cursor_buf_.get();
+    case Buf::kRawBlobCounter: return raw_blob_counter_buf_.get();
+    case Buf::kHashDropCounter: return hash_drop_counter_buf_.get();
+    case Buf::kOversizedSortCounter: return oversized_sort_counter_buf_.get();
+    case Buf::kLargeSort: return large_sort_buf_.get();
+    case Buf::kSortScratch: return sort_scratch_buf_.get();
+    case Buf::kIndirectArgs: return indirect_args_buf_.get();
+    case Buf::kBlobArgs: return blob_args_buf_.get();
+    case Buf::kCount: break;
+  }
+  return VK_NULL_HANDLE;
+}
+
+
 void GpuDetector::CreatePipelines() {
-  // Picks the _u8 shader variant with storageBuffer8BitAccess; decimated_buf_ and thresholded_buf_
-  // switch together.
-  const bool u8 = plan_.u8;
-  auto pick = [u8](const char *base_name, const char *u8_name) {
-    return u8 ? u8_name : base_name;
-  };
-  const VkBuffer decimated_view = plan_.alias_decimated ? gray_buf_.get() : decimated_buf_.get();
-
-  const bool subgroup = plan_.subgroup;
-
-  // 2D dispatches recover (x, y) from gl_GlobalInvocationID.xy without a divide. decimation is
-  // specialization constant 3, after the workgroup size's 0-2.
-  const bool box_dot = plan_.box_dot;
-  decimate_pl_ = vk::ComputePipeline(ctx_,
-                                     ShaderPath(box_dot ? "decimate_box_dot_u8"
-                                                : plan_.box_decimate ? pick("decimate_box", "decimate_box_u8")
-                                                              : pick("decimate", "decimate_u8")),
-                                     {gray_buf_.get(), decimated_buf_.get()}, 8, plan_.wg2d,
-                                     {config_.decimation});
-  block_minmax_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("block_minmax", "block_minmax_u8")),
-      {decimated_view, minmax_unfiltered_buf_.get()}, 16, plan_.wg2d);
-  block_filter_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("block_filter"), {minmax_unfiltered_buf_.get(), minmax_filtered_buf_.get()},
-      8, plan_.wg2d);
-  threshold_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("threshold", "threshold_u8")),
-      {decimated_view, minmax_filtered_buf_.get(), thresholded_buf_.get()}, 16, plan_.wg2d,
-      {threshold_run_});
-  if (plan_.minmax_decimate) {
-    block_minmax_decimate_pl_ = vk::ComputePipeline(
-        ctx_, ShaderPath("block_minmax_decimate_u8"),
-        {gray_buf_.get(), decimated_buf_.get(), minmax_unfiltered_buf_.get()}, 16, plan_.wg2d,
-        {config_.decimation});
+  const StageContext stage_context{plan_, config_};
+  for (size_t i = 0; i < kNumStages; ++i) {
+    const StageDesc &desc = StageInfo(static_cast<Stage>(i));
+    if (!desc.enabled(stage_context)) continue;
+    std::vector<VkBuffer> buffers;
+    for (Buf role : desc.bindings) buffers.push_back(Handle(role));
+    const std::string shader = desc.shader(stage_context);
+    pl_[i] = vk::ComputePipeline(ctx_, ShaderPath(shader.c_str()), buffers, desc.push_bytes,
+                                 desc.workgroup(stage_context), desc.spec(stage_context));
   }
-  uf_init_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("uf_init", "uf_init_u8")), {parent_buf_.get(), thresholded_buf_.get()},
-      8, plan_.wg2d, {uf_init_run_});
-  if (plan_.threshold_block) {
-    threshold_block_pl_ = vk::ComputePipeline(
-        ctx_, ShaderPath("threshold_block_u8"),
-        {decimated_view, minmax_unfiltered_buf_.get(), thresholded_buf_.get(),
-         contrast_floor_buf_.get(), active_cells_buf_.get(), cell_list_buf_.get()},
-        20, plan_.wg2d, {plan_.adaptive_floor ? 1u : 0u, plan_.sparse ? 1u : 0u});
-    if (plan_.sparse) {
-      cell_args_pl_ = vk::ComputePipeline(ctx_, ShaderPath("cell_args"),
-                                          {cell_list_buf_.get(), cell_args_buf_.get()}, 0,
-                                          vk::WorkgroupSize{1, 1, 1});
-    }
-    if (plan_.adaptive_floor) {
-      noise_floor_pl_ = vk::ComputePipeline(
-          ctx_, ShaderPath("noise_floor"),
-          {minmax_unfiltered_buf_.get(), contrast_floor_buf_.get()}, 12, plan_.wg1d);
-    }
-  }
-
-  if (plan_.uf_init_scan) {
-    uf_init_scan_pl_ = vk::ComputePipeline(
-        ctx_, ShaderPath(pick("uf_init_scan", "uf_init_scan_u8")),
-        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), cell_list_buf_.get()},
-        12, vk::WorkgroupSize{plan_.sparse ? 16u : plan_.wg1d.x, 1, 1}, {plan_.count_runs ? 1u : 0u, plan_.sparse ? 1u : 0u});
-  }
-  if (plan_.count_runs) {
-    uf_count_runs_pl_ = vk::ComputePipeline(
-        ctx_, ShaderPath(pick("uf_count_runs", "uf_count_runs_u8")),
-        {parent_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get(), cell_list_buf_.get()},
-        16, vk::WorkgroupSize{plan_.sparse ? 16u : plan_.wg1d.x, 1, 1}, {plan_.sparse ? 1u : 0u});
-  }
-  // Dispatched 2D with a one-row-tall workgroup.
-  // Convergence-flag write mode (see uf_merge_body.glsl) and four pixels per thread: see PipelinePlan.
-  uf_merge_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(plan_.merge_x4 ? "uf_merge_x4_u8" : pick("uf_merge", "uf_merge_u8")),
-      {parent_buf_.get(), thresholded_buf_.get(), uf_changed_buf_.get(), cell_list_buf_.get()}, 16,
-      vk::WorkgroupSize{plan_.sparse ? (plan_.merge_x4 ? 16u : 64u) : plan_.wg1d.x, 1, 1},
-      {plan_.merge_flag_mode, plan_.sparse ? 1u : 0u});
-  // Binding 1 / the third push constant are the convergence flag and the
-  // opt-in to honouring it; see uf_compress.comp.
-  uf_compress_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("uf_compress"), {parent_buf_.get(), uf_changed_buf_.get()}, 12, plan_.wg1d);
-  // As uf_compress plus uf_final's count: bindings 2 and 3 are the thresholded codes and blob_size.
-  uf_compress_count_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("uf_compress_count", "uf_compress_count_u8")),
-      {parent_buf_.get(), uf_changed_buf_.get(), thresholded_buf_.get(), blob_size_buf_.get()}, 16,
-      plan_.wg1d);
-  // Binding 2 lets the shader skip ambiguous (127) pixels.
-  uf_final_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("uf_final", "uf_final_u8")),
-      {parent_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get()}, 12, plan_.wg1d);
-
-  // Binding 4 is uf_changed_buf_, read only by the fused path's speculative attempt. Bindings 5 and 6
-  // let the shader test a pixel's blob size and read the threshold codes itself.
-  blob_diff_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath(pick("blob_diff", "blob_diff_u8")),
-      {parent_buf_.get(), qbp_compacted_buf_.get(), qbp_counter_buf_.get(),
-       qbp_keys_buf_.get(), uf_changed_buf_.get(), blob_size_buf_.get(), thresholded_buf_.get(),
-       cell_list_buf_.get()},
-      20, plan_.sparse ? vk::WorkgroupSize{16, 4, 1} : plan_.wg2d, {plan_.count_runs ? 1u : 0u, plan_.sparse ? 1u : 0u});
-
-  select_blobs_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("select_blobs"),
-      {extents_buf_.get(), selected_extents_buf_.get(), selected_counter_buf_.get(),
-       remap_buf_.get(), raw_blob_counter_buf_.get(), blob_point_offsets_buf_.get(),
-       points_total_buf_.get(), blob_args_buf_.get()},
-      44, plan_.wg1d, {(plan_.lean_tail & 2u) != 0 ? 1u : 0u});
-
-  // Per-blob point base offsets: the inclusive prefix sum of the selected blobs' point counts, in
-  // one workgroup; it also writes the sort's indirect arguments (blob_args_buf_ slot 1).
-  scan_blob_counts_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("scan_blob_counts"),
-      {selected_extents_buf_.get(), selected_counter_buf_.get(), blob_point_offsets_buf_.get(),
-       blob_args_buf_.get()},
-      8, vk::WorkgroupSize{plan_.scan_wg, 1, 1});
-
-  // Mode 0 sorts whole blobs, mode 1 the runs of large blobs, mode 2 merges them (see
-  // sort_points_local_body.glsl).
-  auto make_sort = [&](uint32_t mode) {
-    return vk::ComputePipeline(
-        ctx_,
-        ShaderPath(mode == 0u ? pick("sort_points_local", "sort_points_local_u8")
-                              : pick("sort_points_large", "sort_points_large_u8")),
-        {selected_extents_buf_.get(), blob_point_offsets_buf_.get(), index_points_buf_.get(),
-         decimated_view, line_fit_points_buf_.get(), oversized_sort_counter_buf_.get(),
-         // binding 6: the device-side selected-blob count.
-         selected_counter_buf_.get(), large_sort_buf_.get(), sort_scratch_buf_.get()},
-        20, vk::WorkgroupSize{plan_.local_sort_cap, 1, 1},
-        {plan_.local_sort_split, kSortChunk, mode, kLargeSortCap,
-         mode == 0u ? plan_.sort_rank_all : 0u});
-  };
-  sort_points_local_pl_ = make_sort(0u);
-  sort_large_runs_pl_ = make_sort(1u);
-  sort_large_merge_pl_ = make_sort(2u);
-
-  hash_group_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("hash_group"),
-      {qbp_keys_buf_.get(), hash_owner_buf_.get(),
-       point_slot_buf_.get(), slot_dense_buf_.get(), raw_blob_counter_buf_.get(),
-       hash_drop_counter_buf_.get(), qbp_counter_buf_.get(), extents_buf_.get()},
-      20, plan_.wg1d);
-  // One pipeline per source counter: the counter is binding 0, and
-  // ComputePipeline binds its buffers at construction.
-  build_indirect_args_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("build_indirect_args"),
-      {raw_blob_counter_buf_.get(), blob_args_buf_.get()}, 20,
-      vk::WorkgroupSize{1, 1, 1});
-  build_qbp_args_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("build_indirect_args"),
-      {qbp_counter_buf_.get(), indirect_args_buf_.get()}, 20, vk::WorkgroupSize{1, 1, 1});
-  // Reduction variant priority: subgroup, then 64-bit atomic, then plain 32-bit. The atomic64
-  // variant views extents_buf_ again at binding 4 as uint64_t words.
-  // Binding 4 is bound for all three variants so binding 5 (boundary-point count) keeps its index.
-  std::vector<VkBuffer> reduce_extents_buffers{qbp_compacted_buf_.get(), point_slot_buf_.get(),
-                                               slot_dense_buf_.get(),   extents_buf_.get(),
-                                               extents_buf_.get(),      qbp_counter_buf_.get()};
-  reduce_extents_hash_pl_ = vk::ComputePipeline(
-      ctx_,
-      ShaderPath(subgroup ? "reduce_extents_hash_subgroup"
-                              : (plan_.extents_atomic64 ? "reduce_extents_hash_atomic64_x4"
-                                                  : "reduce_extents_hash_x4")),
-      reduce_extents_buffers, 12, plan_.wg1d);
-  scatter_index_points_pl_ = vk::ComputePipeline(
-      ctx_, ShaderPath("scatter_index_points"),
-      {qbp_compacted_buf_.get(), point_slot_buf_.get(), slot_dense_buf_.get(), remap_buf_.get(),
-       selected_extents_buf_.get(), blob_point_offsets_buf_.get(), blob_cursor_buf_.get(),
-       index_points_buf_.get(), qbp_counter_buf_.get()},
-      16, plan_.wg1d);
 
   lean_point_groups_ = std::min((qbp_capacity_ + plan_.wg1d.x - 1u) / plan_.wg1d.x, 128u);
   lean_select_groups_ = std::min((config_.max_raw_blobs + plan_.wg1d.x - 1u) / plan_.wg1d.x, 32u);
@@ -662,10 +549,10 @@ void GpuDetector::RecordInitScan(VkCommandBuffer cmd) {
   struct { uint32_t dw, dh, min_blob; } pc{decimated_width_, decimated_height_,
                                           config_.min_cluster_pixels};
   if (plan_.sparse) {
-    uf_init_scan_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc);
+    Pl(Stage::kUfInitScan).DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc);
     return;
   }
-  uf_init_scan_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
+  Pl(Stage::kUfInitScan).Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
 }
 
 void GpuDetector::RecordCountRuns(VkCommandBuffer cmd) {
@@ -674,27 +561,27 @@ void GpuDetector::RecordCountRuns(VkCommandBuffer cmd) {
                                                     config_.min_cluster_pixels,
                                                     plan_.sparse ? 64u : 4u * plan_.wg1d.x};
   if (plan_.sparse) {
-    uf_count_runs_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc);
+    Pl(Stage::kUfCountRuns).DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc);
     return;
   }
-  uf_count_runs_pl_.Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
+  Pl(Stage::kUfCountRuns).Dispatch2D(cmd, (decimated_width_ + 3u) / 4u, decimated_height_, &pc);
 }
 
 void GpuDetector::RecordMerge(VkCommandBuffer cmd, vk::BarrierKind barrier) {
   struct { uint32_t dw, dh, band_mask, band_phase; } pc{decimated_width_, decimated_height_, 0u, 0u};
   const uint32_t columns = plan_.merge_x4 ? decimated_width_ / 4u : decimated_width_;
   if (plan_.sparse) {
-    uf_merge_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc, barrier);
+    Pl(Stage::kUfMerge).DispatchIndirect(cmd, cell_args_buf_.get(), 0, &pc, barrier);
     return;
   }
   if (plan_.merge_band == 0u) {
-    uf_merge_pl_.Dispatch2D(cmd, columns, decimated_height_, &pc, barrier);
+    Pl(Stage::kUfMerge).Dispatch2D(cmd, columns, decimated_height_, &pc, barrier);
     return;
   }
   pc.band_mask = plan_.merge_band - 1u;
-  uf_merge_pl_.Dispatch2D(cmd, columns, decimated_height_, &pc);
+  Pl(Stage::kUfMerge).Dispatch2D(cmd, columns, decimated_height_, &pc);
   pc.band_phase = 1u;
-  uf_merge_pl_.Dispatch2D(cmd, columns, decimated_height_ / plan_.merge_band, &pc, barrier);
+  Pl(Stage::kUfMerge).Dispatch2D(cmd, columns, decimated_height_ / plan_.merge_band, &pc, barrier);
 }
 
 void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool trailing_compress) {
@@ -722,17 +609,17 @@ void GpuDetector::RecordUfChunk(VkCommandBuffer c, uint32_t iterations, bool tra
     if (!trailing_compress && iter + 2 == iterations) {
       // The last real compression, just before the verification merge: it also counts blob sizes.
       const UfCountPc count_pc{decimated_width_, decimated_height_, 1u, config_.min_cluster_pixels};
-      uf_compress_count_pl_.Dispatch1D(c, pixels, &count_pc);
+      Pl(Stage::kUfCompressCount).Dispatch1D(c, pixels, &count_pc);
     } else if (predicate) {
       // Runs only when the flag is nonzero, so the guard is skipped.
       const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
       ctx_.CmdBeginConditionalRendering(c, uf_changed_buf_.get(), 0);
-      uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc, BarrierKind::None);
+      Pl(Stage::kUfCompress).Dispatch1D(c, pixels, &compress_pc, BarrierKind::None);
       ctx_.CmdEndConditionalRendering(c);
       vk::ComputePipeline::Barrier(c, BarrierKind::Compute);
     } else {
       const UfCompressPc compress_pc{decimated_width_, decimated_height_, 1u};
-      uf_compress_pl_.Dispatch1D(c, pixels, &compress_pc);
+      Pl(Stage::kUfCompress).Dispatch1D(c, pixels, &compress_pc);
     }
   }
 }
@@ -744,14 +631,14 @@ void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *impo
                                                 block_height_};
   if (imported != nullptr) {
     imported->decimate.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
-    block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
+    Pl(Stage::kBlockMinmax).Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   } else if (plan_.minmax_decimate) {
-    block_minmax_decimate_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
+    Pl(Stage::kBlockMinmaxDecimate).Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   } else {
     if (!plan_.alias_decimated) {
-      decimate_pl_.Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
+      Pl(Stage::kDecimate).Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
     }
-    block_minmax_pl_.Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
+    Pl(Stage::kBlockMinmax).Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   }
 
   if (plan_.threshold_block) {
@@ -761,20 +648,20 @@ void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *impo
     if (plan_.adaptive_floor) {
       struct { uint32_t blocks, min_diff, scale_tenths; } floor_pc{
           block_width_ * block_height_, config_.min_white_black_diff, plan_.floor_scale_tenths};
-      noise_floor_pl_.DispatchRaw(cmd, 1, 1, 1, &floor_pc);
+      Pl(Stage::kNoiseFloor).DispatchRaw(cmd, 1, 1, 1, &floor_pc);
     }
-    threshold_block_pl_.Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
+    Pl(Stage::kThresholdBlock).Dispatch2D(cmd, block_width_, block_height_, &thresh_pc);
     if (plan_.sparse) {
-      cell_args_pl_.DispatchRaw(cmd, 1, 1, 1, nullptr);
+      Pl(Stage::kCellArgs).DispatchRaw(cmd, 1, 1, 1, nullptr);
       vk::ComputePipeline::IndirectDispatchBarrier(cmd);
     }
     return;
   }
   struct { uint32_t bw, bh; } blockdims_pc{block_width_, block_height_};
-  block_filter_pl_.Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
+  Pl(Stage::kBlockFilter).Dispatch2D(cmd, block_width_, block_height_, &blockdims_pc);
   struct { uint32_t dw, dh, min_diff, bw; } thresh_pc{
       decimated_width_, decimated_height_, config_.min_white_black_diff, block_width_};
-  threshold_pl_.Dispatch2D(cmd, (decimated_width_ + threshold_run_ - 1) / threshold_run_,
+  Pl(Stage::kThreshold).Dispatch2D(cmd, (decimated_width_ + kThresholdRun - 1) / kThresholdRun,
                           decimated_height_, &thresh_pc);
 }
 
@@ -822,7 +709,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   if (plan_.uf_init_scan) {
     RecordInitScan(cmd);
   } else {
-    uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+    Pl(Stage::kUfInit).Dispatch2D(cmd, (decimated_width_ + kUfInitRun - 1) / kUfInitRun,
                           decimated_height_, &dwdh_pc);
   }
   if (!plan_.uf_verify) {
@@ -831,7 +718,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
     // walk when the merge joined nothing only if parent[] was flat before the merge.
     if (!plan_.uf_init_scan) {
       const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
-      uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
+      Pl(Stage::kUfCompress).Dispatch1D(cmd, pixels, &compress_init_pc);
     }
     RecordMerge(cmd);
     if (plan_.count_runs) {
@@ -839,7 +726,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
     } else {
       const UfCountPc count_pc{decimated_width_, decimated_height_, plan_.uf_init_scan ? 0u : 1u,
                                config_.min_cluster_pixels};
-      uf_compress_count_pl_.Dispatch1D(cmd, pixels, &count_pc);
+      Pl(Stage::kUfCompressCount).Dispatch1D(cmd, pixels, &count_pc);
     }
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanLabelling));
     return;
@@ -850,10 +737,10 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
     // The only merge is the verification merge, so this is the last real compression: it also
     // counts blob sizes (see RecordUfChunk).
     const UfCountPc count_pc{decimated_width_, decimated_height_, 0u, config_.min_cluster_pixels};
-    uf_compress_count_pl_.Dispatch1D(cmd, pixels, &count_pc);
+    Pl(Stage::kUfCompressCount).Dispatch1D(cmd, pixels, &count_pc);
   } else {
     const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
-    uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
+    Pl(Stage::kUfCompress).Dispatch1D(cmd, pixels, &compress_init_pc);
   }
 
   RecordUfChunk(cmd, chunk, /*trailing_compress=*/false);
@@ -876,7 +763,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   // The speculative first attempt counted blob sizes inside its last real compression; the tail
   // rerun counts here.
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
-  if (!speculative) uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
+  if (!speculative) Pl(Stage::kUfFinal).Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
   // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends
@@ -886,10 +773,10 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
       config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   if (plan_.sparse) {
-    blob_diff_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &blobdiff_pc,
+    Pl(Stage::kBlobDiff).DispatchIndirect(cmd, cell_args_buf_.get(), 0, &blobdiff_pc,
                                    BarrierKind::ComputeAndTransfer);
   } else {
-    blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
+    Pl(Stage::kBlobDiff).Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
                              BarrierKind::ComputeAndTransfer);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
@@ -902,7 +789,7 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   struct { uint32_t wg, slot, divide, clamp, quarter_slot; } qbp_args_pc{plan_.wg1d.x, 1u, 1u,
                                                                        qbp_capacity_, 2u};
   if (!lean_grid) {
-    build_qbp_args_pl_.DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
+    Pl(Stage::kBuildQbpArgs).DispatchRaw(cmd, 1, 1, 1, &qbp_args_pc, BarrierKind::None);
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   }
 
@@ -912,9 +799,9 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
       qbp_capacity_, hash_table_size_ - 1u, 128u, 1u, config_.max_raw_blobs};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
   if (lean_grid) {
-    hash_group_pl_.DispatchRaw(cmd, lean_point_groups_, 1, 1, &hash_pc);
+    Pl(Stage::kHashGroup).DispatchRaw(cmd, lean_point_groups_, 1, 1, &hash_pc);
   } else {
-    hash_group_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
+    Pl(Stage::kHashGroup).DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &hash_pc);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
@@ -923,16 +810,16 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
   struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
       plan_.wg1d.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
   if (!lean_grid) {
-    build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
+    Pl(Stage::kBuildBlobArgs).DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
   }
 
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
   struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{qbp_capacity_,
                                                                          config_.max_raw_blobs, 1u};
   if (lean_grid) {
-    reduce_extents_hash_pl_.DispatchRaw(cmd, lean_point_groups_, 1, 1, &reduce_pc);
+    Pl(Stage::kReduceExtents).DispatchRaw(cmd, lean_point_groups_, 1, 1, &reduce_pc);
   } else {
-    reduce_extents_hash_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), plan_.reduce_x4 ? 24 : 12,
+    Pl(Stage::kReduceExtents).DispatchIndirect(cmd, indirect_args_buf_.get(), plan_.reduce_x4 ? 24 : 12,
                                              &reduce_pc);
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
   }
@@ -950,25 +837,25 @@ void GpuDetector::RecordFusedTail(VkCommandBuffer cmd, bool speculative) {
               config_.fill_max};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
   if (lean_grid) {
-    select_blobs_pl_.DispatchRaw(cmd, lean_select_groups_, 1, 1, &select_pc);
+    Pl(Stage::kSelectBlobs).DispatchRaw(cmd, lean_select_groups_, 1, 1, &select_pc);
   } else {
-    select_blobs_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
+    Pl(Stage::kSelectBlobs).DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
   struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
-  if ((plan_.lean_tail & 2u) == 0) scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
+  if ((plan_.lean_tail & 2u) == 0) Pl(Stage::kScanBlobCounts).DispatchRaw(cmd, 1, 1, 1, &scan_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
   struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
       qbp_capacity_, ipoint_capacity_, config_.max_raw_blobs, 1u};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
   if (lean_grid) {
-    scatter_index_points_pl_.DispatchRaw(cmd, lean_point_groups_, 1, 1, &scatter_pc,
+    Pl(Stage::kScatterIndexPoints).DispatchRaw(cmd, lean_point_groups_, 1, 1, &scatter_pc,
                                          BarrierKind::ComputeAndTransfer);
   } else {
-    scatter_index_points_pl_.DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
+    Pl(Stage::kScatterIndexPoints).DispatchIndirect(cmd, indirect_args_buf_.get(), 12, &scatter_pc,
                                               BarrierKind::ComputeAndTransfer);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
@@ -1023,22 +910,22 @@ void GpuDetector::RecordSort(VkCommandBuffer cmd, uint32_t num_selected_blobs,
   const SortPc pc{num_selected_blobs, count_from_buffer ? 1u : 0u, config_.max_blobs,
                   static_cast<int32_t>(decimated_width_), static_cast<int32_t>(decimated_height_)};
   if (count_from_buffer) {
-    sort_points_local_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 12, &pc,
+    Pl(Stage::kSortLocal).DispatchIndirect(cmd, blob_args_buf_.get(), 12, &pc,
                                            BarrierKind::Compute);
   } else {
-    sort_points_local_pl_.DispatchRaw(cmd, num_selected_blobs, 1, 1, &pc, BarrierKind::Compute);
+    Pl(Stage::kSortLocal).DispatchRaw(cmd, num_selected_blobs, 1, 1, &pc, BarrierKind::Compute);
   }
   // Blobs above plan_.local_sort_split points: their runs, then one pass placing every point.
   vk::ComputePipeline::IndirectDispatchBarrier(cmd);
-  sort_large_runs_pl_.DispatchIndirect(cmd, large_sort_buf_.get(), 0, &pc, BarrierKind::Compute);
-  sort_large_merge_pl_.DispatchIndirect(cmd, large_sort_buf_.get(), 12, &pc,
+  Pl(Stage::kSortLargeRuns).DispatchIndirect(cmd, large_sort_buf_.get(), 0, &pc, BarrierKind::Compute);
+  Pl(Stage::kSortLargeMerge).DispatchIndirect(cmd, large_sort_buf_.get(), 12, &pc,
                                         BarrierKind::ComputeAndTransfer);
 }
 
 // Flattens parent[] unconditionally; the retry path needs a flat forest after a discarded attempt.
 void GpuDetector::RecordFlatten(VkCommandBuffer cmd) {
   const UfCompressPc compress_pc{decimated_width_, decimated_height_, 0u};
-  uf_compress_pl_.Dispatch1D(cmd, decimated_width_ * decimated_height_, &compress_pc);
+  Pl(Stage::kUfCompress).Dispatch1D(cmd, decimated_width_ * decimated_height_, &compress_pc);
 }
 
 void GpuDetector::RecordUfContinuation(VkCommandBuffer cmd, uint32_t iterations) {
@@ -1483,13 +1370,13 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   if (plan_.uf_init_scan) {
     RecordInitScan(cmd);
   } else {
-    uf_init_pl_.Dispatch2D(cmd, (decimated_width_ + uf_init_run_ - 1) / uf_init_run_,
+    Pl(Stage::kUfInit).Dispatch2D(cmd, (decimated_width_ + kUfInitRun - 1) / kUfInitRun,
                           decimated_height_, &dwdh_pc);
   }
   // Flattens the run chains uf_init.comp built before the first merge. honour_changed_flag is 0
   // because the flag is still zero from the clear.
   const UfCompressPc compress_init_pc{decimated_width_, decimated_height_, 0u};
-  if (!plan_.uf_init_scan) uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_init_pc);
+  if (!plan_.uf_init_scan) Pl(Stage::kUfCompress).Dispatch1D(cmd, pixels, &compress_init_pc);
 
   // Seeds the first chunk with last frame's converged iteration count.
   uint32_t chunk = std::max(config_.uf_iterations_per_chunk, last_uf_iterations_);
@@ -1505,7 +1392,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
       RecordCountRuns(cmd);
     } else {
       const UfCompressPc compress_pc{decimated_width_, decimated_height_, plan_.uf_init_scan ? 0u : 1u};
-      uf_compress_pl_.Dispatch1D(cmd, pixels, &compress_pc);
+      Pl(Stage::kUfCompress).Dispatch1D(cmd, pixels, &compress_pc);
     }
   }
   // The labelling span ends here; any extra convergence chunks are not attributed to it.
@@ -1548,7 +1435,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
                                                     config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanUfFinal));
   // uf_count_runs has already counted with plan_.count_runs.
-  if (!plan_.count_runs) uf_final_pl_.Dispatch1D(cmd, pixels, &uf_final_pc);
+  if (!plan_.count_runs) Pl(Stage::kUfFinal).Dispatch1D(cmd, pixels, &uf_final_pc);
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanUfFinal));
 
   // blob_diff tests each pixel's blob size itself (against the same floor as uf_final) and appends
@@ -1557,10 +1444,10 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
       decimated_width_, decimated_height_, qbp_capacity_, 0u, config_.min_cluster_pixels};
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBoundary));
   if (plan_.sparse) {
-    blob_diff_pl_.DispatchIndirect(cmd, cell_args_buf_.get(), 0, &blobdiff_pc,
+    Pl(Stage::kBlobDiff).DispatchIndirect(cmd, cell_args_buf_.get(), 0, &blobdiff_pc,
                                    BarrierKind::ComputeAndTransfer);
   } else {
-    blob_diff_pl_.Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
+    Pl(Stage::kBlobDiff).Dispatch2D(cmd, interior_width_, interior_height_, &blobdiff_pc,
                              BarrierKind::ComputeAndTransfer);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBoundary));
@@ -1582,19 +1469,19 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     struct { uint32_t count, table_mask, max_probes, count_from_buffer, max_raw_blobs; } hash_pc{
         qbp_count, hash_table_size_ - 1u, 128u, 0u, config_.max_raw_blobs};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanHashGroup));
-    hash_group_pl_.Dispatch1D(cmd, qbp_count, &hash_pc);
+    Pl(Stage::kHashGroup).Dispatch1D(cmd, qbp_count, &hash_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanHashGroup));
 
     // Builds select_blobs' dispatch arguments on the device from raw_blob_counter_buf_; it
     // bounds-checks against max_raw_blobs.
     struct { uint32_t wg, slot, divide, clamp, quarter_slot; } build_indirect_pc{
         plan_.wg1d.x, 0u, 1u, config_.max_raw_blobs, 0xFFFFFFFFu};
-    build_indirect_args_pl_.DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
+    Pl(Stage::kBuildBlobArgs).DispatchRaw(cmd, 1, 1, 1, &build_indirect_pc, BarrierKind::None);
 
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanExtents));
     struct { uint32_t count, max_raw_blobs, count_from_buffer; } reduce_pc{
         qbp_count, config_.max_raw_blobs, 0u};
-    reduce_extents_hash_pl_.Dispatch1D(cmd, plan_.reduce_x4 ? (qbp_count + 3u) / 4u : qbp_count,
+    Pl(Stage::kReduceExtents).Dispatch1D(cmd, plan_.reduce_x4 ? (qbp_count + 3u) / 4u : qbp_count,
                                        &reduce_pc);
     vk::ComputePipeline::IndirectDispatchBarrier(cmd);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanExtents));
@@ -1610,18 +1497,18 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
                 config_.aspect_max,         config_.fill_min,
                 config_.fill_max};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanSelect));
-    select_blobs_pl_.DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
+    Pl(Stage::kSelectBlobs).DispatchIndirect(cmd, blob_args_buf_.get(), 0, &select_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanSelect));
 
     struct { uint32_t capacity, sort_args_slot; } scan_pc{config_.max_blobs, 1u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanBlobScan));
-    scan_blob_counts_pl_.DispatchRaw(cmd, 1, 1, 1, &scan_pc);
+    Pl(Stage::kScanBlobCounts).DispatchRaw(cmd, 1, 1, 1, &scan_pc);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanBlobScan));
 
     struct { uint32_t count, capacity, max_raw_blobs, count_from_buffer; } scatter_pc{
         qbp_count, ipoint_capacity_, config_.max_raw_blobs, 0u};
     timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanScatter));
-    scatter_index_points_pl_.Dispatch1D(cmd, qbp_count, &scatter_pc,
+    Pl(Stage::kScatterIndexPoints).Dispatch1D(cmd, qbp_count, &scatter_pc,
                                         BarrierKind::ComputeAndTransfer);
     timestamp_pool_.WriteTimestamp(cmd, SpanEnd(kSpanScatter));
 
