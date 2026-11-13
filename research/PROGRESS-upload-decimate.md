@@ -71,3 +71,8 @@ Build dirs: `$A/build-upload-decimate` (branch), `$A/build-upload-decimate-base`
 - Files touched: `gpu/CpuDecimate.cpp/.h` (new), `gpu/GpuDetector.cpp/.h` (upload, `RecordThreshold`, `RecordFrameHead`, buffer outcome),
   `gpu/PipelinePlan.cpp/.h`, `common/Options.cpp`, `library/CMakeLists.txt`, `tests/unit_tests.cpp`, `tests/CMakeLists.txt` (shared: one test group),
   goldens, `PERFORMANCE.md` options table, `DECISIONS.md`, `CHANGELOG.md`. `StageTable.cpp` and the shaders were not needed.
+- 9. Pi gate (`ud-pigate.sh`, vk_eval at iterations 1, CPU against `CPU_DECIMATE=0`, whole Pi corpus): decimation 4, d2 `FORCE_NO_8BIT`, d4 `BOX_DECIMATE=0`: all
+  26 dumps identical; d2 `BOX_DECIMATE=0`: `noise` one line, `FUSE_SUBMITS=0`: `large-tags` and `noise` one line each, all under 0.003 px (run-to-run noise).
+  Pi micro-benchmark (`decbench`, g++ -O2, hot cache) us, memcpy / d2 box / d2 copy / d4 box / d4 copy: 640x480 9.9 / 12.6 / 5.7 / 14.0 / 18.2;
+  1280x720 44.3 / 49.7 / 35.6 / 47.2 / 56.2; 1920x1080 122 / 146 / 98 / 125 / 141; d3 box at 1080p 3,043 us (too slow: not vectorised).
+  Decision: `want_cpu_decimate` only for decimation 2 and 4; other decimations keep the GPU path (kernels remain correct for them, tested by `unit_decimate`).

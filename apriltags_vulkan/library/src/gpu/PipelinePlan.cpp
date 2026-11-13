@@ -84,7 +84,7 @@ PipelinePlan ResolvePlan(const vk::DeviceCaps &caps, const DetectorConfig &confi
   p.threshold_block =
       p.u8 && !(env.Has("APRILTAG_VK_FUSED_THRESHOLD") && !env.Bool("APRILTAG_VK_FUSED_THRESHOLD", true));
   // The host decimates into a mapped decimated buffer; FinalisePlan confirms it once the buffer exists.
-  p.want_cpu_decimate = config.decimation > 1 && env.Bool("APRILTAG_VK_CPU_DECIMATE", true);
+  p.want_cpu_decimate = (config.decimation == 2 || config.decimation == 4) && env.Bool("APRILTAG_VK_CPU_DECIMATE", true);
   p.minmax_decimate = p.threshold_block && !p.alias_decimated && !p.box_decimate && !p.want_cpu_decimate;
   const double floor_scale = env.Float("APRILTAG_VK_ADAPTIVE_FLOOR", config.adaptive_floor_scale);
   p.floor_scale_tenths = static_cast<uint32_t>(std::max(0.0, floor_scale * 10.0 + 0.5));
