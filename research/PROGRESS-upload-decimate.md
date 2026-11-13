@@ -49,3 +49,9 @@ Build dirs: `$A/build-upload-decimate` (branch), `$A/build-upload-decimate-base`
   cpu median about 0.105 in both (the CPU decimation is inside the gpu part of the timing, as the upload was). Found/false/error
   identical (7146/7348, 1 false, 0.017/0.099 px). Gain: total about -10% overall, -6% at 640x480, -12% at 1280x720, -21% at 1920x1080;
   gpu part -19%. The mapped (BAR) write over PCIe is not a loss here.
+- 5. Pi (Orange Pi 5 Plus, Mali-G610), `~/w/upload-decimate/piab.sh ab2 3 2`: 12 interleaved corpus runs (base new new base ...), decimation 2,
+  no 1920x1080 frames, medians over all frames (ms; total / gpu):
+  base: 0.741 0.763 0.770 0.744 0.761 (and one outlier run, 0.839, with the whole machine slow) / gpu 0.585 0.601 0.594 0.581 0.601;
+  new: 0.704 0.714 0.717 0.728 0.711 0.709 / gpu 0.542 0.551 0.557 0.546 0.549 0.549.
+  Per size (base about, new about): 640x480 0.70 -> 0.66, 1280x720 0.96 -> 0.87. Gain: total about -5.5%, 640x480 about -6%, 1280x720 about -9%,
+  gpu part about -8%. Found 4819/4972, 35 false, error 0.017/0.100 px in every run; all 26 dumps byte-identical to base.
