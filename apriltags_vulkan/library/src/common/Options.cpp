@@ -30,6 +30,8 @@ const OptionDescriptor kTable[] = {
      "Whole-tag photometric polish of decoded tags."},
     {"APRILTAG_VK_PROFILE_FEATURES", T::kMask, "31", C::kFeature, P::kEnvOnly, "",
      "Bit mask of the profile fit's refinements: 1 outliers, 2 coarse to fine, 4 halfway crossing, 8 clip bias, 16 widen blur."},
+    {"APRILTAG_VK_OWN_DECODE", T::kBool, "on", C::kFeature, P::kEnvOnly, "",
+     "Decode quads and reconcile detections with the in-house port; 0 uses libapriltag's (same detections)."},
     {"APRILTAG_VK_GREY_MARGIN", T::kBool, "on", C::kFeature, P::kEnvOnly, "",
      "Retry an undecoded quad as its inner square (grey margin)."},
     {"APRILTAG_VK_SIDE_ONE_OUT", T::kBool, "on", C::kFeature, P::kEnvOnly, "",

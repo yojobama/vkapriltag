@@ -79,6 +79,7 @@ this file and `DESIGN.md` for its name.
 | `APRILTAG_VK_REFINE` | enum | profile | `TagDecoder refine_method` | environment wins | Edge refinement: exact or profile (other values are ignored); used when td->refine_edges is set. |
 | `APRILTAG_VK_POLISH` | bool | off | `TagDecoder::SetPolish` | environment wins | Whole-tag photometric polish of decoded tags. |
 | `APRILTAG_VK_PROFILE_FEATURES` | bit mask | 31 |  | environment only | Bit mask of the profile fit's refinements: 1 outliers, 2 coarse to fine, 4 halfway crossing, 8 clip bias, 16 widen blur. |
+| `APRILTAG_VK_OWN_DECODE` | bool | on |  | environment only | Decode quads and reconcile detections with the in-house port; 0 uses libapriltag's (same detections). |
 | `APRILTAG_VK_GREY_MARGIN` | bool | on |  | environment only | Retry an undecoded quad as its inner square (grey margin). |
 | `APRILTAG_VK_SIDE_ONE_OUT` | bool | on |  | environment only | Refit a side whose border cells read white, one cell further in. |
 | `APRILTAG_VK_THIRD_BIT` | bool | on |  | environment only | Accept a third corrected bit when the three wrong cells touch. |
