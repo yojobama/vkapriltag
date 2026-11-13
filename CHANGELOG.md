@@ -26,6 +26,8 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ### Changed (GPU internals)
 
+- `WorkerPool::ParallelFor` wakes only as many workers as the batch has items to spare (desktop corpus median -3.7%, Pi neutral).
+
 - `PipelinePlan` resolves every GPU variant choice once from the device, the configuration and the options (`ResolvePlan`, `FinalisePlan`);
   `DetectorConfig` has its own header; a stage table (`StageDesc`) builds each of the 26 pipelines; one recorder serves the group, extents,
   select, scan and scatter stages of the fused, lean and unfused flows. Detections and the recorded GPU work are unchanged
