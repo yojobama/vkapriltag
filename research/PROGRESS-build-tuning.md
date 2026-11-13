@@ -38,3 +38,18 @@ else 0: LevelPass, FitSide, ClipBias, FitQuadForBlob (about 90 loops, mostly 506
 Reading for the other agents: the CPU tail is branchy scalar code over short, data-dependent loops (early exits, argmax, nested searches);
 the compilers find no loop worth vectorising beyond the single sample accumulation loops (ProfilePass 281, LevelPass 439, BuildFit 383,
 Evaluate 826). Gains there need restructuring by hand (fixed-trip loops without early exit, struct-of-arrays, intrinsics as Dot4 does), not flags.
+
+## Experiments
+Method: options implemented first (`cmake/BuildTuning.cmake`: VKAPRILTAG_LTO, VKAPRILTAG_TUNE, VKAPRILTAG_CODEGEN, VKAPRILTAG_PGO[_DIR], all off by default),
+variants built as `$A/build-build-tuning-<name>` (desktop, `bt/dbuild.sh NAME args`) and `~/w/build-tuning/b-<name>` (Pi, `bt_build.sh`).
+Timing: `bt/abn.sh DEC OUT ROUNDS name=exe ...` (whole corpus, 5 iterations per frame, interleaved with rotating order, 5 rounds), summary `bt/an.py`
+(median over rounds of corpus median/p95 per frame, gpu, cpu, four scenarios). Scripts live in the scratchpad `bt/` dir; copies of the essentials are in `research/build-tuning-scripts/`.
+
+### E1 desktop (MSVC 19.5, Ryzen 5600X), 5 rounds, % against `base` (unmodified flags)
+Decimation 2: base 0.3530 / p95 0.6640 ms, gpu 0.2390, cpu 0.1036.
+- lto (/GL /LTCG): med +2.4%, cpu +5.0% (slower), dumps equal.
+- avx2 (/arch:AVX2): med -4.2%, p95 -3.6%, cpu -12.6%; dumps equal in the quick check (ctest pending).
+- gw (/Gw): med +3.2% (noise or worse; no gain).
+- lto+avx2: med -3.0%, cpu -10.5%.
+Decimation 1: base 0.4090 / 0.8615, gpu 0.2984, cpu 0.1079: every variant came out 1 to 6% SLOWER including `gw`, gpu part +1% everywhere,
+so the base binary has a systematic advantage (binary layout / build provenance). Need a second copy of base built the same way to measure the noise floor (E2).
