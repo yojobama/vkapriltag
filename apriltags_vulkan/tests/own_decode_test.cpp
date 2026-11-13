@@ -122,20 +122,26 @@ void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, C
   const int n = rig.decoder.Decode(p, reversed, im, &h, &first, tags);
 
   bool ok = true;
+  const char *why = "";
   const bool up_h = up.H != nullptr;
-  if ((n >= 0) != up_h) ok = false;
-  if (ok && up_h && !SameHomography(h.h, up.H->data)) ok = false;
+  if ((n >= 0) != up_h) ok = false, why = "homography validity";
+  if (ok && up_h && !SameHomography(h.h, up.H->data)) ok = false, why = "homography bits";
   if (n < 0) ++c->degenerate;
   const int up_n = zarray_size(dets);
-  if (ok && std::max(n, 0) != up_n) ok = false;
+  if (ok && std::max(n, 0) != up_n) ok = false, why = "detection count";
   for (int i = 0; ok && i < up_n; ++i) {
     apriltag_detection_t *d;
     zarray_get(dets, i, &d);
     const own::DecodedTag &t = tags[i];
-    ok = d->family == t.family && d->id == t.id && d->hamming == t.hamming &&
-         Bits(d->decision_margin) == Bits(t.margin) && SameHomography(d->H->data, t.h) &&
-         Bits(d->c[0]) == Bits(t.c[0]) && Bits(d->c[1]) == Bits(t.c[1]);
-    for (int k = 0; ok && k < 4; ++k) ok = Bits(d->p[k][0]) == Bits(t.p[k][0]) && Bits(d->p[k][1]) == Bits(t.p[k][1]);
+    if (d->family != t.family || d->id != t.id) ok = false, why = "id";
+    else if (d->hamming != t.hamming) ok = false, why = "hamming";
+    else if (Bits(d->decision_margin) != Bits(t.margin)) ok = false, why = "margin";
+    else if (!SameHomography(d->H->data, t.h)) ok = false, why = "detection homography";
+    else if (Bits(d->c[0]) != Bits(t.c[0]) || Bits(d->c[1]) != Bits(t.c[1])) ok = false, why = "centre";
+    for (int k = 0; ok && k < 4; ++k) {
+      if (Bits(d->p[k][0]) != Bits(t.p[k][0]) || Bits(d->p[k][1]) != Bits(t.p[k][1])) ok = false, why = "corner";
+    }
+    if (!ok) std::printf("  detail: upstream id %d ham %d margin %.9g, own id %d ham %d margin %.9g\n", d->id, d->hamming, d->decision_margin, t.id, t.hamming, t.margin);
   }
   for (int i = 0; i < up_n; ++i) {
     apriltag_detection_t *d;
@@ -156,18 +162,25 @@ void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, C
   const bool sample_h = rig.decoder.SampleCode(p, reversed, im, &sh, &raw);
   ++c->samples_compared;
   const float own_margin = raw.valid ? raw.margin : -1.0f;
-  if (sample_h != (probe.H != nullptr)) ok = false;
-  if (ok && sample_h) ok = SameHomography(sh.h, probe.H->data);
-  if (ok && sample_h) ok = Bits(own_margin) == Bits(up_margin) && raw.rcode == up_code;
+  if (sample_h != (probe.H != nullptr)) ok = false, why = "sample homography validity";
+  if (ok && sample_h && !SameHomography(sh.h, probe.H->data)) ok = false, why = "sample homography bits";
+  if (ok && sample_h && Bits(own_margin) != Bits(up_margin)) {
+    ok = false, why = "sample margin";
+    std::printf("  detail: upstream margin %.9g, own %.9g\n", up_margin, own_margin);
+  }
+  if (ok && sample_h && raw.rcode != up_code) {
+    ok = false, why = "sample code";
+    std::printf("  detail: upstream rcode %llx, own %llx\n", static_cast<unsigned long long>(up_code), static_cast<unsigned long long>(raw.rcode));
+  }
   // the first family's sample inside the decode is the same read
-  if (ok && n >= 0 && sample_h) ok = first.valid == raw.valid && Bits(first.margin) == Bits(raw.margin) && first.rcode == raw.rcode;
+  if (ok && n >= 0 && sample_h && !(first.valid == raw.valid && Bits(first.margin) == Bits(raw.margin) && first.rcode == raw.rcode)) ok = false, why = "decode sample";
   if (sample_h && !raw.valid) ++c->rejected_polarity;
 
   if (!ok) {
     ++c->mismatches;
     if (c->mismatches <= 10) {
-      std::printf("MISMATCH (%s) corners %.9g %.9g  %.9g %.9g  %.9g %.9g  %.9g %.9g rev=%d: upstream n=%d own n=%d\n", what,
-                  p[0][0], p[0][1], p[1][0], p[1][1], p[2][0], p[2][1], p[3][0], p[3][1], reversed, up_n, n);
+      std::printf("MISMATCH (%s: %s) corners %.9g %.9g  %.9g %.9g  %.9g %.9g  %.9g %.9g rev=%d: upstream n=%d own n=%d\n", what,
+                  why, p[0][0], p[0][1], p[1][0], p[1][1], p[2][0], p[2][1], p[3][0], p[3][1], reversed, up_n, n);
     }
   }
   if (up.H) matd_destroy(up.H);

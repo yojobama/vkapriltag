@@ -36,6 +36,10 @@ FetchContent_MakeAvailable(apriltag)
 # Pin gnu17: newer GCC defaults turn the old C sources' incompatible pointer calls into errors.
 if(TARGET apriltag)
   target_compile_options(apriltag PRIVATE -std=gnu17)
+  # No fused multiply-adds, so the own decode (OwnDecode.cpp, same flag) computes what this library computes.
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(apriltag PRIVATE -ffp-contract=off)
+  endif()
 endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
@@ -205,7 +209,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(vkapriltag PRIVATE -Wall -Wextra -Wno-unused-parameter)
   # No fused multiply-adds in the quad fit: which ones GCC fuses depends on how the code is
   # arranged, so its corners would change with the code's layout rather than its arithmetic.
-  set_source_files_properties(src/gpu/QuadDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+  set_source_files_properties(src/gpu/QuadDecode.cpp src/OwnDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 set_target_properties(vkapriltag PROPERTIES OUTPUT_NAME vkapriltag)
