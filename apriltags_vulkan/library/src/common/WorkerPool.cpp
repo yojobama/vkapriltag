@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -61,6 +62,15 @@ void PinThread(const std::vector<int> &cpus) {
   (void)cpus;
 #endif
 }
+
+// The pool whose task this thread is running, so that a nested ParallelFor fails loudly.
+thread_local const WorkerPool *t_running_pool = nullptr;
+
+struct RunningScope {
+  explicit RunningScope(const WorkerPool *pool) : previous(std::exchange(t_running_pool, pool)) {}
+  ~RunningScope() { t_running_pool = previous; }
+  const WorkerPool *previous;
+};
 
 }  // namespace
 
@@ -119,6 +129,7 @@ void WorkerPool::DrainBatch(unsigned slot) {
   const std::function<void(size_t, unsigned)> *fn = fn_;
   if (fn == nullptr) return;
   const size_t count = count_;
+  const RunningScope running(this);
 
   // arg = items this thread claimed; a thread that claims none shows how late it woke.
   prof::Scope drain("pool.drain");
@@ -163,10 +174,16 @@ void WorkerPool::WorkerMain(unsigned slot) {
 
 void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsigned)> &fn) {
   if (count == 0) return;
-  std::lock_guard<std::mutex> call_lock(call_mutex_);
+  if (t_running_pool == this) throw std::logic_error("WorkerPool::ParallelFor called from one of its own tasks");
+  if (!call_mutex_.try_lock()) {
+    contended_.fetch_add(1, std::memory_order_relaxed);
+    call_mutex_.lock();
+  }
+  const std::lock_guard<std::mutex> call_lock(call_mutex_, std::adopt_lock);
 
   // A single item (or a single-threaded pool) runs inline on the calling thread as slot 0.
   if (workers_.empty() || count == 1) {
+    const RunningScope running(this);
     for (size_t i = 0; i < count; ++i) fn(i, 0);
     return;
   }

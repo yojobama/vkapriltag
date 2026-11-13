@@ -23,13 +23,17 @@ struct QuadFitScratch {
   std::vector<uint32_t> hull_keys;
 };
 
+// A worker pool sized and pinned as QuadDecode(config) would build its own.
+std::shared_ptr<WorkerPool> MakeWorkerPool(const DetectorConfig &config);
+
 // CPU tail of the detector pipeline: cumulative sums, peak finding and the
 // per-blob quad fit over the GPU's raw line-fit points. Blobs are fitted in
 // parallel on a worker pool; results are returned in blob order.
 class QuadDecode {
  public:
-  // Honours APRILTAG_CPU_THREADS when config.cpu_threads is left at 0.
-  explicit QuadDecode(const DetectorConfig &config);
+  // Honours APRILTAG_CPU_THREADS when config.cpu_threads is left at 0. `pool` (see MakeWorkerPool) is
+  // shared with other stages that run one after another with this one; null builds its own.
+  explicit QuadDecode(const DetectorConfig &config, std::shared_ptr<WorkerPool> pool = nullptr);
 
   // Fits quads to the line-fit points and returns their corners in
   // full-resolution (un-decimated) pixel coordinates.
@@ -46,7 +50,7 @@ class QuadDecode {
 
  private:
   DetectorConfig config_;
-  std::unique_ptr<WorkerPool> pool_;
+  std::shared_ptr<WorkerPool> pool_;
   // One entry per pool slot.
   mutable std::vector<QuadFitScratch> scratch_;
   mutable DpStats last_dp_stats_;

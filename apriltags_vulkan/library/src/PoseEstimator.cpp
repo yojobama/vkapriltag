@@ -662,11 +662,11 @@ bool HomographyToPose(const double H[3][3], double fx, double fy, double cx, dou
 }  // namespace
 
 PoseEstimator::PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32_t cpu_threads,
-                             double convergence_tol)
+                             double convergence_tol, std::shared_ptr<WorkerPool> pool)
     : intrinsics_(intrinsics),
       tagsize_(tagsize),
       convergence_tol_(convergence_tol > 0.0 ? convergence_tol : 0.0),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "pose-worker")) {
+      pool_(pool ? std::move(pool) : std::make_shared<WorkerPool>(ResolveThreadCount(cpu_threads), "pose-worker")) {
   const auto positive = [](double v) { return std::isfinite(v) && v > 0.0; };
   if (!positive(tagsize) || !positive(intrinsics.fx) || !positive(intrinsics.fy) ||
       !std::isfinite(intrinsics.cx) || !std::isfinite(intrinsics.cy)) {

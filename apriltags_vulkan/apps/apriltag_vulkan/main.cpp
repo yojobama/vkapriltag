@@ -123,10 +123,12 @@ int main(int argc, char **argv) {
     config.normal_border = !tf->reversed_border;
 
     // decimation must match config.decimation, so this is built after config.
-    apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation);
+    const auto pool = apriltag_vulkan::MakeWorkerPool(config);
+    apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation, 0, apriltag_vulkan::RefineEdgesMethod::kProfile,
+                                            0.0f, apriltag_vulkan::WorkerPoolOptions(), false, false, pool);
 
     apriltag_vulkan::GpuDetector detector(ctx, config);
-    apriltag_vulkan::QuadDecode quad_decode(config);
+    apriltag_vulkan::QuadDecode quad_decode(config, pool);
 
     std::vector<uint8_t> gray;
     uint64_t frame_index = 0;

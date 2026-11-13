@@ -83,9 +83,10 @@ TrackingDetector::TrackingDetector(vk::Context &ctx, apriltag_detector_t *td,
     : config_(config), tracking_(tracking), td_(td) {
   ApplyEnv(&tracking_);
   gpu_ = std::make_unique<GpuDetector>(ctx, config_);
-  quad_decode_ = std::make_unique<QuadDecode>(config_);
+  pool_ = MakeWorkerPool(config_);
+  quad_decode_ = std::make_unique<QuadDecode>(config_, pool_);
   full_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, config_.cpu_threads, RefineEdgesMethod::kProfile,
-                                              0.0f, config_.PoolOptions(), false, config_.small_tag_rescue);
+                                              0.0f, config_.PoolOptions(), false, config_.small_tag_rescue, pool_);
 }
 
 TrackingDetector::~TrackingDetector() {
@@ -196,6 +197,8 @@ zarray_t *TrackingDetector::DetectFull(const uint8_t *gray_frame) {
 
 void TrackingDetector::EnsureBackground() {
   if (bg_thread_.joinable()) return;
+  // The background thread runs quad_decode_ while the caller tracks with full_decoder_: separate pools.
+  quad_decode_ = std::make_unique<QuadDecode>(config_);
   bg_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, tracking_.async_threads, RefineEdgesMethod::kProfile,
                                           0.0f, config_.PoolOptions(), true, config_.small_tag_rescue);
   bg_stop_ = false;
