@@ -484,7 +484,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     for (size_t b = 0; b < K; ++b) {
       if (a == b) continue;
       FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), 0, 0,
-              nullptr, seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
+              nullptr, a < b ? seg_params[a][b] : nullptr, &seg_err[a][b], &seg_mse[a][b]);
     }
   }
   const double max_mse = config.max_line_fit_mse;

@@ -8,3 +8,8 @@ Branch research/2026-11-quadfit-speed (from 1879a92). Base build: $A/build-quadf
   different quads (after refine), so the homography is not recomputed for the same quad except when refine leaves it unchanged.
   TryThirdBit reuses c.raw (no resample). ReadBorder runs on the unrefined quad (precheck) and in TrySideOneOut twice.
 - Plan: (1) DP path on unpacked int32 arrays (exact in int32: coords < 2^14); (2) peaks path; (3) ReadBorder median.
+- Exp 1 (a5fc8a8): DP path on unpacked int32 arrays (x, y, w in QuadFitScratch; sq dist and cross product exact in int32).
+  Desktop d2 corpus dumps vs base: identical apart from noise.txt (base itself flips between two outputs, new gives the same two).
+  Dumps: $A/qf-dumps (base_d2, base2_d2, new_d2). Pi build: ~/w/quadfit-speed/build_{base,new} (-g -fno-omit-frame-pointer).
+  Timing scripts: scratchpad qf_dtime.sh (desktop), ~/w/qf_time.sh (Pi). Results pending.
+- Uncommitted next: peaks path computes lineparam23 only for ascending segment pairs.
