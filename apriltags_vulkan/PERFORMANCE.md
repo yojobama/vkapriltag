@@ -103,6 +103,7 @@ variables with no configuration field are environment only. For the reasoning be
 | `APRILTAG_VK_TRACKING_ASYNC_INTERVAL` | int | 1 | `TrackingConfig::async_interval` | environment wins | The background detector starts at most every this many frames (at least 1). |
 | `APRILTAG_VK_TRACKING_ASYNC_COPY` | bool | on | `TrackingConfig::async_copy` | environment wins | Copy each frame for the background detector. |
 | `APRILTAG_VK_TRACKING_ASYNC_DROP` | bool | on | `TrackingConfig::async_drop_lost` | environment wins | A lost track stays out of the output until a background result finds it again. |
+| `APRILTAG_VK_CPU_TAIL` | bool | off |  | environment only | Run group, select and sort on the host for frames with few boundary points (integrated GPUs). |
 
 ### Tuning (same detections, different cost)
 
@@ -137,6 +138,7 @@ variables with no configuration field are environment only. For the reasoning be
 | `APRILTAG_VK_MERGE_X4` | bool | on for integrated GPUs |  | environment only | Merge four pixels per thread (needs 8-bit storage and a width divisible by 4). |
 | `APRILTAG_VK_MERGE_BAND` | int | 8 discrete, 0 integrated or sparse |  | environment only | Rows merged in bands of this many (power of two) before the band boundaries; 0 is one pass. |
 | `APRILTAG_VK_LEAN_TAIL` | bit mask | 3 integrated, 0 other |  | environment only | Leaner tail: bit 1 fixed-grid kernels, bit 2 offsets from select. |
+| `APRILTAG_VK_CPU_TAIL_MAX_POINTS` | int | 10000 |  | environment only | Largest boundary-point count whose tail runs on the host. |
 | `APRILTAG_VK_TRACKING_ASYNC_THREADS` | int | 1 | `TrackingConfig::async_threads` | environment wins | Threads of the background decoder; 0 is all cores. |
 | `APRILTAG_VK_POLISH_N` | int | 8000 |  | environment only | Most pixels the polish fit uses per tag (read once per process). |
 | `APRILTAG_VK_POLISH_BLUREXTRA` | float | 2.0 |  | environment only | Polish: extra blur width, in pixels, added to the window (read once per process). |

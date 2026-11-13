@@ -382,6 +382,7 @@ void GpuDetector::CreateBuffers() {
     tc.aspect_max = config_.aspect_max;
     tc.fill_min = config_.fill_min;
     tc.fill_max = config_.fill_max;
+    tc.sqrt_via_rsqrt = plan_.cpu_tail_rsqrt;
     cpu_tail_ = std::make_unique<CpuTail>(tc);
   }
 

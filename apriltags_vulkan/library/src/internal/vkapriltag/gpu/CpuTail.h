@@ -25,6 +25,8 @@ struct CpuTailConfig {
   float fill_min = 0.5f;
   float fill_max = 2.5f;
   uint32_t large_sort_cap = 65536;
+  // The device computes sqrt as the reciprocal of the reciprocal square root (Mali).
+  bool sqrt_via_rsqrt = false;
 };
 
 // hash_group, reduce_extents_hash, select_blobs, scatter_index_points and sort_points_local on the
@@ -48,7 +50,7 @@ class CpuTail {
     uint32_t k0 = 0, k1 = 0, id1 = 0;
   };
   void GrowTable();
-  int32_t Gradient(int32_t ix, int32_t iy, int32_t dx, int32_t dy) const;
+  int32_t DecimatedAt(int32_t x, int32_t y) const;
   RawLineFitPoint LineFitPoint(uint32_t packed, uint32_t blob) const;
 
   CpuTailConfig config_;
@@ -57,7 +59,8 @@ class CpuTail {
   std::vector<MinMaxExtentsGpu> raw_;
   std::vector<uint32_t> point_blob_;
   std::vector<uint32_t> remap_, offset_, cursor_;
-  std::vector<uint64_t> sort_keys_;
+  std::vector<uint64_t> sort_keys_, sort_tmp_;
+  std::vector<uint32_t> histogram_;
   std::vector<MinMaxExtentsGpu> selected_;
   std::vector<RawLineFitPoint> out_;
   uint32_t num_points_ = 0;

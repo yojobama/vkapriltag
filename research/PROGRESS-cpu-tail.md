@@ -47,3 +47,30 @@ itself (77 us for 4,400 points in the micro-benchmark) and the second readback w
 - Options `APRILTAG_VK_CPU_TAIL` (off) and `APRILTAG_VK_CPU_TAIL_MAX_POINTS` (10000). `PipelinePlan` gains `cpu_tail_want`, `cpu_tail_max_points`, `cpu_tail`.
 - On unified memory the two boundary buffers become HostVisibleCached when the mode is wanted. Discrete GPUs: mode off for now.
 - Only frames uploaded by `Detect(gray)` (not imported frames) take the CPU tail.
+
+### Equivalence test (`tests/cpu_tail_test.cpp`, ctest `cpu_tail`)
+
+Two `GpuDetector`s on the same frames (one with `APRILTAG_VK_CPU_TAIL=1` and the threshold raised so every frame takes the CPU tail), per frame:
+the selected blobs (canonical order: smallest point, then size), each blob's extents bit for bit, its sorted point list (a multiset comparison
+where equal angle keys swap, counted as "tie reorders"), then `QuadDecode` + `TagDecoder` on both, ids, Hamming distances and corners.
+
+- Desktop (RX 9060 XT, discrete, boundary points reach the host through a staged copy of the first `max_points` entries):
+  100 committed frames at decimation 2 and 1: 0 failures, corners bit-identical. 8 blobs differ in presence: a blob whose fill ratio is exactly
+  0.5 (13x13 or 15x15 boxes with 26 or 30 points) is rejected by the GPU's division and kept by the exact division on the host. The test
+  tolerates a one-sided blob only when its fill ratio is within 1e-6 of 0.5 or 2.5 and counts them ("threshold ties").
+- Pi (Mali-G610): every frame differs in the gradient weight W of some points by exactly 1 (GPU one lower): the Mali's `sqrt` of a perfect square
+  comes out just below the integer, so `int(sqrt(g))` is one less. (Result of the bias experiment below.)
+
+The first desktop timing with `getenv` inside the per-point weight computation took 1.2 ms (the call is slow on Windows): fixed by reading it once;
+it is an experiment only and must not stay (options_lint rejects it).
+
+Desktop, full corpus offline (`cpu_tail_test --dir $A/napa-corpus`, decimation 2 and 1, 8,886 frames, 217,295 selected blobs, 13,562 detections):
+0 failures, 1,515 frames with tie reorders (equal angle keys), 863 threshold ties, corners within 0.00275 px (the noise of the unsorted ties).
+
+Pi bias experiment (committed binary with `CT_SQRT_BIAS`, removed since): the Mali's `sqrt` is not simply low: the observed failures at
+perfect squares n*n for n in {7, 13, 14, 15, 30, 52, 56, 63, 104, 105, 112, 117, 120, 125, 126, 221} and exact results for
+n in {1, 2, 3, 4, 5, 94, 99, 146, 173, 205} are reproduced exactly by `1 / (1 / sqrtf(v))` in float32 (`ct_rsqrt.py`: 35 of the 361
+perfect squares fall below n, none of the observed exact ones do). So `sqrt` on the Mali is the reciprocal of the reciprocal square root.
+`CpuTailConfig::sqrt_via_rsqrt` (plan field `cpu_tail_rsqrt`, true for ARM vendor id 0x13B5) emulates it.
+
+Desktop track_eval (full,key; off against on) ran for the ten sequences; the SUMMARY lines hold timing only. Recall comparison: see below.

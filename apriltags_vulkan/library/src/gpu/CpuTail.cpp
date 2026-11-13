@@ -18,20 +18,44 @@ uint32_t HashPair(uint32_t k0, uint32_t k1) {
   return h;
 }
 
-void SortKeys(uint64_t *keys, uint32_t count) {
-  if (count <= 24) {
-    for (uint32_t i = 1; i < count; ++i) {
-      const uint64_t v = keys[i];
-      uint32_t j = i;
-      while (j > 0 && keys[j - 1] > v) {
-        keys[j] = keys[j - 1];
-        --j;
-      }
-      keys[j] = v;
+void InsertionSort(uint64_t *keys, uint32_t count) {
+  for (uint32_t i = 1; i < count; ++i) {
+    const uint64_t v = keys[i];
+    uint32_t j = i;
+    while (j > 0 && keys[j - 1] > v) {
+      keys[j] = keys[j - 1];
+      --j;
     }
-    return;
+    keys[j] = v;
   }
-  std::sort(keys, keys + count);
+}
+
+// Orders (angle key << 32 | point index) words; returns the sorted words (in keys or in tmp).
+const uint64_t *SortKeys(uint64_t *keys, uint32_t count, std::vector<uint64_t> &tmp, std::vector<uint32_t> &hist) {
+  if (count <= 24) {
+    InsertionSort(keys, count);
+    return keys;
+  }
+  if (count > 4096) {
+    std::sort(keys, keys + count);
+    return keys;
+  }
+  // Bucket by angle, then insertion-sort the nearly ordered result.
+  uint32_t buckets = 32;
+  while (buckets < count) buckets *= 2;
+  if (hist.size() < buckets) hist.resize(buckets);
+  if (tmp.size() < count) tmp.resize(count);
+  std::fill(hist.begin(), hist.begin() + buckets, 0u);
+  for (uint32_t i = 0; i < count; ++i) ++hist[((keys[i] >> 32) * buckets) >> 20];
+  uint32_t sum = 0;
+  for (uint32_t b = 0; b < buckets; ++b) {
+    const uint32_t c = hist[b];
+    hist[b] = sum;
+    sum += c;
+  }
+  for (uint32_t i = 0; i < count; ++i) tmp[hist[((keys[i] >> 32) * buckets) >> 20]++] = keys[i];
+  InsertionSort(tmp.data(), count);
+  return tmp.data();
 }
 
 }  // namespace
@@ -50,20 +74,21 @@ void CpuTail::GrowTable() {
   table_.swap(bigger);
 }
 
-int32_t CpuTail::Gradient(int32_t ix, int32_t iy, int32_t dx, int32_t dy) const {
+int32_t CpuTail::DecimatedAt(int32_t x, int32_t y) const {
   const int32_t k = static_cast<int32_t>(config_.decimation);
   const int32_t w = static_cast<int32_t>(config_.width);
-  auto dec = [&](int32_t x, int32_t y) -> int32_t {
-    if (k == 1) return gray_[y * w + x];
-    if (!config_.box_decimate) return gray_[y * k * w + x * k];
-    int32_t sum = 0;
-    for (int32_t yy = 0; yy < k; ++yy) {
-      const uint8_t *row = gray_ + (y * k + yy) * w + x * k;
-      for (int32_t xx = 0; xx < k; ++xx) sum += row[xx];
-    }
-    return (sum + k * k / 2) / (k * k);
-  };
-  return dec(ix + dx, iy + dy) - dec(ix - dx, iy - dy);
+  if (k == 1) return gray_[y * w + x];
+  if (!config_.box_decimate) return gray_[y * k * w + x * k];
+  if (k == 2) {
+    const uint8_t *row = gray_ + 2 * y * w + 2 * x;
+    return (row[0] + row[1] + row[w] + row[w + 1] + 2) >> 2;
+  }
+  int32_t sum = 0;
+  for (int32_t yy = 0; yy < k; ++yy) {
+    const uint8_t *row = gray_ + (y * k + yy) * w + x * k;
+    for (int32_t xx = 0; xx < k; ++xx) sum += row[xx];
+  }
+  return (sum + k * k / 2) / (k * k);
 }
 
 RawLineFitPoint CpuTail::LineFitPoint(uint32_t packed, uint32_t blob) const {
@@ -75,11 +100,10 @@ RawLineFitPoint CpuTail::LineFitPoint(uint32_t packed, uint32_t blob) const {
   const int32_t dh = static_cast<int32_t>(config_.height / config_.decimation);
   int32_t weight = 1;
   if (ix > 0 && ix + 1 < dw && iy > 0 && iy + 1 < dh) {
-    const int32_t gx = Gradient(ix, iy, 1, 0);
-    const int32_t gy = Gradient(ix, iy, 0, 1);
-    const int32_t v = gx * gx + gy * gy;
-    float r = std::sqrt(static_cast<float>(v));
-    if (std::getenv("CT_SQRT_BIAS") != nullptr) r = std::nextafter(r, 0.0f);
+    const int32_t gx = DecimatedAt(ix + 1, iy) - DecimatedAt(ix - 1, iy);
+    const int32_t gy = DecimatedAt(ix, iy + 1) - DecimatedAt(ix, iy - 1);
+    const float v = static_cast<float>(gx * gx + gy * gy);
+    const float r = config_.sqrt_via_rsqrt ? 1.0f / (1.0f / std::sqrt(v)) : std::sqrt(v);
     weight = static_cast<int32_t>(r) + 1;
   }
   RawLineFitPoint out;
@@ -222,7 +246,7 @@ void CpuTail::Run(const uint32_t *compacted, const uint32_t *keys, uint32_t coun
     const float d = std::fabs(dx) + std::fabs(dy);
     const float ratio = d > 0.0f ? dy / d : 0.0f;
     const float pseudo = dx >= 0.0f ? (dy >= 0.0f ? ratio : 4.0f + ratio) : 2.0f - ratio;
-    const int32_t theta_int = static_cast<int32_t>(std::nearbyint(pseudo * 2.5e5f));
+    const int32_t theta_int = static_cast<int32_t>(std::lrintf(pseudo * 2.5e5f));
     const uint32_t theta = std::min(static_cast<uint32_t>(std::max(theta_int, 0)), kMaxThetaKey);
     const uint32_t rank = cursor_[sel]++;
     if (rank >= e.count) continue;
@@ -234,13 +258,14 @@ void CpuTail::Run(const uint32_t *compacted, const uint32_t *keys, uint32_t coun
   for (uint32_t sel = 0; sel < selected_.size(); ++sel) {
     const uint32_t n = std::min(cursor_[sel], selected_[sel].count);
     uint64_t *keys_begin = sort_keys_.data() + offset_[sel];
+    const uint64_t *sorted = keys_begin;
     if (n > config_.large_sort_cap) {
       ++oversized_;
     } else {
-      SortKeys(keys_begin, n);
+      sorted = SortKeys(keys_begin, n, sort_tmp_, histogram_);
     }
     RawLineFitPoint *out = out_.data() + offset_[sel];
-    for (uint32_t j = 0; j < n; ++j) out[j] = LineFitPoint(compacted[static_cast<uint32_t>(keys_begin[j])], sel);
+    for (uint32_t j = 0; j < n; ++j) out[j] = LineFitPoint(compacted[static_cast<uint32_t>(sorted[j])], sel);
   }
   num_points_ = std::min(total, config_.point_capacity);
 }

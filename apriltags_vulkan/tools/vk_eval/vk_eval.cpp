@@ -157,6 +157,7 @@ int main(int argc, char **argv) {
         decimation = 1;
         for (const auto &l : level_specs) decimation = std::max(decimation, l.decimation);
       }
+      uint64_t cpu_tail_frames = 0, cpu_tail_mispredicts = 0;
       std::shared_ptr<apriltag_vulkan::WorkerPool> pool;
       std::unique_ptr<apriltag_vulkan::QuadDecode> quad_decode;
       std::unique_ptr<apriltag_vulkan::TagDecoder> tag_decoder;
@@ -168,6 +169,10 @@ int main(int argc, char **argv) {
           tag_decoder.reset();
           quad_decode.reset();
           pool.reset();
+          if (detector) {
+            cpu_tail_frames += detector->cpu_tail_frames();
+            cpu_tail_mispredicts += detector->cpu_tail_mispredicts();
+          }
           detector.reset();
           multi.reset();
           config = apriltag_vulkan::DetectorConfig{};
@@ -215,6 +220,13 @@ int main(int argc, char **argv) {
         if (out.is_open()) eval::WriteDets(out, int(n), ToDets(*dets));
       }
       tag_decoder.reset();
+      if (detector) {
+        cpu_tail_frames += detector->cpu_tail_frames();
+        cpu_tail_mispredicts += detector->cpu_tail_mispredicts();
+      }
+      if (cpu_tail_frames + cpu_tail_mispredicts > 0)
+        std::printf("cpu_tail_frames=%llu mispredicts=%llu\n", static_cast<unsigned long long>(cpu_tail_frames),
+                  static_cast<unsigned long long>(cpu_tail_mispredicts));
     }
     std::printf("images=%zu median_total=%.4f ms\n", paths.size(), eval::Median(all_total));
   } catch (const std::exception &e) {

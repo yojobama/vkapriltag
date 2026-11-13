@@ -30,6 +30,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # default_d1
 wg1d 128
 wg2d 8x8
@@ -62,6 +65,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # default_d4
 wg1d 128
 wg2d 8x8
@@ -94,6 +100,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # no_subgroup
 wg1d 128
 wg2d 8x8
@@ -126,6 +135,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # no_int64_atomic
 wg1d 128
 wg2d 8x8
@@ -158,6 +170,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # no_subgroup_no_int64
 wg1d 128
 wg2d 8x8
@@ -190,6 +205,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # no_8bit
 wg1d 128
 wg2d 8x8
@@ -222,6 +240,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # no_conditional_rendering
 wg1d 128
 wg2d 8x8
@@ -254,6 +275,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # box_decimate_off
 wg1d 128
 wg2d 8x8
@@ -286,6 +310,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # adaptive_floor_off
 wg1d 128
 wg2d 8x8
@@ -318,6 +345,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # fused_threshold_off
 wg1d 128
 wg2d 8x8
@@ -350,6 +380,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # uf_init_scan_off
 wg1d 128
 wg2d 8x8
@@ -382,6 +415,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # uf_verify
 wg1d 128
 wg2d 8x8
@@ -414,6 +450,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # sparse_off
 wg1d 128
 wg2d 8x8
@@ -446,6 +485,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # merge_x4_on
 wg1d 128
 wg2d 8x8
@@ -478,6 +520,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # merge_band_16
 wg1d 128
 wg2d 8x8
@@ -510,6 +555,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # lean_tail_0
 wg1d 128
 wg2d 8x8
@@ -542,6 +590,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 0
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # lean_tail_3
 wg1d 128
 wg2d 8x8
@@ -574,6 +625,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # fuse_submits_off
 wg1d 128
 wg2d 8x8
@@ -606,6 +660,9 @@ extents_direct_read 1
 fused_submits 0
 prerecord 0
 lean_tail 0
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # no_host_cached_readback
 wg1d 128
 wg2d 8x8
@@ -638,6 +695,9 @@ extents_direct_read 0
 fused_submits 0
 prerecord 0
 lean_tail 0
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # prerecord_off
 wg1d 128
 wg2d 8x8
@@ -670,6 +730,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 0
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # sort_wg_128
 wg1d 128
 wg2d 8x8
@@ -702,6 +765,9 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0
 # small_shared_memory
 wg1d 128
 wg2d 8x8
@@ -734,3 +800,6 @@ extents_direct_read 1
 fused_submits 1
 prerecord 1
 lean_tail 3
+cpu_tail 0
+cpu_tail_max_points 10000
+cpu_tail_rsqrt 0

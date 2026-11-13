@@ -51,6 +51,7 @@ struct PipelinePlan {
   // boundary buffers are host-readable.
   bool cpu_tail_want = false;
   uint32_t cpu_tail_max_points = 0;
+  bool cpu_tail_rsqrt = false;
 
   // Resolved after the buffers exist (FinalisePlan).
   bool cpu_tail = false;

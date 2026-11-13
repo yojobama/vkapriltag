@@ -123,6 +123,7 @@ PipelinePlan ResolvePlan(const vk::DeviceCaps &caps, const DetectorConfig &confi
 
   p.cpu_tail_want = env.Bool("APRILTAG_VK_CPU_TAIL", false);
   p.cpu_tail_max_points = 10000;
+  p.cpu_tail_rsqrt = caps.vendor_id == 0x13B5u;
   if (const auto v = env.ULong("APRILTAG_VK_CPU_TAIL_MAX_POINTS")) p.cpu_tail_max_points = static_cast<uint32_t>(*v);
   return p;
 }
@@ -192,6 +193,7 @@ std::string PipelinePlan::Describe() const {
   line("lean_tail", lean_tail);
   line("cpu_tail", cpu_tail);
   line("cpu_tail_max_points", cpu_tail_max_points);
+  line("cpu_tail_rsqrt", cpu_tail_rsqrt);
   return os.str();
 }
 
