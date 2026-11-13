@@ -274,6 +274,16 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
     int used = 0;
 
     for (int s = 0; s < np; s++) {
+      {
+        static const double ab = Options::FromEnvironment().Float("APRILTAG_VK_RS_ABORT", -1.0);
+        static const double half = Options::FromEnvironment().Float("APRILTAG_VK_RS_HALF", 1.0);
+        if (truncated != nullptr && ab >= 0 && s == np / 2 && s >= 8 && used < ab * half * s) {
+          g_stop = true;
+          *edge_width = 0;
+          *truncated = 0;
+          return true;
+        }
+      }
       const double alpha = (1.0 + s) / (np + 1);
       double x0, y0;
       side.PointAt(alpha, &x0, &y0);

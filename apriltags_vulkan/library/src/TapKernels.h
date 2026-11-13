@@ -27,7 +27,7 @@ inline void BlendTaps(const Img *im, const int *xis, const int *yis, const float
 #if defined(VKAPRILTAG_TAP_SSE2) || defined(VKAPRILTAG_TAP_NEON)
   const uint8_t *data = im->data;
   const ptrdiff_t stride = im->stride;
-  auto pair = [&](int k) {
+  [[maybe_unused]] auto pair = [&](int k) {
     const uint8_t *row0 = data + yis[k] * stride + xis[k];
     uint16_t a, b;
     std::memcpy(&a, row0, 2);
@@ -57,7 +57,15 @@ inline void BlendTaps(const Img *im, const int *xis, const int *yis, const float
   const uint32x4_t low = vdupq_n_u32(0xFF);
   const float32x4_t one = vdupq_n_f32(1.0f);
   for (; m + 4 <= n; m += 4) {
-    const uint32_t lanes[4] = {pair(m), pair(m + 1), pair(m + 2), pair(m + 3)};
+    int32_t off[4];
+    vst1q_s32(off, vmlaq_n_s32(vld1q_s32(xis + m), vld1q_s32(yis + m), im->stride));
+    uint32_t lanes[4];
+    for (int k = 0; k < 4; ++k) {
+      uint16_t a, b;
+      std::memcpy(&a, data + off[k], 2);
+      std::memcpy(&b, data + off[k] + stride, 2);
+      lanes[k] = static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 16);
+    }
     const uint32x4_t v = vld1q_u32(lanes);
     const float32x4_t p00 = vcvtq_f32_u32(vandq_u32(v, low));
     const float32x4_t p01 = vcvtq_f32_u32(vandq_u32(vshrq_n_u32(v, 8), low));

@@ -31,6 +31,7 @@ const OptionDescriptor kTable[] = {
     {"APRILTAG_VK_PROFILE_FEATURES", T::kMask, "31", C::kFeature, P::kEnvOnly, "",
      "Bit mask of the profile fit's refinements: 1 outliers, 2 coarse to fine, 4 halfway crossing, 8 clip bias, 16 widen blur."},
     {"APRILTAG_VK_RS_SPACING1", T::kFloat, "1.5", C::kFeature, P::kEnvOnly, "", "experiment"},
+    {"APRILTAG_VK_RS_HALF", T::kFloat, "1", C::kFeature, P::kEnvOnly, "", "experiment"},
     {"APRILTAG_VK_RS_MAXN", T::kInt, "96", C::kFeature, P::kEnvOnly, "", "experiment"},
     {"APRILTAG_VK_RS_ABORT", T::kFloat, "-1", C::kFeature, P::kEnvOnly, "", "experiment"},
     {"APRILTAG_VK_GREY_MARGIN", T::kBool, "on", C::kFeature, P::kEnvOnly, "",
