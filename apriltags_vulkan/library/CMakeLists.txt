@@ -148,6 +148,8 @@ add_library(vkapriltag STATIC
   src/common/Options.cpp
 )
 add_library(vkapriltag::vkapriltag ALIAS vkapriltag)
+# The static library can be linked into a shared object (the language bindings).
+set_target_properties(vkapriltag PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_dependencies(vkapriltag vkapriltag_shaders)
 
