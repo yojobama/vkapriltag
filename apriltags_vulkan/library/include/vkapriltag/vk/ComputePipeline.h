@@ -54,6 +54,14 @@ struct DispatchProbe {
 
 // A compute pipeline bound to a fixed list of SSBOs (in order from binding 0) plus an optional push
 // constant block; the descriptor set is written once at construction.
+// Records the order of the GPU work being recorded (dispatches, barriers, fills, copies, submits) as text, for tests.
+struct DispatchTrace {
+  static void Start();
+  static std::string Stop();
+  static bool Active();
+  static void Note(const std::string &line);
+};
+
 class ComputePipeline {
  public:
   ComputePipeline() = default;

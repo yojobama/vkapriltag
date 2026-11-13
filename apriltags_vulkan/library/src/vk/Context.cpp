@@ -1,4 +1,5 @@
 #include "vkapriltag/vk/Context.h"
+#include "vkapriltag/vk/ComputePipeline.h"
 
 #include "vkapriltag/vk/CompletionFlag.h"
 #include "vkapriltag/vk/EmbeddedShaders.h"
@@ -1109,6 +1110,7 @@ void Lane::SubmitRing(size_t i, const VkSubmitInfo &submit_info) {
     CheckVk(result, "vkQueueSubmit");
   }
   ++submit_count;
+  if (DispatchTrace::Active()) DispatchTrace::Note("submit");
 }
 
 void Lane::SubmitAndWait(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage) {
@@ -1184,6 +1186,7 @@ void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, VkSemaphore wait,
     CheckVk(vkQueueSubmit(queue_, 1, &submit_info, persistent_fence_), "vkQueueSubmit");
   }
   ++submit_count;
+  if (DispatchTrace::Active()) DispatchTrace::Note("submit");
   if (flag != nullptr && flag->Wait(std::chrono::milliseconds(2))) {
     persistent_pending_ = true;
     return;

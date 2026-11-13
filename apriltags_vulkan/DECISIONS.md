@@ -73,7 +73,7 @@ Pi is the Orange Pi 5 / 5 Plus (Mali-G610).
 | Last boundary closed by a speculative record plus retry | default (retry now only with `UF_VERIFY`) | | -0.7% (decimation 1) to -5.2% (decimation 4); exposed a destructive in-place rewrite (DEVICE_LOST) and a missing compute->transfer barrier | O 8, P §3c | none |
 | Fused path on RDNA4 via `HostVisibleCached` | default | host-cached readback on the desktop | RX GPU total -19.8% / -21.3%; saves about 0.19 ms | P §3c | none |
 | Unfused four-submit flow | default only where host-cached readback is missing | `DetectUnfused` | "No measured device is stuck on it"; +11.5% `Detect()` on the Mali; dead `fuse` branches and the duplicated timestamp code removed in 2026-11 (`CollectGpuTimings`) | P §8g, `PR del-experiments` | none |
-| `MemoryKind::DeviceLocalReadback` | removed from use | old readback kind | replaced by `HostVisibleCached` for both readbacks; the enum remains unused | P §3c | `HostVisibleCached` |
+| `MemoryKind::DeviceLocalReadback` | removed from use | old readback kind | replaced by `HostVisibleCached` for both readbacks; the enum value was deleted in 2026-11 | P §3c | `HostVisibleCached` |
 | Pre-recorded command buffers | default | record once, replay; `PRERECORD=0` kept as a debugging switch (per-dispatch timing, capture) | desktop `Detect()` -4.7%; Pi -3.2%, host overhead 193->127 us | P §8f, §8g, `PR del-switches` | none |
 | Six fewer dispatches | default | `init_extents` into `hash_group`, copies into `select_blobs`, one-workgroup scan | 4.12->4.09 / 1.99->1.93 ms; "a tiny dispatch with its barrier costs about 10 us" | P §8t, O 28 | none |
 | "Dispatch diet" | bounded | | about 8 dispatches at 3.5 us, near 1% | P §8k | none |

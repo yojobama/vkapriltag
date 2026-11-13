@@ -1,0 +1,57 @@
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=12 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=360
+fill offset=0 bytes=4
+fill offset=0 bytes=262144
+fill offset=0 bytes=8192
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=32
+barrier compute+transfer
+dispatch decimate_box_dot_u8 grid=20,15,1 push=8:aac888cd1d6d0edb
+barrier compute
+dispatch block_minmax_u8 grid=5,4,1 push=16:d8418cbc85b3520d
+barrier compute
+dispatch noise_floor grid=1,1,1 push=12:c5a3dbfcd37baf1e
+barrier compute
+dispatch threshold_block_u8 grid=5,4,1 push=20:19f3dc1ec9f7f268
+barrier compute
+dispatch cell_args grid=1,1,1 push=0:14650fb0739d0383
+barrier compute
+barrier indirect
+dispatch_indirect uf_init_scan_u8 offset=0 push=12:f327526b51fb9073
+barrier compute
+dispatch_indirect uf_merge_x4_u8 offset=0 push=16:b1496b0abdcf383b
+barrier compute
+dispatch_indirect uf_count_runs_u8 offset=0 push=16:cb1bc01c29f120e3
+barrier compute
+dispatch_indirect blob_diff_u8 offset=0 push=20:5ea6d42f2f97eb77
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=4
+dispatch hash_group grid=128,1,1 push=20:166f5fa6c97b7e05
+barrier compute
+dispatch reduce_extents_hash_atomic64_x4 grid=128,1,1 push=12:8c3014b0bc3668ef
+barrier compute
+dispatch select_blobs grid=32,1,1 push=44:7a087f15cb9259d7
+barrier compute
+dispatch scatter_index_points grid=128,1,1 push=16:d31aae2f446e08c3
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=16
+copy bytes=4 src_offset=0 dst_offset=20
+copy bytes=4 src_offset=0 dst_offset=12
+copy bytes=4 src_offset=0 dst_offset=8
+barrier indirect
+dispatch_indirect sort_points_local_u8 offset=12 push=20:901fe92618500c92
+barrier compute
+barrier indirect
+dispatch_indirect sort_points_large_u8 offset=0 push=20:901fe92618500c92
+barrier compute
+dispatch_indirect sort_points_large_u8 offset=12 push=20:901fe92618500c92
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=24
+barrier host_read
+submit

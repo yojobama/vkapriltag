@@ -1,0 +1,55 @@
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=12 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=1200
+fill offset=0 bytes=4
+fill offset=0 bytes=262144
+fill offset=0 bytes=8192
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=32
+barrier compute+transfer
+dispatch block_minmax_decimate_u8 grid=10,8,1 push=16:9a3435cfe82c0794
+barrier compute
+dispatch noise_floor grid=1,1,1 push=12:a57e898b0a7b6fc8
+barrier compute
+dispatch threshold_block_u8 grid=10,8,1 push=20:3c54843bb719ca21
+barrier compute
+dispatch cell_args grid=1,1,1 push=0:14650fb0739d0383
+barrier compute
+barrier indirect
+dispatch_indirect uf_init_scan_u8 offset=0 push=12:76bf58ff807e9fa0
+barrier compute
+dispatch_indirect uf_merge_x4_u8 offset=0 push=16:4ac454c49780dcb8
+barrier compute
+dispatch_indirect uf_count_runs_u8 offset=0 push=16:61ecae011e810de0
+barrier compute
+dispatch_indirect blob_diff_u8 offset=0 push=20:e5704b50185ccd1e
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=4
+dispatch hash_group grid=128,1,1 push=20:737f4f9c213830c7
+barrier compute
+dispatch reduce_extents_hash_atomic64_x4 grid=128,1,1 push=12:dd426e012ff95771
+barrier compute
+dispatch select_blobs grid=32,1,1 push=44:7a087f15cb9259d7
+barrier compute
+dispatch scatter_index_points grid=128,1,1 push=16:8a196abef9027ebb
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=16
+copy bytes=4 src_offset=0 dst_offset=20
+copy bytes=4 src_offset=0 dst_offset=12
+copy bytes=4 src_offset=0 dst_offset=8
+barrier indirect
+dispatch_indirect sort_points_local_u8 offset=12 push=20:3a9f1cb37d46e4f5
+barrier compute
+barrier indirect
+dispatch_indirect sort_points_large_u8 offset=0 push=20:3a9f1cb37d46e4f5
+barrier compute
+dispatch_indirect sort_points_large_u8 offset=12 push=20:3a9f1cb37d46e4f5
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=24
+barrier host_read
+submit
