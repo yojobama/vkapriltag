@@ -55,3 +55,19 @@ Build dirs: `$A/build-upload-decimate` (branch), `$A/build-upload-decimate-base`
   new: 0.704 0.714 0.717 0.728 0.711 0.709 / gpu 0.542 0.551 0.557 0.546 0.549 0.549.
   Per size (base about, new about): 640x480 0.70 -> 0.66, 1280x720 0.96 -> 0.87. Gain: total about -5.5%, 640x480 about -6%, 1280x720 about -9%,
   gpu part about -8%. Found 4819/4972, 35 false, error 0.017/0.100 px in every run; all 26 dumps byte-identical to base.
+- 6. Desktop gate, same `new` binary with `APRILTAG_VK_CPU_DECIMATE=0` (GPU decimation) against default (CPU), whole corpus dumps
+  (`ud-gate.sh`): decimation 4: identical; decimation 2 with `BOX_DECIMATE=0`: identical; decimation 4 with `BOX_DECIMATE=0`: identical;
+  `FUSE_SUBMITS=0` (unfused flow): identical; `FORCE_NO_8BIT=1` (32-bit layout): identical except one 0.0006 px line of `noise` and
+  `PRERECORD=0`: one such line (the known noise frame). Decimation 3 (needs width divisible by 3, so only the 300 1920x1080 frames of
+  the corpus, `ud-d3.sh`): box on: one line differs by under 0.001 px (noise), `BOX_DECIMATE=0`: identical.
+  Facade tests (`facade_stride`, `facade_pipelined`, ...) pass in ctest: the stride path packs the frame before `Detect`, and the pipelined mode
+  waits for the previous frame's GPU work before the next write, as for the grey buffer, so no upload is shared.
+- 7. Sequences (10 x 200 frames, `track_eval --modes full,key --decimation 2`, `ud-seq.sh`): the detections of base and new are identical
+  in all 20 dumps (only the `# path .. ms` timing comment lines differ).
+- 8. Remaining per-frame copy traffic (read, not changed): `FinishFused` memcpy of the selected extents (selected blobs x 32 bytes: a few hundred bytes to
+  a few KB); `FramePipeline` copies the line-fit points (8 bytes per point, up to tens of KB on busy frames) once per frame in pipelined mode;
+  the facade copies a strided input into a packed buffer (a full-frame memcpy, only when stride != width); `TrackingDetector` async mode copies the full
+  frame into `bg_copy_`; the facade's result copy is the detections list (tiny). The full-frame upload was the dominant copy and is gone at decimation above 1.
+- Files touched: `gpu/CpuDecimate.cpp/.h` (new), `gpu/GpuDetector.cpp/.h` (upload, `RecordThreshold`, `RecordFrameHead`, buffer outcome),
+  `gpu/PipelinePlan.cpp/.h`, `common/Options.cpp`, `library/CMakeLists.txt`, `tests/unit_tests.cpp`, `tests/CMakeLists.txt` (shared: one test group),
+  goldens, `PERFORMANCE.md` options table, `DECISIONS.md`, `CHANGELOG.md`. `StageTable.cpp` and the shaders were not needed.
