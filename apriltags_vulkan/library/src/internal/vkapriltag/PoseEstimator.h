@@ -6,39 +6,12 @@
 #include <vector>
 
 #include "vkapriltag/Detection.h"
+#include "vkapriltag/Pose.h"
 #include "vkapriltag/common/WorkerPool.h"
 
 namespace apriltag_vulkan {
 
 // Pinhole camera intrinsics in pixels; lens distortion is not modelled.
-struct CameraIntrinsics {
-  double fx = 0.0;
-  double fy = 0.0;
-  double cx = 0.0;
-  double cy = 0.0;
-};
-
-// The tag's pose in the camera optical frame (`t` position, `R` orientation), as libapriltag's
-// pose type. `error` is the object-space error of the fit; `valid` is false if no pose
-// could be computed.
-struct TagPose {
-  double R[3][3] = {};
-  double t[3] = {};
-  double error = 0.0;
-  bool valid = false;
-  // Orthogonal-iteration steps run (the cap when early exit is disabled).
-  int iterations = 0;
-};
-
-// Both candidate solutions of the planar-pose ambiguity, before the lower-error one is chosen.
-struct TagPosePair {
-  TagPose solution1;  // orthogonal iteration from the homography seed
-  TagPose solution2;  // the second local minimum, if one exists
-};
-
-// Tag pose from four corners, ported from libapriltag's apriltag_pose.c: homography seed,
-// orthogonal iteration, and a search for the second local minimum, with the lower-error solution
-// winning. Uses fixed-size 3x3/3x1 arithmetic instead of heap matrices. Runs on the CPU.
 class PoseEstimator {
  public:
   // Iteration cap (libapriltag uses 50).

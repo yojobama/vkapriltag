@@ -115,6 +115,7 @@ add_library(vkapriltag STATIC
   src/vk/ComputePipeline.cpp
   src/vk/PipelineCache.cpp
   src/vk/QueryPool.cpp
+  src/Detector.cpp
   src/gpu/GpuDetector.cpp
   src/gpu/PipelinePlan.cpp
   src/gpu/StageTable.cpp
@@ -154,8 +155,13 @@ target_include_directories(vkapriltag PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-# Internal headers (Geometry.h), found by every source file regardless of its directory.
-target_include_directories(vkapriltag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Internal headers (the stages, the Vulkan layer, Geometry.h), found by every source file and by the in-tree
+# tools and tests that link vkapriltag::internal; they are not installed.
+target_include_directories(vkapriltag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/internal)
+add_library(vkapriltag_internal INTERFACE)
+target_link_libraries(vkapriltag_internal INTERFACE vkapriltag)
+target_include_directories(vkapriltag_internal INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/internal)
+add_library(vkapriltag::internal ALIAS vkapriltag_internal)
 
 if(VKAPRILTAG_HAVE_DOT_SHADER)
   target_compile_definitions(vkapriltag PRIVATE VKAPRILTAG_HAVE_DOT_SHADER=1)

@@ -58,7 +58,7 @@ def scenarios(corpus):
     return sorted(d for d in os.listdir(corpus) if os.path.exists(os.path.join(corpus, d, "list.txt")))
 
 
-def run_profile(exe, corpus, profile, out_dir):
+def run_profile(exe, corpus, profile, out_dir, extra=()):
     env = dict(os.environ)
     env.update(profile["env"])
     for scenario in scenarios(corpus):
@@ -71,6 +71,7 @@ def run_profile(exe, corpus, profile, out_dir):
                "--warmup", "0", "--decimation", str(profile["decimation"])]
         if scenario == "family16h5":
             cmd += ["--family", "tag16h5"]
+        cmd += list(extra)
         r = subprocess.run(cmd, env=env, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"{scenario}: vk_eval failed ({r.returncode})\n{r.stdout}{r.stderr}")
@@ -83,6 +84,7 @@ def main():
     ap.add_argument("--golden", default=os.path.join(HERE, "golden"))
     ap.add_argument("--profiles", default="")
     ap.add_argument("--update", action="store_true")
+    ap.add_argument("--vk-eval-arg", action="append", default=[], help="an extra argument for vk_eval (repeatable)")
     ap.add_argument("--out", default="")
     ap.add_argument("--tolerance", type=float, default=0.02)
     ap.add_argument("--noise-frames", type=int, default=2)
@@ -95,7 +97,7 @@ def main():
         t0 = time.time()
         out_dir = os.path.join(a.out, name) if a.out else tempfile.mkdtemp(prefix=f"golden-{name}-")
         os.makedirs(out_dir, exist_ok=True)
-        run_profile(a.vk_eval, a.corpus, profiles[name], out_dir)
+        run_profile(a.vk_eval, a.corpus, profiles[name], out_dir, a.vk_eval_arg)
         gold_dir = os.path.join(a.golden, name)
         if a.update:
             os.makedirs(gold_dir, exist_ok=True)

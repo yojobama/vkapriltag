@@ -24,7 +24,7 @@ elseif (OpenCV_FOUND)
           validate_against_libapriltag/validate_against_libapriltag_opencv.cpp
   )
 
-  target_link_libraries(apriltag_vulkan_validate PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  target_link_libraries(apriltag_vulkan_validate PRIVATE vkapriltag::internal ${OpenCV_LIBS})
   vkapriltag_use_upstream(apriltag_vulkan_validate)
   # --renderdoc-capture needs RenderDoc's in-application API header; without it the option warns.
   find_path(RENDERDOC_APP_INCLUDE_DIR renderdoc_app.h
@@ -48,7 +48,7 @@ elseif (OpenCV_FOUND)
   add_executable(apriltag_pose_e2e_validate
           validate_pose_e2e/validate_pose_e2e.cpp
   )
-  target_link_libraries(apriltag_pose_e2e_validate PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  target_link_libraries(apriltag_pose_e2e_validate PRIVATE vkapriltag::internal ${OpenCV_LIBS})
   vkapriltag_use_upstream(apriltag_pose_e2e_validate)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_pose_e2e_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -58,7 +58,7 @@ elseif (OpenCV_FOUND)
   add_executable(apriltag_synth_ground_truth
           synth_pose_ground_truth/synth_pose_ground_truth.cpp
   )
-  target_link_libraries(apriltag_synth_ground_truth PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  target_link_libraries(apriltag_synth_ground_truth PRIVATE vkapriltag::internal ${OpenCV_LIBS})
   vkapriltag_use_upstream(apriltag_synth_ground_truth)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_synth_ground_truth PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -68,7 +68,7 @@ else()
   add_executable(apriltag_vulkan_validate
     validate_against_libapriltag/validate_against_libapriltag.cpp
   )
-  target_link_libraries(apriltag_vulkan_validate PRIVATE vkapriltag::vkapriltag)
+  target_link_libraries(apriltag_vulkan_validate PRIVATE vkapriltag::internal)
   vkapriltag_use_upstream(apriltag_vulkan_validate)
 endif()
 
@@ -80,7 +80,7 @@ endif()
 
 # Throughput of concurrent detector streams on one GPU, each on a chosen queue family. Needs no OpenCV.
 add_executable(bench_multiqueue bench_multiqueue/bench_multiqueue.cpp)
-target_link_libraries(bench_multiqueue PRIVATE vkapriltag::vkapriltag)
+target_link_libraries(bench_multiqueue PRIVATE vkapriltag::internal)
 install(TARGETS bench_multiqueue RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # What a pipeline barrier costs: K independent dispatches replayed with no barrier, an execution-only
@@ -98,20 +98,20 @@ add_executable(bench_barrier bench_barrier/bench_barrier.cpp
   ${CMAKE_BINARY_DIR}/shaders/barrier_probe.comp.spv)
 target_compile_definitions(bench_barrier PRIVATE
   BARRIER_PROBE_SPV="${CMAKE_BINARY_DIR}/shaders/barrier_probe.comp.spv")
-target_link_libraries(bench_barrier PRIVATE vkapriltag::vkapriltag)
+target_link_libraries(bench_barrier PRIVATE vkapriltag::internal)
 install(TARGETS bench_barrier RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(UNIX)
   # Imports a dma-buf (dma-heap allocation or V4L2 capture buffer) as the detector's input frame.
   add_executable(dmabuf_import_test dmabuf_import_test/dmabuf_import_test.cpp)
-  target_link_libraries(dmabuf_import_test PRIVATE vkapriltag::vkapriltag)
+  target_link_libraries(dmabuf_import_test PRIVATE vkapriltag::internal)
 endif()
 
 # Pose verification: compares PoseEstimator with libapriltag's apriltag_pose.c stage by stage over a synthetic sweep,
 # degenerate geometry and (with --data) real detections. Needs no OpenCV.
 if(TARGET apriltag)
   add_executable(apriltag_pose_validate validate_pose/validate_pose.cpp)
-  target_link_libraries(apriltag_pose_validate PRIVATE vkapriltag::vkapriltag)
+  target_link_libraries(apriltag_pose_validate PRIVATE vkapriltag::internal)
   vkapriltag_use_upstream(apriltag_pose_validate)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_pose_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
@@ -122,7 +122,7 @@ endif()
 if(VKAPRILTAG_REGEN_VECTORS)
   add_executable(gen_decode_vectors upstream/gen_decode_vectors.cpp)
   target_include_directories(gen_decode_vectors PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tests ${PROJECT_SOURCE_DIR}/tools/vk_eval)
-  target_link_libraries(gen_decode_vectors PRIVATE vkapriltag::vkapriltag)
+  target_link_libraries(gen_decode_vectors PRIVATE vkapriltag::internal)
   vkapriltag_use_upstream(gen_decode_vectors)
 endif()
 
@@ -147,14 +147,14 @@ endif()
 
 # Runs a frame sequence through TrackingDetector with tracking off and on, interleaved, and reports times and paths.
 add_executable(track_eval track_eval/track_eval.cpp)
-target_link_libraries(track_eval PRIVATE vkapriltag::vkapriltag)
+target_link_libraries(track_eval PRIVATE vkapriltag::internal)
 install(TARGETS track_eval RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Evaluation harness: runs a frame list through the GPU pipeline and CPU tail and writes the detection dump
 # that napa_corpus/score_corpus.py scores. Needs no OpenCV.
 add_executable(vk_eval vk_eval/vk_eval.cpp)
 target_include_directories(vk_eval PRIVATE vk_eval)
-target_link_libraries(vk_eval PRIVATE vkapriltag::vkapriltag)
+target_link_libraries(vk_eval PRIVATE vkapriltag::internal)
 # --ref (the unmodified libapriltag CPU detector) needs upstream.
 if(TARGET apriltag)
   target_sources(vk_eval PRIVATE vk_eval/vk_eval_ref.cpp)

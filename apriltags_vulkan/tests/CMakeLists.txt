@@ -4,13 +4,13 @@ find_package(Python3 COMPONENTS Interpreter)
 
 add_executable(unit_tests unit_tests.cpp)
 target_include_directories(unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/library/src)
-target_link_libraries(unit_tests PRIVATE vkapriltag::vkapriltag)
+target_link_libraries(unit_tests PRIVATE vkapriltag::internal)
 
 # The differential test of the decode against the upstream results recorded in own_decode_vectors.bin
 # (tools/upstream/gen_decode_vectors.cpp writes the file). It needs no upstream.
 add_executable(own_decode_test own_decode_test.cpp)
 target_include_directories(own_decode_test PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tools/vk_eval)
-target_link_libraries(own_decode_test PRIVATE vkapriltag::vkapriltag)
+target_link_libraries(own_decode_test PRIVATE vkapriltag::internal)
 set(OWN_DECODE_VECTORS ${CMAKE_CURRENT_SOURCE_DIR}/own_decode_vectors.bin)
 add_test(NAME own_decode_random COMMAND own_decode_test random ${OWN_DECODE_VECTORS})
 add_test(NAME own_decode_reconcile COMMAND own_decode_test reconcile ${OWN_DECODE_VECTORS})
@@ -23,7 +23,7 @@ set_tests_properties(own_decode_random own_decode_reconcile own_decode_corpus PR
 # The recorded GPU work of the first frame, per device (tests/gpu_trace/<device>/<profile>.txt; devices without goldens skip).
 add_executable(gpu_trace_test gpu_trace_test.cpp)
 target_include_directories(gpu_trace_test PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tools/vk_eval)
-target_link_libraries(gpu_trace_test PRIVATE vkapriltag::vkapriltag)
+target_link_libraries(gpu_trace_test PRIVATE vkapriltag::internal)
 function(add_gpu_trace name decimation)
   add_test(NAME gpu_trace_${name}
     COMMAND gpu_trace_test --image ${CMAKE_CURRENT_SOURCE_DIR}/corpus/one-tag/one-tag_640x480_000.png
@@ -51,6 +51,15 @@ add_gpu_trace(fused_threshold_off_d2 2 "APRILTAG_VK_FUSED_THRESHOLD=0")
 add_gpu_trace(uf_init_scan_off_d2 2 "APRILTAG_VK_UF_INIT_SCAN=0")
 add_gpu_trace(prerecord_off_d2 2 "APRILTAG_VK_PRERECORD=0")
 
+# The public Detector in every mode (needs a Vulkan device).
+add_executable(facade_test facade_test.cpp)
+target_include_directories(facade_test PRIVATE ${PROJECT_SOURCE_DIR}/tools/vk_eval)
+target_link_libraries(facade_test PRIVATE vkapriltag::vkapriltag)
+foreach(group sync pipelined tracking levels pose stride device errors)
+  add_test(NAME facade_${group} COMMAND facade_test ${CMAKE_CURRENT_SOURCE_DIR}/corpus ${group})
+  set_tests_properties(facade_${group} PROPERTIES TIMEOUT 300)
+endforeach()
+
 foreach(group decode geometry geom edges quadfit options steps pool)
   add_test(NAME unit_${group} COMMAND unit_tests ${group})
 endforeach()
@@ -64,6 +73,13 @@ if(TARGET vk_eval AND Python3_FOUND)
             --corpus ${CMAKE_CURRENT_SOURCE_DIR}/corpus
             --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden)
   set_tests_properties(golden_detections PROPERTIES TIMEOUT 600)
+  add_test(NAME golden_detections_facade
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/golden_test.py
+            --vk-eval $<TARGET_FILE:vk_eval>
+            --corpus ${CMAKE_CURRENT_SOURCE_DIR}/corpus
+            --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden
+            --vk-eval-arg=--facade)
+  set_tests_properties(golden_detections_facade PROPERTIES TIMEOUT 600)
   add_test(NAME options_lint
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/options_lint.py
             --root ${PROJECT_SOURCE_DIR} --vk-eval $<TARGET_FILE:vk_eval>)
