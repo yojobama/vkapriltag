@@ -6,25 +6,19 @@ add_executable(unit_tests unit_tests.cpp)
 target_include_directories(unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/library/src)
 target_link_libraries(unit_tests PRIVATE vkapriltag::vkapriltag)
 
-# The differential test of the decode against the patched upstream library.
-if(TARGET apriltag)
-  add_executable(own_decode_test own_decode_test.cpp)
-  target_include_directories(own_decode_test PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tools/vk_eval ${PROJECT_SOURCE_DIR}/tools)
-  target_link_libraries(own_decode_test PRIVATE vkapriltag::vkapriltag apriltag)
-  add_test(NAME own_decode_random COMMAND own_decode_test random)
-  add_test(NAME own_decode_reconcile COMMAND own_decode_test reconcile)
-  add_test(NAME families_match_upstream COMMAND own_decode_test families)
-  add_test(NAME own_decode_corpus
-    COMMAND own_decode_test corpus ${CMAKE_CURRENT_SOURCE_DIR}/corpus ${CMAKE_CURRENT_SOURCE_DIR}/own_decode_quads.txt)
-  add_test(NAME own_decode_comparison_can_fail COMMAND own_decode_test random "" "" tag16h5)
-  set_tests_properties(own_decode_comparison_can_fail PROPERTIES WILL_FAIL TRUE ENVIRONMENT OWN_DECODE_TEST_SABOTAGE=1)
-  set_tests_properties(own_decode_random own_decode_reconcile own_decode_corpus PROPERTIES TIMEOUT 600)
-  # Windows has no rpath: put the apriltag DLL beside the executable.
-  if(WIN32)
-    add_custom_command(TARGET own_decode_test POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:apriltag> $<TARGET_FILE_DIR:own_decode_test>)
-  endif()
-endif()
+# The differential test of the decode against the upstream results recorded in own_decode_vectors.bin
+# (tools/upstream/gen_decode_vectors.cpp writes the file). It needs no upstream.
+add_executable(own_decode_test own_decode_test.cpp)
+target_include_directories(own_decode_test PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tools/vk_eval)
+target_link_libraries(own_decode_test PRIVATE vkapriltag::vkapriltag)
+set(OWN_DECODE_VECTORS ${CMAKE_CURRENT_SOURCE_DIR}/own_decode_vectors.bin)
+add_test(NAME own_decode_random COMMAND own_decode_test random ${OWN_DECODE_VECTORS})
+add_test(NAME own_decode_reconcile COMMAND own_decode_test reconcile ${OWN_DECODE_VECTORS})
+add_test(NAME families_match_upstream COMMAND own_decode_test families ${OWN_DECODE_VECTORS})
+add_test(NAME own_decode_corpus COMMAND own_decode_test corpus ${OWN_DECODE_VECTORS} ${CMAKE_CURRENT_SOURCE_DIR}/corpus)
+add_test(NAME own_decode_comparison_can_fail COMMAND own_decode_test random ${OWN_DECODE_VECTORS} "" tag16h5)
+set_tests_properties(own_decode_comparison_can_fail PROPERTIES WILL_FAIL TRUE ENVIRONMENT OWN_DECODE_TEST_SABOTAGE=1)
+set_tests_properties(own_decode_random own_decode_reconcile own_decode_corpus PROPERTIES TIMEOUT 600)
 
 foreach(group decode geometry geom edges quadfit options steps pool)
   add_test(NAME unit_${group} COMMAND unit_tests ${group})

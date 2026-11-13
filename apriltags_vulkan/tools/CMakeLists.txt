@@ -119,6 +119,14 @@ if(TARGET apriltag)
   install(TARGETS apriltag_pose_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
+# Records upstream's decode of a fixed set of quads as tests/own_decode_vectors.bin (needs the patched upstream).
+if(TARGET apriltag)
+  add_executable(gen_decode_vectors upstream/gen_decode_vectors.cpp)
+  target_include_directories(gen_decode_vectors PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tests ${PROJECT_SOURCE_DIR}/tools/vk_eval)
+  target_link_libraries(gen_decode_vectors PRIVATE vkapriltag::vkapriltag)
+  vkapriltag_use_upstream(gen_decode_vectors)
+endif()
+
 # Mali hardware-counter tools (Linux, Arm Mali): hwcnt_run prints every counter over a command's
 # run, hwcnt_timeline samples selected counters periodically. Built against Arm's libGPUCounters.
 option(VKAPRILTAG_BUILD_MALI_COUNTERS "Build the Mali hardware-counter tools (fetches libGPUCounters)" OFF)

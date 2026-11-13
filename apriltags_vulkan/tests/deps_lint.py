@@ -10,9 +10,9 @@ import pathlib
 import re
 import sys
 
-# Files that may use upstream: the differential test and the reference validation tools (S3 makes them optional).
+# Files that may use upstream: the vector generator and the reference validation tools.
 ALLOWED = {
-    "tests/own_decode_test.cpp",
+    "tools/upstream/gen_decode_vectors.cpp",
     "tools/upstream/UpstreamAdapter.h",
     "tools/vk_eval/vk_eval_ref.cpp",
     "tools/validate_against_libapriltag/validate_common.h",
