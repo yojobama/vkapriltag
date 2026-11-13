@@ -450,10 +450,10 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
       const size_t i = first + j;
       const LineFitMoments &hi = cp[i + k_off], &lo = cp[i - k_off - 1];
       const int64_t W = static_cast<int32_t>(hi.W - lo.W);
-      const int64_t mx = hi.Mx - lo.Mx, my = hi.My - lo.My;
-      const int64_t Cxx = (hi.Mxx - lo.Mxx) * W - mx * mx;
-      const int64_t Cxy = (hi.Mxy - lo.Mxy) * W - mx * my;
-      const int64_t Cyy = (hi.Myy - lo.Myy) * W - my * my;
+      const int32_t mx = static_cast<int32_t>(hi.Mx - lo.Mx), my = static_cast<int32_t>(hi.My - lo.My);
+      const int64_t Cxx = (hi.Mxx - lo.Mxx) * W - static_cast<int64_t>(mx) * mx;
+      const int64_t Cxy = (hi.Mxy - lo.Mxy) * W - static_cast<int64_t>(mx) * my;
+      const int64_t Cyy = (hi.Myy - lo.Myy) * W - static_cast<int64_t>(my) * my;
       wd[j] = static_cast<float>(Cxx - Cyy);
       wsum[j] = static_cast<float>(Cxx + Cyy);
       wx[j] = 2 * static_cast<float>(Cxy);
@@ -540,12 +540,20 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   double seg_mse[kNMaxima][kNMaxima];
   double seg_params[kNMaxima][kNMaxima][2];
   for (size_t a = 0; a < K; ++a) {
-    for (size_t b = 0; b < K; ++b) {
-      if (a == b) continue;
-      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), 0, 0,
-              nullptr, a < b ? seg_params[a][b] : nullptr, &seg_err[a][b], &seg_mse[a][b]);
+    for (size_t b = a + 1; b < K; ++b) {
+      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), 0, 0, nullptr,
+              seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
     }
   }
+  // The closing segments (b, a) are fitted when the search first needs them.
+  bool closing_done[kNMaxima][kNMaxima] = {};
+  auto closing = [&](size_t b, size_t a) {
+    if (!closing_done[b][a]) {
+      closing_done[b][a] = true;
+      FitLine(ReadMomentsWindow(cs, total_points, point_indices[b], point_indices[a]), 0, 0, nullptr,
+              nullptr, &seg_err[b][a], &seg_mse[b][a]);
+    }
+  };
   QF_T1(4, K * (K - 1));
   QF_T0(5);
   const double max_mse = config.max_line_fit_mse;
@@ -573,6 +581,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
         for (uint32_t m3 = m2 + 1; m3 < kNMaxima; ++m3) {
           if (m3 >= K) break;
           if (seg_mse[m2][m3] > max_mse) continue;
+          closing(m3, m0);
           if (seg_mse[m3][m0] > max_mse) continue;
 
           const double total = errm0m1 + errm1m2 + seg_err[m2][m3] + seg_err[m3][m0];

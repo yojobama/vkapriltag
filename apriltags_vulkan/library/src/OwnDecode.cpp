@@ -270,13 +270,15 @@ float SampleFamily(const FamilyTables &f, double sharpening, const Image *im, co
   double B[2][3] = {{0, 0, 0}, {0, 0, 0}};
   uint8_t read[kMaxBorder];
   bool all[2] = {true, true};
+  // The border samples projected in one pass over the table, which vectorises.
+  double border_x[kMaxBorder], border_y[kMaxBorder];
+  for (int k = 0; k < f.nborder; ++k) Project(h, f.bx[k], f.by[k], &border_x[k], &border_y[k]);
   int n = 0;
   for (int p = 0; p < 8; ++p) {
     const int m = p & 1;
     for (int i = 0; i < w; ++i, ++n) {
       const double tagx = f.bx[n], tagy = f.by[n];
-      double px, py;
-      Project(h, tagx, tagy, &px, &py);
+      const double px = border_x[n], py = border_y[n];
       const int ix = px;
       const int iy = py;
       if (ix < 0 || iy < 0 || ix >= im->width || iy >= im->height) {
@@ -318,10 +320,11 @@ float SampleFamily(const FamilyTables &f, double sharpening, const Image *im, co
   double values[kMaxGrid];
   std::memset(values, 0, sizeof(double) * tw * tw);
   bool finite = true;
-  for (const FamilyTables::Bit &bit : f.bits) {
-    double px, py;
-    Project(h, bit.x, bit.y, &px, &py);
-    const double v = ValueForPixel(im, px, py);
+  double bit_x[64], bit_y[64];
+  for (size_t k = 0; k < f.bits.size(); ++k) Project(h, f.bits[k].x, f.bits[k].y, &bit_x[k], &bit_y[k]);
+  for (size_t k = 0; k < f.bits.size(); ++k) {
+    const FamilyTables::Bit &bit = f.bits[k];
+    const double v = ValueForPixel(im, bit_x[k], bit_y[k]);
     if (v == -1) continue;
     const double thresh = ((cb[0] * bit.x + cb[1] * bit.y + cb[2]) + (cw[0] * bit.x + cw[1] * bit.y + cw[2])) / 2.0;
     values[bit.cell] = v - thresh;
