@@ -12,7 +12,7 @@ fill offset=0 bytes=4
 fill offset=0 bytes=4
 fill offset=0 bytes=32
 barrier compute+transfer
-dispatch block_minmax_decimate_u8 grid=10,8,1 push=16:9a3435cfe82c0794
+dispatch block_minmax_u8 grid=10,8,1 push=16:9a3435cfe82c0794
 barrier compute
 dispatch noise_floor grid=1,1,1 push=12:a57e898b0a7b6fc8
 barrier compute

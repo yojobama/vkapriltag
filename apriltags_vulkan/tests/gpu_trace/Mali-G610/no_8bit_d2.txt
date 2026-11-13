@@ -10,8 +10,6 @@ fill offset=0 bytes=4
 fill offset=0 bytes=4
 fill offset=0 bytes=32
 barrier compute+transfer
-dispatch decimate_box grid=40,30,1 push=8:445c8f869b52f5b8
-barrier compute
 dispatch block_minmax grid=10,8,1 push=16:9a3435cfe82c0794
 barrier compute
 dispatch block_filter grid=10,8,1 push=8:751c92464eedae2f
