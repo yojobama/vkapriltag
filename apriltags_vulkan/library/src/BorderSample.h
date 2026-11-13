@@ -7,8 +7,8 @@ extern "C" {
 
 namespace apriltag_vulkan {
 
-// Grey levels read around a tag's border, from the row-major homography H (9 values) of its black square (tag
-// coordinates [-1, 1] across the W-cell square, as quad_update_homographies builds it).
+// Grey levels read around a tag's border, from the row-major homography H (9 values) of its black square
+// (tag coordinates [-1, 1] across the W-cell square).
 struct BorderLevels {
   double black = 0;  // median of the border cells
   double white = 0;  // median of the quiet ring half a cell outside the border

@@ -15,9 +15,9 @@ extern "C" {
 
 namespace apriltag_vulkan {
 
-// Decodes CPU-computed quad candidates (DetectedQuad from QuadDecode) into tags via the `apriltag`
-// library's quad_decode_index and reconcile_detections (exposed by
-// cmake/patches/apriltag-expose-decode-steps.patch): id, hamming distance, decision margin,
+// Decodes CPU-computed quad candidates (DetectedQuad from QuadDecode) into tags with the in-house port of
+// the `apriltag` library's quad_decode_index and reconcile_detections (OwnDecode; APRILTAG_VK_OWN_DECODE=0
+// uses the library's, exposed by cmake/patches/apriltag-expose-decode-steps.patch): id, hamming distance, decision margin,
 // centre and homography-refined corners. If `td->refine_edges` is set, each quad is refined
 // (see RefineEdgesMethod) before decoding. Stops at 2D detection; pose is not computed here.
 // Quads are decoded in parallel over a WorkerPool and merged in quad order, so the output does
