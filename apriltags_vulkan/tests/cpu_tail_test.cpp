@@ -63,21 +63,74 @@ bool SameExtents(const apriltag_vulkan::MinMaxExtentsGpu &a, const apriltag_vulk
          a.pxgx_plus_pygy_sum == b.pxgx_plus_pygy_sum && a.gx_sum == b.gx_sum && a.gy_sum == b.gy_sum;
 }
 
+// Host-timed GPU phase of frame B, alternating with frame A, with the mode off and with a threshold between
+// the two frames' boundary-point counts (every B frame then runs the head, then the rest of the tail).
+int Mispredict(const std::string &path_a, const std::string &path_b) {
+  apriltag_vulkan::vk::Context ctx;
+  const eval::Image a = eval::LoadGrey(path_a), b = eval::LoadGrey(path_b);
+  if (a.width != b.width || a.height != b.height) {
+    std::cerr << "the frames must have the same size\n";
+    return 2;
+  }
+  apriltag_vulkan::DetectorConfig config;
+  config.width = uint32_t(a.width);
+  config.height = uint32_t(a.height);
+  config.decimation = 2;
+  SetEnv("APRILTAG_VK_CPU_TAIL", nullptr);
+  apriltag_vulkan::GpuDetector off(ctx, config);
+  off.Detect(a.grey.data());
+  const uint32_t points_a = off.last_profile().boundary_points;
+  off.Detect(b.grey.data());
+  const uint32_t points_b = off.last_profile().boundary_points;
+  const uint32_t threshold = (points_a + points_b) / 2;
+  SetEnv("APRILTAG_VK_CPU_TAIL", "1");
+  SetEnv("APRILTAG_VK_CPU_TAIL_MAX_POINTS", std::to_string(threshold).c_str());
+  apriltag_vulkan::GpuDetector on(ctx, config);
+  SetEnv("APRILTAG_VK_CPU_TAIL", nullptr);
+  SetEnv("APRILTAG_VK_CPU_TAIL_MAX_POINTS", nullptr);
+  std::vector<double> off_a, off_b, on_a, on_b;
+  for (int r = 0; r < 400; ++r) {
+    off.Detect(a.grey.data());
+    off_a.push_back(off.last_profile().gpu_ms);
+    off.Detect(b.grey.data());
+    off_b.push_back(off.last_profile().gpu_ms);
+    on.Detect(a.grey.data());
+    on_a.push_back(on.last_profile().gpu_ms);
+    on.Detect(b.grey.data());
+    on_b.push_back(on.last_profile().gpu_ms);
+  }
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+  };
+  std::printf("points A %u, B %u, threshold %u; cpu tail frames %llu, mispredicts %llu of 800 frames\n", points_a,
+              points_b, threshold, static_cast<unsigned long long>(on.cpu_tail_frames()),
+              static_cast<unsigned long long>(on.cpu_tail_mispredicts()));
+  std::printf("gpu phase ms: A off %.4f on %.4f | B off %.4f on %.4f\n", median(off_a), median(on_a), median(off_b),
+              median(on_b));
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
-  std::string list, dir;
+  std::string list, dir, alt_a, alt_b;
   std::vector<unsigned> decimations = {2, 1};
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--list" && i + 1 < argc) list = argv[++i];
     else if (a == "--dir" && i + 1 < argc) dir = argv[++i];
+    else if (a == "--mispredict" && i + 2 < argc) {
+      alt_a = argv[++i];
+      alt_b = argv[++i];
+    }
     else if (a == "--decimation" && i + 1 < argc) decimations = {static_cast<unsigned>(std::stoi(argv[++i]))};
     else {
       std::cerr << "usage: cpu_tail_test (--list files.txt | --dir DIR) [--decimation N]\n";
       return 2;
     }
   }
+  if (!alt_a.empty()) return Mispredict(alt_a, alt_b);
   if (list.empty() == dir.empty()) {
     std::cerr << "usage: cpu_tail_test (--list files.txt | --dir DIR) [--decimation N]\n";
     return 2;
