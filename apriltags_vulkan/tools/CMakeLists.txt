@@ -1,5 +1,8 @@
 # The tools that compare against upstream libapriltag include upstream/UpstreamAdapter.h and link `apriltag`;
 # they are built only when upstream is fetched (VKAPRILTAG_UPSTREAM_VALIDATION).
+if(VKAPRILTAG_UPSTREAM_VALIDATION)
+  add_subdirectory(upstream)
+endif()
 function(vkapriltag_use_upstream target)
   target_link_libraries(${target} PRIVATE apriltag)
   target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -120,7 +123,7 @@ if(TARGET apriltag)
 endif()
 
 # Records upstream's decode of a fixed set of quads as tests/own_decode_vectors.bin (needs the patched upstream).
-if(TARGET apriltag)
+if(VKAPRILTAG_REGEN_VECTORS)
   add_executable(gen_decode_vectors upstream/gen_decode_vectors.cpp)
   target_include_directories(gen_decode_vectors PRIVATE ${PROJECT_SOURCE_DIR}/library/src ${PROJECT_SOURCE_DIR}/tests ${PROJECT_SOURCE_DIR}/tools/vk_eval)
   target_link_libraries(gen_decode_vectors PRIVATE vkapriltag::vkapriltag)

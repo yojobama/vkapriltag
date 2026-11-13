@@ -1,7 +1,5 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
-project(ApriltagVulkan VERSION 1.10.1 LANGUAGES C CXX)
-
-# Policy floor so the fetched apriltag's old cmake_minimum_required() configures.
+project(ApriltagVulkan VERSION 1.10.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,10 +17,15 @@ if(WIN32)
 endif()
 
 option(VKAPRILTAG_BUILD_APPS "Build the interactive sample app (V4L2 camera capture)" ON)
-option(VKAPRILTAG_BUILD_TOOLS "Build the libapriltag cross-validation tool" ON)
-# The library does not use upstream libapriltag. With this ON it is fetched (patched) for the differential test and
-# the tools that compare against it; OFF builds the library, the tests and the tools that need no upstream.
-option(VKAPRILTAG_UPSTREAM_VALIDATION "Fetch upstream libapriltag for the differential tests and reference validation tools" ON)
+option(VKAPRILTAG_BUILD_TOOLS "Build the evaluation, benchmark and validation tools" ON)
+# The library, its tests and the packages use no upstream libapriltag and fetch nothing. With this ON, stock upstream
+# is fetched for the reference validation tools that compare against it (tools/upstream).
+option(VKAPRILTAG_UPSTREAM_VALIDATION "Fetch upstream libapriltag and build the reference validation tools" OFF)
+# Also patches upstream and builds gen_decode_vectors, which rewrites tests/own_decode_vectors.bin.
+option(VKAPRILTAG_REGEN_VECTORS "Build the generator of the recorded decode test vectors (needs VKAPRILTAG_UPSTREAM_VALIDATION=ON)" OFF)
+if(VKAPRILTAG_REGEN_VECTORS AND NOT VKAPRILTAG_UPSTREAM_VALIDATION)
+  message(FATAL_ERROR "VKAPRILTAG_REGEN_VECTORS needs VKAPRILTAG_UPSTREAM_VALIDATION=ON")
+endif()
 
 # The vkapriltag library: Vulkan compute detection pipeline + CPU QuadDecode/TagDecoder tail.
 add_subdirectory(library)
