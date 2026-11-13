@@ -1,6 +1,7 @@
 name: vkapriltag parity gate
 
-# Builds the Vulkan-compute pipeline and runs apriltag_synth_ground_truth as a regression gate:
+# Builds the Vulkan-compute pipeline with no upstream and runs every default test (no network needed), then builds
+# it again with VKAPRILTAG_UPSTREAM_VALIDATION=ON and runs apriltag_synth_ground_truth as a regression gate:
 # it fails if the stock libapriltag / vkapriltag pose delta exceeds a threshold.
 # Runs on Mesa's software Vulkan (lavapipe), as the runners have no GPU.
 
@@ -55,24 +56,36 @@ jobs:
           vulkaninfo --summary | grep -q "deviceType.*CPU" || \
             (echo "::error::no CPU/software Vulkan device found even with VK_ICD_FILENAMES=$VK_ICD_FILENAMES" && exit 1)
 
-      - name: Configure
+      - name: Configure (no upstream)
         run: cmake -B build -S apriltags_vulkan -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+      - name: Build (no upstream)
         run: cmake --build build -j
+
+      - name: Check that nothing from upstream libapriltag was fetched
+        run: |
+          if [ -d build/_deps ]; then
+            echo "::error::the default build fetched dependencies: $(ls build/_deps)"
+            exit 1
+          fi
+
+      - name: Run the default tests
+        # Unit tests, the decode differential test against the recorded upstream vectors, the golden detections
+        # (same IDs and corners within 0.02 px of the goldens made on a desktop GPU, tests/golden_test.py), the
+        # lints and the installed-package consumer.
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Configure with upstream validation
+        run: cmake -B build-parity -S apriltags_vulkan -DCMAKE_BUILD_TYPE=Release -DVKAPRILTAG_UPSTREAM_VALIDATION=ON
+
+      - name: Build with upstream validation
+        run: cmake --build build-parity -j
 
       - name: Run libapriltag-vs-vkapriltag parity gate
         id: gate
         run: |
           set -o pipefail
-          ./build/tools/apriltag_synth_ground_truth | tee gate_output.txt
-
-      - name: Run CPU unit tests
-        run: ctest --test-dir build -R '^unit_' --output-on-failure
-
-      - name: Run golden detection test on the corpus subset
-        # Same IDs and corners within 0.02 px of the goldens made on a desktop GPU (tests/golden_test.py).
-        run: ctest --test-dir build -R '^golden_' --output-on-failure
+          ./build-parity/tools/apriltag_synth_ground_truth | tee gate_output.txt
 
       - name: Publish results to job summary
         if: always()

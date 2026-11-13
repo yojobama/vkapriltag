@@ -6,44 +6,6 @@
 find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 
-# ---------------------------------------------------------------------------
-# Upstream AprilRobotics apriltag, patched to expose quad_decode_index() and reconcile_detections(); only the
-# differential test and the reference validation tools use it (VKAPRILTAG_UPSTREAM_VALIDATION).
-# ---------------------------------------------------------------------------
-if(VKAPRILTAG_UPSTREAM_VALIDATION)
-include(FetchContent)
-set(APRILTAG_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-decode-steps.patch)
-# Patch scoping the pthreads_cross emulation to "_WIN32 and not MinGW" so MinGW uses its real pthread.h.
-set(APRILTAG_MINGW_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-mingw-real-pthreads.patch)
-# Patch exposing the bit-sampling step without the code lookup (quad_sample_code, apriltag_min_hamming).
-set(APRILTAG_PROBE_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-code-probe.patch)
-# Patch removing the decode's per-quad heap allocations (the unused inverse homography, the quad copy
-# per family and two scratch buffers), with identical results.
-set(APRILTAG_NOALLOC_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-decode-no-alloc.patch)
-FetchContent_Declare(
-  apriltag
-  GIT_REPOSITORY https://github.com/AprilRobotics/apriltag.git
-  GIT_TAG v3.4.5
-  # Applied via ApplyPatches.cmake, which skips patches already present.
-  # Comma-separated, not semicolon-separated.
-  PATCH_COMMAND ${CMAKE_COMMAND}
-        "-DPATCHES=${APRILTAG_PATCH_FILE},${APRILTAG_PROBE_PATCH_FILE},${APRILTAG_MINGW_PATCH_FILE},${APRILTAG_NOALLOC_PATCH_FILE}"
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/ApplyPatches.cmake
-)
-# Disable upstream's example binaries so they are not installed.
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(apriltag)
-
-# Pin gnu17: newer GCC defaults turn the old C sources' incompatible pointer calls into errors.
-if(TARGET apriltag)
-  target_compile_options(apriltag PRIVATE -std=gnu17)
-  # No fused multiply-adds, so the own decode (OwnDecode.cpp, same flag) computes what this library computes.
-  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(apriltag PRIVATE -ffp-contract=off)
-  endif()
-endif()
-endif()
-
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
 
 set(SHADER_SOURCES

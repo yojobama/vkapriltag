@@ -33,6 +33,7 @@ jobs:
 
       - name: Install build dependencies
         # No libopencv-dev: only tools/ need OpenCV and they are built with -DVKAPRILTAG_BUILD_TOOLS=OFF.
+        # Nothing is fetched at configure time: the library uses no upstream libapriltag.
         # No glslang-tools: Ubuntu 24.04's 15.1 cannot compile the integer dot product shader
         # (GL_EXT_integer_dot_product needs glslang 15.2 or later), so glslang is built below.
         run: |
@@ -68,6 +69,23 @@ jobs:
 
       - name: Check the package includes the integer dot product shader
         run: dpkg-deb -c build/*.deb | grep decimate_box_dot_u8.comp.spv
+
+      - name: Check the package has no libapriltag
+        # The library does not use upstream: no upstream files in the package, no dependency on it, nothing fetched.
+        run: |
+          if dpkg-deb -c build/*.deb | grep -v '/vkapriltag/' | grep -E '/(lib)?apriltag(\.|-|_pose)|/include/apriltag/|/tag(16h5|25h9|36h11)\.h'; then
+            echo "::error::the package holds files from upstream libapriltag"
+            exit 1
+          fi
+          dpkg-deb -f build/*.deb Depends
+          if dpkg-deb -f build/*.deb Depends | grep -i apriltag; then
+            echo "::error::the package depends on a libapriltag package"
+            exit 1
+          fi
+          if [ -d build/_deps ]; then
+            echo "::error::the build fetched dependencies: $(ls build/_deps)"
+            exit 1
+          fi
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4

@@ -128,7 +128,7 @@ This port intentionally does less than the CUDA original and upstream
   `apriltags_vulkan/PERFORMANCE.md`). It has been run on an AMD RX 9060 XT and
   an ARM Mali-G610, and earlier revisions on an Intel iGPU and an NVIDIA
   MX230; other vendors are untested at this revision.
-- CMake 3.16+, a C++20 compiler.
+- CMake 3.16+, a C++20 compiler. Nothing is fetched at configure time and no AprilTag library is needed.
 - `glslangValidator` (Vulkan SDK or `glslang-tools`) to compile the shaders. The integer dot product
   decimation shader needs glslang 15.2 or later; with an older one it is left out of the build (the
   plain shader runs instead, with identical detections) and CMake says so. `-DVKAPRILTAG_DOT_SHADER=ON`
@@ -151,7 +151,9 @@ Relevant options (all in `apriltags_vulkan/CMakeLists.txt` /
 | Option | Default | Effect |
 | --- | --- | --- |
 | `VKAPRILTAG_BUILD_APPS` | `ON` | Build the V4L2 camera sample app (Linux only, regardless of this flag). |
-| `VKAPRILTAG_BUILD_TOOLS` | `ON` | Build the libapriltag cross-validation tool. |
+| `VKAPRILTAG_BUILD_TOOLS` | `ON` | Build the evaluation, benchmark and validation tools. |
+| `VKAPRILTAG_UPSTREAM_VALIDATION` | `OFF` | Fetch stock upstream libapriltag (needs the network) and build the reference validation tools that compare against it (`apriltag_vulkan_validate`, the pose and synthetic ground-truth tools, `vk_eval --ref`). The library, the tests and the packages never use it. |
+| `VKAPRILTAG_REGEN_VECTORS` | `OFF` | With the option above: patch upstream and build `gen_decode_vectors`, which records `tests/own_decode_vectors.bin`. |
 | `VKAPRILTAG_EMBED_SHADERS` | `ON` | Compile the SPIR-V shader corpus into the library binary, so a deployed build needs nothing on disk beside it (important for e.g. a JNI `.so` extracted from a jar at runtime). Off falls back to loading `.spv` files from an install-relative `SHADER_DIR`. |
 
 ## Quick start
@@ -209,6 +211,10 @@ rest of `DetectorConfig` (cluster-size floors, aspect/fill-ratio filters,
 capacity caps, etc. — all have working defaults).
 
 ## Verifying correctness
+
+The default `ctest` needs no upstream libapriltag: it compares the in-house decode bit for bit with upstream's
+results recorded in `tests/own_decode_vectors.bin`, and runs the golden-detection and unit tests. The tools below
+compare against live upstream and are built with `-DVKAPRILTAG_UPSTREAM_VALIDATION=ON`.
 
 ```sh
 build/tools/apriltag_vulkan_validate --data path/to/your/images --family tag36h11
@@ -548,7 +554,7 @@ apriltags_vulkan/
                benchmarks (bench_multiqueue for several streams, bench_barrier
                for the cost of a barrier), and the Mali counter tools
                (hwcnt_run, hwcnt_timeline)
-  cmake/       the upstream apriltag patch, shader-embedding machinery
+  cmake/       the shader compilation and embedding machinery
   OPTIMIZATION_NOTES.md   detailed performance history and rejected approaches
   PERFORMANCE.md          how to configure, run and measure it per device
 ```
@@ -557,6 +563,8 @@ apriltags_vulkan/
 
 Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for
 attribution: this project is based on frc971's `apriltags_cuda` and
-includes software derived from AprilRobotics' `apriltag` (fetched at build
-time as an unmodified dependency, patched only to expose three internal
-entry points — see `cmake/patches/`).
+contains code derived from AprilRobotics' `apriltag` (BSD-2-Clause): the tag
+family code tables and the decode (`library/src/OwnDecode.*`). It does not
+link, fetch or install upstream `apriltag`; upstream is used only by the
+optional validation tools (`VKAPRILTAG_UPSTREAM_VALIDATION`), and its licence
+text is reproduced in NOTICE.

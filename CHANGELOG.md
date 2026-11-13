@@ -18,6 +18,31 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
   Output is unchanged. The patched-upstream decode (`APRILTAG_VK_OWN_DECODE=0`) is removed; upstream is only needed by
   the differential test and the reference validation tools (`VKAPRILTAG_UPSTREAM_VALIDATION`).
 
+### Changed (build)
+
+- **The project no longer depends on libapriltag.** A default configure fetches nothing (no network, no C
+  compiler needed), applies no patches, and the library, the tests, the install tree and the `.deb` packages hold
+  nothing from AprilRobotics' library; `find_package(vkapriltag)` needs only Vulkan and Threads. The decode is the
+  in-house `OwnDecode` and the family tables are generated into `library/src/families/`; both derive from upstream
+  and `NOTICE` says so and carries upstream's BSD-2-Clause licence.
+- `VKAPRILTAG_UPSTREAM_VALIDATION` now defaults to `OFF`. With `ON`, stock upstream v3.4.5 is fetched (excluded from the
+  `all` target and the install rules) for the reference validation tools (`apriltag_vulkan_validate`,
+  `apriltag_pose_validate`, `apriltag_pose_e2e_validate`, `apriltag_synth_ground_truth`, `vk_eval --ref`), which are no
+  longer installed. The parity workflow turns it on for the parity gate and runs the default `ctest` first.
+- The differential decode test (`own_decode_*`, `families_match_upstream`) compares the library with upstream's results
+  recorded in `tests/own_decode_vectors.bin` (4.8 MB: 3120 random and 2974 corpus quads, 2500 reconcile sets and the
+  family table hashes), still bit for bit and with the `comparison_can_fail` self-test. `-DVKAPRILTAG_REGEN_VECTORS=ON`
+  (with the validation option) patches upstream and builds `gen_decode_vectors` to rewrite the file.
+- New tests: `installed_package_consumer` (installs to a temporary prefix, checks it holds nothing from upstream, builds
+  and runs a `find_package(vkapriltag)` consumer on a corpus frame) and a stricter `deps_lint`.
+
+### Removed (build)
+
+- The FetchContent of upstream in the default build, `cmake/patches/` (the decode patches and `ApplyPatches.cmake` now
+  live in `tools/upstream/patches/` and are used only to regenerate the test vectors; the decode no-alloc patch and the
+  `-std=gnu17` / `-ffp-contract=off` pins for the apriltag target are gone from the default build), and the project's
+  C language.
+
 ### Added
 
 - **Pre-warm for frames that arrive at camera rate.** A GPU idle for a few milliseconds takes about 0.5 ms
