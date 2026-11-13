@@ -4,7 +4,6 @@ namespace apriltag_vulkan {
 
 // The on/off choices of the per-candidate decode steps; the defaults are TagDecoder's.
 struct DecodeSwitches {
-  bool own_decode = true;
   bool grey_margin = true;
   bool small_rescue = false;
   bool polish = false;
