@@ -44,12 +44,17 @@ template <typename S, bool kTruncate>
 inline void TapAlong(S x0, S y0, S u, S nx, S ny, int *xi, int *yi, S *fx, S *fy) {
   const S x = x0 + u * nx - S(0.5);
   const S y = y0 + u * ny - S(0.5);
-  const S xt = kTruncate ? std::trunc(x) : std::floor(x);
-  const S yt = kTruncate ? std::trunc(y) : std::floor(y);
-  *xi = static_cast<int>(xt);
-  *yi = static_cast<int>(yt);
-  *fx = x - xt;
-  *fy = y - yt;
+  // The floor goes through a truncating conversion and a compare: it vectorises without SSE4.1.
+  int xs = static_cast<int>(x);
+  int ys = static_cast<int>(y);
+  if (!kTruncate) {
+    xs -= x < static_cast<S>(xs);
+    ys -= y < static_cast<S>(ys);
+  }
+  *xi = xs;
+  *yi = ys;
+  *fx = x - static_cast<S>(xs);
+  *fy = y - static_cast<S>(ys);
 }
 
 // Median (the element at n / 2 once sorted) of v[0..n), which is reordered.

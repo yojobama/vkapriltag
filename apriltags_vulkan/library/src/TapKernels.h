@@ -1,0 +1,78 @@
+#pragma once
+
+// Bilinear blend of many taps at once (internal, not installed). The scalar loop is the reference; the
+// SSE2 and NEON kernels blend four taps per step in the same operation order.
+
+#include <cstdint>
+#include <cstring>
+
+#include "Geometry.h"
+
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#define VKAPRILTAG_TAP_SSE2 1
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#define VKAPRILTAG_TAP_NEON 1
+#endif
+
+namespace apriltag_vulkan::geom {
+
+// out[m] = BilinearAt(im, xis[m], yis[m], fxs[m], fys[m]) for m in [0, n); every tap's 2x2 block must lie
+// inside the image.
+template <typename Img>
+inline void BlendTaps(const Img *im, const int *xis, const int *yis, const float *fxs, const float *fys, int n,
+                      float *out) {
+  int m = 0;
+#if defined(VKAPRILTAG_TAP_SSE2) || defined(VKAPRILTAG_TAP_NEON)
+  const uint8_t *data = im->data;
+  const ptrdiff_t stride = im->stride;
+  auto pair = [&](int k) {
+    const uint8_t *row0 = data + yis[k] * stride + xis[k];
+    uint16_t a, b;
+    std::memcpy(&a, row0, 2);
+    std::memcpy(&b, row0 + stride, 2);
+    return static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 16);
+  };
+#endif
+#if defined(VKAPRILTAG_TAP_SSE2)
+  const __m128i low = _mm_set1_epi32(0xFF);
+  const __m128 one = _mm_set1_ps(1.0f);
+  for (; m + 4 <= n; m += 4) {
+    const __m128i v = _mm_set_epi32(static_cast<int>(pair(m + 3)), static_cast<int>(pair(m + 2)),
+                                    static_cast<int>(pair(m + 1)), static_cast<int>(pair(m)));
+    const __m128 p00 = _mm_cvtepi32_ps(_mm_and_si128(v, low));
+    const __m128 p01 = _mm_cvtepi32_ps(_mm_and_si128(_mm_srli_epi32(v, 8), low));
+    const __m128 p10 = _mm_cvtepi32_ps(_mm_and_si128(_mm_srli_epi32(v, 16), low));
+    const __m128 p11 = _mm_cvtepi32_ps(_mm_srli_epi32(v, 24));
+    const __m128 fx = _mm_loadu_ps(fxs + m), fy = _mm_loadu_ps(fys + m);
+    const __m128 gx = _mm_sub_ps(one, fx), gy = _mm_sub_ps(one, fy);
+    __m128 acc = _mm_mul_ps(_mm_mul_ps(gx, gy), p00);
+    acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(fx, gy), p01));
+    acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(gx, fy), p10));
+    acc = _mm_add_ps(acc, _mm_mul_ps(_mm_mul_ps(fx, fy), p11));
+    _mm_storeu_ps(out + m, acc);
+  }
+#elif defined(VKAPRILTAG_TAP_NEON)
+  const uint32x4_t low = vdupq_n_u32(0xFF);
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  for (; m + 4 <= n; m += 4) {
+    const uint32_t lanes[4] = {pair(m), pair(m + 1), pair(m + 2), pair(m + 3)};
+    const uint32x4_t v = vld1q_u32(lanes);
+    const float32x4_t p00 = vcvtq_f32_u32(vandq_u32(v, low));
+    const float32x4_t p01 = vcvtq_f32_u32(vandq_u32(vshrq_n_u32(v, 8), low));
+    const float32x4_t p10 = vcvtq_f32_u32(vandq_u32(vshrq_n_u32(v, 16), low));
+    const float32x4_t p11 = vcvtq_f32_u32(vshrq_n_u32(v, 24));
+    const float32x4_t fx = vld1q_f32(fxs + m), fy = vld1q_f32(fys + m);
+    const float32x4_t gx = vsubq_f32(one, fx), gy = vsubq_f32(one, fy);
+    float32x4_t acc = vmulq_f32(vmulq_f32(gx, gy), p00);
+    acc = vfmaq_f32(acc, vmulq_f32(fx, gy), p01);
+    acc = vfmaq_f32(acc, vmulq_f32(gx, fy), p10);
+    acc = vfmaq_f32(acc, vmulq_f32(fx, fy), p11);
+    vst1q_f32(out + m, acc);
+  }
+#endif
+  for (; m < n; ++m) out[m] = BilinearAt<float>(im, xis[m], yis[m], fxs[m], fys[m]);
+}
+
+}  // namespace apriltag_vulkan::geom

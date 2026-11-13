@@ -3,6 +3,7 @@
 #include "vkapriltag/common/Options.h"
 
 #include "Geometry.h"
+#include "TapKernels.h"
 #include "TestHooks.h"
 
 #include <algorithm>
@@ -284,7 +285,7 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
       }
       if (!geom::BlockInside(im, xis[0], yis[0]) || !geom::BlockInside(im, xis[taps - 1], yis[taps - 1])) continue;
       float prof[kMaxTaps];
-      for (int m = 0; m < taps; ++m) prof[m] = BilinearAt<float>(im, xis[m], yis[m], fxs[m], fys[m]);
+      geom::BlendTaps(im, xis, yis, fxs, fys, taps, prof);
 
       // Gradient along the normal (outside brighter than inside for a normal border).
       float g[kMaxTaps];
