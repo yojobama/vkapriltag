@@ -7,7 +7,7 @@ extern "C" {
 
 namespace apriltag_vulkan {
 
-// Grey levels read around a tag's border, from the homography H of its black square (tag
+// Grey levels read around a tag's border, from the row-major homography H (9 values) of its black square (tag
 // coordinates [-1, 1] across the W-cell square, as quad_update_homographies builds it).
 struct BorderLevels {
   double black = 0;  // median of the border cells
@@ -21,6 +21,6 @@ struct BorderLevels {
 
 // Samples the border cells and the quiet ring. Returns false if any sample falls outside the image
 // or the quiet ring is not brighter than the border.
-bool ReadBorder(const matd_t *H, const image_u8_t *im, int width_cells, BorderLevels *out);
+bool ReadBorder(const double *H, const image_u8_t *im, int width_cells, BorderLevels *out);
 
 }  // namespace apriltag_vulkan

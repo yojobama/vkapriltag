@@ -1,6 +1,7 @@
 #include "BorderSample.h"
 
 #include "Geometry.h"
+#include "OwnDecode.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,14 +12,14 @@ extern "C" {
 
 namespace apriltag_vulkan {
 
-bool ReadBorder(const matd_t *H, const image_u8_t *im, int width_cells, BorderLevels *out) {
+bool ReadBorder(const double *H, const image_u8_t *im, int width_cells, BorderLevels *out) {
   const int w = width_cells;
   if (w < 4 || w > 16) return false;
   const double cells = w;
   // The cell (c, r) of the W x W square has its centre at (c + 0.5, r + 0.5) cells from the corner.
   auto at = [&](double cu, double cv, double *value) {
     double x, y;
-    homography_project(H, -1.0 + 2.0 * cu / cells, -1.0 + 2.0 * cv / cells, &x, &y);
+    own::Project(H, -1.0 + 2.0 * cu / cells, -1.0 + 2.0 * cv / cells, &x, &y);
     return geom::SampleEdge<double>(im, x, y, value);
   };
   double border[64], ring[80];
