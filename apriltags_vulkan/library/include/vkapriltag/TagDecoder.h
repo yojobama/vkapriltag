@@ -43,10 +43,13 @@ class TagDecoder {
   // `refine_method` may be overridden by APRILTAG_VK_REFINE; used only if `td->refine_edges` is set.
   // Margin gate in grey levels (0 = off); APRILTAG_VK_PROBE_MARGIN overrides it.
   // `small_tag_rescue` is DetectorConfig::small_tag_rescue; APRILTAG_VK_SMALL_RESCUE overrides it.
+  // `pool`, if given, is used instead of a pool of its own (`cpu_threads` and `pool_options` are then
+  // ignored); share it only with stages that run one after another with this decoder.
   explicit TagDecoder(apriltag_detector_t *td, uint32_t decimation = 1, uint32_t cpu_threads = 0,
                       RefineEdgesMethod refine_method = RefineEdgesMethod::kProfile,
                       float probe_margin = 0.0f, const WorkerPoolOptions &pool_options = WorkerPoolOptions(),
-                      bool background_thread = false, bool small_tag_rescue = false);
+                      bool background_thread = false, bool small_tag_rescue = false,
+                      std::shared_ptr<WorkerPool> pool = nullptr);
   ~TagDecoder();
 
   TagDecoder(const TagDecoder &) = delete;
@@ -105,7 +108,7 @@ class TagDecoder {
   Stats SumSlotStats() const;
 
   apriltag_detector_t *td_;  // not owned
-  std::unique_ptr<WorkerPool> pool_;
+  std::shared_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
   // APRILTAG_VK_GREY_MARGIN=0 turns off: retry a quad that did not decode as its inner square.
   bool grey_margin_ = true;

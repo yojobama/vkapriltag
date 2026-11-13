@@ -1,6 +1,7 @@
 // CPU-only unit tests of the pure helpers and the CPU stages; no Vulkan device is used.
-// usage: unit_tests [decode|geometry|geom|edges|quadfit|options]   (no argument runs all)
+// usage: unit_tests [decode|geometry|geom|edges|quadfit|options|steps|pool]   (no argument runs all)
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "Geometry.h"
@@ -937,6 +939,32 @@ void TestSteps() {
   TestFamilyLimits();
 }
 
+void TestPool() {
+  av::WorkerPool pool(4);
+  std::atomic<int> sum{0};
+  pool.ParallelFor(100, [&](size_t i, unsigned) { sum += static_cast<int>(i); });
+  CHECK(sum == 4950);
+
+  bool threw = false;
+  try {
+    pool.ParallelFor(8, [&](size_t, unsigned) { pool.ParallelFor(2, [](size_t, unsigned) {}); });
+  } catch (const std::logic_error &) {
+    threw = true;
+  }
+  CHECK(threw);
+  pool.ParallelFor(8, [&](size_t, unsigned) {});
+
+  // Two threads on one pool take turns and both finish.
+  std::atomic<int> total{0};
+  const auto work = [&] {
+    for (int r = 0; r < 200; ++r) pool.ParallelFor(16, [&](size_t, unsigned) { ++total; });
+  };
+  std::thread a(work), b(work);
+  a.join();
+  b.join();
+  CHECK(total == 2 * 200 * 16);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -950,6 +978,7 @@ int main(int argc, char **argv) {
   if (all || !std::strcmp(which, "quadfit")) TestQuadFit(), ran = true;
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;
   if (all || !std::strcmp(which, "steps")) TestSteps(), ran = true;
+  if (all || !std::strcmp(which, "pool")) TestPool(), ran = true;
   if (!ran) {
     std::printf("unknown test group %s\n", which);
     return 2;

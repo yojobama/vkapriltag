@@ -146,6 +146,8 @@ class TrackingDetector {
   TrackingConfig tracking_;
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<GpuDetector> gpu_;
+  // Shared by quad_decode_ and full_decoder_ until the background thread starts (see EnsureBackground).
+  std::shared_ptr<WorkerPool> pool_;
   std::unique_ptr<QuadDecode> quad_decode_;
   std::unique_ptr<TagDecoder> full_decoder_;
   std::vector<Track> tracks_;

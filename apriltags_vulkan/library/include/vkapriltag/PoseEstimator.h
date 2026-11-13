@@ -55,9 +55,10 @@ class PoseEstimator {
   // std::invalid_argument unless tagsize, fx and fy are finite and positive and cx, cy finite.
   //
   // `cpu_threads` is the total parallelism for EstimateAll (0 = hardware_concurrency, or
-  // APRILTAG_CPU_THREADS). `convergence_tol` is the early-exit threshold above.
+  // APRILTAG_CPU_THREADS). `convergence_tol` is the early-exit threshold above. `pool`, if given, is
+  // used instead of a pool of its own (`cpu_threads` is then ignored).
   PoseEstimator(CameraIntrinsics intrinsics, double tagsize, uint32_t cpu_threads = 0,
-                double convergence_tol = kDefaultConvergenceTol);
+                double convergence_tol = kDefaultConvergenceTol, std::shared_ptr<WorkerPool> pool = nullptr);
 
   PoseEstimator(const PoseEstimator &) = delete;
   PoseEstimator &operator=(const PoseEstimator &) = delete;
@@ -88,7 +89,7 @@ class PoseEstimator {
   CameraIntrinsics intrinsics_;
   double tagsize_ = 0.0;
   double convergence_tol_ = kDefaultConvergenceTol;
-  std::unique_ptr<WorkerPool> pool_;
+  std::shared_ptr<WorkerPool> pool_;
 };
 
 }  // namespace apriltag_vulkan

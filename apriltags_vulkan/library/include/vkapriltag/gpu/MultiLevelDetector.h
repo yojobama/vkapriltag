@@ -35,6 +35,7 @@ class MultiLevelDetector {
     std::unique_ptr<GpuDetector> detector;
     std::unique_ptr<QuadDecode> quad_decode;
   };
+  std::shared_ptr<WorkerPool> pool_;  // the levels run one after another
   std::vector<Level> levels_;
   double last_gpu_ms_ = 0.0;
 };

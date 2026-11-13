@@ -29,6 +29,7 @@ bool SameTag(const QuadShape &a, const QuadShape &b) {
 
 MultiLevelDetector::MultiLevelDetector(vk::Context &ctx, const DetectorConfig &base,
                                        std::vector<LevelSpec> levels) {
+  pool_ = MakeWorkerPool(base);
   // Coarsest first, so a finer level's duplicate of a quad is the one dropped.
   std::stable_sort(levels.begin(), levels.end(),
                    [](const LevelSpec &a, const LevelSpec &b) { return a.decimation > b.decimation; });
@@ -41,7 +42,7 @@ MultiLevelDetector::MultiLevelDetector(vk::Context &ctx, const DetectorConfig &b
     Level level;
     level.spec = spec;
     level.detector = std::make_unique<GpuDetector>(ctx, config);
-    level.quad_decode = std::make_unique<QuadDecode>(config);
+    level.quad_decode = std::make_unique<QuadDecode>(config, pool_);
     levels_.push_back(std::move(level));
   }
 }

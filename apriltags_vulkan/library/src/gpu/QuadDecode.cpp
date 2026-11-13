@@ -867,10 +867,14 @@ bool HasOutliers(std::span<const RawLineFitPoint> points, size_t begin, size_t e
 
 }  // namespace
 
-QuadDecode::QuadDecode(const DetectorConfig &config)
+std::shared_ptr<WorkerPool> MakeWorkerPool(const DetectorConfig &config) {
+  return std::make_shared<WorkerPool>(ResolveThreadCount(config.cpu_threads), "cpu-worker",
+                                      ResolveWorkerPoolOptions(config.PoolOptions()));
+}
+
+QuadDecode::QuadDecode(const DetectorConfig &config, std::shared_ptr<WorkerPool> pool)
     : config_(config),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(config.cpu_threads), "quad-worker",
-                                   ResolveWorkerPoolOptions(config.PoolOptions()))),
+      pool_(pool ? std::move(pool) : MakeWorkerPool(config)),
       scratch_(pool_->threads()) {
   const Options env = Options::FromEnvironment();
   config_.quad_fit_method = ResolveQuadFitMethod(env, config_.quad_fit_method);

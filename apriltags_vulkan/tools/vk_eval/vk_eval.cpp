@@ -145,6 +145,7 @@ int main(int argc, char **argv) {
         decimation = 1;
         for (const auto &l : level_specs) decimation = std::max(decimation, l.decimation);
       }
+      std::shared_ptr<apriltag_vulkan::WorkerPool> pool;
       std::unique_ptr<apriltag_vulkan::QuadDecode> quad_decode;
       std::unique_ptr<apriltag_vulkan::TagDecoder> tag_decoder;
       apriltag_vulkan::DetectorConfig config;
@@ -154,6 +155,7 @@ int main(int argc, char **argv) {
         if ((!detector && !multi) || config.width != uint32_t(im.width) || config.height != uint32_t(im.height)) {
           tag_decoder.reset();
           quad_decode.reset();
+          pool.reset();
           detector.reset();
           multi.reset();
           config = apriltag_vulkan::DetectorConfig{};
@@ -164,15 +166,17 @@ int main(int argc, char **argv) {
           config.tag_width = uint32_t(tf->width_at_border);
           config.reversed_border = tf->reversed_border;
           config.normal_border = !tf->reversed_border;
+          config.cpu_threads = threads;
+          pool = apriltag_vulkan::MakeWorkerPool(config);
           if (!level_specs.empty()) {
             multi = std::make_unique<apriltag_vulkan::MultiLevelDetector>(ctx, config, level_specs);
           } else {
             detector = std::make_unique<apriltag_vulkan::GpuDetector>(ctx, config);
-            quad_decode = std::make_unique<apriltag_vulkan::QuadDecode>(config);
+            quad_decode = std::make_unique<apriltag_vulkan::QuadDecode>(config, pool);
           }
           tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(
               td, decimation, threads, apriltag_vulkan::RefineEdgesMethod::kProfile, 0.0f,
-              apriltag_vulkan::WorkerPoolOptions(), false, config.small_tag_rescue);
+              apriltag_vulkan::WorkerPoolOptions(), false, config.small_tag_rescue, pool);
         }
         eval::Timings t;
         zarray_t *dets = nullptr;

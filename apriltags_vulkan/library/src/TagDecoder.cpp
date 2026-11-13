@@ -239,10 +239,11 @@ WorkerPoolOptions ResolvePoolOptions(const WorkerPoolOptions &configured, bool b
 TagDecoder::TagDecoder(apriltag_detector_t *td, uint32_t decimation, uint32_t cpu_threads,
                        RefineEdgesMethod refine_method, float probe_margin,
                        const WorkerPoolOptions &pool_options, bool background_thread,
-                       bool small_tag_rescue)
+                       bool small_tag_rescue, std::shared_ptr<WorkerPool> pool)
     : td_(td),
-      pool_(std::make_unique<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker",
-                                         ResolvePoolOptions(pool_options, background_thread))),
+      pool_(pool ? std::move(pool)
+                 : std::make_shared<WorkerPool>(ResolveThreadCount(cpu_threads), "tag-worker",
+                                                ResolvePoolOptions(pool_options, background_thread))),
       refine_method_(ResolveRefineEdgesMethod(refine_method)),
       probe_margin_(probe_margin) {
   // refine_edges() reads td_->quad_decimate for its search radius.
