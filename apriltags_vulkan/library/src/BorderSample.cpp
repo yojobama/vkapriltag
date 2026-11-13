@@ -6,13 +6,9 @@
 #include <algorithm>
 #include <cmath>
 
-extern "C" {
-#include "common/homography.h"
-}
-
 namespace apriltag_vulkan {
 
-bool ReadBorder(const double *H, const image_u8_t *im, int width_cells, BorderLevels *out) {
+bool ReadBorder(const double *H, const Image *im, int width_cells, BorderLevels *out) {
   const int w = width_cells;
   if (w < 4 || w > 16) return false;
   const double cells = w;

@@ -32,9 +32,9 @@ optional fourth for pose:
    (measured ~8% of blobs). Deliberately CPU: this only ever touches a few
    thousand candidate values per frame, and is far simpler to get right as
    scalar C++ than as compute shaders.
-3. **`TagDecoder`** — wraps the unmodified, upstream `apriltag` C library's
-   own per-family bit-sampling and hamming decode, fed the quads from step 2.
-   Optionally (`apriltag_detector_t::refine_edges`, off by default) also runs
+3. **`TagDecoder`** — the in-house port of the `apriltag` library's per-family
+   bit-sampling and hamming decode, fed the quads from step 2.
+   Optionally (`TagDecoderConfig::refine_edges`) also runs
    gradient-based corner refinement on each quad first, in the same per-quad
    task and the same order `apriltag_detector_detect()` uses internally.
    Which implementation runs is `APRILTAG_VK_REFINE`'s choice: `profile` (the
@@ -167,24 +167,26 @@ apriltag_vulkan::vk::Context ctx;
 apriltag_vulkan::DetectorConfig config;
 config.width = width;
 config.height = height;
-config.tag_width = tf->width_at_border;       // from an apriltag_family_t*
+// tf: const apriltag_vulkan::Family*, e.g. Family::ByName("tag36h11")
+config.tag_width = tf->width_at_border;
 config.reversed_border = tf->reversed_border;
 config.normal_border = !tf->reversed_border;
 
 apriltag_vulkan::GpuDetector detector(ctx, config);
 apriltag_vulkan::QuadDecode quad_decode(config);
-// td: apriltag_detector_t*, families already added. The decimation argument
-// must match config.decimation - see TagDecoder's constructor comment - it's
-// needed only if td->refine_edges is set (off by default; flip it on to run
-// upstream's own gradient-based corner refinement before decode).
-apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation);
+// The decimation argument must match config.decimation (it sets the edge
+// refinement's search radius); refinement runs only if refine_edges is set.
+apriltag_vulkan::TagDecoderConfig decoder_config;
+decoder_config.families = {tf};
+decoder_config.refine_edges = false;
+apriltag_vulkan::TagDecoder tag_decoder(decoder_config, config.decimation);
 
 // Per frame:
 detector.Detect(gray_frame);  // tightly packed 8-bit grayscale, width*height bytes
 std::vector<apriltag_vulkan::DetectedQuad> quads =
     quad_decode.Decode(detector.last_line_fit_points);
-zarray_t *detections =
-    tag_decoder.Decode(quads, gray_frame, width, height, config.reversed_border);
+const apriltag_vulkan::DetectionList &detections =
+    tag_decoder.Decode(quads, gray_frame, width, height, config.reversed_border);  // valid until the next Decode
 ```
 
 For pose, additionally (once, at setup):

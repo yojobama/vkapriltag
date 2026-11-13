@@ -1,13 +1,28 @@
+# The tools that compare against upstream libapriltag include upstream/UpstreamAdapter.h and link `apriltag`;
+# they are built only when upstream is fetched (VKAPRILTAG_UPSTREAM_VALIDATION).
+function(vkapriltag_use_upstream target)
+  target_link_libraries(${target} PRIVATE apriltag)
+  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # Windows has no rpath: put the apriltag DLL beside the executable.
+  if(WIN32)
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:apriltag> $<TARGET_FILE_DIR:${target}>)
+  endif()
+endfunction()
+
 # Static-image validation tool: compares decoded tag IDs against apriltag_detector_detect().
 find_package(OpenCV QUIET)
 
-if (OpenCV_FOUND)
+if (NOT TARGET apriltag)
+  message(STATUS "Reference validation tools skipped: VKAPRILTAG_UPSTREAM_VALIDATION is OFF")
+elseif (OpenCV_FOUND)
   message(STATUS "Building OpenCV Compatible validation tool")
   add_executable(apriltag_vulkan_validate
           validate_against_libapriltag/validate_against_libapriltag_opencv.cpp
   )
 
   target_link_libraries(apriltag_vulkan_validate PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  vkapriltag_use_upstream(apriltag_vulkan_validate)
   # --renderdoc-capture needs RenderDoc's in-application API header; without it the option warns.
   find_path(RENDERDOC_APP_INCLUDE_DIR renderdoc_app.h
             PATHS "$ENV{ProgramFiles}/RenderDoc" /usr/include /usr/local/include /opt/renderdoc/include)
@@ -31,6 +46,7 @@ if (OpenCV_FOUND)
           validate_pose_e2e/validate_pose_e2e.cpp
   )
   target_link_libraries(apriltag_pose_e2e_validate PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  vkapriltag_use_upstream(apriltag_pose_e2e_validate)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_pose_e2e_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
@@ -41,6 +57,7 @@ if (OpenCV_FOUND)
           synth_pose_ground_truth/synth_pose_ground_truth.cpp
   )
   target_link_libraries(apriltag_synth_ground_truth PRIVATE vkapriltag::vkapriltag ${OpenCV_LIBS})
+  vkapriltag_use_upstream(apriltag_synth_ground_truth)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_synth_ground_truth PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
@@ -51,13 +68,15 @@ else()
     validate_against_libapriltag/validate_against_libapriltag.cpp
   )
   target_link_libraries(apriltag_vulkan_validate PRIVATE vkapriltag::vkapriltag)
+  vkapriltag_use_upstream(apriltag_vulkan_validate)
 endif()
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(apriltag_vulkan_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
+if(TARGET apriltag_vulkan_validate)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(apriltag_vulkan_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  install(TARGETS apriltag_vulkan_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
-
-install(TARGETS apriltag_vulkan_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Throughput of concurrent detector streams on one GPU, each on a chosen queue family. Needs no OpenCV.
 add_executable(bench_multiqueue bench_multiqueue/bench_multiqueue.cpp)
@@ -90,12 +109,15 @@ endif()
 
 # Pose verification: compares PoseEstimator with libapriltag's apriltag_pose.c stage by stage over a synthetic sweep,
 # degenerate geometry and (with --data) real detections. Needs no OpenCV.
-add_executable(apriltag_pose_validate validate_pose/validate_pose.cpp)
-target_link_libraries(apriltag_pose_validate PRIVATE vkapriltag::vkapriltag)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(apriltag_pose_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
+if(TARGET apriltag)
+  add_executable(apriltag_pose_validate validate_pose/validate_pose.cpp)
+  target_link_libraries(apriltag_pose_validate PRIVATE vkapriltag::vkapriltag)
+  vkapriltag_use_upstream(apriltag_pose_validate)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(apriltag_pose_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  install(TARGETS apriltag_pose_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
-install(TARGETS apriltag_pose_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Mali hardware-counter tools (Linux, Arm Mali): hwcnt_run prints every counter over a command's
 # run, hwcnt_timeline samples selected counters periodically. Built against Arm's libGPUCounters.
@@ -126,8 +148,9 @@ install(TARGETS track_eval RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 add_executable(vk_eval vk_eval/vk_eval.cpp)
 target_include_directories(vk_eval PRIVATE vk_eval)
 target_link_libraries(vk_eval PRIVATE vkapriltag::vkapriltag)
-# Windows has no rpath: put the apriltag DLL beside the executable.
-if(WIN32 AND TARGET apriltag)
-  add_custom_command(TARGET vk_eval POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:apriltag> $<TARGET_FILE_DIR:vk_eval>)
+# --ref (the unmodified libapriltag CPU detector) needs upstream.
+if(TARGET apriltag)
+  target_sources(vk_eval PRIVATE vk_eval/vk_eval_ref.cpp)
+  target_compile_definitions(vk_eval PRIVATE VKAPRILTAG_VK_EVAL_REF=1)
+  vkapriltag_use_upstream(vk_eval)
 endif()

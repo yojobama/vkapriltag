@@ -116,16 +116,15 @@ void FramePipeline::HarvestInFlight(Slot &slot) {
   have_done_ = true;
 }
 
-zarray_t *FramePipeline::DecodeHarvested() {
+const DetectionList *FramePipeline::DecodeHarvested() {
   if (!have_done_) return nullptr;
   VKA_PROF_SCOPE("pipeline.cpu_tail");
   quads_ = quad_decode_.Decode(done_points_);
-  return tag_decoder_.Decode(quads_, done_frame_, done_width_, done_height_,
-                             done_reversed_border_);
+  return &tag_decoder_.Decode(quads_, done_frame_, done_width_, done_height_, done_reversed_border_);
 }
 
-zarray_t *FramePipeline::Push(const uint8_t *gray_frame, uint32_t width, uint32_t height,
-                              bool reversed_border) {
+const DetectionList *FramePipeline::Push(const uint8_t *gray_frame, uint32_t width, uint32_t height,
+                                         bool reversed_border) {
   const DetectorConfig &config = slots_[next_]->detector->config();
   if (width != config.width || height != config.height) {
     throw std::invalid_argument("FramePipeline::Push: frame size differs from the detector's");
@@ -150,7 +149,7 @@ zarray_t *FramePipeline::Push(const uint8_t *gray_frame, uint32_t width, uint32_
   return harvested ? DecodeHarvested() : nullptr;
 }
 
-zarray_t *FramePipeline::Flush() {
+const DetectionList *FramePipeline::Flush() {
   // Slots are used in turn, so the first one in flight from next_ holds the oldest frame.
   for (size_t k = 0; k < slots_.size(); ++k) {
     Slot &slot = *slots_[(next_ + k) % slots_.size()];

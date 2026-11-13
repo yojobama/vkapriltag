@@ -39,12 +39,11 @@ class FramePipeline {
   // owned by the TagDecoder and valid until the next Push()/Flush(). `gray_frame` must stay valid
   // until depth() further Push()/Flush() calls have returned. Rethrows any exception from the GPU
   // pass; throws std::invalid_argument if width or height differ from the detector's config.
-  zarray_t *Push(const uint8_t *gray_frame, uint32_t width, uint32_t height,
-                 bool reversed_border);
+  const DetectionList *Push(const uint8_t *gray_frame, uint32_t width, uint32_t height, bool reversed_border);
 
   // Finishes the oldest frame in flight and returns its detections; nullptr when none is left.
   // Call it until it returns nullptr to drain every frame.
-  zarray_t *Flush();
+  const DetectionList *Flush();
 
   // Profile of the most recently completed frame (the one last returned).
   const GpuDetector::DetectProfile &last_profile() const { return done_profile_; }
@@ -75,7 +74,7 @@ class FramePipeline {
   void WorkerLoop(Slot &slot);
   // Blocks until the slot's GPU pass finishes and swaps its results into done_*.
   void HarvestInFlight(Slot &slot);
-  zarray_t *DecodeHarvested();
+  const DetectionList *DecodeHarvested();
 
   QuadDecode &quad_decode_;
   TagDecoder &tag_decoder_;

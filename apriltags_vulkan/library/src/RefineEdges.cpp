@@ -19,7 +19,7 @@ using geom::BilinearAt;
 constexpr int kMaxProfilePoints = 96;
 
 // Moves each corner to the intersection of its two adjacent fitted lines.
-void IntersectLines(const double lines[4][4], struct quad *quad) {
+void IntersectLines(const double lines[4][4], Quad *quad) {
   for (int i = 0; i < 4; i++) {
     double x, y, det;
     geom::LineCorner(lines[i], lines[(i + 1) & 3], &x, &y, &det);
@@ -34,12 +34,12 @@ void IntersectLines(const double lines[4][4], struct quad *quad) {
 // The frame of one side of a quad: its unit normal (flipped for a reversed border) and midpoint, the
 // points along the side where profiles are taken, and the line stored for the side.
 struct SideSampler {
-  const struct quad *quad;
+  const Quad *quad;
   int a, b;
   double nx, ny, mag, xm, ym;
   float fnx, fny;
 
-  SideSampler(const struct quad *q, int edge) : quad(q), a(edge), b((edge + 1) & 3) {
+  SideSampler(const Quad *q, int edge) : quad(q), a(edge), b((edge + 1) & 3) {
     nx = q->p[b][1] - q->p[a][1];
     ny = -q->p[b][0] + q->p[a][0];
     mag = std::sqrt(nx * nx + ny * ny);
@@ -84,7 +84,7 @@ struct SideSampler {
 };
 
 template <typename Sample>
-void RefineEdgesT(int quad_decimate, const image_u8_t *im, struct quad *quad) {
+void RefineEdgesT(int quad_decimate, const Image *im, Quad *quad) {
   double lines[4][4];  // for each line, [Ex Ey nx ny]
 
   for (int edge = 0; edge < 4; edge++) {
@@ -250,7 +250,7 @@ void FitSide(double *bxs, double *bys, double *ws, int used, double range, doubl
 // the image crosses halfway between the white and black a half cell either side of it, which stays
 // exact for any symmetric blur under about two cells (the gradient's centre of mass does not).
 // Returns false, leaving the quad as it was, if a side's fit is degenerate.
-bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *quad,
+bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
                  double *edge_width, double *truncated = nullptr) {
   const int taps = 2 * static_cast<int>(range / kProfileStep) + 3;
   constexpr int kMaxTaps = 96;
@@ -363,7 +363,7 @@ bool ProfilePass(float range, double cell, const image_u8_t *im, struct quad *qu
 // (the white from the outer end, the black from the inner end), which is exact for a symmetric blur.
 // *ramp receives the median 20% to 80% rise. Returns false, leaving the quad as it was, if no side
 // could be refitted.
-bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ramp = nullptr) {
+bool LevelPass(double cell, const Image *im, Quad *quad, double *ramp = nullptr) {
   const double r_out = std::min(0.5 * cell, 20.0), r_in = std::min(0.5 * cell, 20.0);
   const float step = static_cast<float>(std::max<double>(kProfileStep, std::min(1.0, (r_in + r_out) / kLevelTaps)));
   const int taps = static_cast<int>((r_in + r_out) / step) + 1;
@@ -474,7 +474,7 @@ bool LevelPass(double cell, const image_u8_t *im, struct quad *quad, double *ram
 
 // Heckbert's projective map of the unit square onto quad q, applied to (u, v); q's corners 0..3 are
 // the square's (0,0), (1,0), (1,1) and (0,1).
-void SquareToQuad(const struct quad *q, double u, double v, double *x, double *y) {
+void SquareToQuad(const Quad *q, double u, double v, double *x, double *y) {
   const double dx1 = q->p[1][0] - q->p[2][0], dx2 = q->p[3][0] - q->p[2][0];
   const double dy1 = q->p[1][1] - q->p[2][1], dy2 = q->p[3][1] - q->p[2][1];
   const double sx = q->p[0][0] - q->p[1][0] + q->p[2][0] - q->p[3][0];
@@ -517,7 +517,7 @@ double LobeCentroid(const double *prof, int from, int to, bool falling) {
 // should be one cell wide measures cell - 2 delta while the fitted outline is itself 2 delta small.
 // Measures the border's width across white payload cells and returns delta in pixels (0 when the
 // levels are not clipped, too few cells can be measured, or the sides disagree).
-double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
+double ClipBias(const Quad *q, int width_cells, const Image *im) {
   const double cells = width_cells;
   double black_v[64], white_v[64];
   int nb = 0, nw = 0;
@@ -596,7 +596,7 @@ double ClipBias(const struct quad *q, int width_cells, const image_u8_t *im) {
 }
 
 // Moves every side of the quad outward by d pixels and re-intersects them.
-void GrowQuad(struct quad *q, double d) {
+void GrowQuad(Quad *q, double d) {
   double cx = 0, cy = 0, px[4], py[4], dx[4], dy[4];
   for (int k = 0; k < 4; ++k) {
     cx += 0.25 * q->p[k][0];
@@ -625,17 +625,12 @@ void GrowQuad(struct quad *q, double d) {
   }
 }
 
-void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, struct quad *quad) {
-  const int quad_decimate = static_cast<int>(td->quad_decimate);
+void RefineEdgesProfile(int quad_decimate, int width_at_border, const Image *im, Quad *quad) {
   float reach = static_cast<float>(quad_decimate + 1);
   double edge_width = 0;
   // The cell size in pixels, from the first family's border width; 0 when there is none.
   double cell = 0;
-  if (zarray_size(td->tag_families) > 0) {
-    apriltag_family_t *family = nullptr;
-    zarray_get(td->tag_families, 0, &family);
-    cell = geom::MeanSide(quad->p) / family->width_at_border;
-  }
+  if (width_at_border > 0) cell = geom::MeanSide(quad->p) / width_at_border;
   double truncated = 0;
   if (!ProfilePass(reach, cell, im, quad, &edge_width, &truncated)) {
     RefineEdgesT<double>(quad_decimate, im, quad);
@@ -646,7 +641,7 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
   // Lobes running into the window ends mean a blurred quad: place its edges by the halfway crossing.
   bool widened = false;
   if ((ProfileFeatures() & kWidenBlur) != 0 && truncated > kTruncatedFraction) {
-    struct quad before = *quad;
+    Quad before = *quad;
     double ramp = 0;
     if (LevelPass(cell, im, quad, &ramp) && ramp >= kMinBlurRamp) {
       widened = true;
@@ -662,16 +657,14 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
     if (cell >= 3.0) next = std::min(next, 0.45 * cell);
     if (next >= 0.9 * reach) break;
     reach = static_cast<float>(next);
-    struct quad before = *quad;
+    Quad before = *quad;
     if (!ProfilePass(reach, cell, im, quad, &edge_width)) {
       *quad = before;
       break;
     }
   }
   if ((ProfileFeatures() & kClipBias) != 0) {
-    apriltag_family_t *family = nullptr;
-    zarray_get(td->tag_families, 0, &family);
-    const double delta = ClipBias(quad, family->width_at_border, im);
+    const double delta = ClipBias(quad, width_at_border, im);
     if (delta != 0) GrowQuad(quad, delta);
   }
 }
@@ -680,7 +673,7 @@ void RefineEdgesProfile(const apriltag_detector_t *td, const image_u8_t *im, str
 
 namespace testing {
 
-void IntersectLines(const double lines[4][4], struct quad *quad) { apriltag_vulkan::IntersectLines(lines, quad); }
+void IntersectLines(const double lines[4][4], Quad *quad) { apriltag_vulkan::IntersectLines(lines, quad); }
 void FitSide(double *bxs, double *bys, double *ws, int used, double range, double *mx, double *my,
              double *normal_theta) {
   apriltag_vulkan::FitSide(bxs, bys, ws, used, range, mx, my, normal_theta);
@@ -696,14 +689,13 @@ RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured) {
   }
 }
 
-void RefineEdges(RefineEdgesMethod method, apriltag_detector_t *td, image_u8_t *im,
-                 struct quad *quad) {
+void RefineEdges(RefineEdgesMethod method, int decimation, int width_at_border, const Image *im, Quad *quad) {
   switch (method) {
     case RefineEdgesMethod::kExact:
-      RefineEdgesT<double>(td->quad_decimate, im, quad);
+      RefineEdgesT<double>(decimation, im, quad);
       return;
     case RefineEdgesMethod::kProfile:
-      RefineEdgesProfile(td, im, quad);
+      RefineEdgesProfile(decimation, width_at_border, im, quad);
       return;
   }
 }

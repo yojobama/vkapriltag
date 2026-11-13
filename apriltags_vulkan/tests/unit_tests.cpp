@@ -19,14 +19,10 @@
 #include "TestHooks.h"
 #include "test_check.h"
 #include "vkapriltag/RefineEdges.h"
-#include "vkapriltag/apriltag_family.h"
+#include "vkapriltag/Family.h"
 #include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/WorkerPool.h"
 #include "vkapriltag/gpu/QuadDecode.h"
-
-extern "C" {
-#include "apriltag.h"
-}
 
 namespace av = apriltag_vulkan;
 namespace tst = apriltag_vulkan::testing;
@@ -38,18 +34,36 @@ namespace {
 // ---------------------------------------------------------------- tag decoding helpers
 
 struct Family {
-  apriltag_family_t *f = nullptr;
-  const char *name;
-  explicit Family(const char *n) : name(n) { setup_tag_family(&f, n); }
-  ~Family() { teardown_tag_family(&f, name); }
+  const av::Family *f = nullptr;
+  explicit Family(const char *n) : f(av::Family::ByName(n)) { CHECK(f != nullptr); }
 };
 
-bool Adjacent(const apriltag_family_t *f, int a, int b) {
+// The cells of a family's tag image (total_width squared, 0 or 255), as libapriltag's apriltag_to_image draws them.
+std::vector<uint8_t> RenderTag(const av::Family *fam, int idx) {
+  const int tw = fam->total_width;
+  std::vector<uint8_t> im(size_t(tw) * tw, 0);
+  const int white_border_width = fam->width_at_border + (fam->reversed_border ? 0 : 2);
+  const int white_border_start = (tw - white_border_width) / 2;
+  for (int i = 0; i < white_border_width - 1; i += 1) {
+    im[size_t(white_border_start) * tw + white_border_start + i] = 255;
+    im[size_t(white_border_start + i) * tw + tw - 1 - white_border_start] = 255;
+    im[size_t(tw - 1 - white_border_start) * tw + white_border_start + i + 1] = 255;
+    im[size_t(white_border_start + 1 + i) * tw + white_border_start] = 255;
+  }
+  const int border_start = (tw - fam->width_at_border) / 2;
+  const uint64_t code = fam->codes[idx];
+  for (uint32_t i = 0; i < fam->nbits; i++) {
+    if (code & (uint64_t{1} << (fam->nbits - i - 1))) im[size_t(fam->bit_y[i] + border_start) * tw + fam->bit_x[i] + border_start] = 255;
+  }
+  return im;
+}
+
+bool Adjacent(const av::Family *f, int a, int b) {
   return a != b && std::abs(int(f->bit_x[a]) - int(f->bit_x[b])) <= 1 &&
          std::abs(int(f->bit_y[a]) - int(f->bit_y[b])) <= 1;
 }
 
-uint64_t Cell(const apriltag_family_t *f, int k) { return uint64_t{1} << (f->nbits - 1 - k); }
+uint64_t Cell(const av::Family *f, int k) { return uint64_t{1} << (f->nbits - 1 - k); }
 
 uint64_t RotateTimes(uint64_t w, int nbits, int times) {
   for (int i = 0; i < times; ++i) w = tst::Rotate90(w, nbits);
@@ -79,7 +93,7 @@ void TestRotate90() {
 
 void TestErrorsConnected() {
   Family fam("tag36h11");
-  const apriltag_family_t *f = fam.f;
+  const av::Family *f = fam.f;
   CHECK(tst::ErrorsConnected(f, 0));
   CHECK(tst::ErrorsConnected(f, Cell(f, 10)));
   int adjacent_cell = -1, distant_cell = -1;
@@ -103,7 +117,7 @@ void TestErrorsConnected() {
 void TestMatchThreeTouchingBits() {
   for (const char *name : {"tag36h11", "tag25h9"}) {
     Family fam(name);
-    const apriltag_family_t *f = fam.f;
+    const av::Family *f = fam.f;
     av::ThirdBitIndex index;
     tst::BuildThirdBitIndex(f, &index);
     // Three cells that touch in a chain, and three that are pairwise apart.
@@ -173,7 +187,7 @@ void TestDecode() {
 void TestIntersectLines() {
   // A line is [Ex Ey nx ny]: a point on it and a normal, with the direction (ny, -nx).
   const double square[4][4] = {{10, 10, 0, 1}, {20, 10, -1, 0}, {20, 20, 0, -1}, {10, 20, 1, 0}};
-  struct quad q = {};
+  av::Quad q = {};
   av::testing::IntersectLines(square, &q);
   const double want[4][2] = {{10, 10}, {20, 10}, {20, 20}, {10, 20}};
   for (int i = 0; i < 4; ++i) {
@@ -192,7 +206,7 @@ void TestIntersectLines() {
     lines[i][2] = -dy / len;
     lines[i][3] = dx / len;
   }
-  struct quad r = {};
+  av::Quad r = {};
   av::testing::IntersectLines(lines, &r);
   for (int i = 0; i < 4; ++i) {
     CHECK_NEAR(r.p[i][0], corner[i][0], 1e-4);
@@ -204,7 +218,7 @@ void TestIntersectLines() {
   std::memcpy(par, square, sizeof par);
   par[1][2] = 0;
   par[1][3] = 1;
-  struct quad k = {};
+  av::Quad k = {};
   for (int i = 0; i < 4; ++i) k.p[i][0] = k.p[i][1] = -7.0f;
   av::testing::IntersectLines(par, &k);
   CHECK(k.p[1][0] == -7.0f && k.p[1][1] == -7.0f);
@@ -263,7 +277,7 @@ namespace geo = apriltag_vulkan::geom;
 void TestBilinearAndMedian() {
   // A 4 x 3 image with two bytes of row padding.
   uint8_t buf[6 * 3] = {0, 100, 8, 8, 0, 0, 200, 40, 8, 8, 0, 0, 16, 32, 64, 128, 0, 0};
-  image_u8_t im = {4, 3, 6, buf};
+  av::Image im = {buf, 4, 3, 6};
   CHECK_NEAR(geo::BilinearAt<double>(&im, 0, 0, 0.25, 0.5), 92.5, 0.0);
   CHECK_NEAR(geo::BilinearAt<float>(&im, 0, 0, 0.25f, 0.5f), 92.5, 0.0);
   CHECK_NEAR(geo::BilinearAt<double>(&im, 2, 1, 1.0, 1.0), 128.0, 0.0);
@@ -489,21 +503,17 @@ double RefineError(av::RefineEdgesMethod method, const EdgeCase &c, double *sign
     truth[k][1] = cy + x * std::sin(a) + y * std::cos(a);
   }
   std::vector<uint8_t> pix = RenderQuad(W, H, truth, c.sigma);
-  image_u8_t im = {W, H, W, pix.data()};
+  av::Image im = {pix.data(), W, H, W};
 
   Family fam("tag36h11");
-  apriltag_detector_t *td = apriltag_detector_create();
-  apriltag_detector_add_family(td, fam.f);
-  td->quad_decimate = 1;
-  td->refine_edges = true;
   const double nudge[4][2] = {{0.8, -0.6}, {-0.7, 0.9}, {0.6, 0.7}, {-0.9, -0.5}};
-  struct quad q = {};
+  av::Quad q = {};
   for (int k = 0; k < 4; ++k) {
     q.p[k][0] = float(truth[k][0] + nudge[k][0]);
     q.p[k][1] = float(truth[k][1] + nudge[k][1]);
   }
   q.reversed_border = false;
-  av::RefineEdges(method, td, &im, &q);
+  av::RefineEdges(method, 1, int(fam.f->width_at_border), &im, &q);
   double worst = 0, sx = 0, sy = 0;
   for (int k = 0; k < 4; ++k) {
     worst = std::max(worst, std::hypot(q.p[k][0] - truth[k][0], q.p[k][1] - truth[k][1]));
@@ -512,7 +522,6 @@ double RefineError(av::RefineEdgesMethod method, const EdgeCase &c, double *sign
   }
   if (signed_dx) *signed_dx = sx / 4;
   if (signed_dy) *signed_dy = sy / 4;
-  apriltag_detector_destroy(td);
   return worst;
 }
 
@@ -737,13 +746,11 @@ void TestOptions() {
 // ---------------------------------------------------------------- decode steps on one quad
 
 struct Detector {
-  apriltag_detector_t *td;
-  explicit Detector(apriltag_family_t *f) : td(apriltag_detector_create()) {
-    apriltag_detector_add_family(td, f);
-    td->quad_decimate = 1;
-    td->refine_edges = true;
+  av::TagDecoderConfig cfg;
+  explicit Detector(const av::Family *f) {
+    cfg.families = {f};
+    cfg.refine_edges = true;
   }
-  ~Detector() { apriltag_detector_destroy(td); }
 };
 
 // A tag drawn on a white canvas, kCell pixels per cell. The family image has a one-cell quiet ring
@@ -752,16 +759,10 @@ class TagScene {
  public:
   static constexpr int kCell = 8, kSize = 160, kOrigin = 40;
 
-  TagScene(const apriltag_family_t *f, int id, int ring_grey = 255, const std::vector<int> &flips = {})
+  TagScene(const av::Family *f, int id, int ring_grey = 255, const std::vector<int> &flips = {})
       : f_(f), pix_(size_t(kSize) * kSize, 255) {
-    apriltag_family_t *mutable_family = const_cast<apriltag_family_t *>(f);
-    image_u8_t *tag = apriltag_to_image(mutable_family, uint32_t(id));
     const int tw = f->total_width, start = (tw - int(f->width_at_border)) / 2;
-    std::vector<uint8_t> cells(size_t(tw) * tw);
-    for (int y = 0; y < tw; ++y) {
-      for (int x = 0; x < tw; ++x) cells[size_t(y) * tw + x] = tag->buf[y * tag->stride + x];
-    }
-    image_u8_destroy(tag);
+    std::vector<uint8_t> cells = RenderTag(f, id);
     for (int y = 0; y < tw; ++y) {
       for (int x = 0; x < tw; ++x) {
         if (x == 0 || y == 0 || x == tw - 1 || y == tw - 1) cells[size_t(y) * tw + x] = uint8_t(ring_grey);
@@ -774,10 +775,10 @@ class TagScene {
     for (int y = 0; y < tw * kCell; ++y) {
       for (int x = 0; x < tw * kCell; ++x) pix_[size_t(kOrigin + y) * kSize + kOrigin + x] = cells[size_t(y / kCell) * tw + x / kCell];
     }
-    im_.reset(new image_u8_t{kSize, kSize, kSize, pix_.data()});
+    im_.reset(new av::Image{pix_.data(), kSize, kSize, kSize});
   }
 
-  image_u8_t *image() { return im_.get(); }
+  const av::Image *image() { return im_.get(); }
   void Fill(int x0, int y0, int x1, int y1, uint8_t v) {
     for (int y = y0; y < y1; ++y) std::fill_n(pix_.begin() + size_t(y) * kSize + x0, x1 - x0, v);
   }
@@ -794,13 +795,13 @@ class TagScene {
   }
 
  private:
-  const apriltag_family_t *f_;
+  const av::Family *f_;
   std::vector<uint8_t> pix_;
-  std::unique_ptr<image_u8_t> im_;
+  std::unique_ptr<av::Image> im_;
 };
 
 // Payload cells that touch cell `a`, nearest first.
-std::vector<int> Neighbours(const apriltag_family_t *f, int a) {
+std::vector<int> Neighbours(const av::Family *f, int a) {
   std::vector<int> out;
   for (int b = 0; b < int(f->nbits); ++b) {
     if (Adjacent(f, a, b)) out.push_back(b);
@@ -818,30 +819,30 @@ void TestPreRefineChecks() {
   TagScene tag(fam.f, 7);
   double border[4][2];
   tag.Border(border);
-  CHECK(!tst::PreRefineRejects(det.td, tag.image(), border, false, on));
-  CHECK(!tst::PreRefineRejects(det.td, tag.image(), border, false, grey_off));
+  CHECK(!tst::PreRefineRejects(det.cfg, 1, tag.image(), border, false, on));
+  CHECK(!tst::PreRefineRejects(det.cfg, 1, tag.image(), border, false, grey_off));
 
   // A solid black square has the border of a tag but fewer white payload cells than any code.
   std::vector<uint8_t> black(size_t(TagScene::kSize) * TagScene::kSize, 255);
   for (int y = 48; y < 112; ++y) std::fill_n(black.begin() + y * TagScene::kSize + 48, 64, uint8_t{0});
-  image_u8_t black_im = {TagScene::kSize, TagScene::kSize, TagScene::kSize, black.data()};
+  av::Image black_im = {black.data(), TagScene::kSize, TagScene::kSize, TagScene::kSize};
   const double square[4][2] = {{48, 48}, {112, 48}, {112, 112}, {48, 112}};
-  CHECK(tst::PreRefineRejects(det.td, &black_im, square, false, on));
-  CHECK(tst::PreRefineRejects(det.td, &black_im, square, false, grey_off));
+  CHECK(tst::PreRefineRejects(det.cfg, 1, &black_im, square, false, on));
+  CHECK(tst::PreRefineRejects(det.cfg, 1, &black_im, square, false, grey_off));
   av::DecodeSwitches dark_off = on;
   dark_off.dark_reject = false;
-  CHECK(!tst::PreRefineRejects(det.td, &black_im, square, false, dark_off));
+  CHECK(!tst::PreRefineRejects(det.cfg, 1, &black_im, square, false, dark_off));
 
   // Quads over uniform noise: almost all fail the border or the payload check.
   std::mt19937 rng(7);
   std::vector<uint8_t> noise(size_t(TagScene::kSize) * TagScene::kSize);
   for (uint8_t &v : noise) v = uint8_t(rng() & 255);
-  image_u8_t noise_im = {TagScene::kSize, TagScene::kSize, TagScene::kSize, noise.data()};
+  av::Image noise_im = {noise.data(), TagScene::kSize, TagScene::kSize, TagScene::kSize};
   int rejected = 0;
   for (int i = 0; i < 40; ++i) {
     const double x = 20 + (i % 8) * 8.0, y = 20 + (i / 8) * 8.0;
     const double quad[4][2] = {{x, y}, {x + 70, y}, {x + 70, y + 70}, {x, y + 70}};
-    rejected += tst::PreRefineRejects(det.td, &noise_im, quad, false, on);
+    rejected += tst::PreRefineRejects(det.cfg, 1, &noise_im, quad, false, on);
   }
   std::printf("  noise quads rejected before refining: %d of 40\n", rejected);
   CHECK(rejected >= 20);
@@ -850,7 +851,7 @@ void TestPreRefineChecks() {
   TagScene grey(fam.f, 7, 128);
   double outline[4][2];
   TagScene::Square(0, fam.f->total_width, outline);
-  CHECK(!tst::PreRefineRejects(det.td, grey.image(), outline, false, on));
+  CHECK(!tst::PreRefineRejects(det.cfg, 1, grey.image(), outline, false, on));
 }
 
 void TestRecoverySteps() {
@@ -863,18 +864,18 @@ void TestRecoverySteps() {
   TagScene tag(fam.f, id);
   double border[4][2];
   tag.Border(border);
-  tst::StepResult r = tst::RunCandidateSteps(det.td, tag.image(), border, false, on);
+  tst::StepResult r = tst::RunCandidateSteps(det.cfg, 1, tag.image(), border, false, on);
   CHECK(r.outcome == 3 && r.count == 1 && r.id == id && r.hamming == 0);
 
   // Grey quiet ring: the quad is the ring's outline; only the inner retry decodes it.
   TagScene grey(fam.f, id, 128);
   double outline[4][2];
   TagScene::Square(0, fam.f->total_width, outline);
-  r = tst::RunCandidateSteps(det.td, grey.image(), outline, false, on);
+  r = tst::RunCandidateSteps(det.cfg, 1, grey.image(), outline, false, on);
   CHECK(r.count == 1 && r.id == id);
   av::DecodeSwitches grey_off = on;
   grey_off.grey_margin = false;
-  r = tst::RunCandidateSteps(det.td, grey.image(), outline, false, grey_off);
+  r = tst::RunCandidateSteps(det.cfg, 1, grey.image(), outline, false, grey_off);
   CHECK(r.count == 0);
 
   // Three touching payload cells wrong: only the third-bit match recovers the tag.
@@ -885,12 +886,12 @@ void TestRecoverySteps() {
   }
   TagScene damaged(fam.f, id, 255, flips);
   damaged.Border(border);
-  r = tst::RunCandidateSteps(det.td, damaged.image(), border, false, on);
+  r = tst::RunCandidateSteps(det.cfg, 1, damaged.image(), border, false, on);
   std::printf("  three touching bits wrong: count %d id %d hamming %d\n", r.count, r.id, r.hamming);
   CHECK(r.count == 1 && r.id == id && r.hamming == 3);
   av::DecodeSwitches third_off = on;
   third_off.third_bit = false;
-  r = tst::RunCandidateSteps(det.td, damaged.image(), border, false, third_off);
+  r = tst::RunCandidateSteps(det.cfg, 1, damaged.image(), border, false, third_off);
   CHECK(r.count == 0);
 
   // A dark line one cell above the tag puts the top side out; the side-one-out step moves it back.
@@ -899,17 +900,17 @@ void TestRecoverySteps() {
   const double out[4][2] = {{48, 41}, {112, 41}, {112, 112}, {48, 112}};
   av::DecodeSwitches side_off = on;
   side_off.side_one_out = false;
-  r = tst::RunCandidateSteps(det.td, lined.image(), out, false, side_off);
+  r = tst::RunCandidateSteps(det.cfg, 1, lined.image(), out, false, side_off);
   CHECK(r.count == 1 && r.id == id && r.hamming == 2);
   CHECK_NEAR(r.corners[2][1], 41.0, 0.5);
-  r = tst::RunCandidateSteps(det.td, lined.image(), out, false, on);
+  r = tst::RunCandidateSteps(det.cfg, 1, lined.image(), out, false, on);
   CHECK(r.count == 1 && r.id == id && r.hamming == 0);
   CHECK_NEAR(r.corners[2][1], 48.0, 0.5);
 
   // Three scattered wrong cells are not recovered.
   TagScene scattered(fam.f, id, 255, {0, 17, 33});
   scattered.Border(border);
-  r = tst::RunCandidateSteps(det.td, scattered.image(), border, false, on);
+  r = tst::RunCandidateSteps(det.cfg, 1, scattered.image(), border, false, on);
   CHECK(r.count == 0);
 }
 
@@ -923,20 +924,43 @@ void TestFamilyLimits() {
   double border[4][2];
   one_wrong.Border(border);
   // One corrected bit is more than tag16h5's codes can bear.
-  tst::StepResult r = tst::RunCandidateSteps(det.td, one_wrong.image(), border, false, limits_off);
+  tst::StepResult r = tst::RunCandidateSteps(det.cfg, 1, one_wrong.image(), border, false, limits_off);
   CHECK(r.count == 1 && r.id == 3 && r.hamming == 1);
-  r = tst::RunCandidateSteps(det.td, one_wrong.image(), border, false, on);
+  r = tst::RunCandidateSteps(det.cfg, 1, one_wrong.image(), border, false, on);
   CHECK(r.count == 0);
   TagScene exact(fam.f, 3);
   exact.Border(border);
-  r = tst::RunCandidateSteps(det.td, exact.image(), border, false, on);
+  r = tst::RunCandidateSteps(det.cfg, 1, exact.image(), border, false, on);
   CHECK(r.count == 1 && r.id == 3 && r.hamming == 0);
+}
+
+// An image with row padding gives the same steps and corners as the packed one.
+void TestStridedImage() {
+  Family fam("tag36h11");
+  Detector det(fam.f);
+  const av::DecodeSwitches on;
+  TagScene tag(fam.f, 7);
+  double border[4][2];
+  tag.Border(border);
+  const av::Image *packed = tag.image();
+  const int stride = packed->width + 40;
+  std::vector<uint8_t> padded(size_t(stride) * packed->height, 77);
+  for (int y = 0; y < packed->height; ++y) {
+    std::memcpy(padded.data() + size_t(y) * stride, packed->data + size_t(y) * packed->stride, size_t(packed->width));
+  }
+  const av::Image strided = {padded.data(), packed->width, packed->height, stride};
+  const tst::StepResult a = tst::RunCandidateSteps(det.cfg, 1, packed, border, false, on);
+  const tst::StepResult b = tst::RunCandidateSteps(det.cfg, 1, &strided, border, false, on);
+  CHECK(a.count == 1 && a.id == 7);
+  CHECK(a.count == b.count && a.id == b.id && a.hamming == b.hamming);
+  CHECK(std::memcmp(a.corners, b.corners, sizeof(a.corners)) == 0);
 }
 
 void TestSteps() {
   TestPreRefineChecks();
   TestRecoverySteps();
   TestFamilyLimits();
+  TestStridedImage();
 }
 
 void TestPool() {

@@ -1,8 +1,6 @@
 #pragma once
 
-extern "C" {
-#include "apriltag.h"
-}
+#include "vkapriltag/Types.h"
 
 namespace apriltag_vulkan {
 
@@ -18,8 +16,8 @@ enum class RefineEdgesMethod {
 // Resolves the method: APRILTAG_VK_REFINE ("exact" or "profile") overrides `configured`.
 RefineEdgesMethod ResolveRefineEdgesMethod(RefineEdgesMethod configured);
 
-// Refines `quad`'s corners in place against the full-resolution image `im`; `td` supplies the decimation.
-void RefineEdges(RefineEdgesMethod method, apriltag_detector_t *td, image_u8_t *im,
-                 struct quad *quad);
+// Refines `quad`'s corners in place against the full-resolution image `im`. `decimation` is the detector's
+// (it sets the search radius); `width_at_border` is the tag family's border width in cells, 0 if unknown.
+void RefineEdges(RefineEdgesMethod method, int decimation, int width_at_border, const Image *im, Quad *quad);
 
 }  // namespace apriltag_vulkan

@@ -7,13 +7,10 @@
 #include <thread>
 #include <vector>
 
+#include "vkapriltag/Detection.h"
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/gpu/GpuDetector.h"
 #include "vkapriltag/gpu/QuadDecode.h"
-
-extern "C" {
-#include "apriltag.h"
-}
 
 namespace apriltag_vulkan {
 
@@ -72,9 +69,9 @@ class TrackingDetector {
  public:
   enum class Path { kFull, kTracked };
 
-  // `td` must already have its tag families added and refine_edges set; it is not owned. `config`
-  // is for the full detector; `decimation` of the tracked frames' refinement matches it.
-  TrackingDetector(vk::Context &ctx, apriltag_detector_t *td, const DetectorConfig &config,
+  // `decoder` is copied (its families must outlive this object). `config` is for the full detector; the
+  // decimation of the tracked frames' refinement matches it.
+  TrackingDetector(vk::Context &ctx, const TagDecoderConfig &decoder, const DetectorConfig &config,
                    const TrackingConfig &tracking = {});
   ~TrackingDetector();
 
@@ -83,7 +80,7 @@ class TrackingDetector {
 
   // Detects the tags of one grayscale frame; the buffer must hold the configured width*height bytes (the
   // size is not checked). Returns detections owned by this object, valid until the next Detect().
-  zarray_t *Detect(const uint8_t *gray_frame);
+  const DetectionList &Detect(const uint8_t *gray_frame);
 
   // Forgets every track, so the next frame runs the full detector.
   void Reset();
@@ -124,18 +121,19 @@ class TrackingDetector {
   };
 
   static double Speed(const Track &t);
-  zarray_t *DetectFull(const uint8_t *gray_frame);
-  zarray_t *DetectAsync(const uint8_t *gray_frame);
+  const DetectionList *DetectFull(const uint8_t *gray_frame);
+  const DetectionList *DetectAsync(const uint8_t *gray_frame);
   // Tracks every entry of tracks_ on the frame. Not partial: all or nullptr. Partial: the tracks that
   // succeed (nullptr if none).
-  zarray_t *TrackFrame(const uint8_t *gray_frame, bool partial, Path *path);
-  zarray_t *Solve(const uint8_t *gray_frame, std::vector<size_t> active, const std::vector<DetectedQuad> &start,
-                  std::vector<DetectedQuad> *cur, std::vector<char> *ok);
+  const DetectionList *TrackFrame(const uint8_t *gray_frame, bool partial, Path *path);
+  const DetectionList *Solve(const uint8_t *gray_frame, std::vector<size_t> active,
+                             const std::vector<DetectedQuad> &start, std::vector<DetectedQuad> *cur,
+                             std::vector<char> *ok);
   void PredictQuad(const Track &t, DetectedQuad *q) const;
-  bool Accept(const apriltag_detection_t *det, const Track &t, const DetectedQuad &from) const;
+  bool Accept(const Detection &det, const Track &t, const DetectedQuad &from) const;
   bool CoarseStart(const uint8_t *gray_frame, const Track &t, int d, DetectedQuad *out);
   void EnsureCoarse();
-  void UpdateTracks(zarray_t *dets);
+  void UpdateTracks(const DetectionList &dets);
   void EnsureBackground();
   void StopBackground();
   void BackgroundMain();
@@ -144,14 +142,14 @@ class TrackingDetector {
 
   DetectorConfig config_;
   TrackingConfig tracking_;
-  apriltag_detector_t *td_;  // not owned
+  TagDecoderConfig decoder_config_;
   std::unique_ptr<GpuDetector> gpu_;
   // Shared by quad_decode_ and full_decoder_ until the background thread starts (see EnsureBackground).
   std::shared_ptr<WorkerPool> pool_;
   std::unique_ptr<QuadDecode> quad_decode_;
   std::unique_ptr<TagDecoder> full_decoder_;
   std::vector<Track> tracks_;
-  apriltag_detector_t *coarse_td_ = nullptr;
+  DetectionList tracked_out_;  // the tracked frame's detections, returned by TrackFrame
   std::unique_ptr<TagDecoder> coarse_decoder_;
   std::vector<uint8_t> coarse_img_;
   uint64_t frame_index_ = 0;

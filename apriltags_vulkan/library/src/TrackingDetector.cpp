@@ -38,17 +38,17 @@ void ApplyEnv(TrackingConfig *c) {
 }
 
 // Detection corners run opposite to quad corners (quad p[k] = detection p[3 - k]).
-void QuadFromDetection(const apriltag_detection_t *det, DetectedQuad *q) {
+void QuadFromDetection(const Detection &det, DetectedQuad *q) {
   for (int k = 0; k < 4; ++k) {
-    q->p[3 - k][0] = det->p[k][0];
-    q->p[3 - k][1] = det->p[k][1];
+    q->p[3 - k][0] = det.p[k][0];
+    q->p[3 - k][1] = det.p[k][1];
   }
 }
 
-double MaxShift(const apriltag_detection_t *det, const DetectedQuad &q) {
+double MaxShift(const Detection &det, const DetectedQuad &q) {
   double shift = 0.0;
   for (int k = 0; k < 4; ++k) {
-    shift = std::max(shift, std::hypot(det->p[k][0] - q.p[3 - k][0], det->p[k][1] - q.p[3 - k][1]));
+    shift = std::max(shift, std::hypot(det.p[k][0] - q.p[3 - k][0], det.p[k][1] - q.p[3 - k][1]));
   }
   return shift;
 }
@@ -78,21 +78,20 @@ double TrackingDetector::Speed(const Track &t) {
   return speed;
 }
 
-TrackingDetector::TrackingDetector(vk::Context &ctx, apriltag_detector_t *td,
-                                   const DetectorConfig &config, const TrackingConfig &tracking)
-    : config_(config), tracking_(tracking), td_(td) {
+TrackingDetector::TrackingDetector(vk::Context &ctx, const TagDecoderConfig &decoder, const DetectorConfig &config,
+                                   const TrackingConfig &tracking)
+    : config_(config), tracking_(tracking), decoder_config_(decoder) {
   ApplyEnv(&tracking_);
   gpu_ = std::make_unique<GpuDetector>(ctx, config_);
   pool_ = MakeWorkerPool(config_);
   quad_decode_ = std::make_unique<QuadDecode>(config_, pool_);
-  full_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, config_.cpu_threads, RefineEdgesMethod::kProfile,
+  full_decoder_ = std::make_unique<TagDecoder>(decoder_config_, config_.decimation, config_.cpu_threads, RefineEdgesMethod::kProfile,
                                               0.0f, config_.PoolOptions(), false, config_.small_tag_rescue, pool_);
 }
 
 TrackingDetector::~TrackingDetector() {
   StopBackground();
   coarse_decoder_.reset();
-  if (coarse_td_) apriltag_detector_destroy(coarse_td_);
   bg_decoder_.reset();
   full_decoder_.reset();
 }
@@ -124,39 +123,39 @@ void TrackingDetector::SetAsync(bool async) {
   Reset();
 }
 
-zarray_t *TrackingDetector::Detect(const uint8_t *gray_frame) {
+const DetectionList &TrackingDetector::Detect(const uint8_t *gray_frame) {
   ++frame_index_;
   gpu_->SetAutoPrewarm(!tracking_.enabled);
-  if (tracking_.enabled && tracking_.async) return DetectAsync(gray_frame);
+  if (tracking_.enabled && tracking_.async) return *DetectAsync(gray_frame);
   if (skip_ > 0) --skip_;
   if (tracking_.enabled && !tracks_.empty() && skip_ == 0 && tracked_run_ + 1 < tracking_.keyframe_interval) {
     Path path = Path::kTracked;
-    if (zarray_t *dets = TrackFrame(gray_frame, false, &path)) {
+    if (const DetectionList *dets = TrackFrame(gray_frame, false, &path)) {
       ++tracked_run_;
       gpu_->NoteFrame();
       if (tracked_run_ + 1 >= tracking_.keyframe_interval) gpu_->ExpectGpuFrame();
       backoff_ = 1;
       last_path_ = path;
       ++stats_.frames_tracked;
-      return dets;
+      return *dets;
     }
     ++stats_.tracked_attempts_failed;
     skip_ = backoff_ + 1;
     backoff_ = std::min(backoff_ * 2, tracking_.keyframe_interval);
   }
-  zarray_t *dets = DetectFull(gray_frame);
+  const DetectionList *dets = DetectFull(gray_frame);
   last_path_ = Path::kFull;
   ++stats_.frames_full;
   if (tracking_.enabled) {
-    UpdateTracks(dets);
+    UpdateTracks(*dets);
   } else {
     tracks_.clear();
   }
   tracked_run_ = 0;
-  return dets;
+  return *dets;
 }
 
-zarray_t *TrackingDetector::DetectAsync(const uint8_t *gray_frame) {
+const DetectionList *TrackingDetector::DetectAsync(const uint8_t *gray_frame) {
   EnsureBackground();
   {
     std::unique_lock<std::mutex> lock(bg_mutex_);
@@ -165,7 +164,7 @@ zarray_t *TrackingDetector::DetectAsync(const uint8_t *gray_frame) {
   CollectBackground();
   if (!tracks_.empty()) {
     Path path = Path::kTracked;
-    if (zarray_t *dets = TrackFrame(gray_frame, true, &path)) {
+    if (const DetectionList *dets = TrackFrame(gray_frame, true, &path)) {
       last_path_ = path;
       ++stats_.frames_tracked;
       if (frame_index_ - last_bg_start_ >= tracking_.async_interval && frame_index_ - last_full_index_ > 2) {
@@ -180,26 +179,25 @@ zarray_t *TrackingDetector::DetectAsync(const uint8_t *gray_frame) {
     std::lock_guard<std::mutex> lock(bg_mutex_);
     bg_ready_ = false;
   }
-  zarray_t *dets = DetectFull(gray_frame);
+  const DetectionList *dets = DetectFull(gray_frame);
   last_full_index_ = frame_index_;
   last_path_ = Path::kFull;
   ++stats_.frames_full;
-  UpdateTracks(dets);
+  UpdateTracks(*dets);
   return dets;
 }
 
-zarray_t *TrackingDetector::DetectFull(const uint8_t *gray_frame) {
+const DetectionList *TrackingDetector::DetectFull(const uint8_t *gray_frame) {
   gpu_->Detect(gray_frame);
   const std::vector<DetectedQuad> quads = quad_decode_->Decode(gpu_->last_line_fit_points);
-  return full_decoder_->Decode(quads, gray_frame, config_.width, config_.height,
-                               config_.reversed_border);
+  return &full_decoder_->Decode(quads, gray_frame, config_.width, config_.height, config_.reversed_border);
 }
 
 void TrackingDetector::EnsureBackground() {
   if (bg_thread_.joinable()) return;
   // The background thread runs quad_decode_ while the caller tracks with full_decoder_: separate pools.
   quad_decode_ = std::make_unique<QuadDecode>(config_);
-  bg_decoder_ = std::make_unique<TagDecoder>(td_, config_.decimation, tracking_.async_threads, RefineEdgesMethod::kProfile,
+  bg_decoder_ = std::make_unique<TagDecoder>(decoder_config_, config_.decimation, tracking_.async_threads, RefineEdgesMethod::kProfile,
                                           0.0f, config_.PoolOptions(), true, config_.small_tag_rescue);
   bg_stop_ = false;
   bg_thread_ = std::thread([this] { BackgroundMain(); });
@@ -254,16 +252,14 @@ void TrackingDetector::BackgroundMain() {
     try {
       gpu_->Detect(frame);
       const std::vector<DetectedQuad> quads = quad_decode_->Decode(gpu_->last_line_fit_points);
-      zarray_t *dets = bg_decoder_->Decode(quads, frame, config_.width, config_.height, config_.reversed_border);
-      for (int i = 0; i < zarray_size(dets); ++i) {
-        apriltag_detection_t *det = nullptr;
-        zarray_get(dets, i, &det);
+      const DetectionList &dets = bg_decoder_->Decode(quads, frame, config_.width, config_.height, config_.reversed_border);
+      for (const Detection &det : dets) {
         Track t;
-        t.id = det->id;
-        t.margin = det->decision_margin;
+        t.id = det.id;
+        t.margin = det.decision_margin;
         for (int k = 0; k < 4; ++k) {
-          t.p[k][0] = det->p[k][0];
-          t.p[k][1] = det->p[k][1];
+          t.p[k][0] = det.p[k][0];
+          t.p[k][1] = det.p[k][1];
         }
         result.push_back(t);
       }
@@ -304,17 +300,15 @@ void TrackingDetector::CollectBackground() {
   }
 }
 
-void TrackingDetector::UpdateTracks(zarray_t *dets) {
+void TrackingDetector::UpdateTracks(const DetectionList &dets) {
   std::vector<Track> next;
-  for (int i = 0; i < zarray_size(dets); ++i) {
-    apriltag_detection_t *det = nullptr;
-    zarray_get(dets, i, &det);
+  for (const Detection &det : dets) {
     Track t;
-    t.id = det->id;
-    t.margin = det->decision_margin;
+    t.id = det.id;
+    t.margin = det.decision_margin;
     for (int k = 0; k < 4; ++k) {
-      t.p[k][0] = det->p[k][0];
-      t.p[k][1] = det->p[k][1];
+      t.p[k][0] = det.p[k][0];
+      t.p[k][1] = det.p[k][1];
     }
     const auto old = std::find_if(tracks_.begin(), tracks_.end(),
                                   [&](const Track &o) { return o.id == t.id; });
@@ -343,19 +337,18 @@ void TrackingDetector::PredictQuad(const Track &t, DetectedQuad *q) const {
   }
 }
 
-bool TrackingDetector::Accept(const apriltag_detection_t *det, const Track &t,
-                              const DetectedQuad &from) const {
-  if (det->id != t.id) return false;
-  if (det->decision_margin < tracking_.min_margin ||
-      det->decision_margin < tracking_.min_margin_ratio * t.margin) {
+bool TrackingDetector::Accept(const Detection &det, const Track &t, const DetectedQuad &from) const {
+  if (det.id != t.id) return false;
+  if (det.decision_margin < tracking_.min_margin ||
+      det.decision_margin < tracking_.min_margin_ratio * t.margin) {
     return false;
   }
   const double side = Side(t.p);
-  const double ratio = Side(det->p) / side;
+  const double ratio = Side(det.p) / side;
   if (ratio > tracking_.max_scale_change || ratio * tracking_.max_scale_change < 1.0) return false;
   double cx, cy;
   geom::QuadCentre(from.p, &cx, &cy);
-  return std::hypot(det->c[0] - cx, det->c[1] - cy) <= tracking_.max_jump_frac * side;
+  return std::hypot(det.c[0] - cx, det.c[1] - cy) <= tracking_.max_jump_frac * side;
 }
 
 // Refines one quad on a box-decimated crop (by d) until it settles; the corners come back in frame pixels.
@@ -389,15 +382,13 @@ bool TrackingDetector::CoarseStart(const uint8_t *gray_frame, const Track &t, in
     q.p[k][0] = (pred.p[k][0] - rx0 - centre) / d;
     q.p[k][1] = (pred.p[k][1] - ry0 - centre) / d;
   }
-  coarse_td_->quad_decimate = 2.0f;
   bool settled = false;
   for (int iter = 0; iter < 8 && !settled; ++iter) {
-    zarray_t *dets = coarse_decoder_->Decode({q}, coarse_img_.data(), static_cast<uint32_t>(ow),
-                                          static_cast<uint32_t>(oh), config_.reversed_border);
-    if (zarray_size(dets) != 1) return false;
-    apriltag_detection_t *det = nullptr;
-    zarray_get(dets, 0, &det);
-    if (det->id != t.id || det->decision_margin < 0.5f * tracking_.min_margin) return false;
+    const DetectionList &dets = coarse_decoder_->Decode({q}, coarse_img_.data(), static_cast<uint32_t>(ow),
+                                                        static_cast<uint32_t>(oh), config_.reversed_border);
+    if (dets.size() != 1) return false;
+    const Detection &det = dets[0];
+    if (det.id != t.id || det.decision_margin < 0.5f * tracking_.min_margin) return false;
     settled = MaxShift(det, q) <= tracking_.coarse_converge_px;
     QuadFromDetection(det, &q);
   }
@@ -412,49 +403,37 @@ bool TrackingDetector::CoarseStart(const uint8_t *gray_frame, const Track &t, in
 }
 
 void TrackingDetector::EnsureCoarse() {
-  if (coarse_td_) return;
-  coarse_td_ = apriltag_detector_create();
-  for (int i = 0; i < zarray_size(td_->tag_families); ++i) {
-    apriltag_family_t *family = nullptr;
-    zarray_get(td_->tag_families, i, &family);
-    apriltag_detector_add_family(coarse_td_, family);
-  }
-  coarse_td_->nthreads = 1;
-  coarse_td_->refine_edges = td_->refine_edges;
-  coarse_td_->quad_sigma = td_->quad_sigma;
-  coarse_td_->decode_sharpening = td_->decode_sharpening;
-  coarse_decoder_ = std::make_unique<TagDecoder>(coarse_td_, 2, 1, RefineEdgesMethod::kProfile, 0.0f,
+  if (coarse_decoder_) return;
+  coarse_decoder_ = std::make_unique<TagDecoder>(decoder_config_, 2, 1, RefineEdgesMethod::kProfile, 0.0f,
                                                  WorkerPoolOptions(), false, config_.small_tag_rescue);
 }
 
 // Decodes from cur[i] for i in `active`, feeding each tag's refined corners back until they stop moving.
 // ok[i] is set when track i decodes as itself and has settled; the last decode's detections come back.
-zarray_t *TrackingDetector::Solve(const uint8_t *gray_frame, std::vector<size_t> active,
-                                  const std::vector<DetectedQuad> &start, std::vector<DetectedQuad> *cur,
-                                  std::vector<char> *ok) {
-  zarray_t *dets = nullptr;
+const DetectionList *TrackingDetector::Solve(const uint8_t *gray_frame, std::vector<size_t> active,
+                                              const std::vector<DetectedQuad> &start, std::vector<DetectedQuad> *cur,
+                                              std::vector<char> *ok) {
+  const DetectionList *dets = nullptr;
   for (size_t i : active) (*ok)[i] = 0;
   for (uint32_t iter = 0; iter < tracking_.max_iterations && !active.empty(); ++iter) {
     std::vector<DetectedQuad> quads;
     for (size_t i : active) quads.push_back((*cur)[i]);
-    dets = full_decoder_->Decode(quads, gray_frame, config_.width, config_.height, config_.reversed_border);
+    dets = &full_decoder_->Decode(quads, gray_frame, config_.width, config_.height, config_.reversed_border);
     std::vector<size_t> next;
     bool moving = false;
     for (size_t i : active) {
-      const apriltag_detection_t *hit = nullptr;
+      const Detection *hit = nullptr;
       int hits = 0;
-      for (int d = 0; d < zarray_size(dets); ++d) {
-        apriltag_detection_t *det = nullptr;
-        zarray_get(dets, d, &det);
-        if (det->id == tracks_[i].id) {
-          hit = det;
+      for (const Detection &det : *dets) {
+        if (det.id == tracks_[i].id) {
+          hit = &det;
           ++hits;
         }
       }
       (*ok)[i] = 0;
-      if (hits != 1 || !Accept(hit, tracks_[i], start[i])) continue;
-      const double shift = MaxShift(hit, (*cur)[i]);
-      QuadFromDetection(hit, &(*cur)[i]);
+      if (hits != 1 || !Accept(*hit, tracks_[i], start[i])) continue;
+      const double shift = MaxShift(*hit, (*cur)[i]);
+      QuadFromDetection(*hit, &(*cur)[i]);
       if (shift > tracking_.converge_px) {
         if (iter == 0 && shift > tracking_.max_first_shift_px) continue;
         moving = true;
@@ -469,7 +448,7 @@ zarray_t *TrackingDetector::Solve(const uint8_t *gray_frame, std::vector<size_t>
   return dets;
 }
 
-zarray_t *TrackingDetector::TrackFrame(const uint8_t *gray_frame, bool partial, Path *path) {
+const DetectionList *TrackingDetector::TrackFrame(const uint8_t *gray_frame, bool partial, Path *path) {
   const size_t n = tracks_.size();
   const double w = config_.width, h = config_.height;
   std::vector<DetectedQuad> start(n), cur;
@@ -502,7 +481,7 @@ zarray_t *TrackingDetector::TrackFrame(const uint8_t *gray_frame, bool partial, 
   }
   if (active.empty()) return nullptr;
   cur = start;
-  zarray_t *dets = Solve(gray_frame, active, start, &cur, &ok);
+  const DetectionList *solved = Solve(gray_frame, active, start, &cur, &ok);
 
   std::vector<size_t> accepted;
   for (size_t i : active) {
@@ -514,14 +493,11 @@ zarray_t *TrackingDetector::TrackFrame(const uint8_t *gray_frame, bool partial, 
       if (!tracks_[i].tentative && std::find(accepted.begin(), accepted.end(), i) == accepted.end()) return nullptr;
     }
   }
-  // Only accepted tracks are reported: drop the other detections (the decoder owns the rest).
-  for (int d = zarray_size(dets) - 1; d >= 0; --d) {
-    apriltag_detection_t *det = nullptr;
-    zarray_get(dets, d, &det);
-    const bool keep = std::any_of(accepted.begin(), accepted.end(), [&](size_t i) { return tracks_[i].id == det->id; });
-    if (!keep) {
-      apriltag_detection_destroy(det);
-      zarray_remove_index(dets, d, 0);
+  // Only accepted tracks are reported: the other detections are left out.
+  tracked_out_.clear();
+  for (const Detection &det : *solved) {
+    if (std::any_of(accepted.begin(), accepted.end(), [&](size_t i) { return tracks_[i].id == det.id; })) {
+      tracked_out_.push_back(det);
     }
   }
   for (size_t i = 0; i < n; ++i) {
@@ -532,9 +508,9 @@ zarray_t *TrackingDetector::TrackFrame(const uint8_t *gray_frame, bool partial, 
   for (size_t i = 0; i < n; ++i) {
     if (!tracks_[i].tentative && std::find(accepted.begin(), accepted.end(), i) == accepted.end()) ++stats_.tracks_dropped;
   }
-  UpdateTracks(dets);
+  UpdateTracks(tracked_out_);
   *path = Path::kTracked;
-  return dets;
+  return &tracked_out_;
 }
 
 }  // namespace apriltag_vulkan

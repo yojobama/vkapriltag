@@ -76,10 +76,9 @@ this file and `DESIGN.md` for its name.
 | `APRILTAG_VK_SMALL_RESCUE` | bool | off | `DetectorConfig::small_tag_rescue` | environment wins | Rescue small tags: label small blobs, fit boxes, refit from the full-resolution image. |
 | `APRILTAG_VK_HULL_QUAD` | bool | off | `DetectorConfig::hull_quad` | environment wins | Retry a failed quad fit on the convex hull of the blob (partly covered border). |
 | `APRILTAG_VK_QUADFIT` | enum | dp | `DetectorConfig::quad_fit_method` | environment wins | Corner seeding: dp or peaks (other values are ignored). |
-| `APRILTAG_VK_REFINE` | enum | profile | `TagDecoder refine_method` | environment wins | Edge refinement: exact or profile (other values are ignored); used when td->refine_edges is set. |
+| `APRILTAG_VK_REFINE` | enum | profile | `TagDecoder refine_method` | environment wins | Edge refinement: exact or profile (other values are ignored); used when TagDecoderConfig::refine_edges is set. |
 | `APRILTAG_VK_POLISH` | bool | off | `TagDecoder::SetPolish` | environment wins | Whole-tag photometric polish of decoded tags. |
 | `APRILTAG_VK_PROFILE_FEATURES` | bit mask | 31 |  | environment only | Bit mask of the profile fit's refinements: 1 outliers, 2 coarse to fine, 4 halfway crossing, 8 clip bias, 16 widen blur. |
-| `APRILTAG_VK_OWN_DECODE` | bool | on |  | environment only | Decode quads and reconcile detections with the in-house port; 0 uses libapriltag's (same detections). |
 | `APRILTAG_VK_GREY_MARGIN` | bool | on |  | environment only | Retry an undecoded quad as its inner square (grey margin). |
 | `APRILTAG_VK_SIDE_ONE_OUT` | bool | on |  | environment only | Refit a side whose border cells read white, one cell further in. |
 | `APRILTAG_VK_THIRD_BIT` | bool | on |  | environment only | Accept a third corrected bit when the three wrong cells touch. |

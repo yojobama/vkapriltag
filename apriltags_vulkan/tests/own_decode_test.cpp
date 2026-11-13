@@ -19,7 +19,8 @@
 
 #include "OwnDecode.h"
 #include "test_check.h"
-#include "vkapriltag/apriltag_family.h"
+#include "upstream/UpstreamAdapter.h"
+#include "vkapriltag/Family.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -38,6 +39,8 @@ float quad_sample_code(apriltag_detector_t *td, struct quad *quad_original, imag
 namespace own = apriltag_vulkan::own;
 
 namespace {
+
+apriltag_vulkan::Image ToImage(const image_u8_t *im) { return {im->buf, im->width, im->height, im->stride}; }
 
 uint64_t Bits(double v) {
   uint64_t b;
@@ -65,7 +68,8 @@ int MaxBitsFor(const apriltag_family_t *f, int wanted) {
   return wanted;
 }
 
-// A detector with the given families (each with its own polarity and corrected-bit limit).
+// An upstream detector and an own decoder with the same families (each with its own polarity and
+// corrected-bit limit).
 struct Rig {
   struct Entry {
     const char *name;
@@ -73,15 +77,21 @@ struct Rig {
     int bits;
   };
   explicit Rig(const std::vector<Entry> &entries) : td(apriltag_detector_create()) {
+    own_families.reserve(entries.size());
     for (const Entry &e : entries) {
-      apriltag_family_t *f = nullptr;
-      setup_tag_family(&f, e.name);
+      apriltag_family_t *f = upstream::CreateFamily(e.name);
       f->reversed_border = e.reversed;
-      apriltag_detector_add_family_bits(td, f, MaxBitsFor(f, e.bits));
+      const int bits = MaxBitsFor(f, e.bits);
+      apriltag_detector_add_family_bits(td, f, bits);
       families.push_back({f, e.name});
+      apriltag_vulkan::Family own_family = *apriltag_vulkan::Family::ByName(e.name);
+      own_family.reversed_border = e.reversed;
+      own_family.max_hamming = bits;
+      own_families.push_back(own_family);
+      own_pointers.push_back(&own_families.back());
     }
     td->decode_sharpening = 0.25;
-    if (!decoder.Refresh(td)) {
+    if (!decoder.Refresh(own_pointers, 0.25)) {
       std::printf("FAIL: own decoder does not support the families\n");
       ++testcheck::Failures();
     }
@@ -90,13 +100,29 @@ struct Rig {
   }
   ~Rig() {
     apriltag_detector_destroy(td);
-    for (auto &f : families) teardown_tag_family(&f.first, f.second);
+    for (auto &f : families) upstream::DestroyFamily(f.first, f.second);
   }
   Rig(const Rig &) = delete;
   Rig &operator=(const Rig &) = delete;
 
+  // The position in the family list of an own or an upstream family.
+  int OwnIndex(const apriltag_vulkan::Family *f) const {
+    for (size_t i = 0; i < own_pointers.size(); ++i) {
+      if (own_pointers[i] == f) return static_cast<int>(i);
+    }
+    return -1;
+  }
+  int UpstreamIndex(const apriltag_family_t *f) const {
+    for (size_t i = 0; i < families.size(); ++i) {
+      if (families[i].first == f) return static_cast<int>(i);
+    }
+    return -1;
+  }
+
   apriltag_detector_t *td;
   std::vector<std::pair<apriltag_family_t *, const char *>> families;
+  std::vector<apriltag_vulkan::Family> own_families;
+  std::vector<const apriltag_vulkan::Family *> own_pointers;
   own::Decoder decoder;
 };
 
@@ -110,6 +136,7 @@ bool SameHomography(const double *a, const double *b) {
 // Compares upstream's and the own decode of one quad (and their raw samples); counts mismatches.
 void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, Counters *c, const char *what) {
   ++c->quads;
+  const apriltag_vulkan::Image oim = ToImage(im);
   struct quad up = {};
   std::memcpy(up.p, p, sizeof(up.p));
   up.reversed_border = reversed;
@@ -119,7 +146,7 @@ void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, C
   own::Homography h = {};
   own::RawSample first;
   own::DecodedTag tags[own::Decoder::kMaxFamilies];
-  const int n = rig.decoder.Decode(p, reversed, im, &h, &first, tags);
+  const int n = rig.decoder.Decode(p, reversed, &oim, &h, &first, tags);
 
   bool ok = true;
   const char *why = "";
@@ -133,7 +160,7 @@ void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, C
     apriltag_detection_t *d;
     zarray_get(dets, i, &d);
     const own::DecodedTag &t = tags[i];
-    if (d->family != t.family || d->id != t.id) ok = false, why = "id";
+    if (rig.UpstreamIndex(d->family) != rig.OwnIndex(t.family) || d->id != t.id) ok = false, why = "id";
     else if (d->hamming != t.hamming) ok = false, why = "hamming";
     else if (Bits(d->decision_margin) != Bits(t.margin)) ok = false, why = "margin";
     else if (!SameHomography(d->H->data, t.h)) ok = false, why = "detection homography";
@@ -159,7 +186,7 @@ void CompareQuad(Rig &rig, image_u8_t *im, const float p[4][2], bool reversed, C
   const float up_margin = quad_sample_code(rig.td, &probe, im, &up_code);
   own::Homography sh = {};
   own::RawSample raw;
-  const bool sample_h = rig.decoder.SampleCode(p, reversed, im, &sh, &raw);
+  const bool sample_h = rig.decoder.SampleCode(p, reversed, &oim, &sh, &raw);
   ++c->samples_compared;
   const float own_margin = raw.valid ? raw.margin : -1.0f;
   if (sample_h != (probe.H != nullptr)) ok = false, why = "sample homography validity";
@@ -493,6 +520,17 @@ apriltag_detection_t *MakeDetection(apriltag_family_t *f, int id, int hamming, f
   return d;
 }
 
+apriltag_vulkan::Detection MakeOwnDetection(const apriltag_vulkan::Family *f, int id, int hamming, float margin,
+                                             const double p[4][2]) {
+  apriltag_vulkan::Detection d;
+  d.family = f;
+  d.id = id;
+  d.hamming = hamming;
+  d.decision_margin = margin;
+  std::memcpy(d.p, p, sizeof(d.p));
+  return d;
+}
+
 void TestReconcile() {
   Rig rig({{"tag36h11", false, 2}, {"tag25h9", false, 2}});
   std::mt19937_64 rng(777);
@@ -504,7 +542,7 @@ void TestReconcile() {
     const int n = 2 + int(rng() % 14);
     std::vector<std::array<double, 8>> shapes;
     zarray_t *a = zarray_create(sizeof(apriltag_detection_t *));
-    zarray_t *b = zarray_create(sizeof(apriltag_detection_t *));
+    apriltag_vulkan::DetectionList b;
     const double span = 30 + u(rng) * 60;
     for (int i = 0; i < n; ++i) {
       double p[4][2];
@@ -525,37 +563,37 @@ void TestReconcile() {
       std::array<double, 8> sh;
       std::memcpy(sh.data(), p, sizeof(p));
       shapes.push_back(sh);
-      apriltag_family_t *f = rig.families[rng() % 2].first;
+      const size_t which_family = rng() % 2;
+      apriltag_family_t *f = rig.families[which_family].first;
       const int id = int(rng() % 3);
       const int hamming = int(rng() % 3);
       const float margin = u(rng) < 0.5 ? float(int(rng() % 4) * 10) : float(u(rng) * 40);
       apriltag_detection_t *d1 = MakeDetection(f, id, hamming, margin, p);
-      apriltag_detection_t *d2 = MakeDetection(f, id, hamming, margin, p);
       zarray_add(a, &d1);
-      zarray_add(b, &d2);
+      b.push_back(MakeOwnDetection(rig.own_pointers[which_family], id, hamming, margin, p));
     }
     reconcile_detections(a, poly0, poly1);
-    own::Reconcile(b);
+    own::Reconcile(&b);
     ++sets;
     removed += n - zarray_size(a);
-    bool same = zarray_size(a) == zarray_size(b);
+    bool same = zarray_size(a) == static_cast<int>(b.size());
     for (int i = 0; same && i < zarray_size(a); ++i) {
-      apriltag_detection_t *x, *y;
+      apriltag_detection_t *x;
       zarray_get(a, i, &x);
-      zarray_get(b, i, &y);
-      same = x->id == y->id && x->family == y->family && x->hamming == y->hamming &&
-             Bits(x->decision_margin) == Bits(y->decision_margin) && std::memcmp(x->p, y->p, sizeof(x->p)) == 0;
+      const apriltag_vulkan::Detection &y = b[i];
+      same = x->id == y.id && rig.UpstreamIndex(x->family) == rig.OwnIndex(y.family) && x->hamming == y.hamming &&
+             Bits(x->decision_margin) == Bits(y.decision_margin) && std::memcmp(x->p, y.p, sizeof(x->p)) == 0;
     }
     if (same) {
       qsort(a->data, a->size, a->el_sz, [](const void *l, const void *r) {
         return (*static_cast<apriltag_detection_t *const *>(l))->id - (*static_cast<apriltag_detection_t *const *>(r))->id;
       });
-      own::SortById(b);
+      own::SortById(&b);
       for (int i = 0; same && i < zarray_size(a); ++i) {
-        apriltag_detection_t *x, *y;
+        apriltag_detection_t *x;
         zarray_get(a, i, &x);
-        zarray_get(b, i, &y);
-        same = std::memcmp(x->p, y->p, sizeof(x->p)) == 0 && x->id == y->id;
+        const apriltag_vulkan::Detection &y = b[i];
+        same = std::memcmp(x->p, y.p, sizeof(x->p)) == 0 && x->id == y.id;
       }
       equal_order += same;
     }
@@ -563,14 +601,12 @@ void TestReconcile() {
       ++mismatches;
       if (mismatches <= 5) std::printf("MISMATCH reconcile set %d\n", iter);
     }
-    for (zarray_t *z : {a, b}) {
-      for (int i = 0; i < zarray_size(z); ++i) {
-        apriltag_detection_t *d;
-        zarray_get(z, i, &d);
-        apriltag_detection_destroy(d);
-      }
-      zarray_destroy(z);
+    for (int i = 0; i < zarray_size(a); ++i) {
+      apriltag_detection_t *d;
+      zarray_get(a, i, &d);
+      apriltag_detection_destroy(d);
     }
+    zarray_destroy(a);
   }
   zarray_destroy(poly0);
   zarray_destroy(poly1);
@@ -634,11 +670,11 @@ void Bench(const std::string &corpus, const std::string &quads_file) {
     const double t_up = Seconds() - t0;
     t0 = Seconds();
     for (const Frame &f : frames) {
-      image_u8_t im{f.w, f.h, f.w, f.pixels};
+      const apriltag_vulkan::Image oim{f.pixels, f.w, f.h, f.w};
       for (const RecordedQuad &q : f.quads) {
         own::DecodedTag tags[own::Decoder::kMaxFamilies];
         own::Homography h;
-        const int n = rig.decoder.Decode(q.p, q.reversed, &im, &h, nullptr, tags);
+        const int n = rig.decoder.Decode(q.p, q.reversed, &oim, &h, nullptr, tags);
         sink += std::max(n, 0);
       }
     }
@@ -653,11 +689,11 @@ void Bench(const std::string &corpus, const std::string &quads_file) {
     const double t_hom = Seconds() - t0;
     t0 = Seconds();
     for (const Frame &f : frames) {
-      image_u8_t im{f.w, f.h, f.w, f.pixels};
+      const apriltag_vulkan::Image oim{f.pixels, f.w, f.h, f.w};
       for (const RecordedQuad &q : f.quads) {
         own::Homography h;
         own::RawSample raw;
-        sink += rig.decoder.SampleCode(q.p, q.reversed, &im, &h, &raw);
+        sink += rig.decoder.SampleCode(q.p, q.reversed, &oim, &h, &raw);
       }
     }
     const double t_sample = Seconds() - t0;
@@ -669,6 +705,34 @@ void Bench(const std::string &corpus, const std::string &quads_file) {
   for (Frame &f : frames) stbi_image_free(f.pixels);
 }
 
+// ---------------------------------------------------------------- family tables
+
+// Every built-in family equals the table libapriltag builds for the same name.
+void TestFamilies() {
+  long checked = 0;
+  for (const char *name : kFamilies) {
+    apriltag_family_t *up = upstream::CreateFamily(name);
+    const apriltag_vulkan::Family *own_family = apriltag_vulkan::Family::ByName(name);
+    CHECK(up != nullptr && own_family != nullptr);
+    if (!up || !own_family) continue;
+    bool same = std::strcmp(own_family->name, up->name) == 0 && own_family->ncodes == up->ncodes &&
+                own_family->nbits == up->nbits && own_family->width_at_border == up->width_at_border &&
+                own_family->total_width == up->total_width && own_family->reversed_border == up->reversed_border &&
+                own_family->h == up->h && own_family->max_hamming == 2;
+    for (uint32_t i = 0; same && i < up->ncodes; ++i) same = own_family->codes[i] == up->codes[i];
+    for (uint32_t i = 0; same && i < up->nbits; ++i) {
+      same = own_family->bit_x[i] == up->bit_x[i] && own_family->bit_y[i] == up->bit_y[i];
+    }
+    if (!same) std::printf("MISMATCH family %s\n", name);
+    CHECK(same);
+    checked += up->ncodes;
+    upstream::DestroyFamily(up, name);
+  }
+  CHECK(apriltag_vulkan::Family::ByName("tag99h99") == nullptr);
+  CHECK(apriltag_vulkan::Family::All().size() == std::size(kFamilies));
+  std::printf("families: %zu families, %ld codes compared\n", std::size(kFamilies), checked);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -678,10 +742,11 @@ int main(int argc, char **argv) {
   bool ran = false;
   if (which == "all" || which == "random") TestRandom(argc > 4 ? argv[4] : nullptr), ran = true;
   if (which == "all" || which == "reconcile") TestReconcile(), ran = true;
+  if (which == "all" || which == "families") TestFamilies(), ran = true;
   if ((which == "all" || which == "corpus") && !corpus.empty()) TestCorpus(corpus, quads), ran = true;
   if (which == "bench") Bench(corpus, quads), ran = true;
   if (!ran) {
-    std::printf("usage: own_decode_test <random|reconcile|corpus|bench> [corpus-dir quads-file]\n");
+    std::printf("usage: own_decode_test <random|reconcile|families|corpus|bench> [corpus-dir quads-file]\n");
     return 2;
   }
   if (testcheck::Failures() != 0) {

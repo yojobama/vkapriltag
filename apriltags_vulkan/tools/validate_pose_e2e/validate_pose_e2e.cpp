@@ -18,6 +18,7 @@
 #include "vkapriltag/PoseEstimator.h"
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/apriltag_family.h"
+#include "upstream/UpstreamAdapter.h"
 #include "vkapriltag/gpu/GpuDetector.h"
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
@@ -256,7 +257,7 @@ int Run(int argc, char **argv) {
     intr.cx = cx_override >= 0.0 ? cx_override : width / 2.0;
     intr.cy = cy_override >= 0.0 ? cy_override : height / 2.0;
 
-    apriltag_family_t *tf = nullptr;
+    const apriltag_vulkan::Family *tf = nullptr;
     if (!setup_tag_family(&tf, family_name.c_str())) {
       std::cerr << "Failed to set up family '" << family_name << "' for " << file << std::endl;
       ++images_failed;
@@ -264,9 +265,9 @@ int Run(int argc, char **argv) {
     }
 
     // ---------------- vkapriltag pipeline: detection ----------------
-    apriltag_detector_t *td_ours = apriltag_detector_create();
-    apriltag_detector_add_family(td_ours, tf);
-    td_ours->refine_edges = our_refine_edges;
+    apriltag_vulkan::TagDecoderConfig decoder_config;
+    decoder_config.families = {tf};
+    decoder_config.refine_edges = our_refine_edges;
 
     apriltag_vulkan::DetectorConfig config;
     config.width = width;
@@ -279,16 +280,17 @@ int Run(int argc, char **argv) {
     apriltag_vulkan::vk::Context ctx;
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);
-    apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
+    apriltag_vulkan::TagDecoder tag_decoder(decoder_config, decimation);
 
     detector.Detect(image.data);
     std::vector<apriltag_vulkan::DetectedQuad> quads =
         quad_decode.Decode(detector.last_line_fit_points);
-    zarray_t *ours = tag_decoder.Decode(quads, image.data, width, height, config.reversed_border);
+    const apriltag_vulkan::DetectionList &ours = tag_decoder.Decode(quads, image.data, width, height, config.reversed_border);
 
     // ---------------- stock libapriltag pipeline: detection ----------------
+    apriltag_family_t *up_family = upstream::CreateFamily(family_name.c_str());
     apriltag_detector_t *td_ref = apriltag_detector_create();
-    apriltag_detector_add_family(td_ref, tf);
+    apriltag_detector_add_family(td_ref, up_family);
     td_ref->quad_decimate = static_cast<float>(decimation);
     td_ref->nthreads = 1;
     td_ref->refine_edges = ref_refine_edges;
@@ -353,21 +355,18 @@ int Run(int argc, char **argv) {
     // ---------------- pose: vkapriltag side (PoseEstimator) ----------------
     const PoseEstimator est(intr, tagsize);
     std::map<int, PoseResult> our_poses;
-    for (int i = 0; i < zarray_size(ours); ++i) {
-      apriltag_detection_t *det = nullptr;
-      zarray_get(ours, i, &det);
-      if (det == nullptr || det->H == nullptr) continue;
+    for (const apriltag_vulkan::Detection &det : ours) {
       double H[3][3], corners[4][2];
       for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 3; ++b) H[a][b] = MATD_EL(det->H, a, b);
+        for (int b = 0; b < 3; ++b) H[a][b] = det.H[a * 3 + b];
       for (int c = 0; c < 4; ++c) {
-        corners[c][0] = det->p[c][0];
-        corners[c][1] = det->p[c][1];
+        corners[c][0] = det.p[c][0];
+        corners[c][1] = det.p[c][1];
       }
       // EstimateBoth + min(error) matches Estimate(), and also yields the runner-up.
       const apriltag_vulkan::TagPosePair pair = est.EstimateBoth(corners, H);
       PoseResult pr;
-      pr.id = det->id;
+      pr.id = det.id;
       for (int c = 0; c < 4; ++c) {
         pr.corners[c][0] = corners[c][0];
         pr.corners[c][1] = corners[c][1];
@@ -474,8 +473,8 @@ int Run(int argc, char **argv) {
     std::cout << std::endl;
 
     apriltag_detections_destroy(ref);
-    apriltag_detector_destroy(td_ours);
     apriltag_detector_destroy(td_ref);
+    upstream::DestroyFamily(up_family, family_name.c_str());
     teardown_tag_family(&tf, family_name.c_str());
   }
 

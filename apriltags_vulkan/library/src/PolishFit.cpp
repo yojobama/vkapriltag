@@ -247,7 +247,7 @@ struct BoxInfo {
   int thin = 1;
 };
 
-void ComputeBox(const Fit &f, const Mapping &map, int limit, const image_u8_t *im, BoxInfo *b) {
+void ComputeBox(const Fit &f, const Mapping &map, int limit, const Image *im, BoxInfo *b) {
   const int W = f.width;
   double inv[9];
   CellToNormalised(map, inv);
@@ -278,7 +278,7 @@ void ComputeBox(const Fit &f, const Mapping &map, int limit, const image_u8_t *i
 }
 
 // A sparse sample of pixels beside the class-changing cell edges, for the blur scan.
-void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, const image_u8_t *im) {
+void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, const Image *im) {
   const int W = f.width;
   scan->Clear();
   double inv[9];
@@ -297,7 +297,7 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
     LocalScale(map, xn, yn, f.scale, &u2, &v2, &gu, &gv);
     scan->x.push_back(static_cast<float>(xn));
     scan->y.push_back(static_cast<float>(yn));
-    scan->obs.push_back(static_cast<float>(im->buf[static_cast<size_t>(py) * im->stride + px]));
+    scan->obs.push_back(static_cast<float>(im->data[static_cast<size_t>(py) * im->stride + px]));
     scan->u0.push_back(static_cast<float>(u2));
     scan->v0.push_back(static_cast<float>(v2));
     scan->gu.push_back(static_cast<float>(gu));
@@ -330,7 +330,7 @@ void BuildScan(Fit *scan, const Fit &f, const Mapping &map, double cell_px, cons
 
 // The working set directly: pixels whose window (half_window_px) touches more than one known cell class and no
 // unknown cell, on the lattice of `box.thin`, with the cell window of each pixel frozen for reach_px.
-void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px, const BoxInfo &box, const image_u8_t *im) {
+void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px, const BoxInfo &box, const Image *im) {
   const int W = f->width;
   f->n = 0;
   if (box.x1 < box.x0 || box.y1 < box.y0) return;
@@ -371,7 +371,7 @@ void BuildFit(Fit *f, const Mapping &map, double half_window_px, double reach_px
   grow(f->C);
   size_t out = 0;
   for (int py = box.y0; py <= box.y1; ++py) {
-    const uint8_t *row = im->buf + static_cast<size_t>(py) * im->stride;
+    const uint8_t *row = im->data + static_cast<size_t>(py) * im->stride;
     const float y = (static_cast<float>(py) + 0.5f - cyf) * inv_scale;
     const float a0 = g1 * y + g2, b0 = g4 * y + g5, c0 = g7 * y + 1.0f;
     const int off = ((-(py * lr)) % k + k) % k;
@@ -933,8 +933,8 @@ double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int wi
 
 }  // namespace
 
-bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
-  const apriltag_family_t *fam = det->family;
+bool PolishDetection(const Image *im, Detection *det) {
+  const Family *fam = det->family;
   if (fam == nullptr || fam->reversed_border) return false;
   const int W = static_cast<int>(fam->width_at_border);
   if (W < 4 || W > kMaxCells || det->id < 0 || det->id >= static_cast<int>(fam->ncodes)) return false;
@@ -956,12 +956,11 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
   }
 
   // The detection's tag-to-pixel homography, composed with tag [-1, 1] -> cell coordinates.
-  const matd_t *H = det->H;
-  if (H == nullptr) return false;
+  const double *H = det->H;
   const double hw = 0.5 * W;
   double m[9];  // cell -> pixel
   for (int r = 0; r < 3; ++r) {
-    const double h0 = MATD_EL(H, r, 0), h1 = MATD_EL(H, r, 1), h2 = MATD_EL(H, r, 2);
+    const double h0 = H[3 * r + 0], h1 = H[3 * r + 1], h2 = H[3 * r + 2];
     m[3 * r + 0] = h0 / hw;
     m[3 * r + 1] = h1 / hw;
     m[3 * r + 2] = h2 - h0 - h1;
@@ -1037,7 +1036,7 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
           const int ix = static_cast<int>(px), iy = static_cast<int>(py);
           if (ix < 0 || iy < 0 || ix >= im->width || iy >= im->height) continue;
           const double expected = fit.cls[j + 1][i + 1] ? p.lev[1] : p.lev[0];
-          if (std::fabs(im->buf[iy * im->stride + ix] - expected) > 0.3 * range) marked[j][i] = 1;
+          if (std::fabs(im->data[iy * im->stride + ix] - expected) > 0.3 * range) marked[j][i] = 1;
         }
       }
       for (int j = 0; j < W; ++j) {
@@ -1164,17 +1163,17 @@ bool PolishDetection(const image_u8_t *im, apriltag_detection_t *det) {
       mc[3 * r + c] = row[0] * cn[c] + row[1] * cn[3 + c] + row[2] * cn[6 + c];
     }
   }
-  matd_t *newH = det->H;
+  double *newH = det->H;
   for (int r = 0; r < 3; ++r) {
     const double c0 = mc[3 * r], c1 = mc[3 * r + 1], c2 = mc[3 * r + 2];
-    MATD_EL(newH, r, 0) = c0 * hw;
-    MATD_EL(newH, r, 1) = c1 * hw;
-    MATD_EL(newH, r, 2) = c2 + c0 * hw + c1 * hw;
+    newH[3 * r + 0] = c0 * hw;
+    newH[3 * r + 1] = c1 * hw;
+    newH[3 * r + 2] = c2 + c0 * hw + c1 * hw;
   }
   auto project = [&](double x, double y, double *ox, double *oy) {
-    const double w = MATD_EL(newH, 2, 0) * x + MATD_EL(newH, 2, 1) * y + MATD_EL(newH, 2, 2);
-    *ox = (MATD_EL(newH, 0, 0) * x + MATD_EL(newH, 0, 1) * y + MATD_EL(newH, 0, 2)) / w;
-    *oy = (MATD_EL(newH, 1, 0) * x + MATD_EL(newH, 1, 1) * y + MATD_EL(newH, 1, 2)) / w;
+    const double w = newH[6] * x + newH[7] * y + newH[8];
+    *ox = (newH[0] * x + newH[1] * y + newH[2]) / w;
+    *oy = (newH[3] * x + newH[4] * y + newH[5]) / w;
   };
   project(0, 0, &det->c[0], &det->c[1]);
   for (int k = 0; k < 4; ++k) project((k == 1 || k == 2) ? 1 : -1, (k < 2) ? 1 : -1, &det->p[k][0], &det->p[k][1]);

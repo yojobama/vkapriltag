@@ -52,13 +52,9 @@ double ProcessCpuSeconds() {
 #endif
 }
 
-std::string DetsText(int index, zarray_t *z) {
-  std::vector<apriltag_detection_t *> dets;
-  for (int i = 0; i < zarray_size(z); ++i) {
-    apriltag_detection_t *d;
-    zarray_get(z, i, &d);
-    dets.push_back(d);
-  }
+std::string DetsText(int index, const apriltag_vulkan::DetectionList &z) {
+  std::vector<const apriltag_vulkan::Detection *> dets;
+  for (const apriltag_vulkan::Detection &d : z) dets.push_back(&d);
   std::sort(dets.begin(), dets.end(), [](auto *a, auto *b) { return a->id < b->id; });
   std::ostringstream out;
   out << "F " << index << ' ' << dets.size() << '\n';
@@ -177,14 +173,14 @@ int main(int argc, char **argv) {
     std::cerr << "error: no frames in " << list << "\n";
     return 1;
   }
-  apriltag_family_t *tf = nullptr;
+  const apriltag_vulkan::Family *tf = nullptr;
   if (!setup_tag_family(&tf, family.c_str())) return 1;
   int rc = 0;
   try {
     vk::Context ctx;
-    apriltag_detector_t *td = apriltag_detector_create();
-    apriltag_detector_add_family(td, tf);
-    td->refine_edges = true;
+    TagDecoderConfig decoder_config;
+    decoder_config.families = {tf};
+    decoder_config.refine_edges = true;
     DetectorConfig config;
     config.width = width;
     config.height = height;
@@ -193,7 +189,7 @@ int main(int argc, char **argv) {
     config.reversed_border = tf->reversed_border;
     config.normal_border = !tf->reversed_border;
     tc.enabled = true;
-    TrackingDetector det(ctx, td, config, tc);
+    TrackingDetector det(ctx, decoder_config, config, tc);
     const TrackingConfig base = det.tracking();
 
     const size_t nm = modes.size();
@@ -224,7 +220,7 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::microseconds(int(gap_ms * 1000)));
           }
           const auto t0 = Clock::now();
-          zarray_t *dets = det.Detect(frames[n].data());
+          const DetectionList &dets = det.Detect(frames[n].data());
           const auto t1 = Clock::now();
           const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
           if (round >= 0) {
@@ -285,7 +281,6 @@ int main(int argc, char **argv) {
       }
       std::printf("\n");
     }
-    apriltag_detector_destroy(td);
   } catch (const std::exception &e) {
     std::cerr << "error: " << e.what() << "\n";
     rc = 1;

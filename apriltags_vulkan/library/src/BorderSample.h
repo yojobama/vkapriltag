@@ -1,9 +1,6 @@
 #pragma once
 
-extern "C" {
-#include "apriltag.h"
-#include "common/matd.h"
-}
+#include "vkapriltag/Types.h"
 
 namespace apriltag_vulkan {
 
@@ -21,6 +18,6 @@ struct BorderLevels {
 
 // Samples the border cells and the quiet ring. Returns false if any sample falls outside the image
 // or the quiet ring is not brighter than the border.
-bool ReadBorder(const double *H, const image_u8_t *im, int width_cells, BorderLevels *out);
+bool ReadBorder(const double *H, const Image *im, int width_cells, BorderLevels *out);
 
 }  // namespace apriltag_vulkan

@@ -11,10 +11,10 @@
 namespace apriltag_vulkan::geom {
 
 // Four-tap bilinear blend of the pixels at (xi, yi) with fractions (fx, fy); the order is upstream's
-// verbatim, and reassociating it changes the rounding. `Img` has buf, stride, width and height.
+// verbatim, and reassociating it changes the rounding. `Img` has data, stride, width and height.
 template <typename S, typename Img>
 inline S BilinearAt(const Img *im, int xi, int yi, S fx, S fy) {
-  const uint8_t *row0 = im->buf + yi * im->stride + xi;
+  const uint8_t *row0 = im->data + yi * im->stride + xi;
   const uint8_t *row1 = row0 + im->stride;
   return (1 - fx) * (1 - fy) * row0[0] + fx * (1 - fy) * row0[1] + (1 - fx) * fy * row1[0] +
          fx * fy * row1[1];

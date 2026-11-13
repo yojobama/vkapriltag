@@ -20,6 +20,9 @@ endif()
 
 option(VKAPRILTAG_BUILD_APPS "Build the interactive sample app (V4L2 camera capture)" ON)
 option(VKAPRILTAG_BUILD_TOOLS "Build the libapriltag cross-validation tool" ON)
+# The library does not use upstream libapriltag. With this ON it is fetched (patched) for the differential test and
+# the tools that compare against it; OFF builds the library, the tests and the tools that need no upstream.
+option(VKAPRILTAG_UPSTREAM_VALIDATION "Fetch upstream libapriltag for the differential tests and reference validation tools" ON)
 
 # The vkapriltag library: Vulkan compute detection pipeline + CPU QuadDecode/TagDecoder tail.
 add_subdirectory(library)

@@ -18,6 +18,7 @@
 #include "vkapriltag/PoseEstimator.h"
 #include "vkapriltag/TagDecoder.h"
 #include "vkapriltag/apriltag_family.h"
+#include "upstream/UpstreamAdapter.h"
 #include "vkapriltag/gpu/GpuDetector.h"
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
@@ -89,7 +90,7 @@ void Mul33(const double a[3][3], const double b[3][3], double out[3][3]) {
 
 // Renders family/id as a solid-cell greyscale bitmap: `cell_px` pixels per cell, `total_width` cells square
 // (border ring, data cells, quiet zone). Quiet zone and "1" bits are white (255), border ring and "0" bits black (0); reversed_border is not handled.
-cv::Mat RenderTagBitmap(const apriltag_family_t *tf, uint32_t id, int cell_px, int *border_start_px,
+cv::Mat RenderTagBitmap(const apriltag_vulkan::Family *tf, uint32_t id, int cell_px, int *border_start_px,
                         int *border_width_px) {
   const int total_px = tf->total_width * cell_px;
   cv::Mat bitmap(total_px, total_px, CV_8UC1, cv::Scalar(255));  // quiet zone: white.
@@ -297,7 +298,7 @@ int Run(int argc, char **argv) {
   CameraIntrinsics intr{static_cast<double>(width), static_cast<double>(width), width / 2.0,
                         height / 2.0};
 
-  apriltag_family_t *tf = nullptr;
+  const apriltag_vulkan::Family *tf = nullptr;
   if (!setup_tag_family(&tf, family_name.c_str())) {
     std::cerr << "Failed to set up family '" << family_name << "'" << std::endl;
     return 1;
@@ -351,13 +352,14 @@ int Run(int argc, char **argv) {
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);
 
-    apriltag_detector_t *td_ours = apriltag_detector_create();
-    apriltag_detector_add_family(td_ours, tf);
-    td_ours->refine_edges = refine_edges;
-    apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
+    apriltag_vulkan::TagDecoderConfig decoder_config;
+    decoder_config.families = {tf};
+    decoder_config.refine_edges = refine_edges;
+    apriltag_vulkan::TagDecoder tag_decoder(decoder_config, decimation);
 
+    apriltag_family_t *up_family = upstream::CreateFamily(family_name.c_str());
     apriltag_detector_t *td_ref = apriltag_detector_create();
-    apriltag_detector_add_family(td_ref, tf);
+    apriltag_detector_add_family(td_ref, up_family);
     td_ref->quad_decimate = static_cast<float>(decimation);
     td_ref->nthreads = 1;
     td_ref->refine_edges = refine_edges;
@@ -396,19 +398,16 @@ int Run(int argc, char **argv) {
               detector.Detect(frame.data);
               std::vector<apriltag_vulkan::DetectedQuad> quads =
                   quad_decode.Decode(detector.last_line_fit_points);
-              zarray_t *ours =
+              const apriltag_vulkan::DetectionList &ours =
                   tag_decoder.Decode(quads, frame.data, width, height, config.reversed_border);
-              for (int i = 0; i < zarray_size(ours); ++i) {
-                apriltag_detection_t *det = nullptr;
-                zarray_get(ours, i, &det);
-                if (det == nullptr || det->H == nullptr || det->id != static_cast<int>(id))
-                  continue;
+              for (const apriltag_vulkan::Detection &det : ours) {
+                if (det.id != static_cast<int>(id)) continue;
                 double H[3][3], corners[4][2];
                 for (int a = 0; a < 3; ++a)
-                  for (int b = 0; b < 3; ++b) H[a][b] = MATD_EL(det->H, a, b);
+                  for (int b = 0; b < 3; ++b) H[a][b] = det.H[a * 3 + b];
                 for (int c = 0; c < 4; ++c) {
-                  corners[c][0] = det->p[c][0];
-                  corners[c][1] = det->p[c][1];
+                  corners[c][0] = det.p[c][0];
+                  corners[c][1] = det.p[c][1];
                 }
                 const TagPose tp = est.Estimate(corners, H);
                 vk.decoded = true;
@@ -496,8 +495,8 @@ int Run(int argc, char **argv) {
         }
       }
     }
-    apriltag_detector_destroy(td_ours);
     apriltag_detector_destroy(td_ref);
+    upstream::DestroyFamily(up_family, family_name.c_str());
   }
   if (csv != nullptr) std::fclose(csv);
   teardown_tag_family(&tf, family_name.c_str());
