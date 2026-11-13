@@ -690,12 +690,6 @@ int PreferSmaller(int pref, double q0, double q1) {
   return 0;
 }
 
-int DetectionCompare(const void *_a, const void *_b) {
-  const Detection *a = *static_cast<const Detection *const *>(_a);
-  const Detection *b = *static_cast<const Detection *const *>(_b);
-  return a->id - b->id;
-}
-
 // Removes entry i by moving the last one into its place.
 void RemoveShuffle(DetectionList *list, size_t i) {
   if (i + 1 < list->size()) (*list)[i] = list->back();
@@ -732,15 +726,8 @@ void Reconcile(DetectionList *detections) {
 }
 
 void SortById(DetectionList *detections) {
-  // qsort over pointers, as the array of pointers upstream sorts, so that ties come out the same.
-  std::vector<const Detection *> order;
-  order.reserve(detections->size());
-  for (const Detection &d : *detections) order.push_back(&d);
-  std::qsort(order.data(), order.size(), sizeof(const Detection *), DetectionCompare);
-  DetectionList sorted;
-  sorted.reserve(order.size());
-  for (const Detection *d : order) sorted.push_back(*d);
-  *detections = std::move(sorted);
+  std::stable_sort(detections->begin(), detections->end(),
+                   [](const Detection &l, const Detection &r) { return l.id < r.id; });
 }
 
 }  // namespace apriltag_vulkan::own

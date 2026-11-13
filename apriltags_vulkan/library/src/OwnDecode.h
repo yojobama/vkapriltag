@@ -92,7 +92,7 @@ class Decoder {
 // in the same order (a removed entry is replaced by the last one).
 void Reconcile(DetectionList *detections);
 
-// Sorts the list by tag id as the detector's output order does (not stable, as upstream's).
+// Sorts the list by tag id; detections with equal ids keep their order (stable).
 void SortById(DetectionList *detections);
 
 }  // namespace apriltag_vulkan::own
