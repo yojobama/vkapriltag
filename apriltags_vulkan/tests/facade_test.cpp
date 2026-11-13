@@ -88,8 +88,7 @@ void TestPipelined(uint32_t depth) {
       for (int id : got[i]) std::printf("%d ", id);
       std::printf("expected: ");
       for (int id : expected[i]) std::printf("%d ", id);
-      std::printf("
-");
+      std::printf("\n");
     }
     CHECK(got[i] == expected[i]);
   }
