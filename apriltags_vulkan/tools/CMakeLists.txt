@@ -53,7 +53,6 @@ elseif (OpenCV_FOUND)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_pose_e2e_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
-  install(TARGETS apriltag_pose_e2e_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
   # Renders a tag at a known 6-DoF pose and compares both pipelines against it. Needs OpenCV.
   add_executable(apriltag_synth_ground_truth
@@ -64,7 +63,6 @@ elseif (OpenCV_FOUND)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_synth_ground_truth PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
-  install(TARGETS apriltag_synth_ground_truth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 else()
   message(STATUS "Building validation tool without OpenCV (using pgm)")
   add_executable(apriltag_vulkan_validate
@@ -78,7 +76,6 @@ if(TARGET apriltag_vulkan_validate)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_vulkan_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
-  install(TARGETS apriltag_vulkan_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # Throughput of concurrent detector streams on one GPU, each on a chosen queue family. Needs no OpenCV.
@@ -119,7 +116,6 @@ if(TARGET apriltag)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag_pose_validate PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
-  install(TARGETS apriltag_pose_validate RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # Records upstream's decode of a fixed set of quads as tests/own_decode_vectors.bin (needs the patched upstream).

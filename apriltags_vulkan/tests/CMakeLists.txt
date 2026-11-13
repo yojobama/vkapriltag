@@ -42,3 +42,15 @@ if(Python3_FOUND)
   add_test(NAME deps_lint
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/deps_lint.py --root ${PROJECT_SOURCE_DIR})
 endif()
+
+# Installs the build to a temporary prefix, checks it holds nothing from upstream libapriltag, and builds and runs
+# tests/consumer against it with find_package(vkapriltag).
+if(Python3_FOUND AND TARGET vk_eval)
+  add_test(NAME installed_package_consumer
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/consumer_test.py
+            --cmake ${CMAKE_COMMAND} --build-dir ${CMAKE_BINARY_DIR} --config $<CONFIG>
+            --generator ${CMAKE_GENERATOR} --make-program ${CMAKE_MAKE_PROGRAM} --cxx ${CMAKE_CXX_COMPILER}
+            --consumer ${CMAKE_CURRENT_SOURCE_DIR}/consumer --stb-dir ${PROJECT_SOURCE_DIR}/tools/vk_eval
+            --image ${CMAKE_CURRENT_SOURCE_DIR}/corpus/one-tag/one-tag_640x480_000.png --expect-id 316)
+  set_tests_properties(installed_package_consumer PROPERTIES TIMEOUT 600)
+endif()
