@@ -42,7 +42,7 @@ gray frame (8-bit, width x height, tightly packed)
 | Decode | `TagDecoder.cpp` (candidate steps), `RefineEdges.cpp`, `BorderSample.cpp`, `PolishFit.cpp`, `OwnDecode.cpp` (sampling, lookup, reconcile), `Family.cpp` and `src/families/*.cpp` (generated tables, `tools/gen_families.py`), `Geometry.h` (shared CPU geometry), `DecodeSwitches.h` |
 | Composites | `FramePipeline.cpp`, `TrackingDetector.cpp`, `gpu/MultiLevelDetector.cpp`, `PoseEstimator.cpp` |
 | Support | `common/WorkerPool.cpp`, `common/Options.cpp` (the options registry), `common/Profiler.cpp`, `common/pgm_io.cpp` |
-| Public headers | `include/vkapriltag/` (`Types.h`, `Family.h`, `Detection.h`, `TagDecoder.h`, `TrackingDetector.h`, `FramePipeline.h`, `PoseEstimator.h`, `RefineEdges.h`, `PolishFit.h`, `apriltag_family.h`, `gpu/`, `vk/`, `common/`) |
+| Public headers | `include/vkapriltag/` (`Detector.h`, `Detection.h`, `Family.h`, `Pose.h`, `Version.h`); the facade is `src/Detector.cpp`, the stages are in `src/internal/vkapriltag/` |
 | Harness and tests | `tools/vk_eval`, `tools/eval.sh`, `tools/track_eval`, `tools/napa_corpus/`, `tests/` |
 
 ## 3. GPU frame flow
@@ -372,49 +372,48 @@ decoder, tracker or context takes one copy at construction, and a few process-wi
 name throws. The reference table is generated (`vk_eval --list-options`) into `PERFORMANCE.md` section 2; the `options_lint` test
 fails if the library reads the environment anywhere else, if a source names an unregistered variable, or if the table drifts.
 
-### 9.2 Public types (`include/vkapriltag/`)
+### 9.2 The public interface (`include/vkapriltag/`)
 
-| Header | Types |
+Only these headers are installed (`deps_lint` enforces it, and that they include no Vulkan header):
+
+| Header | Contents |
 | --- | --- |
-| `Types.h` | `Image` (data, width, height, stride), `Quad` (four float corners, `reversed_border`) |
-| `Family.h` | `Family` (code words, cell tables, `max_hamming`; `ByName`, `All`) |
+| `Detector.h` | `Detector` (pimpl; `Detect`, `Flush`, `ImportHostFrame`, `ImportDmaBufFrame`, `Reset`, `Describe`), `DetectorOptions`, `Mode`, `Level`, `Result`, `Timing`, `Device`, `DeviceOptions`, `Error`, `ErrorCode` |
 | `Detection.h` | `Detection` (family, id, hamming, `decision_margin`, `H[9]`, centre `c`, corners `p`), `DetectionList` |
-| `gpu/GpuDetector.h` | `DetectorConfig`, `GpuDetector`, `DetectProfile`, `DetectedQuad` |
-| `TagDecoder.h` | `TagDecoderConfig` (families, `refine_edges`, `decode_sharpening`), `TagDecoder` |
-| `TrackingDetector.h`, `FramePipeline.h`, `gpu/MultiLevelDetector.h`, `PoseEstimator.h` | the composites and pose |
-| `vk/Context.h` | `Context`, `ContextOptions`, `DeviceCaps`, `Lane` |
-| `common/WorkerPool.h`, `common/Options.h`, `common/Profiler.h` | pool, registry, tracing |
+| `Family.h` | `Family` (`ByName`, `All`) |
+| `Pose.h` | `CameraIntrinsics`, `TagPose`, `TagPosePair` |
+| `Version.h` | `VKAPRILTAG_VERSION_*` (2.0.0; CMake checks it against the project version) |
 
-The corner order of a `Detection` is the order the decode reports; a `DetectedQuad` is counter-clockwise on screen in full-resolution
-pixels. A `DetectionList` returned by `Decode`, `Push` or `Detect` is owned by the decoder and valid until the next call.
+The stages (`GpuDetector`, `QuadDecode`, `TagDecoder`, `FramePipeline`, `TrackingDetector`, `MultiLevelDetector`, `PoseEstimator`,
+the Vulkan layer in `vk/`, `common/`) live in `library/src/internal/vkapriltag/`. They are not installed; in-tree tools and tests
+reach them through the `vkapriltag::internal` target. `facade_test` and the installed-package consumer link only
+`vkapriltag::vkapriltag`.
+
+The corner order of a `Detection` is the order the decode reports. A `Result` is owned by the `Detector` and valid until the next
+call; the Python binding returns copies.
 
 ### 9.3 The per-frame call sequence
 
-From `apps/apriltag_vulkan/main.cpp` and `tools/vk_eval` (the sample app turns refinement off; the library default is on):
-
 ```cpp
-vk::Context ctx;
-DetectorConfig config;                 // width, height, decimation (default 2) ...
-config.width = w;  config.height = h;
-const Family *tf = Family::ByName("tag36h11");
-config.tag_width = tf->width_at_border;
-config.reversed_border = tf->reversed_border;
-config.normal_border = !tf->reversed_border;
-
-TagDecoderConfig dc;  dc.families = {tf};            // refine_edges is true by default
-auto pool = MakeWorkerPool(config);                  // one pool for the whole pipeline
-GpuDetector detector(ctx, config);
-QuadDecode quad_decode(config, pool);
-TagDecoder decoder(dc, config.decimation, 0, RefineEdgesMethod::kProfile, 0.0f,
-                   WorkerPoolOptions(), false, false, pool);
-
-// per frame, gray is width*height tightly packed bytes
-detector.Detect(gray);
-std::vector<DetectedQuad> quads = quad_decode.Decode(detector.last_line_fit_points);
-const DetectionList &tags = decoder.Decode(quads, gray, w, h, config.reversed_border);
+DetectorOptions options;
+options.width = w;  options.height = h;
+Detector detector(options);                         // family names, decimation, mode, features and pose are options
+const Result &result = detector.Detect(grey);       // detections, poses (when options.tag_size > 0), timing
 ```
 
-For tracking replace the three calls with `TrackingDetector::Detect(gray)`; for pipelining use `FramePipeline::Push`.
+`Detector::Impl` (`src/Detector.cpp`) composes the internal stages by mode:
+
+| Mode | Stages |
+| --- | --- |
+| `kSync` | `GpuDetector` then `QuadDecode` then `TagDecoder` |
+| `kPipelined`, depth 1 or 2 | `FramePipeline` over the same three (depth 2 gives the second `GpuDetector` its own `Lane` on the same queue: a lane is used by one thread at a time) |
+| `kTracking` (keyframe or `tracking_async`) | `TrackingDetector` |
+| `levels` set (kSync only) | `MultiLevelDetector` then `TagDecoder` |
+
+One `WorkerPool` serves the quad fit, the decode and the pose estimator. `PoseEstimator` runs on the result when `tag_size` is positive.
+Combinations the stages cannot do (levels with tracking or pipelining, families of different border width) throw
+`Error(ErrorCode::kUnsupported)`. `DetectorOptions::stream` picks a queue of a shared `Device`; a device with fewer queues than
+streams shares its first queue.
 
 ### 9.4 Build and dependencies
 
@@ -438,6 +437,8 @@ lavapipe, then the upstream parity gate.
 | `own_decode_comparison_can_fail` | the comparison fails when the decode is sabotaged (`WILL_FAIL`) | no |
 | `golden_detections` | `tests/golden_test.py`: `vk_eval` over the committed subset (`tests/corpus`, 10 scenarios x 5 frames, 640x480 PNG) in five profiles (`tests/profiles.json`: d1, d2, `rescue-hull`, `polish`, `features15`) against `tests/golden/<profile>/`: same ids and Hamming distances per frame, corners within 0.02 px, at most 2 differing frames per profile | yes |
 | `gpu_trace_*` | `tests/gpu_trace_test.cpp`: the recorded GPU work of the first frame (every dispatch with its grid or indirect offset and a hash of its push constants, barriers, fills, copies, submits) per device and profile, compared with `tests/gpu_trace/<device>/<profile>.txt` (RX 9060 XT and Mali-G610 committed; other devices skip). `GPU_TRACE_UPDATE=1 ctest -R gpu_trace` rewrites them |
+| `facade_*` | `tests/facade_test.cpp` (linked against the public target only): every mode, pose, strided input, a shared device and the errors; `golden_detections_facade` runs the five golden profiles through `vk_eval --facade` |
+| `swig_python` | `bindings/swig/swig_test.py` (when built with `VKAPRILTAG_BUILD_SWIG=ON`): a corpus frame through the Python module, numpy and bytes input, stride, pose, pipelined mode and the exceptions |
 | `unit_plan` | `tests/unit_tests.cpp` group `plan`: the resolved `PipelinePlan` of a discrete and an integrated device class under 21 variations against `tests/plan/<class>.txt`, and the stage table's consistency |
 | `options_lint` | no `getenv` outside the registry, every named variable registered, `PERFORMANCE.md` table equals `vk_eval --list-options` | needs `vk_eval` built |
 | `deps_lint` | no upstream types or includes outside the validation files, `VKAPRILTAG_UPSTREAM_VALIDATION` defaults off | no |

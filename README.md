@@ -79,35 +79,27 @@ hands back a software device that is 50 to 500 times slower; the detector refuse
 ## Quick start
 
 ```cpp
-#include "vkapriltag/gpu/GpuDetector.h"
-#include "vkapriltag/gpu/QuadDecode.h"
-#include "vkapriltag/TagDecoder.h"
-#include "vkapriltag/vk/Context.h"
+#include "vkapriltag/Detector.h"
 using namespace apriltag_vulkan;
 
-vk::Context ctx;
-DetectorConfig config;
-config.width = width;  config.height = height;
-const Family *tf = Family::ByName("tag36h11");
-config.tag_width = tf->width_at_border;
-config.reversed_border = tf->reversed_border;
-config.normal_border = !tf->reversed_border;
+DetectorOptions options;
+options.width = width;  options.height = height;      // tag36h11, decimation 2, refinement on by default
+Detector detector(options);                            // opens the GPU
 
-TagDecoderConfig dc;  dc.families = {tf};               // refine_edges is on by default
-auto pool = MakeWorkerPool(config);                     // one pool for the whole pipeline
-GpuDetector detector(ctx, config);
-QuadDecode quad_decode(config, pool);
-TagDecoder decoder(dc, config.decimation, 0, RefineEdgesMethod::kProfile, 0.0f, WorkerPoolOptions(), false, false, pool);
-
-// Per frame (gray: width*height tightly packed bytes):
-detector.Detect(gray);
-std::vector<DetectedQuad> quads = quad_decode.Decode(detector.last_line_fit_points);
-const DetectionList &tags = decoder.Decode(quads, gray, width, height, config.reversed_border);  // valid until the next call
+// Per frame (grey: width * height tightly packed bytes, or pass the row stride as a second argument):
+const Result &result = detector.Detect(grey);          // valid until the next call
+for (const Detection &tag : result.detections) {
+  // tag.id, tag.hamming, tag.decision_margin, tag.c (centre), tag.p[4][2] (corners), tag.H (homography)
+}
 ```
 
-For pose, build a `PoseEstimator({.fx, .fy, .cx, .cy}, tag_size_metres)` once and call `EstimateAll(tags, poses)` per frame. For
-tracking use `TrackingDetector::Detect(gray)` instead of the three calls; for pipelining use `FramePipeline::Push`.
-`apps/apriltag_vulkan/main.cpp` is a complete V4L2 example (it turns refinement off; the library default is on).
+Everything else is an option: `options.mode` is `Mode::kSync`, `kPipelined` (the GPU works on this frame while the CPU decodes
+the previous one) or `kTracking` (slow scenes skip the GPU on most frames); `options.levels` runs several decimations;
+`options.small_tag_rescue`, `hull_quad` and `polish` trade time for recall and precision; `options.tag_size` with
+`options.intrinsics` adds a pose per detection (`result.poses`); several cameras share one `Device`. Failures throw
+`apriltag_vulkan::Error` with a code. `apps/apriltag_vulkan/main.cpp` is a complete V4L2 example.
+
+Python, and through the same SWIG interface Java and C#, are in [apriltags_vulkan/bindings/swig](apriltags_vulkan/bindings/swig/README.md).
 
 ## Performance
 

@@ -118,8 +118,10 @@ struct Result {
 
 class Detector {
  public:
-  // Opens its own device when `device` is null.
-  explicit Detector(const DetectorOptions &options, std::shared_ptr<Device> device = nullptr);
+  // Opens its own device.
+  explicit Detector(const DetectorOptions &options);
+  // Runs on a device that other detectors share.
+  Detector(const DetectorOptions &options, std::shared_ptr<Device> device);
   ~Detector();
   Detector(const Detector &) = delete;
   Detector &operator=(const Detector &) = delete;
@@ -140,6 +142,10 @@ class Detector {
 
   // Forgets the tracks of kTracking mode (for example after a scene cut).
   void Reset();
+
+  // The frame size this detector was made for.
+  uint32_t width() const;
+  uint32_t height() const;
 
   // A one-line description of the device and the buffers.
   std::string Describe() const;

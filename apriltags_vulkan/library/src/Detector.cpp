@@ -250,6 +250,8 @@ struct Detector::Impl {
   }
 };
 
+Detector::Detector(const DetectorOptions &options) : Detector(options, nullptr) {}
+
 Detector::Detector(const DetectorOptions &options, std::shared_ptr<Device> device)
     : impl_(Guard([&] { return std::make_unique<Impl>(options, std::move(device)); })) {}
 
@@ -292,6 +294,9 @@ void Detector::ImportDmaBufFrame(const uint8_t *key, int dmabuf_fd, size_t bytes
 void Detector::Reset() {
   if (impl_->tracker) impl_->tracker->Reset();
 }
+
+uint32_t Detector::width() const { return impl_->options.width; }
+uint32_t Detector::height() const { return impl_->options.height; }
 
 std::string Detector::Describe() const {
   std::string s = impl_->device->Describe();

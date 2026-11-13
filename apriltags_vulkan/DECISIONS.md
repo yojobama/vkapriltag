@@ -192,3 +192,18 @@ Pi is the Orange Pi 5 / 5 Plus (Mali-G610).
 | One current-truth page | `ARCHITECTURE.md`; the options reference is generated from the registry into `PERFORMANCE.md` section 2 | RR 6.10 |
 | Freeze the history | `OPTIMIZATION_NOTES.md`, the two root idea files, the chronological `PERFORMANCE.md` sections and the old `DESIGN.md` and README moved unchanged to `archive/` | RR 5.6 |
 | This log | seeded from the mining report; the contradictions it found (about 20) are resolved in the rows above by naming the current default | this file |
+
+## 11. GPU structure and the public API (2026-11)
+
+| Decision | Status | What | Result | Record |
+| --- | --- | --- | --- | --- |
+| Dispatch-trace goldens | added | `DispatchTrace` records every dispatch (grid or indirect offset, a hash of its push constants), barrier, fill, copy and submit of the first frame; compared per device and profile | 17 profiles on the RX 9060 XT and the Mali-G610; 19 dispatches on the desktop and 16 on the Mali, as counted by hand before | `tests/gpu_trace_test.cpp` |
+| `PipelinePlan` | added | every variant choice (shader family, decimation, labelling, merge, reduction, lean tail, sort sizes, fused submits, pre-recording) resolved once by `ResolvePlan` and, after the readback buffers exist, `FinalisePlan`; replaces about 25 members and three derivations | `unit_plan` compares both device classes under 21 variations; traces and detections unchanged | `gpu/PipelinePlan.cpp` |
+| Stage table | added | one `StageDesc` per pipeline (shader chosen by the plan, buffers by `Buf` role, push size, workgroup, constants); `CreatePipelines` is a loop; 26 pipeline members became one array | `GpuDetector.cpp` 1,742 to 1,661 lines before the recorder change; traces unchanged | `gpu/StageTable.cpp` |
+| One recorder for the group-to-scatter stages | added | `RecordGroupSelectScatter(grid)` serves the fused (indirect), lean (fixed grid) and unfused (host-sized) flows | traces of every profile unchanged | `GpuDetector.cpp` |
+| Descriptor sets separate from pipelines | dropped | the only duplicate pipeline pair is `build_indirect_args`, and the sort pipelines differ in their constants | not worth a second binding mechanism | this entry |
+| Unfused head shared with `RecordFrameHead` | dropped | with `UF_VERIFY` the head's counting compression would count blob sizes twice (the unfused flow counts in `uf_final`) | kept separate | this entry |
+| `MemoryKind::DeviceLocalReadback` | removed | unused since the readbacks became `HostVisibleCached` | | `Buffer.h` |
+| One public `Detector` | default (2.0.0) | options struct, `Result`, `Device`, `Error`; composes the stages by `Mode`; the stage classes left the installed headers | the five golden profiles through `vk_eval --facade` equal the stage-composed dumps; `facade_*` covers every mode; ThreadSanitizer on the Pi clean | `Detector.h`, `ARCHITECTURE.md` 9.2 |
+| Second pipelined detector on its own lane | fixed | two detectors on one lane raced in `Lane::SubmitPersistentAndWait` and gave wrong results at depth 2 | found by `facade_pipelined` and ThreadSanitizer on the Mali | `Detector.cpp` |
+| SWIG bindings | added | `bindings/swig/vkapriltag.i`; Python built and tested on both machines, Java and C# generated | `swig_python` passes on Windows and on the Pi | `bindings/swig/README.md` |
