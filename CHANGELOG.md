@@ -36,6 +36,9 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
 - New tests: `installed_package_consumer` (installs to a temporary prefix, checks it holds nothing from upstream, builds
   and runs a `find_package(vkapriltag)` consumer on a corpus frame) and a stricter `deps_lint`.
 
+- Detections with equal ids are now ordered stably (reconcile's surviving order); the output used to order them as the C
+  library's `qsort` happened to, which differs between MSVC and glibc. Other output is unchanged.
+
 ### Removed (build)
 
 - The FetchContent of upstream in the default build, `cmake/patches/` (the decode patches and `ApplyPatches.cmake` now

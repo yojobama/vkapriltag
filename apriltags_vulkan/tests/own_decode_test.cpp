@@ -216,16 +216,31 @@ void TestReconcile(const dv::File &f) {
     own::Reconcile(&b);
     ++sets;
     removed += static_cast<long>(s.dets.size() - s.kept.size());
-    bool same = b.size() == s.kept.size();
-    for (size_t i = 0; same && i < b.size(); ++i) {
+    const char *stage = nullptr;
+    size_t at = 0;
+    if (b.size() != s.kept.size()) stage = "survivor count";
+    for (size_t i = 0; !stage && i < b.size(); ++i) {
       const dv::ReconcileDet &x = s.dets[s.kept[i]];
-      same = SameAs(b[i], x, true) && rig.Index(b[i].family) == x.family;
+      if (!(SameAs(b[i], x, true) && rig.Index(b[i].family) == x.family)) stage = "survivors", at = i;
     }
-    if (same) {
+    // The expected id order: a stable sort of the recorded survivors (qsort's order for equal ids is not portable).
+    std::vector<uint8_t> expected = s.kept;
+    std::stable_sort(expected.begin(), expected.end(), [&](uint8_t l, uint8_t r) { return s.dets[l].id < s.dets[r].id; });
+    if (!stage) {
       own::SortById(&b);
-      for (size_t i = 0; same && i < b.size(); ++i) same = SameAs(b[i], s.dets[s.sorted[i]], false);
+      for (size_t i = 0; !stage && i < b.size(); ++i) {
+        if (!SameAs(b[i], s.dets[expected[i]], false)) stage = "id order", at = i;
+      }
     }
-    if (!same && ++mismatches <= 5) std::printf("MISMATCH reconcile set %ld\n", sets - 1);
+    if (stage && ++mismatches <= 5) {
+      std::printf("MISMATCH reconcile set %ld (%s, position %zu): own ids", sets - 1, stage, at);
+      for (const apriltag_vulkan::Detection &d : b) std::printf(" %d", d.id);
+      std::printf("; expected survivors");
+      for (uint8_t k : s.kept) std::printf(" %d", s.dets[k].id);
+      std::printf("; recorded sorted");
+      for (uint8_t k : s.sorted) std::printf(" %d", s.dets[k].id);
+      std::printf("\n");
+    }
   }
   std::printf("reconcile: %ld sets, %ld detections removed, %ld mismatches\n", sets, removed, mismatches);
   CHECK(mismatches == 0);

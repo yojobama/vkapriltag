@@ -72,3 +72,13 @@ Goal of S3: build, test and package with no upstream fetch and no patches by def
 - The CMake 3.16 to 3.27 branch of `tools/upstream/CMakeLists.txt` (FetchContent_Populate) was not run (CMake 4.2.3 here).
 - `ldd` path of consumer_test.py, `dpkg-deb` checks in release.yml, and the parity workflow on lavapipe (CI).
 - MinGW patch path; `-DVKAPRILTAG_REGEN_VECTORS=ON` on Linux.
+
+## Follow-up: reconcile on the Pi
+`own_decode_reconcile` failed on aarch64/glibc (2082 of 2500 sets) while all 6094 decode cases passed: the recorded
+"sorted" order came from the MSVC `qsort`, which orders equal ids differently from glibc's. `SortById` is now a
+`std::stable_sort` on id (equal ids keep reconcile's surviving order) and the test derives the expected order from the
+recorded survivors with the same stable rule (the recorded qsort order is no longer compared; survivors, their order and
+each detection's fields still are). On the desktop: ctest 17 of 17, 0 reconcile mismatches, corpus d1/d2 vs base only the
+usual noise frames (no id or Hamming change; 52 of 8406 dump frames hold equal ids), goldens pass. A mismatch now prints
+the stage (survivor count, survivors, id order) and the ids seen. The decode comparisons use IEEE double/float arithmetic
+only through the code under test and compare recorded bits; they passed on the Pi, so libm and FMA did not matter there.
