@@ -15,6 +15,7 @@
 namespace apriltag_vulkan {
 namespace {
 
+thread_local bool g_stop = false;
 using geom::BilinearAt;
 
 constexpr int kMaxProfilePoints = 96;
@@ -265,7 +266,9 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
     const SideSampler side(quad, edge);
     const double nx = side.nx, ny = side.ny, xm = side.xm, ym = side.ym;
     const float fnx = side.fnx, fny = side.fny;
-    const int np = side.Profiles(kProfileSpacing);
+    static const double sp1 = Options::FromEnvironment().Float("APRILTAG_VK_RS_SPACING1", 1.5);
+    static const int maxn = static_cast<int>(Options::FromEnvironment().ULong("APRILTAG_VK_RS_MAXN").value_or(96ul));
+    const int np = std::min(maxn, side.Profiles(truncated != nullptr ? sp1 : kProfileSpacing));
     // The refined points of this side, relative to its midpoint, and their weights.
     double bxs[kMaxProfilePoints], bys[kMaxProfilePoints], ws[kMaxProfilePoints];
     int used = 0;
@@ -343,6 +346,15 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
       bys[used] = y0 + n0 * ny - ym;
       ws[used] = best;
       used++;
+    }
+    {
+      static const double ab = Options::FromEnvironment().Float("APRILTAG_VK_RS_ABORT", -1.0);
+      if (truncated != nullptr && ab >= 0 && (used < 3 || used < ab * np)) {
+        g_stop = true;
+        *edge_width = 0;
+        *truncated = 0;
+        return true;
+      }
     }
     if (used < 3) {
       // Too few usable profiles: keep this side where it was.
@@ -635,6 +647,10 @@ void RefineEdgesProfile(int quad_decimate, int width_at_border, const Image *im,
   double truncated = 0;
   if (!ProfilePass(reach, cell, im, quad, &edge_width, &truncated)) {
     RefineEdgesT<double>(quad_decimate, im, quad);
+    return;
+  }
+  if (g_stop) {
+    g_stop = false;
     return;
   }
   if (cell <= 0) return;

@@ -24,3 +24,17 @@ MSVC `/Qvec-report:2`: the position loop and nothing else in `ProfilePass` vecto
 Four taps per step: eight 16-bit loads packed into 4 lanes of [r00 r01 r10 r11], widened by shift and mask, blended in upstream's order.
 Desktop micro-benchmark: 30.3 -> 27.6 us/quad, checksum identical (bit-identical on x86; NEON uses fused multiply-add as gcc contracts the scalar loop).
 `TapAlong` floor via truncating cast and compare (vectorises without SSE4.1): no measurable change on MSVC (kept, output identical).
+
+## 3. Accuracy of the kept step 2 (desktop, decimation 2, `$A/rs-out/{base_d2,new_d2}`)
+`ctest` 44/44 pass. All 26 scenario dumps byte-identical to the base build except one frame of `noise` (about 0.003 px, the known GPU noise).
+
+## 4. Experiments with temporary env knobs (registered in Options.cpp as "experiment", to be removed or finalised)
+`APRILTAG_VK_RS_SPACING1` (first-pass profile spacing, default 1.5), `RS_MAXN` (cap on profiles per side), `RS_ABORT` (stop after pass 1 when a side has fewer than max(3, f*np) usable profiles).
+Commands: `bash $S/rs_acc.sh <vk_eval.exe> <outdir> 2 ENV=...` then `python $S/cmpn/sum.py $A/napa-corpus out.json <dirs>`.
+| variant | found | false | err med/p95 | verdict |
+|---|---|---|---|---|
+| base | 7146 | 1 | 0.017/0.099 | |
+| MAXN=40 | 7146 | 1 | 0.023/0.111 | dropped (error up) |
+| SPACING1=2.0 | 7145 | 1 | 0.019/0.103 | dropped (error up, one tag lost) |
+| ABORT=0 (a side under 3 usable profiles) | 7146 | 1 | 0.017/0.099 | dumps equal to base up to noise; timing pending |
+| ABORT=0.25 | 7146 | 1 | 0.017/0.099 | dumps equal to base up to noise; timing pending |
