@@ -118,3 +118,26 @@ Pi, stage 2 (`ct_pi_stage2.sh`) so far:
   clutter frame runs the head, waits, reads the count and submits the rest): gpu phase of the clutter frame 0.5375 ms off, 0.6778 ms on: a misprediction costs +140 us on the Pi.
   The one-tag frames on the full path are unchanged (0.3993 / 0.4010).
 - Desktop track_eval (full,key, ten sequences, off against on, `score_seq.py`): recall 100% everywhere, false detections, wrong ids, corner errors and path shares identical.
+
+Pi timing, 3 interleaved rounds (off, on), same binary, threshold 10000, gpu/total median ms (`ct_agg.py`):
+
+| scenario | d2 off | d2 on | d1 off | d1 on | d2, 16 ms gaps off | d2, 16 ms gaps on |
+| --- | --- | --- | --- | --- | --- | --- |
+| one-tag | 0.5543/0.6632 | 0.4507/0.5597 | 0.9670/1.0737 | 0.8950/0.9927 | 0.6497/0.8246 | 0.5897/0.7491 |
+| many-tags | 0.7429/0.9133 | 0.6421/0.8267 | 1.0164/1.1497 | 1.0227/1.1804 | 0.7338/0.9080 | 0.9205/1.3064 |
+| dense-tags | 0.8773/1.4541 | 0.8627/1.4329 | 1.7360/2.1247 | 1.7641/2.1396 | 0.9243/1.5480 | 0.9301/1.6326 |
+| jpeg | 1.2969/1.8434 | 1.2902/1.8598 | 3.4310/4.5602 | 3.4644/4.5878 | 1.3813/2.1364 | 1.3768/2.4144 |
+| noise | 0.6161/0.7547 | 0.5464/0.6965 | 0.8374/0.9822 | 0.8067/0.9548 | 0.6962/0.9599 | 0.7163/0.9308 |
+| small-tags | 0.5282/0.6127 | 0.4250/0.5179 | 0.8714/1.0278 | 0.8737/0.9406 | 0.5615/0.7079 | 0.4807/0.5847 |
+| all frames | 0.5854/0.7455 | 0.5297/0.6799 | 0.9079/1.0742 | 0.9039/1.0450 | 0.7009/0.9234 | 0.7833/1.0717 |
+
+Share of detects on the CPU tail (Pi): d2 52,482 of about 59,800 (88%), 402 mispredicts; d1 37,344 (62%), 1,038 mispredicts; gaps 4,386 of 4,680 (94%), 51 mispredicts.
+(The gap runs cover the six listed scenarios only, 3 iterations.)
+
+Result: on the Pi at decimation 2 back to back the mode saves 55 us of the gpu phase (9%) and 66 us of the total on the whole corpus, 105 us on one-tag;
+dense-tags and jpeg gain nothing (more points than the CPU tail wins on, and it costs more there than on the GPU). At decimation 1 it is flat (-4 us). With 16 ms
+gaps between frames it LOSES: +82 us gpu over all six scenarios (many-tags +187 us, one-tag still -60 us). A mispredicted frame costs +140 us. The tail is
+cold in the caches after an idle gap and the CPU cores are slower to start; not investigated further.
+Pi track_eval (full,key, ten sequences, off against on, `score_seq.py`): recall, false detections, wrong ids, errors and path shares identical.
+Recommendation: leave `APRILTAG_VK_CPU_TAIL` off on both device classes. It wins clearly only on the Pi at decimation 2 with frames back to back, which is
+not the camera cadence, and it loses at 16 ms gaps.
