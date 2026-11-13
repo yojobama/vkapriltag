@@ -14,9 +14,19 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <chrono>
+#include <atomic>
+#include <cstdio>
 
 namespace apriltag_vulkan {
 namespace {
+// QFSTAT
+std::atomic<uint64_t> g_ns[8], g_cnt[8], g_pts[8];
+inline uint64_t NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+struct QfPrint { ~QfPrint() { const char *n[8] = {"dp_try","peaks_prefix","peaks_err","peaks_filter_peaks","peaks_seglines","peaks_search","fitline_calls","blobs_total"};
+  for (int i = 0; i < 8; ++i) std::fprintf(stderr, "QFSTAT %-20s ns=%llu cnt=%llu pts=%llu\n", n[i], (unsigned long long)g_ns[i], (unsigned long long)g_cnt[i], (unsigned long long)g_pts[i]); } } g_qfprint;
+#define QF_T0(i) const uint64_t qf_t##i = NowNs()
+#define QF_T1(i, np) do { g_ns[i] += NowNs() - qf_t##i; g_cnt[i]++; g_pts[i] += (np); } while (0)
 
 // Gaussian filter taps applied to the windowed error.
 constexpr std::array<double, 7> kFilterCoefficients = {
@@ -380,7 +390,9 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
       scratch.pw[k] = p.W();
     }
     const UnpackedPoints unpacked{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
+    QF_T0(0);
     FitQuadResult dp_result = TryDpQuad(config, unpacked, total_points);
+    QF_T1(0, total_points);
     if (dp_result.valid) {
       dp_result.dp_attempted = true;
       dp_result.dp_used = true;
@@ -399,6 +411,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   filtered.resize(total_points);
   peaks.clear();
 
+  QF_T0(1);
   const int32_t x0 = points[begin].x2(), y0 = points[begin].y2();
   result.x0 = x0;
   result.y0 = y0;
@@ -428,28 +441,85 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     }
   }
 
+  QF_T1(1, total_points);
+  QF_T0(2);
   const int ksz = std::min<int>(20, static_cast<int>(total_points / 12));
 
-  // Windowed error per point. Circular indices use conditional subtraction instead of `%`.
+  // Windowed error per point. Windows that do not wrap are evaluated in two vectorisable stages;
+  // the rest use circular indices with conditional subtraction instead of `%`.
   const size_t n = total_points;
   const size_t k_off = static_cast<size_t>(ksz);
-  for (size_t i = 0; i < n; ++i) {
-    const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
-    size_t i1 = i + k_off;
-    if (i1 >= n) i1 -= n;
-    error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+  if (k_off >= 1 && n > 2 * k_off + 1) {
+    const size_t first = k_off + 1, last = n - k_off - 1;  // i0 >= 1 and i1 < n inside [first, last]
+    const size_t count = last - first + 1;
+    scratch.win_diff.resize(count);
+    scratch.win_xy2.resize(count);
+    scratch.win_sum.resize(count);
+    scratch.win_w8.resize(count);
+    float *wd = scratch.win_diff.data(), *wx = scratch.win_xy2.data(), *wsum = scratch.win_sum.data(),
+          *w8 = scratch.win_w8.data();
+    const LineFitMoments *cp = cs.data();
+    for (size_t j = 0; j < count; ++j) {
+      const size_t i = first + j;
+      const LineFitMoments &hi = cp[i + k_off], &lo = cp[i - k_off - 1];
+      const int64_t W = static_cast<int32_t>(hi.W - lo.W);
+      const int64_t mx = hi.Mx - lo.Mx, my = hi.My - lo.My;
+      const int64_t Cxx = (hi.Mxx - lo.Mxx) * W - mx * mx;
+      const int64_t Cxy = (hi.Mxy - lo.Mxy) * W - mx * my;
+      const int64_t Cyy = (hi.Myy - lo.Myy) * W - my * my;
+      wd[j] = static_cast<float>(Cxx - Cyy);
+      wsum[j] = static_cast<float>(Cxx + Cyy);
+      wx[j] = 2 * static_cast<float>(Cxy);
+      w8[j] = static_cast<float>(static_cast<double>(W) * W * 8.0);
+    }
+    const int32_t window_n = static_cast<int32_t>(2 * k_off + 1);
+    double *err = error.data() + first;
+    for (size_t j = 0; j < count; ++j) {
+      const double dx = wd[j], dy = wx[j];
+      const float h = static_cast<float>(std::sqrt(dx * dx + dy * dy));
+      const float eig_small = (wsum[j] - h) / w8[j];
+      err[j] = window_n * eig_small;
+    }
+    for (size_t i = 0; i < first; ++i) {
+      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+      size_t i1 = i + k_off;
+      if (i1 >= n) i1 -= n;
+      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+    }
+    for (size_t i = last + 1; i < n; ++i) {
+      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+      size_t i1 = i + k_off;
+      if (i1 >= n) i1 -= n;
+      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+    }
+  } else {
+    for (size_t i = 0; i < n; ++i) {
+      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
+      size_t i1 = i + k_off;
+      if (i1 >= n) i1 -= n;
+      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
+    }
   }
 
-  // 7-tap Gaussian filter, applied circularly.
+  QF_T1(2, total_points);
+  QF_T0(3);
+  // 7-tap Gaussian filter, applied circularly, over the errors padded with their wrap-around.
   constexpr size_t kHalf = kFilterCoefficients.size() / 2;  // 3
-  for (size_t i = 0; i < n; ++i) {
-    double accumulated = 0.0;
-    size_t idx = (i >= kHalf) ? (i - kHalf) : (i + n - kHalf);
-    for (size_t j = 0; j < kFilterCoefficients.size(); ++j) {
-      accumulated += error[idx] * kFilterCoefficients[j];
-      if (++idx == n) idx = 0;
+  std::vector<double> &padded = scratch.padded;
+  padded.resize(n + 2 * kHalf);
+  for (size_t j = 0; j < kHalf; ++j) {
+    padded[j] = error[(j + n - kHalf) % n];
+    padded[n + kHalf + j] = error[j % n];
+  }
+  std::copy(error.begin(), error.begin() + static_cast<std::ptrdiff_t>(n), padded.begin() + kHalf);
+  {
+    const double *e = padded.data();
+    double *f = filtered.data();
+    for (size_t i = 0; i < n; ++i) {
+      double accumulated = 0.0;
+      for (size_t j = 0; j < kFilterCoefficients.size(); ++j) accumulated += e[i + j] * kFilterCoefficients[j];
+      f[i] = accumulated;
     }
-    filtered[i] = accumulated;
   }
 
   // Peaks are strict local maxima of the filtered error, stored negated so an ascending sort
@@ -470,12 +540,14 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   const size_t K = std::min<size_t>(peaks.size(), kNMaxima);
   if (K < 4) return result;
 
-  std::stable_sort(peaks.begin(), peaks.end(),
-                   [](const auto &a, const auto &b) { return a.first < b.first; });
+  std::partial_sort(peaks.begin(), peaks.begin() + static_cast<std::ptrdiff_t>(K), peaks.end(),
+                    [](const auto &a, const auto &b) { return a.first != b.first ? a.first < b.first : a.second < b.second; });
   std::array<uint32_t, kNMaxima> point_indices{};
   for (size_t k = 0; k < K; ++k) point_indices[k] = peaks[k].second;
   std::sort(point_indices.begin(), point_indices.begin() + K);
 
+  QF_T1(3, total_points);
+  QF_T0(4);
   // Line fit of the segment between every ordered pair of peaks; (b, a) with b > a closes the quad.
   double seg_err[kNMaxima][kNMaxima];
   double seg_mse[kNMaxima][kNMaxima];
@@ -487,6 +559,8 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
               nullptr, a < b ? seg_params[a][b] : nullptr, &seg_err[a][b], &seg_mse[a][b]);
     }
   }
+  QF_T1(4, K * (K - 1));
+  QF_T0(5);
   const double max_mse = config.max_line_fit_mse;
 
   // Brute force all C(10, 4) = 210 combinations, keeping the minimum total error.
@@ -527,6 +601,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
     }
   }
 
+  QF_T1(5, K);
   if (best_error == std::numeric_limits<double>::max()) return result;
   if (!(best_error < config.max_line_fit_mse * total_points)) return result;
 
@@ -944,11 +1019,15 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     }
     FitQuadResult fq;
     if (!(rescue && n_points < config_.min_cluster_pixels)) {
+      QF_T0(7);
       fq = FitQuadForBlob(config_, line_fit_points, spans[s].begin, spans[s].end, scratch_[slot]);
+      QF_T1(7, n_points);
     }
     r.dp_attempted = fq.dp_attempted;
     r.dp_used = fq.dp_used;
+    QF_T0(6);
     r.has_quad = fq.valid && UpdateFitQuad(config_, fq, &r.quad);
+    QF_T1(6, fq.valid);
     r.quad.gradient = static_cast<float>(mean_w);
     const double d = 0.5 * config_.decimation;
     if (rescue && !r.has_quad && mean_w >= kMinRescueGradient && (xhi - xlo) * d <= kMaxRescueBox &&

@@ -18,6 +18,8 @@ struct QuadFitScratch {
   std::vector<LineFitMoments> cs;
   std::vector<double> error;
   std::vector<double> filtered;
+  std::vector<double> padded;
+  std::vector<float> win_diff, win_xy2, win_sum, win_w8;
   std::vector<std::pair<double, uint32_t>> peaks;
   std::vector<std::pair<int32_t, int32_t>> hull_points;
   std::vector<std::pair<int32_t, int32_t>> hull;
