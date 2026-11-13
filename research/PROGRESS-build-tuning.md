@@ -53,3 +53,19 @@ Decimation 2: base 0.3530 / p95 0.6640 ms, gpu 0.2390, cpu 0.1036.
 - lto+avx2: med -3.0%, cpu -10.5%.
 Decimation 1: base 0.4090 / 0.8615, gpu 0.2984, cpu 0.1079: every variant came out 1 to 6% SLOWER including `gw`, gpu part +1% everywhere,
 so the base binary has a systematic advantage (binary layout / build provenance). Need a second copy of base built the same way to measure the noise floor (E2).
+
+### E2 desktop with a second base (base2 = same flags as base, built from this branch with the new module): noise floor and variants, 7 rounds
+Cross-session drift of the unmodified flags is large (corpus median 0.353 in E1, 0.3685 in E2 at decimation 2; the GPU is shared), so only the
+interleaved columns inside one run mean anything. Dump equality: lines that differ against `base2_1` (the GPU front end gives 0 to 7 lines of noise per run).
+Decimation 2 (base2 0.3685 / p95 0.6924, gpu 0.2433, cpu 0.1117): lto med -4.7% p95 -3.5% cpu -1.8%; avx2 med -7.8% p95 -8.5% cpu -16.9%; lto+avx2 med -3.5% p95 -3.8% cpu -8.0%.
+Decimation 1 (base2 0.4136 / 0.8590, gpu 0.3046, cpu 0.1098): lto +1.0% / -0.9% / cpu -1.5%; avx2 -0.1% / -0.5% / cpu -4.6%; lto+avx2 -1.4% / -2.9% / cpu -6.8%.
+Per scenario (d2, total ms change): avx2 one-tag -3.0%, dense-tags -5.8%, jpeg -12.6%, busy-background -9.2%.
+Dumps equal within noise for all (0 to 5 differing lines against the base2 run; base2 itself 7 at d1). So: /arch:AVX2 is the only win; LTO is within noise.
+
+### E3 Pi (RK3588, gcc 14.2), 5 rounds, 4 variants per run against `base`
+Decimation 2, group A (base med 0.7714, p95 1.2690, gpu 0.5877, cpu 0.1546): lto med -3.2% cpu +0.9%; a76 (-mcpu=cortex-a76) med -3.3% cpu -3.0%; lse (-march=armv8.2-a) med 0.0% cpu +2.8%.
+Decimation 2, group B (base 0.7863 / 1.2714, cpu 0.1627): cg (-fno-math-errno -fno-trapping-math -fno-semantic-interposition -fno-plt) -5.8% cpu -6.9%; o2 (-O2 instead of -O3) cpu +19.5%, one-tag +3.4%, dense +11.1%, jpeg +8.9% (O3 is clearly better); lto+a76 -3.9% cpu -7.1%.
+Decimation 1: group A (base 1.0649 / 2.0588, cpu 0.1438): lto +0.6% cpu +1.0%; a76 -0.2% cpu -0.6%; lse +4.3% cpu +4.7%. Group B (base 1.0622 / 2.0635, cpu 0.1447): cg +3.8% cpu +14.5% (contradicts d2: noise); o2 +13.1% cpu +42.7%; lto+a76 +1.7% cpu -0.6%.
+The Pi cpu part is 0.14 to 0.16 ms of 0.77 to 1.06, and it swings by +-10% between runs (threads land on A55 or A76 cores), so only -O2 (clearly worse) is distinguishable from noise.
+Dumps: 4 to 11 differing lines per run against the base run, the same as base against base (5 to 9): GPU noise.
+Next: pin to the A76 cores (`taskset -c 4-7`) to take the scheduler out of the cpu medians, break cg into its four flags, combine, then PGO (gcc on the Pi, MSVC on the desktop), ctest per config, SWIG and consumer checks.
