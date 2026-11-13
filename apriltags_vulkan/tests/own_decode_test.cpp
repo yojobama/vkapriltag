@@ -630,6 +630,26 @@ void Bench(const std::string &corpus, const std::string &quads_file) {
       }
     }
     const double t_own = Seconds() - t0;
+    t0 = Seconds();
+    for (const Frame &f : frames) {
+      for (const RecordedQuad &q : f.quads) {
+        own::Homography h;
+        sink += own::ComputeHomography(q.p, &h);
+      }
+    }
+    const double t_hom = Seconds() - t0;
+    t0 = Seconds();
+    for (const Frame &f : frames) {
+      image_u8_t im{f.w, f.h, f.w, f.pixels};
+      for (const RecordedQuad &q : f.quads) {
+        own::Homography h;
+        own::RawSample raw;
+        sink += rig.decoder.SampleCode(q.p, q.reversed, &im, &h, &raw);
+      }
+    }
+    const double t_sample = Seconds() - t0;
+    std::printf("    own: homography %.0f ns, + sampling %.0f ns, + lookup and detection %.0f ns per attempt\n",
+                1e9 * t_hom / attempts, 1e9 * t_sample / attempts, 1e9 * t_own / attempts);
     std::printf("  round %d: upstream %.0f attempts/s, own %.0f attempts/s (x%.2f)  [%ld]\n", round, attempts / t_up,
                 attempts / t_own, t_up / t_own, sink);
   }
