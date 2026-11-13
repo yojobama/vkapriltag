@@ -15,10 +15,6 @@
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
 
-extern "C" {
-#include "apriltag.h"
-}
-
 namespace {
 
 volatile std::sig_atomic_t g_stop = 0;
@@ -90,16 +86,15 @@ int main(int argc, char **argv) {
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
 
-  apriltag_family_t *tf = nullptr;
+  const apriltag_vulkan::Family *tf = nullptr;
   if (!setup_tag_family(&tf, family_name.c_str())) {
     return 1;
   }
 
-  // Tag decode via the `apriltag` C library (no pose estimation); quad_decimate matches the 2x
-  // GPU decimation.
-  apriltag_detector_t *td = apriltag_detector_create();
-  apriltag_detector_add_family(td, tf);
-  td->refine_edges = false;  // Set to true to enable edge refinement.
+  // Tag decode on the CPU (no pose estimation).
+  apriltag_vulkan::TagDecoderConfig decoder_config;
+  decoder_config.families = {tf};
+  decoder_config.refine_edges = false;  // Set to true to enable edge refinement.
 
   try {
     // The camera first: the detector is built for the size the driver actually negotiated.
@@ -108,7 +103,6 @@ int main(int argc, char **argv) {
       std::cerr << "Requested " << width << "x" << height << " but device negotiated "
                << capture.width() << "x" << capture.height() << "; adjust --width/--height."
                << std::endl;
-      apriltag_detector_destroy(td);
       teardown_tag_family(&tf, family_name.c_str());
       return 1;
     }
@@ -124,7 +118,7 @@ int main(int argc, char **argv) {
 
     // decimation must match config.decimation, so this is built after config.
     const auto pool = apriltag_vulkan::MakeWorkerPool(config);
-    apriltag_vulkan::TagDecoder tag_decoder(td, config.decimation, 0, apriltag_vulkan::RefineEdgesMethod::kProfile,
+    apriltag_vulkan::TagDecoder tag_decoder(decoder_config, config.decimation, 0, apriltag_vulkan::RefineEdgesMethod::kProfile,
                                             0.0f, apriltag_vulkan::WorkerPoolOptions(), false, false, pool);
 
     apriltag_vulkan::GpuDetector detector(ctx, config);
@@ -148,15 +142,14 @@ int main(int argc, char **argv) {
           quad_decode.Decode(detector.last_line_fit_points);
       const auto t1 = std::chrono::steady_clock::now();
 
-      zarray_t *detections = tag_decoder.Decode(quads, gray.data(), width, height,
-                                              config.reversed_border);
+      const auto &detections = tag_decoder.Decode(quads, gray.data(), width, height, config.reversed_border);
       const auto t2 = std::chrono::steady_clock::now();
 
       const double quaddecode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
       const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
 
       std::cout << "Frame " << frame_index << ": " << quads.size() << " candidate quad(s), "
-           << zarray_size(detections) << " decoded tag(s). "
+           << detections.size() << " decoded tag(s). "
            << "GPU(total=" << profile.total_ms << " ms, upload=" << profile.upload_ms
            << ", label=" << profile.threshold_label_ms << ", boundary=" << profile.boundary_ms
            << ", sort=" << profile.sort_group_ms << ", linefit=" << profile.linefit_ms
@@ -182,12 +175,10 @@ int main(int argc, char **argv) {
     std::cout << "Shutting down." << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "Fatal error: " << e.what() << std::endl;
-    apriltag_detector_destroy(td);
     teardown_tag_family(&tf, family_name.c_str());
     return 1;
   }
 
-  apriltag_detector_destroy(td);
   teardown_tag_family(&tf, family_name.c_str());
   return 0;
 }

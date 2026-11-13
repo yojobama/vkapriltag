@@ -29,10 +29,6 @@
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
 
-extern "C" {
-#include "apriltag.h"
-}
-
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -91,7 +87,7 @@ bool SameQuads(const Quads &x, const Quads &y) {
 // Decimation for every detector this tool creates (--decimation).
 uint32_t g_decimation = 2;
 
-apriltag_vulkan::DetectorConfig MakeConfig(uint32_t w, uint32_t h, const apriltag_family_t *tf) {
+apriltag_vulkan::DetectorConfig MakeConfig(uint32_t w, uint32_t h, const apriltag_vulkan::Family *tf) {
   apriltag_vulkan::DetectorConfig config;
   config.width = w;
   config.height = h;
@@ -113,7 +109,7 @@ int AllocHeap(size_t bytes) {
   return r < 0 ? -1 : static_cast<int>(alloc.fd);
 }
 
-int RunHeap(const std::string &pgm, int iterations, apriltag_family_t *tf, bool yuyv) {
+int RunHeap(const std::string &pgm, int iterations, const apriltag_vulkan::Family *tf, bool yuyv) {
   std::vector<uint8_t> gray;
   uint32_t w = 0, h = 0;
   if (!apriltag_vulkan::LoadGrayPgm(pgm, &gray, &w, &h)) {
@@ -184,7 +180,7 @@ struct CamBuf {
 };
 
 int RunCamera(const std::string &dev, uint32_t want_w, uint32_t want_h, int frames,
-              apriltag_family_t *tf, int sync_mode) {
+              const apriltag_vulkan::Family *tf, int sync_mode) {
   const int fd = open(dev.c_str(), O_RDWR);
   if (fd < 0) {
     std::cerr << "cannot open " << dev << std::endl;
@@ -363,10 +359,10 @@ int main(int argc, char **argv) {
     std::cerr << e.what() << std::endl;
     return 1;
   }
-  apriltag_family_t *tf = nullptr;
+  const apriltag_vulkan::Family *tf = nullptr;
   if (!setup_tag_family(&tf, "tag36h11")) return 1;
   struct FamilyOwner {
-    apriltag_family_t *tf;
+    const apriltag_vulkan::Family *tf;
     ~FamilyOwner() { teardown_tag_family(&tf, "tag36h11"); }
   } family_owner{tf};
   try {

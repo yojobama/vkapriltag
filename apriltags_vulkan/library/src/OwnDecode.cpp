@@ -6,10 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 
-extern "C" {
-#include "common/matd.h"
-}
-
 // Derived from AprilRobotics apriltag v3.4.5 (apriltag.c, common/g2d.c, apriltag_math.h), BSD-2-Clause.
 namespace apriltag_vulkan::own {
 
@@ -19,6 +15,7 @@ constexpr int kMaxCells = 32;                   // the widest border (cells) a f
 constexpr int kMaxBorder = 8 * kMaxCells;       // border samples
 constexpr int kMaxGrid = 1024;                  // total_width squared
 constexpr double kPi = 3.14159265358979323846;  // M_PI
+constexpr double kSingularEps = 1e-8;           // matd.h MATD_EPS
 
 uint64_t Rotate90(uint64_t w, int nbits) {
   int p = nbits;
@@ -98,7 +95,7 @@ bool Singular3(const double *a) {
       for (int k = 0; k < 3; k++) std::swap(lu[p][k], lu[j][k]);
     }
     double LUjj = lu[j][j];
-    if (std::fabs(LUjj) < MATD_EPS) singular = true;
+    if (std::fabs(LUjj) < kSingularEps) singular = true;
     if (LUjj != 0) {
       LUjj = 1.0 / LUjj;
       for (int i = j + 1; i < 3; i++) lu[i][j] *= LUjj;
@@ -137,9 +134,9 @@ constexpr int kRotations = 4;
 
 class FamilyTables {
  public:
-  FamilyTables(const apriltag_family_t *f, int max_hamming)
+  explicit FamilyTables(const Family *f)
       : family(f), w(f->width_at_border), tw(f->total_width), nbits(static_cast<int>(f->nbits)),
-        max_hamming(max_hamming), reversed(f->reversed_border) {
+        max_hamming(f->max_hamming), reversed(f->reversed_border) {
     ok = BuildBorder() && BuildBits() && BuildIndex();
     for (int r = 0; r < kRotations; ++r) {
       const double theta = r * kPi / 2.0;
@@ -148,7 +145,7 @@ class FamilyTables {
     }
   }
 
-  const apriltag_family_t *family;
+  const Family *family;
   int w, tw, nbits, max_hamming;
   bool reversed;
   bool ok = false;
@@ -261,33 +258,6 @@ class FamilyTables {
 };
 
 namespace {
-
-// libapriltag's table holds, for each code in order, the codes within max_hamming bits; the maximum
-// is the one whose entry count matches.
-bool InferMaxHamming(const apriltag_family_t *f, int *max_hamming) {
-  struct QuickDecodeHeader {
-    int nentries;
-    void *entries;
-  };
-  const QuickDecodeHeader *qd = static_cast<const QuickDecodeHeader *>(f->impl);
-  if (qd == nullptr) return false;
-  const uint32_t ncodes = f->ncodes, nbits = f->nbits;
-  uint32_t capacity = ncodes;
-  for (int m = 0; m <= 3; ++m) {
-    if (static_cast<uint32_t>(qd->nentries) == capacity * 3) {
-      *max_hamming = m;
-      return true;
-    }
-    if (m == 0) {
-      capacity += ncodes * nbits;
-    } else if (m == 1) {
-      capacity += ncodes * nbits * (nbits - 1);
-    } else if (m == 2) {
-      capacity += ncodes * nbits * (nbits - 1) * (nbits - 2);
-    }
-  }
-  return false;
-}
 
 // Reads the border and payload cells of a quad with homography h; the code word goes to *rcode.
 // Returns the decision margin, or -1 (with *rcode 0) if the polarity is wrong.
@@ -494,25 +464,17 @@ bool ComputeHomography(const float p[4][2], Homography *out) {
 Decoder::Decoder() = default;
 Decoder::~Decoder() = default;
 
-bool Decoder::Refresh(const apriltag_detector_t *td) {
-  sharpening_ = td->decode_sharpening;
-  const int count = zarray_size(td->tag_families);
+bool Decoder::Refresh(std::span<const Family *const> families, double sharpening) {
+  sharpening_ = sharpening;
+  const int count = static_cast<int>(families.size());
   if (count > kMaxFamilies) return false;
   bool same = static_cast<int>(families_.size()) == count;
   for (int i = 0; same && i < count; ++i) {
-    apriltag_family_t *f = nullptr;
-    zarray_get(td->tag_families, i, &f);
-    same = families_[i]->family == f;
+    same = families_[i]->family == families[i] && families_[i]->max_hamming == families[i]->max_hamming;
   }
   if (!same) {
     families_.clear();
-    for (int i = 0; i < count; ++i) {
-      apriltag_family_t *f = nullptr;
-      zarray_get(td->tag_families, i, &f);
-      int max_hamming = 0;
-      if (!InferMaxHamming(f, &max_hamming)) return false;
-      families_.push_back(std::make_unique<FamilyTables>(f, max_hamming));
-    }
+    for (int i = 0; i < count; ++i) families_.push_back(std::make_unique<FamilyTables>(families[i]));
   }
   for (const auto &f : families_) {
     if (!f->ok) return false;
@@ -533,7 +495,7 @@ bool Decoder::SampleCode(const float p[4][2], bool reversed_border, const Image 
   return true;
 }
 
-void Decoder::FillTag(const apriltag_family_t *family, int id, int hamming, int rotation, float margin,
+void Decoder::FillTag(const Family *family, int id, int hamming, int rotation, float margin,
                       const double *h, DecodedTag *out) {
   out->family = family;
   out->id = id;
@@ -584,7 +546,7 @@ int Decoder::Decode(const float p[4][2], bool reversed_border, const Image *im, 
 
 int Decoder::MinHamming(uint64_t rcode) const {
   if (families_.empty()) return 64;
-  const apriltag_family_t *family = families_[0]->family;
+  const Family *family = families_[0]->family;
   int best = 64;
   for (int r = 0; r < kRotations; ++r) {
     for (uint32_t c = 0; c < family->ncodes; ++c) best = std::min(best, std::popcount(rcode ^ family->codes[c]));
@@ -593,19 +555,18 @@ int Decoder::MinHamming(uint64_t rcode) const {
   return best;
 }
 
-apriltag_detection_t *Decoder::NewDetection(const DecodedTag &tag) {
-  apriltag_detection_t *det = static_cast<apriltag_detection_t *>(std::calloc(1, sizeof(apriltag_detection_t)));
-  det->family = const_cast<apriltag_family_t *>(tag.family);
-  det->id = tag.id;
-  det->hamming = tag.hamming;
-  det->decision_margin = tag.margin;
-  det->H = matd_create(3, 3);
-  std::memcpy(det->H->data, tag.h, sizeof(tag.h));
-  det->c[0] = tag.c[0];
-  det->c[1] = tag.c[1];
+Detection Decoder::ToDetection(const DecodedTag &tag) {
+  Detection det;
+  det.family = tag.family;
+  det.id = tag.id;
+  det.hamming = tag.hamming;
+  det.decision_margin = tag.margin;
+  std::memcpy(det.H, tag.h, sizeof(tag.h));
+  det.c[0] = tag.c[0];
+  det.c[1] = tag.c[1];
   for (int i = 0; i < 4; ++i) {
-    det->p[i][0] = tag.p[i][0];
-    det->p[i][1] = tag.p[i][1];
+    det.p[i][0] = tag.p[i][0];
+    det.p[i][1] = tag.p[i][1];
   }
   return det;
 }
@@ -729,37 +690,39 @@ int PreferSmaller(int pref, double q0, double q1) {
 }
 
 int DetectionCompare(const void *_a, const void *_b) {
-  const apriltag_detection_t *a = *static_cast<apriltag_detection_t *const *>(_a);
-  const apriltag_detection_t *b = *static_cast<apriltag_detection_t *const *>(_b);
+  const Detection *a = *static_cast<const Detection *const *>(_a);
+  const Detection *b = *static_cast<const Detection *const *>(_b);
   return a->id - b->id;
+}
+
+// Removes entry i by moving the last one into its place.
+void RemoveShuffle(DetectionList *list, size_t i) {
+  if (i + 1 < list->size()) (*list)[i] = list->back();
+  list->pop_back();
 }
 
 }  // namespace
 
-void Reconcile(zarray_t *detections) {
-  for (int i0 = 0; i0 < zarray_size(detections); i0++) {
-    apriltag_detection_t *det0;
-    zarray_get(detections, i0, &det0);
-    for (int i1 = i0 + 1; i1 < zarray_size(detections); i1++) {
-      apriltag_detection_t *det1;
-      zarray_get(detections, i1, &det1);
-      if (det0->id != det1->id || det0->family != det1->family) continue;
-      if (!Overlaps(det0->p, det1->p)) continue;
+void Reconcile(DetectionList *detections) {
+  DetectionList &d = *detections;
+  for (int i0 = 0; i0 < static_cast<int>(d.size()); i0++) {
+    for (int i1 = i0 + 1; i1 < static_cast<int>(d.size()); i1++) {
+      const Detection &det0 = d[i0], &det1 = d[i1];
+      if (det0.id != det1.id || det0.family != det1.family) continue;
+      if (!Overlaps(det0.p, det1.p)) continue;
 
       int pref = 0;
-      pref = PreferSmaller(pref, det0->hamming, det1->hamming);
-      pref = PreferSmaller(pref, -det0->decision_margin, -det1->decision_margin);
+      pref = PreferSmaller(pref, det0.hamming, det1.hamming);
+      pref = PreferSmaller(pref, -det0.decision_margin, -det1.decision_margin);
       for (int i = 0; i < 4; i++) {
-        pref = PreferSmaller(pref, det0->p[i][0], det1->p[i][0]);
-        pref = PreferSmaller(pref, det0->p[i][1], det1->p[i][1]);
+        pref = PreferSmaller(pref, det0.p[i][0], det1.p[i][0]);
+        pref = PreferSmaller(pref, det0.p[i][1], det1.p[i][1]);
       }
       if (pref < 0) {
-        apriltag_detection_destroy(det1);
-        zarray_remove_index(detections, i1, 1);
+        RemoveShuffle(&d, i1);
         i1--;
       } else {
-        apriltag_detection_destroy(det0);
-        zarray_remove_index(detections, i0, 1);
+        RemoveShuffle(&d, i0);
         i0--;
         break;
       }
@@ -767,8 +730,16 @@ void Reconcile(zarray_t *detections) {
   }
 }
 
-void SortById(zarray_t *detections) {
-  std::qsort(detections->data, static_cast<size_t>(detections->size), detections->el_sz, DetectionCompare);
+void SortById(DetectionList *detections) {
+  // qsort over pointers, as the array of pointers upstream sorts, so that ties come out the same.
+  std::vector<const Detection *> order;
+  order.reserve(detections->size());
+  for (const Detection &d : *detections) order.push_back(&d);
+  std::qsort(order.data(), order.size(), sizeof(const Detection *), DetectionCompare);
+  DetectionList sorted;
+  sorted.reserve(order.size());
+  for (const Detection *d : order) sorted.push_back(*d);
+  *detections = std::move(sorted);
 }
 
 }  // namespace apriltag_vulkan::own

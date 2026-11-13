@@ -762,36 +762,21 @@ TagPose PoseEstimator::Estimate(const double corners[4][2], const double H[3][3]
   return (both.solution1.error <= both.solution2.error) ? both.solution1 : both.solution2;
 }
 
-void PoseEstimator::EstimateAll(const std::vector<const apriltag_detection_t *> &detections,
-                                std::vector<TagPose> &out) const {
+void PoseEstimator::EstimateAll(std::span<const Detection> detections, std::vector<TagPose> &out) const {
   out.assign(detections.size(), TagPose{});
   pool_->ParallelFor(detections.size(), [&](size_t i, unsigned /*slot*/) {
-    const apriltag_detection_t *det = detections[i];
-    if (det == nullptr || det->H == nullptr) return;
+    const Detection &det = detections[i];
     double H[3][3];
     for (int a = 0; a < 3; ++a)
-      for (int b = 0; b < 3; ++b) H[a][b] = MATD_EL(det->H, a, b);
+      for (int b = 0; b < 3; ++b) H[a][b] = det.H[a * 3 + b];
     double corners[4][2];
     for (int c = 0; c < 4; ++c) {
-      corners[c][0] = det->p[c][0];
-      corners[c][1] = det->p[c][1];
+      corners[c][0] = det.p[c][0];
+      corners[c][1] = det.p[c][1];
     }
     // Each entry is written by exactly one task, in input order.
     out[i] = Estimate(corners, H);
   });
-}
-
-void PoseEstimator::EstimateAll(const zarray_t *detections, std::vector<TagPose> &out) const {
-  std::vector<const apriltag_detection_t *> flat;
-  flat.reserve(detections != nullptr ? static_cast<size_t>(zarray_size(detections)) : 0u);
-  if (detections != nullptr) {
-    for (int i = 0; i < zarray_size(detections); ++i) {
-      apriltag_detection_t *det = nullptr;
-      zarray_get(const_cast<zarray_t *>(detections), i, &det);
-      flat.push_back(det);
-    }
-  }
-  EstimateAll(flat, out);
 }
 
 }  // namespace apriltag_vulkan

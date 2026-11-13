@@ -6,6 +6,18 @@ All notable changes to vkapriltag. Per-version detail with measurements for 1.8.
 
 ## Unreleased
 
+### Changed (API)
+
+- **The library no longer uses libapriltag's types.** `Detection` (id, hamming, decision margin, centre, corners,
+  `double H[9]`, `const Family *`), `Family` (the built-in tag tables plus an explicit `max_hamming`; `Family::ByName`),
+  `Image` (data, width, height, stride) and `Quad` replace `apriltag_detection_t`, `apriltag_family_t`, `image_u8_t`
+  and `struct quad`. `TagDecoder` and `TrackingDetector` take a `TagDecoderConfig` (families, `refine_edges`,
+  `decode_sharpening`) instead of an `apriltag_detector_t *`; `Decode()`, `FramePipeline::Push()/Flush()` and
+  `TrackingDetector::Detect()` return `DetectionList` (`std::vector<Detection>`), valid until the next call;
+  `PoseEstimator::EstimateAll` takes a `std::span<const Detection>`; `setup_tag_family` returns a `const Family *`.
+  Output is unchanged. The patched-upstream decode (`APRILTAG_VK_OWN_DECODE=0`) is removed; upstream is only needed by
+  the differential test and the reference validation tools (`VKAPRILTAG_UPSTREAM_VALIDATION`).
+
 ### Added
 
 - **Pre-warm for frames that arrive at camera rate.** A GPU idle for a few milliseconds takes about 0.5 ms

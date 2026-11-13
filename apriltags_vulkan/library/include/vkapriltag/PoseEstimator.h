@@ -2,13 +2,11 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
+#include "vkapriltag/Detection.h"
 #include "vkapriltag/common/WorkerPool.h"
-
-extern "C" {
-#include "apriltag.h"
-}
 
 namespace apriltag_vulkan {
 
@@ -21,7 +19,7 @@ struct CameraIntrinsics {
 };
 
 // The tag's pose in the camera optical frame (`t` position, `R` orientation), as libapriltag's
-// apriltag_pose_t. `error` is the object-space error of the fit; `valid` is false if no pose
+// pose type. `error` is the object-space error of the fit; `valid` is false if no pose
 // could be computed.
 struct TagPose {
   double R[3][3] = {};
@@ -40,7 +38,7 @@ struct TagPosePair {
 
 // Tag pose from four corners, ported from libapriltag's apriltag_pose.c: homography seed,
 // orthogonal iteration, and a search for the second local minimum, with the lower-error solution
-// winning. Uses fixed-size 3x3/3x1 arithmetic instead of matd_t. Runs on the CPU.
+// winning. Uses fixed-size 3x3/3x1 arithmetic instead of heap matrices. Runs on the CPU.
 class PoseEstimator {
  public:
   // Iteration cap (libapriltag uses 50).
@@ -73,12 +71,8 @@ class PoseEstimator {
   // The lower-error candidate (libapriltag's estimate_tag_pose).
   TagPose Estimate(const double corners[4][2], const double H[3][3]) const;
 
-  // Estimates every detection in parallel; results are in input order.
-  void EstimateAll(const std::vector<const apriltag_detection_t *> &detections,
-                   std::vector<TagPose> &out) const;
-
-  // Overload for the zarray_t* of apriltag_detection_t* returned by TagDecoder::Decode.
-  void EstimateAll(const zarray_t *detections, std::vector<TagPose> &out) const;
+  // Estimates every detection in parallel (a DetectionList converts); results are in input order.
+  void EstimateAll(std::span<const Detection> detections, std::vector<TagPose> &out) const;
 
   const CameraIntrinsics &intrinsics() const { return intrinsics_; }
   double tagsize() const { return tagsize_; }

@@ -1,9 +1,6 @@
 #pragma once
 
-extern "C" {
-#include "apriltag.h"
-}
-
+#include "vkapriltag/Detection.h"
 #include "vkapriltag/Types.h"
 
 namespace apriltag_vulkan {
@@ -12,6 +9,6 @@ namespace apriltag_vulkan {
 // fitted Gaussian per axis, with fitted black, white and outside levels and sensor clipping. Updates
 // det->H, det->c and det->p and returns true; returns false, leaving det as it was, if the tag is
 // unsupported or the fit is rejected. `im` is the full-resolution image.
-bool PolishDetection(const Image *im, apriltag_detection_t *det);
+bool PolishDetection(const Image *im, Detection *det);
 
 }  // namespace apriltag_vulkan

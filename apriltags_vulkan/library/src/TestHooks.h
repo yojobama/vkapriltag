@@ -9,10 +9,10 @@
 namespace apriltag_vulkan::testing {
 
 uint64_t Rotate90(uint64_t w, int nbits);
-bool ErrorsConnected(const apriltag_family_t *f, uint64_t diff);
-void BuildThirdBitIndex(const apriltag_family_t *f, ThirdBitIndex *index);
+bool ErrorsConnected(const Family *f, uint64_t diff);
+void BuildThirdBitIndex(const Family *f, ThirdBitIndex *index);
 bool MatchThreeTouchingBits(const ThirdBitIndex &index, uint64_t rcode, int *id, int *rotation);
-int MaxCorrectedBits(const apriltag_family_t *f);
+int MaxCorrectedBits(const Family *f);
 
 // The decode steps on one quad (corners in pixel coordinates, top left first, clockwise on screen).
 // `outcome` is 0 dropped, 1 stopped by the margin gate, 2 rejected before refining, 3 ran to the end.
@@ -23,10 +23,10 @@ struct StepResult {
   int hamming = -1;
   double corners[4][2] = {};  // the first detection's corners
 };
-bool PreRefineRejects(apriltag_detector_t *td, const Image *im, const double corners[4][2], bool reversed_border,
-                      const DecodeSwitches &switches);
-StepResult RunCandidateSteps(apriltag_detector_t *td, const Image *im, const double corners[4][2],
-                             bool reversed_border, const DecodeSwitches &switches);
+bool PreRefineRejects(const TagDecoderConfig &config, int decimation, const Image *im, const double corners[4][2],
+                      bool reversed_border, const DecodeSwitches &switches);
+StepResult RunCandidateSteps(const TagDecoderConfig &config, int decimation, const Image *im,
+                             const double corners[4][2], bool reversed_border, const DecodeSwitches &switches);
 
 void IntersectLines(const double lines[4][4], Quad *quad);
 void FitSide(double *bxs, double *bys, double *ws, int used, double range, double *mx, double *my,

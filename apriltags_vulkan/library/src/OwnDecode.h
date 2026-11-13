@@ -2,14 +2,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
+#include "vkapriltag/Detection.h"
+#include "vkapriltag/Family.h"
 #include "vkapriltag/Types.h"
-
-extern "C" {
-#include "apriltag.h"
-#include "common/zarray.h"
-}
 
 // The decode of a quad into tags: bit sampling, code lookup, homography and reconcile. It gives the
 // results of libapriltag's quad_decode_index and reconcile_detections bit for bit, without their
@@ -40,7 +38,7 @@ struct RawSample {
 };
 
 struct DecodedTag {
-  const apriltag_family_t *family = nullptr;
+  const Family *family = nullptr;
   int id = 0;
   int hamming = 0;
   int rotation = 0;
@@ -60,9 +58,9 @@ class Decoder {
   Decoder(const Decoder &) = delete;
   Decoder &operator=(const Decoder &) = delete;
 
-  // Rebuilds the tables if the detector's family list changed. False if a family is not supported
-  // (the caller then keeps to libapriltag for the whole run).
-  bool Refresh(const apriltag_detector_t *td);
+  // Rebuilds the tables if the family list (or a family's max_hamming) changed; `sharpening` is the
+  // decode's sharpening weight. False if a family is not supported.
+  bool Refresh(std::span<const Family *const> families, double sharpening);
 
   // Samples the quad with the first family of its border polarity (libapriltag's quad_sample_code).
   // Returns false, with the homography invalid, if the quad is degenerate; *h is then unset.
@@ -79,11 +77,10 @@ class Decoder {
   // The smallest Hamming distance from rcode to any code of the first family, over four rotations.
   int MinHamming(uint64_t rcode) const;
 
-  // A new detection (calloc-ed, with a matd homography) that apriltag_detection_destroy frees.
-  static apriltag_detection_t *NewDetection(const DecodedTag &tag);
+  static Detection ToDetection(const DecodedTag &tag);
 
   // Builds a DecodedTag from a decode: homography turned by `rotation`, centre and corners.
-  static void FillTag(const apriltag_family_t *family, int id, int hamming, int rotation, float margin,
+  static void FillTag(const Family *family, int id, int hamming, int rotation, float margin,
                       const double *h, DecodedTag *out);
 
  private:
@@ -92,10 +89,10 @@ class Decoder {
 };
 
 // libapriltag's reconcile_detections: removes the lesser of two overlapping detections of one tag,
-// in the same order, from an array of apriltag_detection_t pointers.
-void Reconcile(zarray_t *detections);
+// in the same order (a removed entry is replaced by the last one).
+void Reconcile(DetectionList *detections);
 
-// Sorts the array by tag id as the detector's output order does.
-void SortById(zarray_t *detections);
+// Sorts the list by tag id as the detector's output order does (not stable, as upstream's).
+void SortById(DetectionList *detections);
 
 }  // namespace apriltag_vulkan::own

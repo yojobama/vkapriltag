@@ -933,8 +933,8 @@ double Optimise(Fit *f, Params *p, double kcut, int max_iter, double tol, int wi
 
 }  // namespace
 
-bool PolishDetection(const Image *im, apriltag_detection_t *det) {
-  const apriltag_family_t *fam = det->family;
+bool PolishDetection(const Image *im, Detection *det) {
+  const Family *fam = det->family;
   if (fam == nullptr || fam->reversed_border) return false;
   const int W = static_cast<int>(fam->width_at_border);
   if (W < 4 || W > kMaxCells || det->id < 0 || det->id >= static_cast<int>(fam->ncodes)) return false;
@@ -956,12 +956,11 @@ bool PolishDetection(const Image *im, apriltag_detection_t *det) {
   }
 
   // The detection's tag-to-pixel homography, composed with tag [-1, 1] -> cell coordinates.
-  const matd_t *H = det->H;
-  if (H == nullptr) return false;
+  const double *H = det->H;
   const double hw = 0.5 * W;
   double m[9];  // cell -> pixel
   for (int r = 0; r < 3; ++r) {
-    const double h0 = MATD_EL(H, r, 0), h1 = MATD_EL(H, r, 1), h2 = MATD_EL(H, r, 2);
+    const double h0 = H[3 * r + 0], h1 = H[3 * r + 1], h2 = H[3 * r + 2];
     m[3 * r + 0] = h0 / hw;
     m[3 * r + 1] = h1 / hw;
     m[3 * r + 2] = h2 - h0 - h1;
@@ -1164,17 +1163,17 @@ bool PolishDetection(const Image *im, apriltag_detection_t *det) {
       mc[3 * r + c] = row[0] * cn[c] + row[1] * cn[3 + c] + row[2] * cn[6 + c];
     }
   }
-  matd_t *newH = det->H;
+  double *newH = det->H;
   for (int r = 0; r < 3; ++r) {
     const double c0 = mc[3 * r], c1 = mc[3 * r + 1], c2 = mc[3 * r + 2];
-    MATD_EL(newH, r, 0) = c0 * hw;
-    MATD_EL(newH, r, 1) = c1 * hw;
-    MATD_EL(newH, r, 2) = c2 + c0 * hw + c1 * hw;
+    newH[3 * r + 0] = c0 * hw;
+    newH[3 * r + 1] = c1 * hw;
+    newH[3 * r + 2] = c2 + c0 * hw + c1 * hw;
   }
   auto project = [&](double x, double y, double *ox, double *oy) {
-    const double w = MATD_EL(newH, 2, 0) * x + MATD_EL(newH, 2, 1) * y + MATD_EL(newH, 2, 2);
-    *ox = (MATD_EL(newH, 0, 0) * x + MATD_EL(newH, 0, 1) * y + MATD_EL(newH, 0, 2)) / w;
-    *oy = (MATD_EL(newH, 1, 0) * x + MATD_EL(newH, 1, 1) * y + MATD_EL(newH, 1, 2)) / w;
+    const double w = newH[6] * x + newH[7] * y + newH[8];
+    *ox = (newH[0] * x + newH[1] * y + newH[2]) / w;
+    *oy = (newH[3] * x + newH[4] * y + newH[5]) / w;
   };
   project(0, 0, &det->c[0], &det->c[1]);
   for (int k = 0; k < 4; ++k) project((k == 1 || k == 2) ? 1 : -1, (k < 2) ? 1 : -1, &det->p[k][0], &det->p[k][1]);

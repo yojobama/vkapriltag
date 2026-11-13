@@ -7,9 +7,10 @@ find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
-# Upstream AprilRobotics apriltag, patched to expose quad_decode_index() and reconcile_detections()
-# so the GPU pipeline can feed its own quads to the CPU decode.
+# Upstream AprilRobotics apriltag, patched to expose quad_decode_index() and reconcile_detections(); only the
+# differential test and the reference validation tools use it (VKAPRILTAG_UPSTREAM_VALIDATION).
 # ---------------------------------------------------------------------------
+if(VKAPRILTAG_UPSTREAM_VALIDATION)
 include(FetchContent)
 set(APRILTAG_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-decode-steps.patch)
 # Patch scoping the pthreads_cross emulation to "_WIN32 and not MinGW" so MinGW uses its real pthread.h.
@@ -40,6 +41,7 @@ if(TARGET apriltag)
   if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(apriltag PRIVATE -ffp-contract=off)
   endif()
+endif()
 endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
@@ -203,7 +205,6 @@ target_compile_definitions(vkapriltag PUBLIC
 target_link_libraries(vkapriltag PUBLIC
   Vulkan::Vulkan
   Threads::Threads
-  apriltag
 )
 
 # Tracing hooks (common/Profiler.h); OFF compiles every scope away.

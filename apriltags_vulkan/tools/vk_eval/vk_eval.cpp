@@ -22,21 +22,19 @@
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
 
-extern "C" {
-#include "apriltag.h"
-}
+#ifdef VKAPRILTAG_VK_EVAL_REF
+#include "vk_eval_ref.h"
+#endif
 
 namespace {
 
-std::vector<eval::Det> ToDets(zarray_t *z) {
+std::vector<eval::Det> ToDets(const apriltag_vulkan::DetectionList &z) {
   std::vector<eval::Det> dets;
-  for (int i = 0; i < zarray_size(z); ++i) {
-    apriltag_detection_t *d;
-    zarray_get(z, i, &d);
-    eval::Det e{d->id, d->hamming, d->decision_margin, {d->c[0], d->c[1]}, {}};
+  for (const apriltag_vulkan::Detection &d : z) {
+    eval::Det e{d.id, d.hamming, d.decision_margin, {d.c[0], d.c[1]}, {}};
     for (int k = 0; k < 4; ++k) {
-      e.p[k][0] = d->p[k][0];
-      e.p[k][1] = d->p[k][1];
+      e.p[k][0] = d.p[k][0];
+      e.p[k][1] = d.p[k][1];
     }
     dets.push_back(e);
   }
@@ -82,7 +80,7 @@ int main(int argc, char **argv) {
     }
   }
   const bool tracing = apriltag_vulkan::prof::EnableFromEnv();
-  apriltag_family_t *tf = nullptr;
+  const apriltag_vulkan::Family *tf = nullptr;
   if (!setup_tag_family(&tf, family.c_str())) return 1;
   int rc = 0;
   try {
@@ -92,36 +90,16 @@ int main(int argc, char **argv) {
     std::vector<double> all_total;
 
     if (ref) {
-      apriltag_detector_t *td = apriltag_detector_create();
-      apriltag_detector_add_family(td, tf);
-      td->quad_decimate = float(decimation);
-      td->nthreads = int(threads ? threads : std::max(1u, std::thread::hardware_concurrency()));
-      std::printf("libapriltag CPU, quad_decimate %u, %d threads\n", decimation, td->nthreads);
-      for (size_t n = 0; n < paths.size(); n++) {
-        eval::Image im = eval::LoadGrey(paths[n]);
-        image_u8_t u8{im.width, im.height, im.width, im.grey.data()};
-        eval::Timings t;
-        zarray_t *dets = nullptr;
-        for (int it = 0; it < warmup + iterations; it++) {
-          if (dets) apriltag_detections_destroy(dets);
-          if (const char *g = std::getenv("VK_EVAL_GAP_MS")) std::this_thread::sleep_for(std::chrono::microseconds(int(std::atof(g) * 1000)));
-          const auto t0 = eval::Clock::now();
-          dets = apriltag_detector_detect(td, &u8);
-          const auto t1 = eval::Clock::now();
-          if (it >= warmup) t.Add(0.0, eval::Ms(t0, t1));
-        }
-        if (iterations > 1) eval::PrintTimings(paths[n], t, size_t(td->nquads), size_t(zarray_size(dets)));
-        all_total.push_back(eval::Median(t.total));
-        if (out.is_open()) eval::WriteDets(out, int(n), ToDets(dets));
-        apriltag_detections_destroy(dets);
-      }
-      apriltag_detector_destroy(td);
+#ifdef VKAPRILTAG_VK_EVAL_REF
+      RunReference(paths, family, decimation, threads, warmup, iterations, out.is_open() ? &out : nullptr, &all_total);
+#else
+      throw std::runtime_error("--ref needs a build with VKAPRILTAG_UPSTREAM_VALIDATION=ON");
+#endif
     } else {
       apriltag_vulkan::vk::Context ctx;
-      apriltag_detector_t *td = apriltag_detector_create();
-      apriltag_detector_add_family(td, tf);
-      // As apriltag_vulkan_validate: upstream's default refine_edges, decoded with the default method.
-      td->refine_edges = true;
+      apriltag_vulkan::TagDecoderConfig decoder_config;
+      decoder_config.families = {tf};
+      decoder_config.refine_edges = true;
       std::unique_ptr<apriltag_vulkan::GpuDetector> detector;
       std::unique_ptr<apriltag_vulkan::MultiLevelDetector> multi;
       std::vector<apriltag_vulkan::LevelSpec> level_specs;
@@ -175,11 +153,11 @@ int main(int argc, char **argv) {
             quad_decode = std::make_unique<apriltag_vulkan::QuadDecode>(config, pool);
           }
           tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(
-              td, decimation, threads, apriltag_vulkan::RefineEdgesMethod::kProfile, 0.0f,
+              decoder_config, decimation, threads, apriltag_vulkan::RefineEdgesMethod::kProfile, 0.0f,
               apriltag_vulkan::WorkerPoolOptions(), false, config.small_tag_rescue, pool);
         }
         eval::Timings t;
-        zarray_t *dets = nullptr;
+        const apriltag_vulkan::DetectionList *dets = nullptr;
         size_t candidates = 0;
         for (int it = 0; it < warmup + iterations; it++) {
           if (const char *g = std::getenv("VK_EVAL_GAP_MS")) std::this_thread::sleep_for(std::chrono::microseconds(int(std::atof(g) * 1000)));
@@ -192,19 +170,17 @@ int main(int argc, char **argv) {
           }
           const auto t1 = eval::Clock::now();
           if (!multi) quads = quad_decode->Decode(detector->last_line_fit_points);
-          dets = tag_decoder->Decode(quads, im.grey.data(), im.width, im.height,
-                                     config.reversed_border);
+          dets = &tag_decoder->Decode(quads, im.grey.data(), im.width, im.height, config.reversed_border);
           const auto t2 = eval::Clock::now();
           candidates = quads.size();
           if (it >= warmup) t.Add(eval::Ms(t0, t1), eval::Ms(t1, t2));
         }
-        if (iterations > 1) eval::PrintTimings(paths[n], t, candidates, size_t(zarray_size(dets)));
+        if (iterations > 1) eval::PrintTimings(paths[n], t, candidates, dets->size());
         all_total.push_back(eval::Median(t.total));
         // Owned by the TagDecoder.
-        if (out.is_open()) eval::WriteDets(out, int(n), ToDets(dets));
+        if (out.is_open()) eval::WriteDets(out, int(n), ToDets(*dets));
       }
       tag_decoder.reset();
-      apriltag_detector_destroy(td);
     }
     std::printf("images=%zu median_total=%.4f ms\n", paths.size(), eval::Median(all_total));
   } catch (const std::exception &e) {
