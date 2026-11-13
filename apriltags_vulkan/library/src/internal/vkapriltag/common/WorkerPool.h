@@ -72,6 +72,7 @@ class WorkerPool {
   size_t count_ = 0;
   std::atomic<size_t> next_{0};
   std::atomic<size_t> outstanding_{0};  // workers still inside the current batch
+  std::atomic<int> tickets_{0};         // workers that may still join the current batch
   std::atomic<uint64_t> generation_{0};
   std::atomic<bool> stop_{false};
   WorkerPoolOptions options_;

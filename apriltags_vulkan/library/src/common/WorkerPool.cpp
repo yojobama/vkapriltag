@@ -163,6 +163,9 @@ void WorkerPool::WorkerMain(unsigned slot) {
       seen = generation_.load(std::memory_order_relaxed);
     }
 
+    // A batch with few items admits only as many workers as it has items to spare; the rest go back to sleep.
+    if (tickets_.fetch_sub(1, std::memory_order_acq_rel) <= 0) continue;
+
     DrainBatch(slot);
 
     if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -188,15 +191,22 @@ void WorkerPool::ParallelFor(size_t count, const std::function<void(size_t, unsi
     return;
   }
 
+  size_t helpers = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     fn_ = &fn;
     count_ = count;
     next_.store(0, std::memory_order_relaxed);
-    outstanding_.store(workers_.size(), std::memory_order_relaxed);
+    helpers = std::min(workers_.size(), count - 1);
+    outstanding_.store(helpers, std::memory_order_relaxed);
+    tickets_.store(static_cast<int>(helpers), std::memory_order_relaxed);
     generation_.fetch_add(1, std::memory_order_release);
   }
-  batch_ready_.notify_all();
+  if (helpers == workers_.size()) {
+    batch_ready_.notify_all();
+  } else {
+    for (size_t i = 0; i < helpers; ++i) batch_ready_.notify_one();
+  }
 
   // The calling thread also drains the batch, as slot 0.
   DrainBatch(0);
