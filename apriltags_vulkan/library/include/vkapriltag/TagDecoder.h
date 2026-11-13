@@ -32,6 +32,8 @@ struct ThirdBitIndex {
   std::vector<uint32_t> ids[4];
 };
 
+struct DecodeEnv;
+
 class TagDecoder {
  public:
   // `td` must already have its tag families added; it is not owned.
@@ -93,6 +95,15 @@ class TagDecoder {
   const ProbeHistogram &probe_histogram() const { return probe_hist_; }
 
  private:
+  // Runs the decode steps on quads[i] on thread `slot`; the detections go to per_quad_[i].
+  void ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, size_t i, unsigned slot);
+  // The per-frame inputs and switches of a Decode() call; builds the third-bit index if it is stale.
+  DecodeEnv MakeEnv(image_u8_t *im, bool reversed_border, bool timing);
+  // Folds the per-thread probe histograms and rows into probe_hist_ and rows_.
+  void MergeSlotRecords();
+  // Sums the per-thread accumulators; wall_ms is left for the caller.
+  Stats SumSlotStats() const;
+
   apriltag_detector_t *td_;  // not owned
   std::unique_ptr<WorkerPool> pool_;
   RefineEdgesMethod refine_method_;
