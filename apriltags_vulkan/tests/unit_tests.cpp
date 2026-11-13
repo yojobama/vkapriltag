@@ -934,10 +934,33 @@ void TestFamilyLimits() {
   CHECK(r.count == 1 && r.id == 3 && r.hamming == 0);
 }
 
+// An image with row padding gives the same steps and corners as the packed one.
+void TestStridedImage() {
+  Family fam("tag36h11");
+  Detector det(fam.f);
+  const av::DecodeSwitches on;
+  TagScene tag(fam.f, 7);
+  double border[4][2];
+  tag.Border(border);
+  const av::Image *packed = tag.image();
+  const int stride = packed->width + 40;
+  std::vector<uint8_t> padded(size_t(stride) * packed->height, 77);
+  for (int y = 0; y < packed->height; ++y) {
+    std::memcpy(padded.data() + size_t(y) * stride, packed->data + size_t(y) * packed->stride, size_t(packed->width));
+  }
+  const av::Image strided = {padded.data(), packed->width, packed->height, stride};
+  const tst::StepResult a = tst::RunCandidateSteps(det.cfg, 1, packed, border, false, on);
+  const tst::StepResult b = tst::RunCandidateSteps(det.cfg, 1, &strided, border, false, on);
+  CHECK(a.count == 1 && a.id == 7);
+  CHECK(a.count == b.count && a.id == b.id && a.hamming == b.hamming);
+  CHECK(std::memcmp(a.corners, b.corners, sizeof(a.corners)) == 0);
+}
+
 void TestSteps() {
   TestPreRefineChecks();
   TestRecoverySteps();
   TestFamilyLimits();
+  TestStridedImage();
 }
 
 void TestPool() {
