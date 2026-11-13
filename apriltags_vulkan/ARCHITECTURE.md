@@ -129,7 +129,10 @@ GPU scheduling, so detections are then not reproducible.
 
 ## 4. Device-class forks
 
-`GpuDetector::CreatePipelines` resolves every fork from `vk::DeviceCaps` (`vk/Context.cpp`) and the options registry. The
+`ResolvePlan` and `FinalisePlan` (`gpu/PipelinePlan.cpp`) resolve every fork from `vk::DeviceCaps` (`vk/Context.cpp`), the
+configuration and the options registry into one `PipelinePlan` (printed by `PipelinePlan::Describe`); the second step runs once
+the readback buffers exist. `CreatePipelines` then builds each pipeline from its `StageDesc` in `gpu/StageTable.cpp` (shader
+chosen by the plan, buffers by `Buf` role, push-constant size, workgroup size, specialisation constants). The
 startup line printed by `vk::Context` reports the device, its limits and the launch geometry. Only two combinations
 are measured as a class: discrete (RX 9060 XT, RADV) and integrated (Mali-G610, libmali); the other combinations are
 reached through the `APRILTAG_VK_FORCE_NO_*` switches and are covered by the golden test (section 10).
@@ -434,6 +437,8 @@ lavapipe, then the upstream parity gate.
 | `own_decode_random`, `own_decode_reconcile`, `own_decode_corpus`, `families_match_upstream` | the decode bit for bit against upstream's results recorded in `tests/own_decode_vectors.bin` (3120 random and 2974 corpus quads, 2500 reconcile sets, family table hashes) | no |
 | `own_decode_comparison_can_fail` | the comparison fails when the decode is sabotaged (`WILL_FAIL`) | no |
 | `golden_detections` | `tests/golden_test.py`: `vk_eval` over the committed subset (`tests/corpus`, 10 scenarios x 5 frames, 640x480 PNG) in five profiles (`tests/profiles.json`: d1, d2, `rescue-hull`, `polish`, `features15`) against `tests/golden/<profile>/`: same ids and Hamming distances per frame, corners within 0.02 px, at most 2 differing frames per profile | yes |
+| `gpu_trace_*` | `tests/gpu_trace_test.cpp`: the recorded GPU work of the first frame (every dispatch with its grid or indirect offset and a hash of its push constants, barriers, fills, copies, submits) per device and profile, compared with `tests/gpu_trace/<device>/<profile>.txt` (RX 9060 XT and Mali-G610 committed; other devices skip). `GPU_TRACE_UPDATE=1 ctest -R gpu_trace` rewrites them |
+| `unit_plan` | `tests/unit_tests.cpp` group `plan`: the resolved `PipelinePlan` of a discrete and an integrated device class under 21 variations against `tests/plan/<class>.txt`, and the stage table's consistency |
 | `options_lint` | no `getenv` outside the registry, every named variable registered, `PERFORMANCE.md` table equals `vk_eval --list-options` | needs `vk_eval` built |
 | `deps_lint` | no upstream types or includes outside the validation files, `VKAPRILTAG_UPSTREAM_VALIDATION` defaults off | no |
 | `installed_package_consumer` | installs to a temporary prefix, checks nothing from upstream is in it, builds a `find_package(vkapriltag)` consumer and runs it on a corpus frame (id 316) | yes |
