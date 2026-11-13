@@ -9,6 +9,28 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ## Unreleased
 
+### Breaking: version 2.0.0, one public `Detector`
+
+- **`vkapriltag/Detector.h` is the public interface.** One `Detector` owns the device, the GPU stages, the CPU tail, the worker pool and
+  the pose estimator; `DetectorOptions` selects families, decimation, `Mode` (sync, pipelined depth 1 or 2, tracking keyframe or async),
+  `levels`, the accuracy features and pose. Failures throw `Error` with an `ErrorCode`. `Device` lets several detectors (cameras) share a GPU.
+- **The stage classes are no longer installed.** `GpuDetector`, `QuadDecode`, `TagDecoder`, `FramePipeline`, `TrackingDetector`,
+  `MultiLevelDetector`, `PoseEstimator` (its `CameraIntrinsics` and `TagPose` are now in `Pose.h`), `RefineEdges`, `PolishFit`, the Vulkan layer,
+  `WorkerPool`, the options registry and the profiler moved to `library/src/internal`; in-tree tools and tests link `vkapriltag::internal`.
+  The installed headers are `Detector.h`, `Detection.h`, `Family.h`, `Pose.h` and `Version.h`, and none includes a Vulkan header.
+- **SWIG bindings** (`VKAPRILTAG_BUILD_SWIG=ON`): Python is built and tested (numpy and buffer input, no copy), Java and C# are generated from the same interface.
+- Migration: construct a `Detector` from `DetectorOptions` instead of `Context` + `DetectorConfig` + `GpuDetector` + `QuadDecode` + `TagDecoder`
+  (`options.width/height/families/decimation`, `refine_edges`, `small_tag_rescue`, `hull_quad`, `polish`, `cpu_threads`); call `Detect(grey)` and read
+  `result.detections`; `FramePipeline` is `Mode::kPipelined`, `TrackingDetector` is `Mode::kTracking`, `MultiLevelDetector` is `options.levels`,
+  `PoseEstimator` is `options.tag_size` with `options.intrinsics` (`result.poses`). Environment overrides are unchanged.
+
+### Changed (GPU internals)
+
+- `PipelinePlan` resolves every GPU variant choice once from the device, the configuration and the options (`ResolvePlan`, `FinalisePlan`);
+  `DetectorConfig` has its own header; a stage table (`StageDesc`) builds each of the 26 pipelines; one recorder serves the group, extents,
+  select, scan and scatter stages of the fused, lean and unfused flows. Detections and the recorded GPU work are unchanged
+  (`gpu_trace_*` and `unit_plan` guard them). `MemoryKind::DeviceLocalReadback` removed.
+
 ### Documentation
 
 - `ARCHITECTURE.md` and `DECISIONS.md` added; `DESIGN.md` is now a short rationale page; `OPTIMIZATION_NOTES.md`, the two root idea

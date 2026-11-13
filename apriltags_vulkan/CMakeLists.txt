@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
-project(ApriltagVulkan VERSION 1.10.1 LANGUAGES CXX)
+project(ApriltagVulkan VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +14,12 @@ include(GNUInstallDirs)
 if(WIN32)
   # Stop <windows.h> defining min()/max() macros and pulling in winsock; set before add_subdirectory.
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# The version in Version.h is the one users see; it must match the project version.
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/library/include/vkapriltag/Version.h VKAPRILTAG_VERSION_LINE REGEX "VKAPRILTAG_VERSION_STRING")
+if(NOT VKAPRILTAG_VERSION_LINE MATCHES "\"${PROJECT_VERSION}\"")
+  message(FATAL_ERROR "library/include/vkapriltag/Version.h (${VKAPRILTAG_VERSION_LINE}) does not match the project version ${PROJECT_VERSION}")
 endif()
 
 option(VKAPRILTAG_BUILD_APPS "Build the interactive sample app (V4L2 camera capture)" ON)
