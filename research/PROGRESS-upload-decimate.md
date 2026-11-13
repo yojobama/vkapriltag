@@ -57,7 +57,7 @@ Build dirs: `$A/build-upload-decimate` (branch), `$A/build-upload-decimate-base`
   gpu part about -8%. Found 4819/4972, 35 false, error 0.017/0.100 px in every run; all 26 dumps byte-identical to base.
 - 6. Desktop gate, same `new` binary with `APRILTAG_VK_CPU_DECIMATE=0` (GPU decimation) against default (CPU), whole corpus dumps
   (`ud-gate.sh`): decimation 4: identical; decimation 2 with `BOX_DECIMATE=0`: identical; decimation 4 with `BOX_DECIMATE=0`: identical;
-  `FUSE_SUBMITS=0` (unfused flow): identical; `FORCE_NO_8BIT=1` (32-bit layout): identical except one 0.0006 px line of `noise` and
+  `FUSE_SUBMITS=0` (unfused flow): identical; `FORCE_NO_8BIT=1` (32-bit layout): identical except one line of `noise` (about 0.003 px) and
   `PRERECORD=0`: one such line (the known noise frame). Decimation 3 (needs width divisible by 3, so only the 300 1920x1080 frames of
   the corpus, `ud-d3.sh`): box on: one line differs by under 0.001 px (noise), `BOX_DECIMATE=0`: identical.
   Facade tests (`facade_stride`, `facade_pipelined`, ...) pass in ctest: the stride path packs the frame before `Detect`, and the pipelined mode
