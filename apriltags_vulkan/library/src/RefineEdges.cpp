@@ -302,15 +302,9 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
 
       // Gradient along the normal (outside brighter than inside for a normal border).
       float g[kMaxTaps];
-      float best = 0;
-      int bj = -1;
-      for (int j = 1; j < taps - 1; ++j) {
-        g[j] = prof[j + 1] - prof[j - 1];
-        if (g[j] > best) {
-          best = g[j];
-          bj = j;
-        }
-      }
+      float best;
+      int bj;
+      geom::GradientPeak(prof, taps, g, &best, &bj);
       if (bj < 0 || best < kMinStep) continue;
       int jl = bj, jr = bj;
       while (jl > 1 && g[jl - 1] > kLobeCut * best) jl--;

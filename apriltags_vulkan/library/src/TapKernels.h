@@ -11,7 +11,7 @@
 #if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
 #define VKAPRILTAG_TAP_SSE2 1
-#elif defined(__ARM_NEON) || defined(__aarch64__)
+#elif defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #define VKAPRILTAG_TAP_NEON 1
 #endif
@@ -80,7 +80,49 @@ inline void BlendTaps(const Img *im, const int *xis, const int *yis, const float
     vst1q_f32(out + m, acc);
   }
 #endif
+  if (m < n && n >= 4 && m > 0) {
+    // The last four taps again: the tap values do not depend on their neighbours.
+    BlendTaps(im, xis + n - 4, yis + n - 4, fxs + n - 4, fys + n - 4, 4, out + n - 4);
+    return;
+  }
   for (; m < n; ++m) out[m] = BilinearAt<float>(im, xis[m], yis[m], fxs[m], fys[m]);
+}
+
+// g[j] = prof[j + 1] - prof[j - 1] for j in [1, taps - 2]; *best is the largest g above zero (0 if none) and
+// *bj the first j reaching it (-1 if none).
+inline void GradientPeak(const float *prof, int taps, float *g, float *best, int *bj) {
+  float top = 0;
+  int j = 1;
+#if defined(VKAPRILTAG_TAP_SSE2)
+  __m128 vmax = _mm_setzero_ps();
+  for (; j + 4 <= taps - 1; j += 4) {
+    const __m128 v = _mm_sub_ps(_mm_loadu_ps(prof + j + 1), _mm_loadu_ps(prof + j - 1));
+    _mm_storeu_ps(g + j, v);
+    vmax = _mm_max_ps(vmax, v);
+  }
+  float lanes[4];
+  _mm_storeu_ps(lanes, vmax);
+  for (int k = 0; k < 4; ++k) top = std::max(top, lanes[k]);
+#elif defined(VKAPRILTAG_TAP_NEON)
+  float32x4_t vmax = vdupq_n_f32(0.0f);
+  for (; j + 4 <= taps - 1; j += 4) {
+    const float32x4_t v = vsubq_f32(vld1q_f32(prof + j + 1), vld1q_f32(prof + j - 1));
+    vst1q_f32(g + j, v);
+    vmax = vmaxq_f32(vmax, v);
+  }
+  top = vmaxvq_f32(vmax);
+#endif
+  for (; j < taps - 1; ++j) {
+    g[j] = prof[j + 1] - prof[j - 1];
+    top = std::max(top, g[j]);
+  }
+  *best = top;
+  *bj = -1;
+  if (top > 0) {
+    int k = 1;
+    while (g[k] != top) ++k;
+    *bj = k;
+  }
 }
 
 }  // namespace apriltag_vulkan::geom
