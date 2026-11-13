@@ -71,6 +71,10 @@ ctest --test-dir build --output-on-failure
 | `VKAPRILTAG_EMBED_SHADERS` | `ON` | Compile SPIR-V into the library so a deployed build needs no files beside it |
 | `VKAPRILTAG_UPSTREAM_VALIDATION` | `OFF` | Fetch stock libapriltag v3.4.5 and build the reference validation tools (`apriltag_vulkan_validate`, the pose tools, `vk_eval --ref`) |
 | `VKAPRILTAG_REGEN_VECTORS` | `OFF` | With the option above: rebuild the recorded decode test vectors |
+| `VKAPRILTAG_LTO` | `OFF` | Link-time optimisation of the library and the in-tree tools (`-flto` with fat objects, MSVC `/GL` `/LTCG`) |
+| `VKAPRILTAG_TUNE` | empty | Target flags for the library, for example `-mcpu=cortex-a76`, `-march=x86-64-v3` or `/arch:AVX2`; the binary then runs only on that CPU |
+| `VKAPRILTAG_CODEGEN` | empty | Extra code generation flags for the library (`;`-separated) |
+| `VKAPRILTAG_PGO` | `OFF` | `GENERATE` builds an instrumented library, `USE` rebuilds with the profile in `VKAPRILTAG_PGO_DIR` (`tools/pgo/train.sh` trains it; same build directory for both steps) |
 
 The golden and consumer tests need a Vulkan device (`APRILTAG_VK_ALLOW_CPU=1` runs them on lavapipe). Score a corpus with
 `apriltags_vulkan/tools/eval.sh` and measure with `vk_eval` (`PERFORMANCE.md` section 5). If no GPU driver is installed the loader

@@ -69,3 +69,16 @@ Decimation 1: group A (base 1.0649 / 2.0588, cpu 0.1438): lto +0.6% cpu +1.0%; a
 The Pi cpu part is 0.14 to 0.16 ms of 0.77 to 1.06, and it swings by +-10% between runs (threads land on A55 or A76 cores), so only -O2 (clearly worse) is distinguishable from noise.
 Dumps: 4 to 11 differing lines per run against the base run, the same as base against base (5 to 9): GPU noise.
 Next: pin to the A76 cores (`taskset -c 4-7`) to take the scheduler out of the cpu medians, break cg into its four flags, combine, then PGO (gcc on the Pi, MSVC on the desktop), ctest per config, SWIG and consumer checks.
+
+### E4 desktop (ctest and more variants; 7 rounds, decimation 2, base2 and a second `base` binary in the same interleave)
+ctest: 44/44 green (own_decode_*, goldens, installed_package_consumer) for base, lto, avx2, avx2+/fp:contract (avx2fc), avx2+/Ob3 /GS- (x2) and lto+avx2.
+MSVC does not fuse under /arch:AVX2 with the default /fp:precise, and the tests also pass with /fp:contract on the whole library.
+`base` and `base2` (identical flags, separate builds) differ by 3.8% in the corpus median and 7% in cpu inside one interleaved run: binary layout noise.
+Corpus median / cpu, against base2 (0.3778 / 0.1208): base -3.8% / -7.2%; avx2 -4.0% / -11.5%; x2 -5.3% / -16.2%; avx2fc -8.6% / -19.0%.
+Against `base` the same variants are +0.2..-5% / -4.6..-13%: AVX2 helps the cpu part by 5 to 15%, the pipeline by 0 to 5%; /Ob3 /GS- adds nothing detectable;
+/fp:contract is the best but is bit-identical only by test, not by guarantee (it lets MSVC fuse in QuadDecode and OwnDecode, which GCC's `-ffp-contract=off` forbids).
+
+### E5 Pi pinned to the A76 cores (`PIN="taskset -c 4-7"`), decimation 2, 5 rounds: the run-to-run spread drops to under 1%
+Group a (base 0.7143, cpu 0.1496): -fno-math-errno +0.3% / cpu +0.6%; -fno-trapping-math +0.2% / +0.6%; -fno-semantic-interposition -fno-plt +0.4% / -0.2%. Nothing.
+Group b (base 0.7175, cpu 0.1499): all four codegen flags -0.1% / +0.8%; + -mcpu=cortex-a76 -0.5% / -1.1%; + lto -0.7% / -1.9%. Dumps identical (0 to 1 lines).
+The unpinned -5.8% / -6.9% of E3 was scheduler noise. Conclusion: on the Pi no compiler flag moves the pipeline by more than 1% (cpu part is 0.15 of 0.72 ms).
