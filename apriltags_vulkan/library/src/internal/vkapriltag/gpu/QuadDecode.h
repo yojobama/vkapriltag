@@ -14,6 +14,7 @@ namespace apriltag_vulkan {
 // Reusable per-blob-fit scratch for the peaks-based fit path. One instance per
 // WorkerPool slot, indexed by the `slot` ParallelFor passes to each task.
 struct QuadFitScratch {
+  std::vector<int32_t> px, py, pw;
   std::vector<LineFitMoments> cs;
   std::vector<double> error;
   std::vector<double> filtered;

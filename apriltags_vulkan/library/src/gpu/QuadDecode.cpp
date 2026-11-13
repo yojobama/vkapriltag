@@ -244,21 +244,24 @@ inline void ArgMax(size_t begin, size_t end, F value, T &best, size_t &best_idx)
   }
 }
 
+// A blob's points unpacked into separate arrays.
+struct UnpackedPoints {
+  const int32_t *x, *y, *w;
+};
+
 // Seeds 4 corner indices: the two mutually-farthest points (2-pass approximation), then the
 // point of maximum perpendicular deviation on each arc. Returns false if the blob does not look
 // like a clean quad (too few points, degenerate diameter, empty arc, or no real deviation).
-bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, size_t n,
-                         uint32_t out_indices[4]) {
+// Coordinates are below 2^14, so squared distances and cross products fit in int32.
+bool FindDpCornerIndices(const UnpackedPoints &pts, size_t n, uint32_t out_indices[4]) {
   if (n < 8) return false;
 
-  const RawLineFitPoint *pts = points.data() + begin;
-  // Squared distance between two points, exact in int64.
-  auto sq_dist = [pts](size_t a, size_t b) {
-    const int64_t dx = pts[a].x2() - pts[b].x2(), dy = pts[a].y2() - pts[b].y2();
+  auto sq_dist = [&pts](size_t a, size_t b) {
+    const int32_t dx = pts.x[a] - pts.x[b], dy = pts.y[a] - pts.y[b];
     return dx * dx + dy * dy;
   };
 
-  int64_t best_d = -1;
+  int32_t best_d = -1;
   size_t a_idx = 0;
   ArgMax(1, n, [&](size_t i) { return sq_dist(0, i); }, best_d, a_idx);
   best_d = -1;
@@ -270,16 +273,15 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
 
   const size_t lo = std::min(a_idx, b_idx), hi = std::max(a_idx, b_idx);
 
-  // Cross product of (b - a) and (p - a), exact in int64, squared in double.
-  const int64_t ax = pts[a_idx].x2(), ay = pts[a_idx].y2();
-  const int64_t abx = pts[b_idx].x2() - ax, aby = pts[b_idx].y2() - ay;
+  const int32_t ax = pts.x[a_idx], ay = pts.y[a_idx];
+  const int32_t abx = pts.x[b_idx] - ax, aby = pts.y[b_idx] - ay;
   auto perp = [&](size_t i) {
-    const double cross = static_cast<double>(abx * (pts[i].y2() - ay) - aby * (pts[i].x2() - ax));
-    return cross * cross;
+    const int32_t cross = abx * (pts.y[i] - ay) - aby * (pts.x[i] - ax);
+    return cross < 0 ? -cross : cross;
   };
 
   size_t c1_idx = n, c2_idx = n;  // n is not a valid index; doubles as "not found"
-  double best_perp1 = -1.0, best_perp2 = -1.0;
+  int32_t best_perp1 = -1, best_perp2 = -1;
   ArgMax(lo + 1, hi, perp, best_perp1, c1_idx);
   ArgMax(0, lo, perp, best_perp2, c2_idx);
   ArgMax(hi + 1, n, perp, best_perp2, c2_idx);
@@ -288,7 +290,8 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
   // Reject degenerate shapes: both corners must deviate from the diameter line (threshold is
   // scaled by diameter_sq^2).
   const double min_perp = 0.0001 * diameter_sq * diameter_sq;
-  if (best_perp1 < min_perp || best_perp2 < min_perp) return false;
+  const double p1 = static_cast<double>(best_perp1), p2 = static_cast<double>(best_perp2);
+  if (p1 * p1 < min_perp || p2 * p2 < min_perp) return false;
 
   // Circular order: lo -> c1 -> hi -> c2. c1 lies between lo and hi, c2 outside [lo, hi].
   out_indices[0] = static_cast<uint32_t>(lo);
@@ -300,20 +303,19 @@ bool FindDpCornerIndices(std::span<const RawLineFitPoint> points, size_t begin, 
 
 // The moments of the circular, inclusive index range [i0, i1] of pts[0, n), relative to (x0, y0);
 // i0 >= i1 wraps, as ReadMomentsWindow. The same integers as the prefix-sum difference.
-inline LineFitMoments SumMomentsWindow(const RawLineFitPoint *pts, size_t n, size_t i0,
-                                       size_t i1, int32_t x0, int32_t y0) {
+inline LineFitMoments SumMomentsWindow(const UnpackedPoints &pts, size_t n, size_t i0, size_t i1,
+                                       int32_t x0, int32_t y0) {
   int64_t mx = 0, my = 0, w_sum = 0, mxx = 0, mxy = 0, myy = 0;
   auto add = [&](size_t from, size_t to) {
     for (size_t k = from; k < to; ++k) {
-      const int32_t x2 = pts[k].x2() - x0, y2 = pts[k].y2() - y0, w = pts[k].W();
-      const int64_t wx = static_cast<int64_t>(w) * x2;
-      const int64_t wy = static_cast<int64_t>(w) * y2;
+      const int32_t x2 = pts.x[k] - x0, y2 = pts.y[k] - y0, w = pts.w[k];
+      const int32_t wx = w * x2, wy = w * y2;
       mx += wx;
       my += wy;
       w_sum += w;
-      mxx += wx * x2;
-      mxy += wx * y2;
-      myy += wy * y2;
+      mxx += static_cast<int64_t>(wx) * x2;
+      mxy += static_cast<int64_t>(wx) * y2;
+      myy += static_cast<int64_t>(wy) * y2;
     }
   };
   if (i0 < i1) {
@@ -336,15 +338,13 @@ inline LineFitMoments SumMomentsWindow(const RawLineFitPoint *pts, size_t n, siz
 // Tries DP corner seeding for one blob, summing each segment's moments directly. Returns an
 // invalid result if seeding fails or a segment exceeds max_line_fit_mse (the caller then falls
 // back to peaks).
-FitQuadResult TryDpQuad(const DetectorConfig &config, std::span<const RawLineFitPoint> points,
-                        size_t begin, size_t total_points) {
+FitQuadResult TryDpQuad(const DetectorConfig &config, const UnpackedPoints &pts, size_t total_points) {
   FitQuadResult result;
   uint32_t idx[4];
-  if (!FindDpCornerIndices(points, begin, total_points, idx)) return result;
+  if (!FindDpCornerIndices(pts, total_points, idx)) return result;
 
-  const RawLineFitPoint *pts = points.data() + begin;
-  result.x0 = pts[0].x2();
-  result.y0 = pts[0].y2();
+  result.x0 = pts.x[0];
+  result.y0 = pts.y[0];
   for (int k = 0; k < 4; ++k) {
     result.moments[k] =
         SumMomentsWindow(pts, total_points, idx[k], idx[(k + 1) % 4], result.x0, result.y0);
@@ -370,7 +370,17 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
 
   if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
     result.dp_attempted = true;  // sticks even if we fall through to peaks below
-    FitQuadResult dp_result = TryDpQuad(config, points, begin, total_points);
+    scratch.px.resize(total_points);
+    scratch.py.resize(total_points);
+    scratch.pw.resize(total_points);
+    for (size_t k = 0; k < total_points; ++k) {
+      const RawLineFitPoint &p = points[begin + k];
+      scratch.px[k] = p.x2();
+      scratch.py[k] = p.y2();
+      scratch.pw[k] = p.W();
+    }
+    const UnpackedPoints unpacked{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
+    FitQuadResult dp_result = TryDpQuad(config, unpacked, total_points);
     if (dp_result.valid) {
       dp_result.dp_attempted = true;
       dp_result.dp_used = true;
