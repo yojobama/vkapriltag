@@ -15,7 +15,16 @@
 namespace apriltag_vulkan {
 namespace {
 
+// Set by the first profile pass when it gives the quad up unrefined.
 thread_local bool g_stop = false;
+
+// From APRILTAG_VK_REFINE_ABORT (read once): the usable fraction of a side's profiles below which the first
+// pass gives the quad up; negative switches it off.
+double RefineAbortFraction() {
+  static const double fraction = Options::FromEnvironment().Float("APRILTAG_VK_REFINE_ABORT", 0.25);
+  return fraction;
+}
+
 using geom::BilinearAt;
 
 constexpr int kMaxProfilePoints = 96;
@@ -261,28 +270,24 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
   double width_sum = 0;
   int width_n = 0, touching = 0;
   double lines[4][4];
+  const double abort_below = truncated != nullptr ? RefineAbortFraction() : -1.0;
 
   for (int edge = 0; edge < 4; edge++) {
     const SideSampler side(quad, edge);
     const double nx = side.nx, ny = side.ny, xm = side.xm, ym = side.ym;
     const float fnx = side.fnx, fny = side.fny;
-    static const double sp1 = Options::FromEnvironment().Float("APRILTAG_VK_RS_SPACING1", 1.5);
-    static const int maxn = static_cast<int>(Options::FromEnvironment().ULong("APRILTAG_VK_RS_MAXN").value_or(96ul));
-    const int np = std::min(maxn, side.Profiles(truncated != nullptr ? sp1 : kProfileSpacing));
+    const int np = side.Profiles(kProfileSpacing);
     // The refined points of this side, relative to its midpoint, and their weights.
     double bxs[kMaxProfilePoints], bys[kMaxProfilePoints], ws[kMaxProfilePoints];
     int used = 0;
 
     for (int s = 0; s < np; s++) {
-      {
-        static const double ab = Options::FromEnvironment().Float("APRILTAG_VK_RS_ABORT", -1.0);
-        static const double half = Options::FromEnvironment().Float("APRILTAG_VK_RS_HALF", 1.0);
-        if (truncated != nullptr && ab >= 0 && s == np / 2 && s >= 8 && used < ab * half * s) {
-          g_stop = true;
-          *edge_width = 0;
-          *truncated = 0;
-          return true;
-        }
+      // First pass only: half way along a side with too few usable profiles, give the quad up unrefined.
+      if (abort_below >= 0 && s == np / 2 && s >= 8 && used < abort_below * s) {
+        g_stop = true;
+        *edge_width = 0;
+        *truncated = 0;
+        return true;
       }
       const double alpha = (1.0 + s) / (np + 1);
       double x0, y0;
@@ -352,8 +357,7 @@ bool ProfilePass(float range, double cell, const Image *im, Quad *quad,
       used++;
     }
     {
-      static const double ab = Options::FromEnvironment().Float("APRILTAG_VK_RS_ABORT", -1.0);
-      if (truncated != nullptr && ab >= 0 && (used < 3 || used < ab * np)) {
+      if (abort_below >= 0 && (used < 3 || used < abort_below * np)) {
         g_stop = true;
         *edge_width = 0;
         *truncated = 0;
