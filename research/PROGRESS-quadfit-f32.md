@@ -49,3 +49,7 @@ Per-stage counters (QFSTAT patch: `qf32_stat3.py` applies, `qf32_unstat3.py` rem
 busy-background: old window 19.7, filter 7.8, seg fits 3.3, search 3.9, total 35.8; new window 8.1, filter 5.5, arcs 4.0, merges+fit 6.0, search 1.8, total 30.1.
 Losing stages: merges + batch line fit, arcs, and the unpack. Step 1: kernel A tail in SSE2 (masked lanes, arrays padded by 8) and an SSE2 unpack: arcs 34.4 -> 25.5, total jpeg 226.8 -> 206.2 ms, busy-background 29.1.
 Step 2: forward segments only in the batch (45 cells), closing segments fitted lazily as the integer fit does, batch line fit in SSE2 (bit-equal to LineKernel, unit test demands ==). jpeg new: window 59.3, filter 33.6, arcs 26.2, merges + batch fit 20.7, search (now with the closing fits) 38.1, total 193.0 ms against 217.5 old; busy-background total 26.6 against 35.8.
+fit_ns per scenario, best of 5 interleaved runs, dec 2, old integer -> new f32 (`qf32_stat3.sh`, 6 scenarios):
+- forced peaks: jpeg 214.3 -> 192.3 ms (0.90), dense-tags 13.35 -> 11.51 (0.86), busy-background 31.0 -> 26.8 (0.87), clutter-only 26.2 -> 22.8 (0.87), one-tag 2.99 -> 2.24 (0.75), many-tags 8.40 -> 5.64 (0.67).
+- default (dp + peaks fallback): jpeg 127.8 -> 92.3 (0.72), dense-tags 6.28 -> 4.35 (0.69), busy-background 17.5 -> 12.3 (0.70), clutter-only 16.0 -> 11.7 (0.73), one-tag 1.17 -> 0.88 (0.76), many-tags 3.29 -> 2.28 (0.69).
+Targets met: forced peaks faster than the integer fit in all six scenarios; default jpeg 92.3 ms below the earlier 110.5 ms.
