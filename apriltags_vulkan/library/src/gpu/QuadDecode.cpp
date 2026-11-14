@@ -354,15 +354,10 @@ FitQuadResult FitQuadForBlobF32(const DetectorConfig &config, std::span<const Ra
                                 size_t end, QuadFitScratch &scratch) {
   FitQuadResult result;
   const size_t n = end - begin;
-  scratch.px.resize(n);
-  scratch.py.resize(n);
-  scratch.pw.resize(n);
-  for (size_t k = 0; k < n; ++k) {
-    const RawLineFitPoint &p = points[begin + k];
-    scratch.px[k] = p.x2();
-    scratch.py[k] = p.y2();
-    scratch.pw[k] = p.W();
-  }
+  scratch.px.resize(n + 8);
+  scratch.py.resize(n + 8);
+  scratch.pw.resize(n + 8);
+  quadf32::Unpack(points.data() + begin, n, scratch.px.data(), scratch.py.data(), scratch.pw.data());
   const quadf32::Points pts{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
   result.f32 = true;
   result.x0 = pts.x[0];

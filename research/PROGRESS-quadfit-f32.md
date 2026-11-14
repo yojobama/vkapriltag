@@ -36,3 +36,15 @@ Commands: MSVC `cl /std:c++20 /O2 /EHsc /DNDEBUG /Qvec-report:2 /c /I<src/intern
 - Decision: option kept, default on (gate passes, output equivalent); benefit on the desktop is confined to the fit stage. Pi not reachable ('Host does not exist'), nothing run there; gcc/NEON scalar-lane path untested at run time.
 - Hull fit (D) not done. Integer fit left in place; deleting it would remove about 370 lines of QuadDecode.cpp (TryDpQuad, SumMomentsWindow, the peaks body of FitQuadForBlob, prefix helpers); FitLine/Int128 stay for the hull fit.
 - Docs: DECISIONS.md section 11 row, CHANGELOG Unreleased, ARCHITECTURE quad fit bullet, PERFORMANCE options table. ctest 46/46.
+
+## Follow-up (review of 9e62d2e): peaks path
+Per-stage counters (QFSTAT patch: `qf32_stat3.py` applies, `qf32_unstat3.py` removes; `bash $S/benchlock.sh bash $S/qf32_stat3.sh $E 2 "jpeg busy-background" APRILTAG_VK_QUADFIT=peaks`, best of 5 interleaved runs, ns summed over the scenario, forced peaks, dec 2), BEFORE any change (9e62d2e + tidy):
+| jpeg | old integer | new f32 |
+| window error (old: prefix sums + windows) | 98.8 ms | 59.0 |
+| filter, peak scan, sort | 45.5 | 34.0 |
+| arcs (kernel A over all points) | - | 34.4 |
+| old: 45 segment fits; new: merges + batch line fit | 30.5 | 58.3 |
+| search | 38.2 | 19.1 |
+| fit_ns total | 217.5 | 226.8 (new also pays the unpack, about 23 ms; old reads the points in place) |
+busy-background: old window 19.7, filter 7.8, seg fits 3.3, search 3.9, total 35.8; new window 8.1, filter 5.5, arcs 4.0, merges+fit 6.0, search 1.8, total 30.1.
+Losing stages: merges + batch line fit, arcs, and the unpack. Step 1: kernel A tail in SSE2 (masked lanes, arrays padded by 8) and an SSE2 unpack: arcs 34.4 -> 25.5, total jpeg 226.8 -> 206.2 ms, busy-background 29.1.

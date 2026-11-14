@@ -720,7 +720,7 @@ void TestQuadFitF32() {
   // Origins: near the corner of the image, and far out where the coordinates approach 16383.
   for (const int32_t base : {0, 2000, 16000}) {
     for (const size_t n : {5u, 8u, 9u, 37u, 200u, 1500u}) {
-      std::vector<int32_t> x(n), y(n), w(n);
+      std::vector<int32_t> x(n + 8), y(n + 8), w(n + 8);
       for (size_t i = 0; i < n; ++i) {
         const double t = 2 * kPi * double(i) / double(n);
         x[i] = base + 100 + int32_t(90 * std::cos(t)) + int32_t(rng() % 3);
@@ -788,6 +788,15 @@ void TestQuadFitF32() {
     }
   }
 
+  // Unpacking equals the accessors.
+  for (const size_t n : {1u, 3u, 4u, 7u, 100u}) {
+    std::vector<av::RawLineFitPoint> raw(n);
+    for (auto &r : raw) r.xy2 = uint32_t(rng()) & 0x0FFFFFFFu, r.w_blob = uint32_t(rng());
+    std::vector<int32_t> ux(n), uy(n), uw(n);
+    qf::Unpack(raw.data(), n, ux.data(), uy.data(), uw.data());
+    for (size_t i = 0; i < n; ++i) CHECK(ux[i] == raw[i].x2() && uy[i] == raw[i].y2() && uw[i] == raw[i].W());
+  }
+
   // The batch line fit equals the single fit, and finds the line of a straight run of points.
   std::vector<float> W(37), N(37), sxx(37), sxy(37), syy(37), e(37), m(37), nx(37), ny(37);
   for (size_t i = 0; i < 37; ++i) {
@@ -810,8 +819,10 @@ void TestQuadFitF32() {
   {
     std::vector<int32_t> x, y, w;
     for (int i = 0; i < 60; ++i) x.push_back(16000 + 2 * i), y.push_back(16000 + i), w.push_back(500);
+    const size_t run = x.size();
+    x.resize(run + 8), y.resize(run + 8), w.resize(run + 8);
     const qf::Points p{x.data(), y.data(), w.data()};
-    const qf::LineFit f = qf::FitLine(qf::RangeMoments(p, x.size(), 0, x.size() - 1, x[0], y[0]));
+    const qf::LineFit f = qf::FitLine(qf::RangeMoments(p, run, 0, run - 1, x[0], y[0]));
     CHECK(f.mse < 1e-3f);
     CHECK(std::fabs(f.nx * 2 + f.ny) < 1e-3);
   }

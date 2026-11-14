@@ -38,8 +38,16 @@ inline __m128 LoadF(const int32_t *p, __m128i origin) { return _mm_cvtepi32_ps(_
 inline __m128 LoadW(const int32_t *p) { return _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p))); }
 #endif
 
+#if VKA_HAVE_SSE2
+// Lanes below rem keep their weight, the others get zero.
+inline __m128i LaneMask(int base, int rem) {
+  return _mm_cmplt_epi32(_mm_setr_epi32(base, base + 1, base + 2, base + 3), _mm_set1_epi32(rem));
+}
+#endif
+
 // First pass over the segments [s[0], s[1]) and [s[2], s[3]): weight and first moments about (ox, oy).
-// With kSimd the full blocks of eight run in SSE2, adding in the same lanes and order as the scalar loop.
+// With kSimd the blocks of eight and the tail run in SSE2 (the arrays need 7 readable elements past the
+// end), adding in the same lanes and order as the scalar loop.
 template <bool kSimd>
 void Pass1(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float &W, float &sx, float &sy) {
   float aw[kLanes] = {}, ax[kLanes] = {}, ay[kLanes] = {};
@@ -51,8 +59,10 @@ void Pass1(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float &W,
       const __m128i vox = _mm_set1_epi32(ox), voy = _mm_set1_epi32(oy);
       __m128 w0 = _mm_loadu_ps(aw), w1 = _mm_loadu_ps(aw + 4), x0 = _mm_loadu_ps(ax), x1 = _mm_loadu_ps(ax + 4),
              y0 = _mm_loadu_ps(ay), y1 = _mm_loadu_ps(ay + 4);
-      for (; k + kLanes <= to; k += kLanes) {
-        const __m128 fw0 = LoadW(p.w + k), fw1 = LoadW(p.w + k + 4);
+      for (; k < to; k += kLanes) {
+        const int rem = to - k < kLanes ? static_cast<int>(to - k) : kLanes;
+        const __m128 fw0 = _mm_cvtepi32_ps(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p.w + k)), LaneMask(0, rem)));
+        const __m128 fw1 = _mm_cvtepi32_ps(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p.w + k + 4)), LaneMask(4, rem)));
         w0 = _mm_add_ps(w0, fw0);
         w1 = _mm_add_ps(w1, fw1);
         x0 = _mm_add_ps(x0, _mm_mul_ps(fw0, LoadF(p.x + k, vox)));
@@ -73,12 +83,12 @@ void Pass1(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float &W,
           ay[l] += w * static_cast<float>(p.y[k + l] - oy);
         }
       }
-    }
-    for (int l = 0; k < to; ++k, ++l) {
-      const float w = static_cast<float>(p.w[k]);
-      aw[l] += w;
-      ax[l] += w * static_cast<float>(p.x[k] - ox);
-      ay[l] += w * static_cast<float>(p.y[k] - oy);
+      for (int l = 0; k < to; ++k, ++l) {
+        const float w = static_cast<float>(p.w[k]);
+        aw[l] += w;
+        ax[l] += w * static_cast<float>(p.x[k] - ox);
+        ay[l] += w * static_cast<float>(p.y[k] - oy);
+      }
     }
   }
   W = Sum8(aw);
@@ -100,8 +110,10 @@ void Pass2(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float mux
       __m128 xx0 = _mm_loadu_ps(axx), xx1 = _mm_loadu_ps(axx + 4), xy0 = _mm_loadu_ps(axy), xy1 = _mm_loadu_ps(axy + 4),
              yy0 = _mm_loadu_ps(ayy), yy1 = _mm_loadu_ps(ayy + 4), rx0 = _mm_loadu_ps(arx), rx1 = _mm_loadu_ps(arx + 4),
              ry0 = _mm_loadu_ps(ary), ry1 = _mm_loadu_ps(ary + 4);
-      for (; k + kLanes <= to; k += kLanes) {
-        const __m128 w0 = LoadW(p.w + k), w1 = LoadW(p.w + k + 4);
+      for (; k < to; k += kLanes) {
+        const int rem = to - k < kLanes ? static_cast<int>(to - k) : kLanes;
+        const __m128 w0 = _mm_cvtepi32_ps(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p.w + k)), LaneMask(0, rem)));
+        const __m128 w1 = _mm_cvtepi32_ps(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p.w + k + 4)), LaneMask(4, rem)));
         const __m128 dx0 = _mm_sub_ps(LoadF(p.x + k, vox), vmx), dx1 = _mm_sub_ps(LoadF(p.x + k + 4, vox), vmx);
         const __m128 dy0 = _mm_sub_ps(LoadF(p.y + k, voy), vmy), dy1 = _mm_sub_ps(LoadF(p.y + k + 4, voy), vmy);
         const __m128 wx0 = _mm_mul_ps(w0, dx0), wx1 = _mm_mul_ps(w1, dx1);
@@ -136,17 +148,17 @@ void Pass2(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float mux
           ary[l] += wy;
         }
       }
-    }
-    for (int l = 0; k < to; ++k, ++l) {
-      const float w = static_cast<float>(p.w[k]);
-      const float dx = static_cast<float>(p.x[k] - ox) - mux;
-      const float dy = static_cast<float>(p.y[k] - oy) - muy;
-      const float wx = w * dx, wy = w * dy;
-      axx[l] += wx * dx;
-      axy[l] += wx * dy;
-      ayy[l] += wy * dy;
-      arx[l] += wx;
-      ary[l] += wy;
+      for (int l = 0; k < to; ++k, ++l) {
+        const float w = static_cast<float>(p.w[k]);
+        const float dx = static_cast<float>(p.x[k] - ox) - mux;
+        const float dy = static_cast<float>(p.y[k] - oy) - muy;
+        const float wx = w * dx, wy = w * dy;
+        axx[l] += wx * dx;
+        axy[l] += wx * dy;
+        ayy[l] += wy * dy;
+        arx[l] += wx;
+        ary[l] += wy;
+      }
     }
   }
   out[0] = Sum8(axx);
@@ -207,6 +219,27 @@ Centred SegmentMomentsImpl(const Points &p, size_t a0, size_t a1, size_t b0, siz
 Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
                        int32_t blob_y0) {
   return SegmentMomentsImpl<true>(p, a0, a1, b0, b1, blob_x0, blob_y0);
+}
+
+void Unpack(const RawLineFitPoint *pts, size_t n, int32_t *x, int32_t *y, int32_t *w) {
+  size_t k = 0;
+#if VKA_HAVE_SSE2
+  const __m128i m14 = _mm_set1_epi32(0x3FFF), m10 = _mm_set1_epi32(0x3FF);
+  for (; k + 4 <= n; k += 4) {
+    const __m128 a = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(pts + k)));
+    const __m128 b = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(pts + k + 2)));
+    const __m128i xy = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)));
+    const __m128i wb = _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(x + k), _mm_and_si128(xy, m14));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(y + k), _mm_and_si128(_mm_srli_epi32(xy, 14), m14));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(w + k), _mm_and_si128(wb, m10));
+  }
+#endif
+  for (; k < n; ++k) {
+    x[k] = pts[k].x2();
+    y[k] = pts[k].y2();
+    w[k] = pts[k].W();
+  }
 }
 
 Centred SegmentMomentsScalar(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,

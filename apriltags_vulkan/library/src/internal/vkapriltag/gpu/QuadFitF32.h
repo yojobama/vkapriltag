@@ -10,7 +10,7 @@
 
 namespace apriltag_vulkan::quadf32 {
 
-// A blob's points as separate arrays, in half-pixel units.
+// A blob's points as separate arrays, in half-pixel units. Each array needs 7 readable elements past its end.
 struct Points {
   const int32_t *x, *y, *w;
 };
@@ -36,6 +36,9 @@ Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t 
 // The same without SSE2, for comparison: results are identical.
 Centred SegmentMomentsScalar(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
                              int32_t blob_y0);
+
+// Splits n raw points into the three arrays.
+void Unpack(const RawLineFitPoint *pts, size_t n, int32_t *x, int32_t *y, int32_t *w);
 
 // The set of one point with weight w at the offset (x, y).
 Centred SinglePoint(float x, float y, float w);
