@@ -774,8 +774,7 @@ void TestQuadFitF32() {
       const size_t k = std::min<size_t>(20, n / 12);
       if (k >= 1 && n > 2 * k + 1) {
         std::vector<float> err(n);
-        qf::WindowScratch scratch;
-        qf::WindowErrors(p, n, k, scratch, err.data());
+        qf::WindowErrors(p, n, k, err.data());
         double worst = 0;
         for (size_t i = 0; i < n; ++i) {
           std::vector<size_t> idx;

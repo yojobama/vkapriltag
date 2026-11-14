@@ -6,11 +6,10 @@
 #include <limits>
 
 #if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(VKAPRILTAG_NO_SSE2)
+#define VKA_HAVE_SSE2 1
 #include <emmintrin.h>
-#endif
-
-#if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(VKAPRILTAG_NO_SSE2)
-#include <emmintrin.h>
+#else
+#define VKA_HAVE_SSE2 0
 #endif
 
 #if defined(_MSC_VER)
@@ -33,12 +32,6 @@ constexpr std::array<float, 7> kTaps = {
 
 // The eight lanes summed in a fixed order.
 inline float Sum8(const float *a) { return ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7])); }
-
-#if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(VKAPRILTAG_NO_SSE2)
-#define VKA_HAVE_SSE2 1
-#else
-#define VKA_HAVE_SSE2 0
-#endif
 
 #if VKA_HAVE_SSE2
 inline __m128 LoadF(const int32_t *p, __m128i origin) { return _mm_cvtepi32_ps(_mm_sub_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p)), origin)); }
@@ -354,7 +347,7 @@ void CombineChunk(const Chunk &cur, const Chunk &next, size_t L, size_t rows, fl
 
 }  // namespace
 
-void WindowErrors(const Points &p, size_t n, size_t k, WindowScratch &, float *error) {
+void WindowErrors(const Points &p, size_t n, size_t k, float *error) {
   const size_t L = 2 * k + 1;
   Chunk store[2];
   int cur = 0;
@@ -385,7 +378,7 @@ bool FitPeaks(const DetectorConfig &config, const Points &p, size_t n, Scratch &
   scratch.error.resize(n);
   float *error = scratch.error.data();
   if (k >= 1 && n > 2 * k + 1) {
-    WindowErrors(p, n, k, scratch.window, error);
+    WindowErrors(p, n, k, error);
   } else {
     const Centred total = SegmentMoments(p, 0, n, 0, 0, x0, y0);
     for (size_t i = 0; i < n; ++i) {

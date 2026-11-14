@@ -50,8 +50,7 @@ void FitLines(const float *W, const float *N, const float *sxx, const float *sxy
 
 // Window error of every point of a closed contour: the line fit error of the 2k+1 points centred
 // on it, wrapping round. Needs k >= 1 and n > 2k + 1.
-struct WindowScratch;
-void WindowErrors(const Points &p, size_t n, size_t k, WindowScratch &scratch, float *error);
+void WindowErrors(const Points &p, size_t n, size_t k, float *error);
 
 // Point on the line (in half-pixel units) and unit normal of a side's fit.
 void LineParams(const Centred &c, int32_t blob_x0, int32_t blob_y0, double out[4]);
@@ -63,9 +62,7 @@ struct Sides {
 };
 
 // Reusable buffers of the peaks path.
-struct WindowScratch {};
 struct Scratch {
-  WindowScratch window;
   std::vector<float> error, padded, filtered;
   std::vector<int32_t> mask;
   std::vector<std::pair<float, uint32_t>> peaks;
