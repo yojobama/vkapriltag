@@ -141,3 +141,13 @@ cold in the caches after an idle gap and the CPU cores are slower to start; not 
 Pi track_eval (full,key, ten sequences, off against on, `score_seq.py`): recall, false detections, wrong ids, errors and path shares identical.
 Recommendation: leave `APRILTAG_VK_CPU_TAIL` off on both device classes. It wins clearly only on the Pi at decimation 2 with frames back to back, which is
 not the camera cadence, and it loses at 16 ms gaps.
+
+Desktop timing, remaining runs (3 interleaved rounds, gpu/total median ms; `on` = 10000, `on3k` = 3000):
+- Decimation 1, whole corpus: all frames off 0.3153/0.4192, on 0.3254/0.4424, on3k 0.3110/0.4194 (one-tag: 0.3168 / 0.3507 / 0.3157). CPU-tail share 37,440 of
+  75,654 detects (49%, 1,395 mispredicts) at 10000; 11,034 (15%, 720) at 3000.
+- Decimation 2, 16 ms gaps, six scenarios, 3 iterations: all off 0.4273/0.6070, on3k 0.4144/0.5982 (-13 us gpu, -9 us total); 3,234 CPU-tail frames of about 3,160 timed
+  iterations plus warmup (186 mispredicts).
+- Desktop conclusion: 10000 loses (+10 to +24 us), 3000 is within noise (-4 to -13 us). Off by default.
+
+Not done: Pi runs of the pipelined facade for timing and the stage 3 gap/other thresholds on the Pi (the Pi became unreachable after stage 2; everything above from the Pi was
+fetched before). The Pi threshold was not tuned below 10000. The worker pool was not used in the tail. Imported frames and dma-buf frames never take the CPU tail.
