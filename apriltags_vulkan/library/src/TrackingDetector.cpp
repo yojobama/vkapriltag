@@ -79,10 +79,10 @@ double TrackingDetector::Speed(const Track &t) {
 }
 
 TrackingDetector::TrackingDetector(vk::Context &ctx, const TagDecoderConfig &decoder, const DetectorConfig &config,
-                                   const TrackingConfig &tracking)
+                                   const TrackingConfig &tracking, vk::Lane *lane)
     : config_(config), tracking_(tracking), decoder_config_(decoder) {
   ApplyEnv(&tracking_);
-  gpu_ = std::make_unique<GpuDetector>(ctx, config_);
+  gpu_ = std::make_unique<GpuDetector>(ctx, lane != nullptr ? *lane : ctx.default_lane(), config_);
   pool_ = MakeWorkerPool(config_);
   quad_decode_ = std::make_unique<QuadDecode>(config_, pool_);
   full_decoder_ = std::make_unique<TagDecoder>(decoder_config_, config_.decimation, config_.cpu_threads, RefineEdgesMethod::kProfile,

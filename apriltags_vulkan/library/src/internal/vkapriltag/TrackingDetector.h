@@ -72,7 +72,7 @@ class TrackingDetector {
   // `decoder` is copied (its families must outlive this object). `config` is for the full detector; the
   // decimation of the tracked frames' refinement matches it.
   TrackingDetector(vk::Context &ctx, const TagDecoderConfig &decoder, const DetectorConfig &config,
-                   const TrackingConfig &tracking = {});
+                   const TrackingConfig &tracking = {}, vk::Lane *lane = nullptr);
   ~TrackingDetector();
 
   TrackingDetector(const TrackingDetector &) = delete;

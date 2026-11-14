@@ -1,11 +1,14 @@
 // The public Detector: every mode, pose, strided input, a shared device and the errors.
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -158,6 +161,62 @@ void TestSharedDevice() {
   CHECK(Ids(second.Detect(frames[0].grey.data())).count(316) == 1);
 }
 
+// Detectors on one shared device, each driven by its own thread, with another made and destroyed meanwhile.
+void TestSharedDeviceThreads() {
+  auto frames = Frames("many-tags");
+  if (frames.size() > 3) frames.resize(3);
+  av::DeviceOptions d;
+  d.expected_streams = 2;
+  auto device = av::Device::Create(d);
+  const av::DetectorOptions base = Options(frames[0]);
+  std::vector<std::multiset<int>> expected;
+  {
+    av::Detector reference(base);
+    for (const eval::Image &im : frames) expected.push_back(Ids(reference.Detect(im.grey.data())));
+  }
+  const std::vector<uint32_t> streams = {0, 0, 1, 3};
+  const int kCalls = 300;
+  std::vector<std::unique_ptr<av::Detector>> owned;
+  for (uint32_t s : streams) {
+    av::DetectorOptions o = base;
+    o.stream = s;
+    owned.push_back(std::make_unique<av::Detector>(o, device));
+  }
+  std::atomic<bool> go{false};
+  std::atomic<int> bad{0}, errors{0};
+  std::vector<std::thread> threads;
+  for (auto &det : owned) {
+    threads.emplace_back([&, p = det.get()] {
+      while (!go) std::this_thread::yield();
+      try {
+        for (int i = 0; i < kCalls; ++i) {
+          const size_t f = static_cast<size_t>(i) % frames.size();
+          if (Ids(p->Detect(frames[f].grey.data())) != expected[f]) ++bad;
+        }
+      } catch (const std::exception &) {
+        ++errors;
+      }
+    });
+  }
+  threads.emplace_back([&] {
+    while (!go) std::this_thread::yield();
+    try {
+      for (int i = 0; i < 10; ++i) {
+        av::DetectorOptions o = base;
+        o.stream = static_cast<uint32_t>(i % 3);
+        av::Detector extra(o, device);
+        if (Ids(extra.Detect(frames[0].grey.data())) != expected[0]) ++bad;
+      }
+    } catch (const std::exception &) {
+      ++errors;
+    }
+  });
+  go = true;
+  for (std::thread &t : threads) t.join();
+  CHECK(bad == 0);
+  CHECK(errors == 0);
+}
+
 void TestErrors() {
   const auto frames = Frames("one-tag");
   const av::DetectorOptions base = Options(frames[0]);
@@ -207,6 +266,7 @@ int main(int argc, char **argv) {
     if (all || which == "pose") TestPose();
     if (all || which == "stride") TestStride();
     if (all || which == "device") TestSharedDevice();
+    if (all || which == "threads") TestSharedDeviceThreads();
     if (all || which == "errors") TestErrors();
   } catch (const std::exception &e) {
     std::printf("FAIL: unexpected exception: %s\n", e.what());

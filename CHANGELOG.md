@@ -13,6 +13,10 @@ changes (sections such as 8ac or 8bb cited below) are in
 - **CPU decimation while uploading** (decimation 2 and 4): the host writes the decimated image into a mapped buffer (NEON / SSE2 kernels), so the
   full-frame copy and the GPU decimate dispatch are gone; detections are bit-identical. `APRILTAG_VK_CPU_DECIMATE=0` restores the GPU decimation.
 
+### Fixed
+
+- **Detectors on a shared `Device` no longer share a lane.** Two detectors with the same `stream`, or with a `stream` beyond the queue count (every stream on a device with one compute queue), used the device's default lane and raced on its command pool and command buffer ring when driven from different threads. A detector on a shared device now always creates its own lane on the queue its stream maps to (streams wrap onto the existing queues), in every mode including tracking and multi-level; the new `facade_threads` test runs four detectors on four threads.
+
 ### Breaking: version 2.0.0, one public `Detector`
 
 - **`vkapriltag/Detector.h` is the public interface.** One `Detector` owns the device, the GPU stages, the CPU tail, the worker pool and

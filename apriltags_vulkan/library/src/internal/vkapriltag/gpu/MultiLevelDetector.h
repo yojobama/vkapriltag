@@ -21,7 +21,8 @@ struct LevelSpec {
 // found at a coarse level is not proposed again by a finer one, which only looks for smaller tags.
 class MultiLevelDetector {
  public:
-  MultiLevelDetector(vk::Context &ctx, const DetectorConfig &base, std::vector<LevelSpec> levels);
+  MultiLevelDetector(vk::Context &ctx, const DetectorConfig &base, std::vector<LevelSpec> levels,
+                     vk::Lane *lane = nullptr);
 
   // Quads from every level, in full-resolution pixel coordinates, without duplicates.
   std::vector<DetectedQuad> Detect(const uint8_t *gray);
