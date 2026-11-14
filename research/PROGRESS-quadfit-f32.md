@@ -16,3 +16,16 @@ Branch `research/2026-11-quadfit-f32`, base `950c7a2`. Brief: scratchpad QUADFIT
 - Accuracy after these changes (same commands as above, plus d1, peaks p2/p1, hull+rescue h2): identical found/false in all five modes (7146, 7129, 7140, 7128, 7228 found); err p95 off->on d2 0.0993->0.0984, d1 0.0965->0.0959, p2 0.0949->0.0949, p1 0.0943->0.0948, h2 0.0980->0.0976; corner differences max 0.186 px, p99 0.0015-0.0021 px. Sequences (track_eval full,key) identical in recall and error.
 - QFSTAT (temporary, removed): min of 4 interleaved runs, fit ns over the scenario, dec 2: default dp: jpeg 125.6->110.5 ms (0.88), dense-tags 5.75->5.43 (0.945), busy-background 18.6->16.5 (0.889), clutter-only 15.5->14.8 (0.956), one-tag 1.161->1.033 (0.889), many-tags 3.65->2.96 (0.812). Forced peaks: jpeg 212.5->232.7 (1.095), dense-tags 1.043, busy-background 1.036, clutter-only 1.043, one-tag 0.897, many-tags 0.751.
 - ctest 46/46 with the unit group; goldens untouched.
+
+## Vectorisation report (QuadFitF32.cpp, current commit line numbers)
+Commands: MSVC `cl /std:c++20 /O2 /EHsc /DNDEBUG /Qvec-report:2 /c /I<src/internal> /I<include> QuadFitF32.cpp`; gcc (MinGW 16.1, x86-64 SSE2) `g++ -std=c++20 -O3 -DNDEBUG [-fno-math-errno] -fopt-info-vec-optimized -fopt-info-vec-missed -c ...`. Raw outputs were in the scratchpad (qf32vec/). Pi gcc 14: not run (board unreachable).
+| Loop | MSVC | gcc x86-64 | note |
+| --- | --- | --- | --- |
+| kernel A lane blocks (Pass1/Pass2, scalar form, l.76/134) | not (1303 too few iterations); SSE2 intrinsics used instead, bit-equal to scalar | vectorised (16 byte, unroll 4) | |
+| kernel A tails (l.84/147) | not | vectorised | |
+| window chunk terms and prefix (BuildChunk, l.304) | not (1500 aliasing) | not (serial scan) | six independent running sums, scalar |
+| window combine (CombineChunk, l.339) | vectorised | not without -fno-math-errno (sqrt errno control flow); vectorised with it | CMake adds -fno-math-errno for this file on GNU/Clang |
+| batch line fit (FitLines, l.263) | not (1100 control flow) | same as combine | |
+| 7-tap filter (l.412) | vectorised | vectorised (versioned for aliasing) | |
+| peak mask (l.425) | vectorised | vectorised | |
+| peak compaction, 4-deep search, merges | scalar | scalar | by design |

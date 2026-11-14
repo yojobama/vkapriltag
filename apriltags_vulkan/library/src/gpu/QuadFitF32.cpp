@@ -5,11 +5,11 @@
 #include <cmath>
 #include <limits>
 
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(VKAPRILTAG_NO_SSE2)
 #include <emmintrin.h>
 #endif
 
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(VKAPRILTAG_NO_SSE2)
 #include <emmintrin.h>
 #endif
 
@@ -34,7 +34,7 @@ constexpr std::array<float, 7> kTaps = {
 // The eight lanes summed in a fixed order.
 inline float Sum8(const float *a) { return ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7])); }
 
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(VKAPRILTAG_NO_SSE2)
 #define VKA_HAVE_SSE2 1
 #else
 #define VKA_HAVE_SSE2 0
