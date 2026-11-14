@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "vkapriltag/gpu/DetectorConfig.h"
@@ -46,7 +47,7 @@ Centred SegmentMomentsAbout(const Points &p, size_t a0, size_t a1, size_t b0, si
 Centred SegmentMomentsAboutScalar(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t ox, int32_t oy,
                                   int32_t blob_x0, int32_t blob_y0);
 
-// Bounding box {lo x, hi x, lo y, hi y} of n points and their packed keys x << 14 | y.
+// Bounding box {lo x, hi x, lo y, hi y} of n points and, when keys is not null, their packed keys x << 14 | y.
 void BoundsAndKeys(const Points &p, size_t n, int32_t bounds[4], uint32_t *keys);
 
 // A hull edge: its start (a point of the blob's grid), unit direction, length and the half width of the
@@ -66,6 +67,30 @@ struct HullScratch {
 // band of it. False when fewer than 6 points are inside the band. simd false runs the portable loops.
 bool FitHullSide(const Points &p, size_t n, int32_t blob_x0, int32_t blob_y0, const HullEdge &e, double band,
                  HullScratch &scratch, Centred *out, bool simd = true);
+
+// Buffers of the hull geometry.
+struct HullGeom {
+  std::vector<int32_t> colmin, colmax, hx, hy;
+  std::vector<char> keep;
+};
+
+// The points that can be vertices of the convex hull: the lowest and the highest point of every column
+// x in [lo_x, hi_x], in (x, y) order, without duplicates.
+void ColumnCandidates(const Points &p, size_t n, int32_t lo_x, int32_t hi_x, HullGeom &g,
+                      std::vector<std::pair<int32_t, int32_t>> &out);
+
+// The first vertex 1..m-1 of the largest squared distance from vertex 0.
+size_t FarVertex(const int32_t *hx, const int32_t *hy, size_t m);
+
+// Douglas-Peucker over the closed polygon (hx, hy), whose vertex 0 is repeated at index m, between vertices
+// i and j: marks the vertices of the simplification in keep.
+void SimplifyHull(const int32_t *hx, const int32_t *hy, size_t i, size_t j, double eps, char *keep);
+
+// The four edges of the k <= 16 polygon edges (vertex v[e], direction (ux, uy), length len) in order of
+// greatest total length whose neighbours are near-perpendicular and whose intersections lie close to the
+// edges' ends. Returns the total length (0 when none) and fills best.
+double ChooseEdges(const std::pair<double, double> *v, size_t k, const double *len, const double *ux, const double *uy,
+                   size_t best[4]);
 
 // Whether more than `fraction` of the n points are farther than `tolerance` from every side of the quad
 // whose corners are in half-pixel units.

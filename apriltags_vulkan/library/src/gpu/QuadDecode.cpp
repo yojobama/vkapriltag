@@ -625,36 +625,6 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
 // Smallest bounding-box side, in half-pixel units, of a blob worth a hull fit.
 constexpr int32_t kMinHullExtent = 40;
 
-// Distance from point (x, y) to the line through a and b.
-double LineDistance(double ax, double ay, double bx, double by, double x, double y) {
-  const double dx = bx - ax, dy = by - ay;
-  const double len = std::sqrt(dx * dx + dy * dy);
-  if (len < 1e-9) return std::hypot(x - ax, y - ay);
-  return std::fabs(dx * (y - ay) - dy * (x - ax)) / len;
-}
-
-// Douglas-Peucker over the closed polygon `hull`, between vertices i and j (unwrapped): marks the
-// vertices of the simplification in `keep`.
-void SimplifyChain(const std::vector<std::pair<int32_t, int32_t>> &hull, size_t i, size_t j, double eps,
-                   std::vector<char> &keep) {
-  const size_t m = hull.size();
-  if (j <= i + 1) return;
-  double best = -1;
-  size_t best_k = i;
-  for (size_t k = i + 1; k < j; ++k) {
-    const double d = LineDistance(hull[i % m].first, hull[i % m].second, hull[j % m].first,
-                                  hull[j % m].second, hull[k % m].first, hull[k % m].second);
-    if (d > best) {
-      best = d;
-      best_k = k;
-    }
-  }
-  if (best <= eps) return;
-  keep[best_k % m] = 1;
-  SimplifyChain(hull, i, best_k, eps, keep);
-  SimplifyChain(hull, best_k, j, eps, keep);
-}
-
 // Quad fit on the convex hull of a blob's boundary points: the four sides are the hull's long edges,
 // which skips a corner an occluder has covered, and each side is refitted on the points near its edge.
 FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineFitPoint> points,
@@ -664,41 +634,35 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   if (n < 600 / config.decimation || n > INT32_MAX / 1023) return result;
   auto &pts = scratch.hull_points;
   auto &hull = scratch.hull;
-  pts.clear();
-  auto &keys = scratch.hull_keys;
-  keys.clear();
+  auto &g = scratch.geom;
   const bool f32 = config.quad_fit_f32;
-  quadf32::Points up{};
-  if (f32) {
-    scratch.px.resize(n + 8);
-    scratch.py.resize(n + 8);
-    scratch.pw.resize(n + 8);
-    quadf32::Unpack(points.data() + begin, n, scratch.px.data(), scratch.py.data(), scratch.pw.data());
-    scratch.unpacked_begin = begin;
-    scratch.unpacked_n = n;
-    up = {scratch.px.data(), scratch.py.data(), scratch.pw.data()};
-    keys.resize(n);
-    int32_t b[4];
-    quadf32::BoundsAndKeys(up, n, b, keys.data());
-    const int32_t long_side = std::max(b[1] - b[0], b[3] - b[2]), short_side = std::min(b[1] - b[0], b[3] - b[2]);
-    if (long_side < kMinHullExtent || short_side * 5 < long_side * 3) return result;
-  } else {
-    int32_t lo_x = INT32_MAX, lo_y = INT32_MAX, hi_x = 0, hi_y = 0;
-    for (size_t k = begin; k < end; ++k) {
-      const int32_t x = points[k].x2(), y = points[k].y2();
-      lo_x = std::min(lo_x, x);
-      hi_x = std::max(hi_x, x);
-      lo_y = std::min(lo_y, y);
-      hi_y = std::max(hi_y, y);
-      keys.push_back(static_cast<uint32_t>(x) << 14 | static_cast<uint32_t>(y));
-    }
-    const int32_t long_side = std::max(hi_x - lo_x, hi_y - lo_y), short_side = std::min(hi_x - lo_x, hi_y - lo_y);
+  scratch.px.resize(n + 8);
+  scratch.py.resize(n + 8);
+  scratch.pw.resize(n + 8);
+  quadf32::Unpack(points.data() + begin, n, scratch.px.data(), scratch.py.data(), scratch.pw.data());
+  scratch.unpacked_begin = begin;
+  scratch.unpacked_n = n;
+  const quadf32::Points up{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
+  int32_t bounds[4];
+  quadf32::BoundsAndKeys(up, n, bounds, nullptr);
+  {
+    const int32_t long_side = std::max(bounds[1] - bounds[0], bounds[3] - bounds[2]),
+                  short_side = std::min(bounds[1] - bounds[0], bounds[3] - bounds[2]);
     if (long_side < kMinHullExtent || short_side * 5 < long_side * 3) return result;
   }
-  std::sort(keys.begin(), keys.end());
-  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-  for (const uint32_t key : keys) pts.emplace_back(static_cast<int32_t>(key >> 14), static_cast<int32_t>(key & 0x3FFF));
-  if (pts.size() < 8) return result;
+  // Only the lowest and highest point of each column can be a hull vertex.
+  quadf32::ColumnCandidates(up, n, bounds[0], bounds[1], g, pts);
+  if (pts.size() < 8) {
+    // Too few candidates to tell: the sorted unique points.
+    auto &keys = scratch.hull_keys;
+    keys.resize(n);
+    for (size_t i = 0; i < n; ++i) keys[i] = static_cast<uint32_t>(up.x[i]) << 14 | static_cast<uint32_t>(up.y[i]);
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    pts.clear();
+    for (const uint32_t key : keys) pts.emplace_back(static_cast<int32_t>(key >> 14), static_cast<int32_t>(key & 0x3FFF));
+    if (pts.size() < 8) return result;
+  }
 
   // Andrew's monotone chain.
   auto cross = [](const std::pair<int32_t, int32_t> &o, const std::pair<int32_t, int32_t> &a,
@@ -706,36 +670,32 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
     return static_cast<int64_t>(a.first - o.first) * (b.second - o.second) -
            static_cast<int64_t>(a.second - o.second) * (b.first - o.first);
   };
-  hull.assign(2 * pts.size(), {0, 0});
-  hull.resize(geom::MonotoneChain(pts.data(), pts.size(), hull.data(), cross));
-  const size_t m = hull.size();
+  if (hull.size() < 2 * pts.size()) hull.resize(2 * pts.size());
+  const size_t m = geom::MonotoneChain(pts.data(), pts.size(), hull.data(), cross);
   if (m < 4) return result;
 
   // Simplify to a few vertices, anchored at the vertex farthest from the first.
-  size_t far = 0;
-  double far_d = -1;
-  for (size_t i = 1; i < m; ++i) {
-    const double d = std::hypot(static_cast<double>(hull[i].first - hull[0].first),
-                                static_cast<double>(hull[i].second - hull[0].second));
-    if (d > far_d) {
-      far_d = d;
-      far = i;
-    }
-  }
+  g.hx.resize(m + 1);
+  g.hy.resize(m + 1);
+  for (size_t i = 0; i < m; ++i) g.hx[i] = hull[i].first, g.hy[i] = hull[i].second;
+  g.hx[m] = g.hx[0];
+  g.hy[m] = g.hy[0];
+  const size_t far = quadf32::FarVertex(g.hx.data(), g.hy.data(), m);
+  const double far_d = std::hypot(static_cast<double>(g.hx[far] - g.hx[0]), static_cast<double>(g.hy[far] - g.hy[0]));
   const double min_side_x2 = std::max(3.0, config.tag_width / static_cast<double>(config.decimation));
   if (far_d < min_side_x2) return result;
-  std::vector<char> keep(m, 0);
-  keep[0] = 1;
-  keep[far] = 1;
+  g.keep.assign(m, 0);
+  g.keep[0] = 1;
+  g.keep[far] = 1;
   constexpr double kEps = 2.4;  // 1.2 pixels, in the points' half-pixel units
-  SimplifyChain(hull, 0, far, kEps, keep);
-  SimplifyChain(hull, far, m, kEps, keep);
+  quadf32::SimplifyHull(g.hx.data(), g.hy.data(), 0, far, kEps, g.keep.data());
+  quadf32::SimplifyHull(g.hx.data(), g.hy.data(), far, m, kEps, g.keep.data());
   std::array<std::pair<double, double>, 16> v;
   size_t k = 0;
   for (size_t i = 0; i < m; ++i) {
-    if (!keep[i]) continue;
+    if (!g.keep[i]) continue;
     if (k == 10) return result;
-    v[k++] = {static_cast<double>(hull[i].first), static_cast<double>(hull[i].second)};
+    v[k++] = {static_cast<double>(g.hx[i]), static_cast<double>(g.hy[i])};
   }
   if (k < 4) return result;
 
@@ -751,35 +711,8 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
 
   // The four edges, in order, of greatest total length whose neighbours are near-perpendicular and
   // whose intersections lie close to the edges' ends.
-  constexpr double kMaxCos = 0.8, kReach = 0.4;
-  double best_len = 0;
   size_t best[4] = {};
-  auto corner_ok = [&](size_t a, size_t b) {
-    if (std::fabs(ux[a] * ux[b] + uy[a] * uy[b]) > kMaxCos) return false;
-    const auto &pa = v[a], &pb = v[b];
-    double cx, cy;
-    if (!geom::IntersectDirected(pa.first, pa.second, ux[a], uy[a], pb.first, pb.second, ux[b], uy[b], &cx, &cy)) {
-      return false;
-    }
-    const auto &ea = v[(a + 1) % k];
-    return std::hypot(cx - ea.first, cy - ea.second) <= kReach * len[a] &&
-           std::hypot(cx - pb.first, cy - pb.second) <= kReach * len[b];
-  };
-  for (size_t a = 0; a < k; ++a)
-    for (size_t b = a + 1; b < k; ++b) {
-      if (!corner_ok(a, b)) continue;
-      for (size_t c = b + 1; c < k; ++c) {
-        if (!corner_ok(b, c)) continue;
-        for (size_t d = c + 1; d < k; ++d) {
-          if (!corner_ok(c, d) || !corner_ok(d, a)) continue;
-          const double total = len[a] + len[b] + len[c] + len[d];
-          if (total > best_len) {
-            best_len = total;
-            best[0] = a, best[1] = b, best[2] = c, best[3] = d;
-          }
-        }
-      }
-    }
+  const double best_len = quadf32::ChooseEdges(v.data(), k, len.data(), ux.data(), uy.data(), best);
   if (best_len < 0.6 * perimeter) return result;
 
   result.x0 = points[begin].x2();
@@ -800,8 +733,8 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
     result.valid = true;
     return result;
   }
-  std::vector<std::array<float, 2>> near;
-  std::vector<int> hist;
+  auto &near = scratch.hull_near;
+  auto &hist = scratch.hull_hist;
   for (int s = 0; s < 4; ++s) {
     const size_t e = best[s];
     const auto &p0 = v[e];
