@@ -29,6 +29,8 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ### Changed (GPU internals)
 
+- Quad fit: integer point arrays for the corner seeding and a two-stage windowed error on the peaks path (bit-identical; the fit is about a third cheaper on candidate-rich frames on the Pi).
+
 - `WorkerPool::ParallelFor` wakes only as many workers as the batch has items to spare (desktop corpus median -3.7%, Pi neutral).
 
 - `PipelinePlan` resolves every GPU variant choice once from the device, the configuration and the options (`ResolvePlan`, `FinalisePlan`);
