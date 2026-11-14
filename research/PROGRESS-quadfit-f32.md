@@ -48,3 +48,4 @@ Per-stage counters (QFSTAT patch: `qf32_stat3.py` applies, `qf32_unstat3.py` rem
 | fit_ns total | 217.5 | 226.8 (new also pays the unpack, about 23 ms; old reads the points in place) |
 busy-background: old window 19.7, filter 7.8, seg fits 3.3, search 3.9, total 35.8; new window 8.1, filter 5.5, arcs 4.0, merges+fit 6.0, search 1.8, total 30.1.
 Losing stages: merges + batch line fit, arcs, and the unpack. Step 1: kernel A tail in SSE2 (masked lanes, arrays padded by 8) and an SSE2 unpack: arcs 34.4 -> 25.5, total jpeg 226.8 -> 206.2 ms, busy-background 29.1.
+Step 2: forward segments only in the batch (45 cells), closing segments fitted lazily as the integer fit does, batch line fit in SSE2 (bit-equal to LineKernel, unit test demands ==). jpeg new: window 59.3, filter 33.6, arcs 26.2, merges + batch fit 20.7, search (now with the closing fits) 38.1, total 193.0 ms against 217.5 old; busy-background total 26.6 against 35.8.

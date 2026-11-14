@@ -811,9 +811,7 @@ void TestQuadFitF32() {
     qf::Centred c;
     c.W = W[i], c.N = N[i], c.sxx = sxx[i], c.sxy = sxy[i], c.syy = syy[i];
     const qf::LineFit f = qf::FitLine(c);
-    CHECK(std::fabs(f.err - e[i]) <= 1e-5 * std::fabs(e[i]) + 1e-6);
-    CHECK(std::fabs(f.mse - m[i]) <= 1e-5 * std::fabs(m[i]) + 1e-6);
-    CHECK(std::fabs(f.nx - nx[i]) < 1e-5 && std::fabs(f.ny - ny[i]) < 1e-5);
+    CHECK(f.err == e[i] && f.mse == m[i] && f.nx == nx[i] && f.ny == ny[i]);
     CHECK(std::fabs(std::hypot(f.nx, f.ny) - 1.0) < 1e-5);
   }
   {

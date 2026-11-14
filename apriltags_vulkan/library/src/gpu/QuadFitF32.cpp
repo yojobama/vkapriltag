@@ -286,7 +286,35 @@ LineFit FitLine(const Centred &c) {
 void FitLines(const float *VKA_RESTRICT W, const float *VKA_RESTRICT N, const float *VKA_RESTRICT sxx,
               const float *VKA_RESTRICT sxy, const float *VKA_RESTRICT syy, size_t count, float *VKA_RESTRICT err,
               float *VKA_RESTRICT mse, float *VKA_RESTRICT nx, float *VKA_RESTRICT ny) {
-  for (size_t i = 0; i < count; ++i) LineKernel(W[i], N[i], sxx[i], sxy[i], syy[i], err[i], mse[i], nx[i], ny[i]);
+  size_t i = 0;
+#if VKA_HAVE_SSE2
+  // The same operations in the same order as LineKernel, four sets at a time.
+  const __m128 one = _mm_set1_ps(1.0f), four = _mm_set1_ps(4.0f), two = _mm_set1_ps(2.0f), eighth = _mm_set1_ps(0.125f);
+  const __m128 zero = _mm_setzero_ps(), inf = _mm_set1_ps(std::numeric_limits<float>::infinity());
+  for (; i + 4 <= count; i += 4) {
+    const __m128 w = _mm_loadu_ps(W + i), n = _mm_loadu_ps(N + i);
+    const __m128 inv = _mm_div_ps(one, w);
+    const __m128 vxx = _mm_mul_ps(_mm_loadu_ps(sxx + i), inv), vxy = _mm_mul_ps(_mm_loadu_ps(sxy + i), inv);
+    const __m128 vyy = _mm_mul_ps(_mm_loadu_ps(syy + i), inv);
+    const __m128 diff = _mm_sub_ps(vxx, vyy), sum = _mm_add_ps(vxx, vyy);
+    const __m128 hyp = _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(diff, diff), _mm_mul_ps(_mm_mul_ps(four, vxy), vxy)));
+    const __m128 eig = _mm_mul_ps(_mm_sub_ps(sum, hyp), eighth);
+    const __m128 nx1 = _mm_sub_ps(diff, hyp), ny1 = _mm_mul_ps(two, vxy);
+    const __m128 nx2 = _mm_mul_ps(two, vxy), ny2 = _mm_sub_ps(_mm_sub_ps(zero, diff), hyp);
+    const __m128 m1 = _mm_add_ps(_mm_mul_ps(nx1, nx1), _mm_mul_ps(ny1, ny1));
+    const __m128 m2 = _mm_add_ps(_mm_mul_ps(nx2, nx2), _mm_mul_ps(ny2, ny2));
+    const __m128 first = _mm_cmpgt_ps(m1, m2);
+    const __m128 ax = _mm_or_ps(_mm_and_ps(first, nx1), _mm_andnot_ps(first, nx2));
+    const __m128 ay = _mm_or_ps(_mm_and_ps(first, ny1), _mm_andnot_ps(first, ny2));
+    const __m128 length = _mm_sqrt_ps(_mm_add_ps(_mm_mul_ps(ax, ax), _mm_mul_ps(ay, ay)));
+    _mm_storeu_ps(nx + i, _mm_div_ps(ax, length));
+    _mm_storeu_ps(ny + i, _mm_div_ps(ay, length));
+    _mm_storeu_ps(err + i, _mm_mul_ps(n, eig));
+    const __m128 positive = _mm_cmpgt_ps(w, zero);
+    _mm_storeu_ps(mse + i, _mm_or_ps(_mm_and_ps(positive, eig), _mm_andnot_ps(positive, inf)));
+  }
+#endif
+  for (; i < count; ++i) LineKernel(W[i], N[i], sxx[i], sxy[i], syy[i], err[i], mse[i], nx[i], ny[i]);
 }
 
 void LineParams(const Centred &c, int32_t blob_x0, int32_t blob_y0, double out[4]) {
@@ -472,11 +500,13 @@ bool FitPeaks(const DetectorConfig &config, const Points &p, size_t n, Scratch &
     pt[j] = SinglePoint(static_cast<float>(p.x[pk[j]] - x0), static_cast<float>(p.y[pk[j]] - y0),
                         static_cast<float>(p.w[pk[j]]));
   }
-  constexpr size_t kCells = kNMaxima * kNMaxima;
-  float sW[kCells] = {}, sN[kCells] = {}, sxx[kCells] = {}, sxy[kCells] = {}, syy[kCells] = {};
-  float smx[kCells] = {}, smy[kCells] = {};
+  constexpr size_t kCells = kNMaxima * (kNMaxima - 1) / 2;
+  float sW[kCells], sN[kCells], sxx[kCells], sxy[kCells], syy[kCells];
+  float smx[kCells], smy[kCells];
   float err[kCells], mse[kCells], nx[kCells], ny[kCells];
-  const size_t cells = K * K;
+  const size_t cells = K * (K - 1) / 2;
+  // Forward segments (a, b), a < b, in row order.
+  auto fwd = [K](size_t a, size_t b) { return a * K - a * (a + 1) / 2 + (b - a - 1); };
   auto put = [&](size_t cell, const Centred &c) {
     sW[cell] = c.W;
     sN[cell] = c.N;
@@ -497,10 +527,10 @@ bool FitPeaks(const DetectorConfig &config, const Points &p, size_t n, Scratch &
     c.syy = syy[cell];
     return c;
   };
-  for (size_t a = 0; a < K; ++a) {
+  for (size_t a = 0; a + 1 < K; ++a) {
     Centred run = arc[a];
     for (size_t b = a + 1; b < K; ++b) {
-      put(a * K + b, Merge(run, pt[b]));
+      put(fwd(a, b), Merge(run, pt[b]));
       run = Merge(run, arc[b]);
     }
   }
@@ -509,31 +539,44 @@ bool FitPeaks(const DetectorConfig &config, const Points &p, size_t n, Scratch &
   for (size_t b = K - 1; b-- > 1;) tail[b] = Merge(arc[b], tail[b + 1]);
   head[1] = arc[0];
   for (size_t a = 2; a < K; ++a) head[a] = Merge(head[a - 1], arc[a - 1]);
-  for (size_t b = 1; b < K; ++b) {
-    for (size_t a = 0; a < b; ++a) {
-      const Centred joined = a == 0 ? tail[b] : Merge(tail[b], head[a]);
-      put(b * K + a, Merge(joined, pt[a]));
-    }
-  }
-  for (size_t d = 0; d < K; ++d) sW[d * K + d] = 1.0f, sN[d * K + d] = 1.0f;
   FitLines(sW, sN, sxx, sxy, syy, cells, err, mse, nx, ny);
+  // The closing segment (b, a), b > a, from the arcs b.. and ..a plus the end point; fitted when first reached.
+  auto closing_set = [&](size_t b, size_t a) {
+    const Centred joined = a == 0 ? tail[b] : Merge(tail[b], head[a]);
+    return Merge(joined, pt[a]);
+  };
+  float cerr[kNMaxima][kNMaxima], cmse[kNMaxima][kNMaxima];
+  bool cdone[kNMaxima][kNMaxima] = {};
+  auto closing = [&](size_t b, size_t a) {
+    if (!cdone[b][a]) {
+      cdone[b][a] = true;
+      const LineFit f = FitLine(closing_set(b, a));
+      cerr[b][a] = f.err;
+      cmse[b][a] = f.mse;
+    }
+  };
 
   const float max_mse = config.max_line_fit_mse;
   float best_error = std::numeric_limits<float>::max();
   size_t best[4] = {0, 0, 0, 0};
   for (size_t m0 = 0; m0 + 3 < K; ++m0) {
     for (size_t m1 = m0 + 1; m1 + 2 < K; ++m1) {
-      if (mse[m0 * K + m1] > max_mse) continue;
-      const float e01 = err[m0 * K + m1];
-      const float n01x = nx[m0 * K + m1], n01y = ny[m0 * K + m1];
+      const size_t c01 = fwd(m0, m1);
+      if (mse[c01] > max_mse) continue;
+      const float e01 = err[c01];
+      const float n01x = nx[c01], n01y = ny[c01];
       for (size_t m2 = m1 + 1; m2 + 1 < K; ++m2) {
-        if (mse[m1 * K + m2] > max_mse) continue;
-        const float e12 = err[m1 * K + m2];
-        const double dot = static_cast<double>(n01x) * nx[m1 * K + m2] + static_cast<double>(n01y) * ny[m1 * K + m2];
+        const size_t c12 = fwd(m1, m2);
+        if (mse[c12] > max_mse) continue;
+        const float e12 = err[c12];
+        const double dot = static_cast<double>(n01x) * nx[c12] + static_cast<double>(n01y) * ny[c12];
         if (std::fabs(dot) > config.cos_critical_rad) continue;
         for (size_t m3 = m2 + 1; m3 < K; ++m3) {
-          if (mse[m2 * K + m3] > max_mse || mse[m3 * K + m0] > max_mse) continue;
-          const float total = e01 + e12 + err[m2 * K + m3] + err[m3 * K + m0];
+          const size_t c23 = fwd(m2, m3);
+          if (mse[c23] > max_mse) continue;
+          closing(m3, m0);
+          if (cmse[m3][m0] > max_mse) continue;
+          const float total = e01 + e12 + err[c23] + cerr[m3][m0];
           if (total < best_error) {
             best_error = total;
             best[0] = m0, best[1] = m1, best[2] = m2, best[3] = m3;
@@ -547,7 +590,8 @@ bool FitPeaks(const DetectorConfig &config, const Points &p, size_t n, Scratch &
 
   for (int j = 0; j < 4; ++j) {
     indices[j] = pk[best[j]];
-    out->side[j] = get(best[j] * K + best[(j + 1) % 4]);
+    const size_t from = best[j], to = best[(j + 1) % 4];
+    out->side[j] = from < to ? get(fwd(from, to)) : closing_set(from, to);
   }
   return true;
 }
