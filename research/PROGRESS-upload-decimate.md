@@ -76,3 +76,7 @@ Build dirs: `$A/build-upload-decimate` (branch), `$A/build-upload-decimate-base`
   Pi micro-benchmark (`decbench`, g++ -O2, hot cache) us, memcpy / d2 box / d2 copy / d4 box / d4 copy: 640x480 9.9 / 12.6 / 5.7 / 14.0 / 18.2;
   1280x720 44.3 / 49.7 / 35.6 / 47.2 / 56.2; 1920x1080 122 / 146 / 98 / 125 / 141; d3 box at 1080p 3,043 us (too slow: not vectorised).
   Decision: `want_cpu_decimate` only for decimation 2 and 4; other decimations keep the GPU path (kernels remain correct for them, tested by `unit_decimate`).
+- 10. Desktop with `VK_EVAL_GAP_MS=16` (one interleaved round, `ab.sh`): base total median 0.494 (gpu 0.331), new 0.550 (gpu 0.370): 640x480 0.421 -> 0.475,
+  1280x720 0.523 -> 0.556, 1920x1080 0.699 -> 0.735; mean 0.612 -> 0.601. A loss in the median at 16 ms gaps (the GPU and the CPU clock down between frames;
+  the mapped write over PCIe and the cold source frame cost more then). Two more rounds queued (`ud-ab16b`). The Pi was unreachable
+  (connection timed out) from this point: the Pi gap run, the Pi ctest of the d2/d4 restriction and the Pi sequences were not run.
