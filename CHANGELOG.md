@@ -9,6 +9,7 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ## Unreleased
 
+- **Quad fit in float32** (`APRILTAG_VK_QUADFIT_F32`, default on; `0` restores the integer fit): the four sides are fitted from centred moments summed in eight fixed float lanes, so the compilers vectorise the sums; the corners differ from the integer fit by 0.002 px at the 99th percentile and the corpus scores are unchanged. The fit stage is 24 to 31% cheaper on the desktop (MSVC; SSE2 kernels on x86-64, portable lanes elsewhere); frame times are unchanged within noise. The hull fit stays on integers.
 - **CPU decimation while uploading** (decimation 2 and 4): the host writes the decimated image into a mapped buffer (NEON / SSE2 kernels), so the
   full-frame copy and the GPU decimate dispatch are gone; detections are bit-identical. `APRILTAG_VK_CPU_DECIMATE=0` restores the GPU decimation.
 

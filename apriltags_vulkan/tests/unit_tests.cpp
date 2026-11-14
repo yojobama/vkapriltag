@@ -1,5 +1,5 @@
 // CPU-only unit tests of the pure helpers and the CPU stages; no Vulkan device is used.
-// usage: unit_tests [decode|geometry|geom|edges|quadfit|options|steps|pool]   (no argument runs all)
+// usage: unit_tests [decode|geometry|geom|edges|quadfit|quadfit32|options|steps|pool]   (no argument runs all)
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -672,6 +672,160 @@ void TestQuadFit() {
   }
 }
 
+// ---------------------------------------------------------------- float32 quad fit kernels
+
+namespace qf = apriltag_vulkan::quadf32;
+
+struct RefSet {
+  double W = 0, N = 0, mx = 0, my = 0, sxx = 0, sxy = 0, syy = 0;
+};
+
+// Central moments of the listed points, in double, with the mean as an offset from (x0, y0).
+RefSet RefMoments(const std::vector<int32_t> &x, const std::vector<int32_t> &y, const std::vector<int32_t> &w,
+                  const std::vector<size_t> &idx, int32_t x0, int32_t y0) {
+  RefSet r;
+  for (size_t i : idx) {
+    r.W += w[i];
+    r.mx += double(w[i]) * (x[i] - x0);
+    r.my += double(w[i]) * (y[i] - y0);
+  }
+  r.N = double(idx.size());
+  r.mx /= r.W;
+  r.my /= r.W;
+  for (size_t i : idx) {
+    const double dx = (x[i] - x0) - r.mx, dy = (y[i] - y0) - r.my;
+    r.sxx += w[i] * dx * dx;
+    r.sxy += w[i] * dx * dy;
+    r.syy += w[i] * dy * dy;
+  }
+  return r;
+}
+
+// The error of a reference set's line fit, as the integer code defines it: N * smaller eigenvalue / (8 W).
+double RefLineError(const RefSet &r) {
+  const double a = r.sxx / r.W, b = r.sxy / r.W, c = r.syy / r.W;
+  return r.N * ((a + c) - std::hypot(a - c, 2 * b)) / 8.0;
+}
+
+// Whether a float set matches the reference to the accuracy the fit needs.
+bool SameSet(const qf::Centred &c, const RefSet &r) {
+  const double scale = r.sxx + r.syy + 1.0;
+  return c.W == float(r.W) && c.N == float(r.N) && std::fabs(c.mx - r.mx) < 2e-3 && std::fabs(c.my - r.my) < 2e-3 &&
+         std::fabs(c.sxx - r.sxx) < 2e-6 * scale && std::fabs(c.sxy - r.sxy) < 2e-6 * scale &&
+         std::fabs(c.syy - r.syy) < 2e-6 * scale;
+}
+
+void TestQuadFitF32() {
+  std::mt19937 rng(7);
+  // Origins: near the corner of the image, and far out where the coordinates approach 16383.
+  for (const int32_t base : {0, 2000, 16000}) {
+    for (const size_t n : {5u, 8u, 9u, 37u, 200u, 1500u}) {
+      std::vector<int32_t> x(n + 8), y(n + 8), w(n + 8);
+      for (size_t i = 0; i < n; ++i) {
+        const double t = 2 * kPi * double(i) / double(n);
+        x[i] = base + 100 + int32_t(90 * std::cos(t)) + int32_t(rng() % 3);
+        y[i] = base + 120 + int32_t(60 * std::sin(t)) + int32_t(rng() % 3);
+        w[i] = 1 + int32_t(rng() % 1023);
+      }
+      const qf::Points p{x.data(), y.data(), w.data()};
+      const int32_t x0 = x[0], y0 = y[0];
+      const size_t ranges[][2] = {{0, n - 1}, {n / 4, n / 2}, {n / 2, n / 4}, {n - 1, 1}, {n / 3, n / 3 + 1}};
+      for (const auto &rg : ranges) {
+        if (rg[0] == rg[1]) continue;
+        std::vector<size_t> idx;
+        if (rg[0] < rg[1]) {
+          for (size_t i = rg[0]; i <= rg[1]; ++i) idx.push_back(i);
+        } else {
+          for (size_t i = rg[0]; i < n; ++i) idx.push_back(i);
+          for (size_t i = 0; i <= rg[1]; ++i) idx.push_back(i);
+        }
+        const qf::Centred c = qf::RangeMoments(p, n, rg[0], rg[1], x0, y0);
+        CHECK(SameSet(c, RefMoments(x, y, w, idx, x0, y0)));
+        const qf::Centred sc = rg[0] < rg[1] ? qf::SegmentMomentsScalar(p, rg[0], rg[1] + 1, 0, 0, x0, y0)
+                                             : qf::SegmentMomentsScalar(p, rg[0], n, 0, rg[1] + 1, x0, y0);
+        CHECK(std::memcmp(&c, &sc, sizeof c) == 0);
+      }
+
+      // A merge of two halves equals the whole.
+      if (n >= 8) {
+        const size_t cut = n / 2;
+        std::vector<size_t> all(n);
+        for (size_t i = 0; i < n; ++i) all[i] = i;
+        const qf::Centred a = qf::SegmentMoments(p, 0, cut, 0, 0, x0, y0);
+        const qf::Centred b = qf::SegmentMoments(p, cut, n, 0, 0, x0, y0);
+        CHECK(SameSet(qf::Merge(a, b), RefMoments(x, y, w, all, x0, y0)));
+        CHECK(SameSet(qf::SegmentMoments(p, 0, cut / 2, cut, n, x0, y0),
+                      [&] {
+                        std::vector<size_t> v;
+                        for (size_t i = 0; i < cut / 2; ++i) v.push_back(i);
+                        for (size_t i = cut; i < n; ++i) v.push_back(i);
+                        return RefMoments(x, y, w, v, x0, y0);
+                      }()));
+        // Adding a single point to a set.
+        const size_t last = n - 1;
+        std::vector<size_t> v;
+        for (size_t i = 0; i < last; ++i) v.push_back(i);
+        v.push_back(last);
+        const qf::Centred one = qf::SinglePoint(float(x[last] - x0), float(y[last] - y0), float(w[last]));
+        CHECK(SameSet(qf::Merge(qf::SegmentMoments(p, 0, last, 0, 0, x0, y0), one), RefMoments(x, y, w, v, x0, y0)));
+      }
+
+      // The windowed error against a direct evaluation of every window.
+      const size_t k = std::min<size_t>(20, n / 12);
+      if (k >= 1 && n > 2 * k + 1) {
+        std::vector<float> err(n);
+        qf::WindowErrors(p, n, k, err.data());
+        double worst = 0;
+        for (size_t i = 0; i < n; ++i) {
+          std::vector<size_t> idx;
+          for (size_t j = 0; j <= 2 * k; ++j) idx.push_back((i + n - k + j) % n);
+          const double ref = RefLineError(RefMoments(x, y, w, idx, x[idx[0]], y[idx[0]]));
+          worst = std::max(worst, std::fabs(err[i] - ref) / (1.0 + ref));
+        }
+        CHECK(worst < 2e-3);
+        if (worst >= 2e-3) std::printf("  window error: base %d n %zu worst relative difference %g\n", base, n, worst);
+      }
+    }
+  }
+
+  // Unpacking equals the accessors.
+  for (const size_t n : {1u, 3u, 4u, 7u, 100u}) {
+    std::vector<av::RawLineFitPoint> raw(n);
+    for (auto &r : raw) r.xy2 = uint32_t(rng()) & 0x0FFFFFFFu, r.w_blob = uint32_t(rng());
+    std::vector<int32_t> ux(n), uy(n), uw(n);
+    qf::Unpack(raw.data(), n, ux.data(), uy.data(), uw.data());
+    for (size_t i = 0; i < n; ++i) CHECK(ux[i] == raw[i].x2() && uy[i] == raw[i].y2() && uw[i] == raw[i].W());
+  }
+
+  // The batch line fit equals the single fit, and finds the line of a straight run of points.
+  std::vector<float> W(37), N(37), sxx(37), sxy(37), syy(37), e(37), m(37), nx(37), ny(37);
+  for (size_t i = 0; i < 37; ++i) {
+    W[i] = 100.0f + float(i);
+    N[i] = 10.0f + float(i);
+    sxx[i] = 1e4f * float(1 + i % 5);
+    sxy[i] = 300.0f * float(int(i % 7) - 3);
+    syy[i] = 20.0f + float(i);
+  }
+  qf::FitLines(W.data(), N.data(), sxx.data(), sxy.data(), syy.data(), 37, e.data(), m.data(), nx.data(), ny.data());
+  for (size_t i = 0; i < 37; ++i) {
+    qf::Centred c;
+    c.W = W[i], c.N = N[i], c.sxx = sxx[i], c.sxy = sxy[i], c.syy = syy[i];
+    const qf::LineFit f = qf::FitLine(c);
+    CHECK(f.err == e[i] && f.mse == m[i] && f.nx == nx[i] && f.ny == ny[i]);
+    CHECK(std::fabs(std::hypot(f.nx, f.ny) - 1.0) < 1e-5);
+  }
+  {
+    std::vector<int32_t> x, y, w;
+    for (int i = 0; i < 60; ++i) x.push_back(16000 + 2 * i), y.push_back(16000 + i), w.push_back(500);
+    const size_t run = x.size();
+    x.resize(run + 8), y.resize(run + 8), w.resize(run + 8);
+    const qf::Points p{x.data(), y.data(), w.data()};
+    const qf::LineFit f = qf::FitLine(qf::RangeMoments(p, run, 0, run - 1, x[0], y[0]));
+    CHECK(f.mse < 1e-3f);
+    CHECK(std::fabs(f.nx * 2 + f.ny) < 1e-3);
+  }
+}
+
 // ---------------------------------------------------------------- options registry
 
 void SetEnv(const char *name, const char *value) {
@@ -1155,6 +1309,7 @@ int main(int argc, char **argv) {
   if (all || !std::strcmp(which, "geom")) TestGeom(), ran = true;
   if (all || !std::strcmp(which, "edges")) TestEdges(), ran = true;
   if (all || !std::strcmp(which, "quadfit")) TestQuadFit(), ran = true;
+  if (all || !std::strcmp(which, "quadfit32")) TestQuadFitF32(), ran = true;
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;
   if (all || !std::strcmp(which, "steps")) TestSteps(), ran = true;
   if (all || !std::strcmp(which, "pool")) TestPool(), ran = true;
