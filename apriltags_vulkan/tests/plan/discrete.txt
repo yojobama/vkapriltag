@@ -11,6 +11,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -43,6 +44,7 @@ box_decimate 0
 box_dot 0
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 0
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -75,6 +77,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -107,6 +110,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -139,6 +143,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -171,6 +176,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -203,6 +209,7 @@ box_decimate 1
 box_dot 0
 threshold_block 0
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 0
 floor_scale_tenths 20
 uf_verify 0
@@ -235,6 +242,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -266,7 +274,41 @@ alias_decimated 0
 box_decimate 0
 box_dot 0
 threshold_block 1
-minmax_decimate 1
+minmax_decimate 0
+cpu_decimate 1
+adaptive_floor 1
+floor_scale_tenths 20
+uf_verify 0
+predicated_compress 1
+uf_init_scan 1
+count_runs 0
+sparse 0
+merge_flag_mode 0
+merge_x4 0
+merge_band 8
+subgroup 1
+extents_atomic64 0
+reduce_x4 0
+gray_direct_write 1
+linefit_direct_read 1
+extents_direct_read 1
+fused_submits 1
+prerecord 1
+lean_tail 0
+# cpu_decimate_off
+wg1d 256
+wg2d 16x16
+scan_wg 1024
+local_sort_cap 1024
+local_sort_split 1024
+sort_rank_all 256
+u8 1
+alias_decimated 0
+box_decimate 1
+box_dot 1
+threshold_block 1
+minmax_decimate 0
+cpu_decimate 0
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -299,6 +341,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 0
 floor_scale_tenths 0
 uf_verify 0
@@ -331,6 +374,7 @@ box_decimate 1
 box_dot 1
 threshold_block 0
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 0
 floor_scale_tenths 20
 uf_verify 0
@@ -363,6 +407,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -395,6 +440,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 1
@@ -427,6 +473,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -459,6 +506,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -491,6 +539,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -523,6 +572,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -555,6 +605,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -587,6 +638,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -619,6 +671,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -651,6 +704,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -683,6 +737,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0
@@ -715,6 +770,7 @@ box_decimate 1
 box_dot 1
 threshold_block 1
 minmax_decimate 0
+cpu_decimate 1
 adaptive_floor 1
 floor_scale_tenths 20
 uf_verify 0

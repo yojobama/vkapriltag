@@ -83,7 +83,9 @@ PipelinePlan ResolvePlan(const vk::DeviceCaps &caps, const DetectorConfig &confi
   // One thread per 4x4 block; the adaptive contrast floor is set per frame on the device and needs it.
   p.threshold_block =
       p.u8 && !(env.Has("APRILTAG_VK_FUSED_THRESHOLD") && !env.Bool("APRILTAG_VK_FUSED_THRESHOLD", true));
-  p.minmax_decimate = p.threshold_block && !p.alias_decimated && !p.box_decimate;
+  // The host decimates into a mapped decimated buffer; FinalisePlan confirms it once the buffer exists.
+  p.want_cpu_decimate = (config.decimation == 2 || config.decimation == 4) && env.Bool("APRILTAG_VK_CPU_DECIMATE", true);
+  p.minmax_decimate = p.threshold_block && !p.alias_decimated && !p.box_decimate && !p.want_cpu_decimate;
   const double floor_scale = env.Float("APRILTAG_VK_ADAPTIVE_FLOOR", config.adaptive_floor_scale);
   p.floor_scale_tenths = static_cast<uint32_t>(std::max(0.0, floor_scale * 10.0 + 0.5));
   p.adaptive_floor = p.threshold_block && p.floor_scale_tenths > 0;
@@ -129,6 +131,10 @@ void FinalisePlan(PipelinePlan &plan, const vk::DeviceCaps &caps, const Options 
   plan.linefit_direct_read = outcome.linefit_direct_read;
   plan.extents_direct_read = outcome.extents_direct_read;
 
+  // Not with the transfer-queue upload, which keeps the staged full frame.
+  plan.cpu_decimate = plan.want_cpu_decimate && outcome.decimated_direct_write && !has_transfer_lane;
+  plan.minmax_decimate = plan.threshold_block && !plan.alias_decimated && !plan.box_decimate && !plan.cpu_decimate;
+
   // With both readbacks in place, the last three submissions record as one.
   plan.fused_submits = outcome.linefit_direct_read && outcome.extents_direct_read;
   if (env.Has("APRILTAG_VK_FUSE_SUBMITS")) {
@@ -164,6 +170,7 @@ std::string PipelinePlan::Describe() const {
   line("box_dot", box_dot);
   line("threshold_block", threshold_block);
   line("minmax_decimate", minmax_decimate);
+  line("cpu_decimate", cpu_decimate);
   line("adaptive_floor", adaptive_floor);
   line("floor_scale_tenths", floor_scale_tenths);
   line("uf_verify", uf_verify);

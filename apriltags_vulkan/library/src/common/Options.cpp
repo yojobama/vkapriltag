@@ -118,6 +118,8 @@ const OptionDescriptor kTable[] = {
      "Run a second merge that checks the labelling converged, with a retry path."},
     {"APRILTAG_VK_PRERECORD", T::kBool, "on when fused without a transfer lane", C::kTuning, P::kDisableOnly, "",
      "Replay pre-recorded command buffers; 0 records every frame."},
+    {"APRILTAG_VK_CPU_DECIMATE", T::kBool, "on where the decimated buffer is mapped", C::kTuning, P::kDisableOnly, "",
+     "Decimate on the CPU while uploading, instead of uploading the frame and decimating on the GPU; 0 keeps the GPU decimation."},
     {"APRILTAG_VK_DOT", T::kBool, "on where supported", C::kTuning, P::kDisableOnly, "",
      "Integer dot product box decimation; 0 uses the plain shader."},
     {"APRILTAG_VK_FUSED_THRESHOLD", T::kBool, "on with 8-bit storage", C::kTuning, P::kDisableOnly, "",

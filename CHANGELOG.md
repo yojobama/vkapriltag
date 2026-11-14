@@ -9,6 +9,9 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ## Unreleased
 
+- **CPU decimation while uploading** (decimation 2 and 4): the host writes the decimated image into a mapped buffer (NEON / SSE2 kernels), so the
+  full-frame copy and the GPU decimate dispatch are gone; detections are bit-identical. `APRILTAG_VK_CPU_DECIMATE=0` restores the GPU decimation.
+
 ### Breaking: version 2.0.0, one public `Detector`
 
 - **`vkapriltag/Detector.h` is the public interface.** One `Detector` owns the device, the GPU stages, the CPU tail, the worker pool and

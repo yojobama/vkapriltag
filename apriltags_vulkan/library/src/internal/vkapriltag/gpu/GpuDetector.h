@@ -191,6 +191,7 @@ class GpuDetector {
   // Detect() without its cleanup; after a throw, DropPendingWait() consumes a signalled upload
   // semaphore so the next frame's copy can signal it again.
   void DetectFrame(const uint8_t *gray_frame);
+  void UploadDecimated(const uint8_t *gray_frame);
   void DropPendingWait() noexcept;
 
   // Grows the readback staging buffer if needed (never shrinks, so steady

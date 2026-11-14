@@ -1,6 +1,7 @@
 #include "vkapriltag/gpu/GpuDetector.h"
 
 #include "vkapriltag/common/Profiler.h"
+#include "vkapriltag/gpu/CpuDecimate.h"
 #include "vkapriltag/vk/EmbeddedShaders.h"
 
 #include <algorithm>
@@ -294,8 +295,14 @@ void GpuDetector::CreateBuffers() {
   // 1 byte per pixel with storageBuffer8BitAccess, else 4. decimated_buf_ and thresholded_buf_ share
   // the setting.
   const VkDeviceSize decimated_bytes_per_pixel = ctx_.caps().has_8bit_storage ? 1 : 4;
-  decimated_buf_ =
-      ssbo(VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel);
+  const VkDeviceSize decimated_bytes = VkDeviceSize(decimated_width_) * decimated_height_ * decimated_bytes_per_pixel;
+  if (plan_.want_cpu_decimate) {
+    decimated_buf_ = vk::Buffer(ctx_, std::max<VkDeviceSize>(decimated_bytes, 4), kSsboUsage,
+                                vk::MemoryKind::DeviceLocalMapped);
+    device_bytes_ += decimated_buf_.size();
+  } else {
+    decimated_buf_ = ssbo(decimated_bytes);
+  }
   minmax_unfiltered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   minmax_filtered_buf_ = ssbo(VkDeviceSize(block_width_) * block_height_ * 4);
   contrast_floor_buf_ = ssbo(16);
@@ -350,7 +357,8 @@ void GpuDetector::CreateBuffers() {
   plan_.linefit_direct_read = line_fit_points_buf_.host_visible() && line_fit_points_buf_.host_cached();
 
   FinalisePlan(plan_, ctx_.caps(), env_, transfer_lane_ != nullptr,
-               BufferOutcome{plan_.gray_direct_write, plan_.linefit_direct_read, plan_.extents_direct_read});
+               BufferOutcome{plan_.gray_direct_write, plan_.linefit_direct_read, plan_.extents_direct_read,
+                             decimated_buf_.host_visible() && decimated_buf_.coherent()});
 
   // Open-addressing table for the (rep0, rep1) grouping, sized to max_raw_blobs; hash_group.comp
   // drops points beyond its probe cap.
@@ -635,7 +643,7 @@ void GpuDetector::RecordThreshold(VkCommandBuffer cmd, const ImportedFrame *impo
   } else if (plan_.minmax_decimate) {
     Pl(Stage::kBlockMinmaxDecimate).Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
   } else {
-    if (!plan_.alias_decimated) {
+    if (!plan_.alias_decimated && !plan_.cpu_decimate) {
       Pl(Stage::kDecimate).Dispatch2D(cmd, decimated_width_, decimated_height_, &dims_pc);
     }
     Pl(Stage::kBlockMinmax).Dispatch2D(cmd, block_width_, block_height_, &minmax_pc);
@@ -676,7 +684,7 @@ void GpuDetector::RecordFrameHead(VkCommandBuffer cmd, const ImportedFrame *impo
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
   if (ctx_.caps().timestamps_supported) vk::DispatchProbe::Begin(cmd, ctx_.device(), this);
-  if (!plan_.gray_direct_write && imported == nullptr && transfer_lane_ == nullptr) {
+  if (!plan_.gray_direct_write && !plan_.cpu_decimate && imported == nullptr && transfer_lane_ == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanClear));
@@ -1106,6 +1114,11 @@ void GpuDetector::DropPendingWait() noexcept {
   }
 }
 
+void GpuDetector::UploadDecimated(const uint8_t *gray_frame) {
+  CpuDecimate(gray_frame, config_.width, config_.height, config_.decimation, plan_.box_decimate, !plan_.u8,
+              decimated_buf_.mapped());
+}
+
 void GpuDetector::DetectFrame(const uint8_t *gray_frame) {
   if (!plan_.fused_submits) {
     DetectUnfused(gray_frame);
@@ -1128,6 +1141,8 @@ void GpuDetector::DetectFrame(const uint8_t *gray_frame) {
   }
   if (frame.imported != nullptr) {
     // Imported: the GPU reads the caller's buffer directly.
+  } else if (plan_.cpu_decimate) {
+    UploadDecimated(gray_frame);
   } else if (plan_.gray_direct_write) {
     gray_buf_.Write(gray_frame, frame.gray_bytes);
   } else {
@@ -1335,6 +1350,8 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
     if (f.key == gray_frame) imported = &f;
   }
   if (imported != nullptr) {
+  } else if (plan_.cpu_decimate) {
+    UploadDecimated(gray_frame);
   } else if (plan_.gray_direct_write) {
     gray_buf_.Write(gray_frame, gray_bytes);
   } else {
@@ -1361,7 +1378,7 @@ void GpuDetector::DetectUnfused(const uint8_t *gray_frame) {
   // One reset covers every span's timestamp pair for the frame (see vk::QueryPool).
   timestamp_pool_.Reset(cmd);
   if (ctx_.caps().timestamps_supported) vk::DispatchProbe::Begin(cmd, ctx_.device(), this);
-  if (!plan_.gray_direct_write && imported == nullptr && transfer_lane_ == nullptr) {
+  if (!plan_.gray_direct_write && !plan_.cpu_decimate && imported == nullptr && transfer_lane_ == nullptr) {
     gray_buf_.RecordCopyFrom(cmd, upload_staging_, gray_bytes);
   }
   timestamp_pool_.WriteTimestamp(cmd, SpanStart(kSpanClear));
@@ -1625,7 +1642,9 @@ std::string GpuDetector::DescribeSizing() const {
   }
   os << ", blob capacity " << config_.max_blobs;
   os << ", device memory " << (device_bytes_ / (1024 * 1024)) << " MiB";
-  os << ", gray upload " << (plan_.gray_direct_write ? "direct (mapped device memory)" : "staged");
+  os << ", gray upload "
+     << (plan_.cpu_decimate ? "decimated on the CPU into mapped device memory"
+         : plan_.gray_direct_write ? "direct (mapped device memory)" : "staged");
   // Whether the line-fit readback avoided its copies depends on a host-cached memory type.
   os << ", linefit readback " << (plan_.linefit_direct_read ? "direct (host-cached)" : "staged");
   os << ", uf_compress skip "

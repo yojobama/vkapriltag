@@ -93,6 +93,7 @@ Pi is the Orange Pi 5 / 5 Plus (Mali-G610).
 | dma-buf import + `decimate_yuyv` | opt-in (API) | | `Detect()` 2.79->2.60 ms; UVC buffers need a `dc civac` flush (0.03-0.17 ms) | P §8d | none |
 | Transfer-only queue upload | opt-in | `ContextOptions::use_transfer_family` | +8% / +28% at 4 / 8 streams, -10% for one stream | P §8d | none |
 | Frames written into mappable device memory (discrete) | default | `GRAY_MAPPED` removed in 2026-11 | 4 streams +13 to +32%; removes a 38 us copy per frame | P §8u, `PR del-switches` | none |
+| CPU decimation while uploading | default (decimation 2 or 4, mapped coherent decimated buffer, no transfer lane) | `CpuDecimate` writes the decimated image straight into a mapped buffer: no full-frame upload, no decimate dispatch; `CPU_DECIMATE=0` | desktop corpus total -10% (1080p -21%), Pi -5.5% (720p -9%), output byte-identical | `PR upload-decimate` | `CPU_DECIMATE` |
 | Decimation 1 reads the grey buffer in place | default | `DEC1_ALIAS` removed in 2026-11 | Pi -2.6% | P §8q, `PR del-switches` | none |
 | Batching cameras into a mosaic | removed | | one stream 1.7x (RX), 1.27x (Mali); "concurrent streams already reach the same saturation" | P §8d | multi-stream lanes |
 | Hardware JPEG decode into a dma-buf | bounded | | open | P §8 (old) | none |

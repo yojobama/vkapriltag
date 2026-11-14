@@ -130,6 +130,7 @@ variables with no configuration field are environment only. For the reasoning be
 | `APRILTAG_VK_FUSE_SUBMITS` | bool | on when the readbacks are direct |  | environment can only disable | Record the last three submissions of a frame as one; 0 keeps the unfused flow. |
 | `APRILTAG_VK_UF_VERIFY` | bool | off |  | environment only | Run a second merge that checks the labelling converged, with a retry path. |
 | `APRILTAG_VK_PRERECORD` | bool | on when fused without a transfer lane |  | environment can only disable | Replay pre-recorded command buffers; 0 records every frame. |
+| `APRILTAG_VK_CPU_DECIMATE` | bool | on where the decimated buffer is mapped |  | environment can only disable | Decimate on the CPU while uploading, instead of uploading the frame and decimating on the GPU; 0 keeps the GPU decimation. |
 | `APRILTAG_VK_DOT` | bool | on where supported |  | environment can only disable | Integer dot product box decimation; 0 uses the plain shader. |
 | `APRILTAG_VK_FUSED_THRESHOLD` | bool | on with 8-bit storage |  | environment can only disable | Fused block min/max and threshold; 0 keeps the separate passes. |
 | `APRILTAG_VK_UF_INIT_SCAN` | bool | on where supported |  | environment can only disable | Initialise the labelling with a workgroup scan; 0 uses uf_init and a compression. |

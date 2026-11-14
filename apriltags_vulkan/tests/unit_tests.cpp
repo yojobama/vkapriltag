@@ -24,6 +24,7 @@
 #include "vkapriltag/Family.h"
 #include "vkapriltag/common/Options.h"
 #include "vkapriltag/common/WorkerPool.h"
+#include "vkapriltag/gpu/CpuDecimate.h"
 #include "vkapriltag/gpu/PipelinePlan.h"
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/gpu/StageTable.h"
@@ -1049,6 +1050,7 @@ void TestPlan(const char *golden_dir) {
       {"no_8bit", 2, [](av::vk::DeviceCaps &c) { c.has_8bit_storage = false; }, {}},
       {"no_conditional_rendering", 2, [](av::vk::DeviceCaps &c) { c.has_conditional_rendering = false; }, {}},
       {"box_decimate_off", 2, nullptr, {{"APRILTAG_VK_BOX_DECIMATE", "0"}}},
+      {"cpu_decimate_off", 2, nullptr, {{"APRILTAG_VK_CPU_DECIMATE", "0"}}},
       {"adaptive_floor_off", 2, nullptr, {{"APRILTAG_VK_ADAPTIVE_FLOOR", "0"}}},
       {"fused_threshold_off", 2, nullptr, {{"APRILTAG_VK_FUSED_THRESHOLD", "0"}}},
       {"uf_init_scan_off", 2, nullptr, {{"APRILTAG_VK_UF_INIT_SCAN", "0"}}},
@@ -1083,7 +1085,7 @@ void TestPlan(const char *golden_dir) {
       config.height = 480;
       config.decimation = static_cast<uint32_t>(cs.decimation);
       av::PipelinePlan plan = av::ResolvePlan(caps, config, env);
-      av::FinalisePlan(plan, caps, env, false, av::BufferOutcome{true, cs.readback_direct, cs.readback_direct});
+      av::FinalisePlan(plan, caps, env, false, av::BufferOutcome{true, cs.readback_direct, cs.readback_direct, true});
       for (const auto &e : cs.env) SetEnv(e.first, nullptr);
       text += std::string("# ") + cs.name + "\n" + plan.Describe();
     }
@@ -1108,6 +1110,40 @@ void TestPlan(const char *golden_dir) {
   }
 }
 
+void TestDecimate() {
+  std::mt19937 rng(7);
+  const uint32_t sizes[][3] = {{96, 48, 2}, {64, 32, 4}, {60, 30, 3}, {200, 100, 2}, {200, 100, 4}, {100, 50, 5},
+                               {46, 22, 2}, {52, 20, 4}, {8, 8, 8}, {640, 480, 2}, {640, 480, 4}, {1280, 720, 2}};
+  for (const auto &s : sizes) {
+    const uint32_t w = s[0], h = s[1], d = s[2];
+    for (int pattern = 0; pattern < 3; ++pattern) {
+      std::vector<uint8_t> src(size_t(w) * h);
+      for (auto &v : src) v = pattern == 0 ? uint8_t(rng()) : pattern == 1 ? 255 : 0;
+      const uint32_t dw = w / d, dh = h / d;
+      for (int box = 0; box < 2; ++box) {
+        std::vector<uint8_t> want(size_t(dw) * dh);
+        for (uint32_t y = 0; y < dh; ++y) {
+          for (uint32_t x = 0; x < dw; ++x) {
+            uint32_t sum = 0;
+            for (uint32_t j = 0; j < d; ++j) {
+              for (uint32_t i = 0; i < d; ++i) sum += src[size_t(y * d + j) * w + x * d + i];
+            }
+            want[size_t(y) * dw + x] = box ? uint8_t((sum + d * d / 2) / (d * d)) : src[size_t(y * d) * w + x * d];
+          }
+        }
+        std::vector<uint8_t> got(want.size(), 0xAA);
+        av::CpuDecimate(src.data(), w, h, d, box != 0, false, got.data());
+        CHECK(got == want);
+        std::vector<uint32_t> wide(want.size(), 0xAAAAAAAAu);
+        av::CpuDecimate(src.data(), w, h, d, box != 0, true, wide.data());
+        bool same = true;
+        for (size_t i = 0; i < want.size(); ++i) same = same && wide[i] == want[i];
+        CHECK(same);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1122,6 +1158,7 @@ int main(int argc, char **argv) {
   if (all || !std::strcmp(which, "options")) TestOptions(), ran = true;
   if (all || !std::strcmp(which, "steps")) TestSteps(), ran = true;
   if (all || !std::strcmp(which, "pool")) TestPool(), ran = true;
+  if (all || !std::strcmp(which, "decimate")) TestDecimate(), ran = true;
   if (!std::strcmp(which, "plan")) TestPlan(argc > 2 ? argv[2] : "tests/plan"), ran = true;
   if (!ran) {
     std::printf("unknown test group %s\n", which);
