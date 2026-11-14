@@ -53,3 +53,21 @@ fit_ns per scenario, best of 5 interleaved runs, dec 2, old integer -> new f32 (
 - forced peaks: jpeg 214.3 -> 192.3 ms (0.90), dense-tags 13.35 -> 11.51 (0.86), busy-background 31.0 -> 26.8 (0.87), clutter-only 26.2 -> 22.8 (0.87), one-tag 2.99 -> 2.24 (0.75), many-tags 8.40 -> 5.64 (0.67).
 - default (dp + peaks fallback): jpeg 127.8 -> 92.3 (0.72), dense-tags 6.28 -> 4.35 (0.69), busy-background 17.5 -> 12.3 (0.70), clutter-only 16.0 -> 11.7 (0.73), one-tag 1.17 -> 0.88 (0.76), many-tags 3.29 -> 2.28 (0.69).
 Targets met: forced peaks faster than the integer fit in all six scenarios; default jpeg 92.3 ms below the earlier 110.5 ms.
+
+### Re-gate after the peaks work (clean build, same commands as before)
+- ctest 46/46, goldens untouched.
+- Accuracy, same binary, F32=0 against default: dec 2 7146/7348, 1 false, err 0.0169/0.0993 -> 0.0169/0.0984, corner diff p99 0.0015, max 0.186; dec 1 7129, 0 false, 0.0167/0.0965 -> 0.0167/0.0959, p99 0.0018, max 0.173; peaks dec 2 7140, 0 false, p95 0.0949 -> 0.0949, p99 0.0018, max 0.171; peaks dec 1 7128, 1 false, 0.0943 -> 0.0948; hull+rescue dec 2 7228, 0 false, 0.0980 -> 0.0976. No scenario differs in found count. Default output is the same as at 9e62d2e up to the GPU run-to-run noise (nonzero corner differences 4190 against 4187), so the sequences were not re-run.
+- Corpus A/B (3 interleaved rounds under the lock, `qf32_ab.sh`, dec 2): total median off 0.285/0.289/0.285, on 0.285/0.283/0.284 ms; cpu median off 0.091/0.095/0.093, on 0.092/0.089/0.089 ms.
+- Pi: `sh $S/pi.sh 'echo ok'` -> "Host does not exist"; nothing ran there.
+
+### Vectorisation table, final code (MSVC /Qvec-report:2; gcc 16.1 x86-64 `-O3 -fno-math-errno -DVKAPRILTAG_NO_SSE2` so the portable loops are the ones reported)
+| Loop | MSVC | gcc |
+| --- | --- | --- |
+| kernel A block loops, portable form | not (1303); SSE2 intrinsics (blocks and masked tail) used on x86-64, bit-equal | vectorised |
+| kernel A tails, portable form | not | not (scalar tail, only used without SSE2) |
+| unpack | SSE2 intrinsics (unit test against the accessors) | scalar loop, not checked |
+| chunk prefix scan (BuildChunk) | not (1500) | not (serial scan, six independent sums) |
+| window combine (CombineChunk) | vectorised | vectorised with -fno-math-errno |
+| batch line fit | SSE2 intrinsics, bit-equal to LineKernel (tail of up to 3 sets scalar) | scalar tail only without SSE2; the portable loop under gcc was vectorised with -fno-math-errno earlier, not re-checked in this form |
+| 7-tap filter, peak mask | vectorised | vectorised |
+| merges, search, closing fits | scalar by design | scalar by design |
