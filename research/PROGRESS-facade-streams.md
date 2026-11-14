@@ -5,7 +5,7 @@ Branch research/2026-11-facade-streams (base e9e6195). Build dir ext/avk-compare
 ## Step 1: threaded test, unfixed code
 - Added group `threads` (`facade_threads`) to tests/facade_test.cpp: shared device (expected_streams 2), detectors with stream 0, 0, 1, 3,
   one thread each, 300 Detect() calls over three many-tags frames, plus an extra detector made and destroyed 10 times meanwhile.
-- Unfixed tree, plain run, 3 times: passes (about 0.8 s). The race is not visible in the output on this machine (one compute queue family, AMD).
+- Unfixed tree, plain run, 3 times: passes (about 0.8 s). The race is not visible in the output on this machine. (Correction: this desktop has two compute-capable families, so the earlier "one compute queue family" was wrong. Context.cpp creates one queue per family for expected_streams 2, so queue_count is 2 with streams interleaved: streams 0 and 0 share slot 0, streams 1 and 3 share slot 1. The single-queue wrap case, as on the Mali, is not exercised here.)
 - Unfixed tree with VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation: test still passes, but the layer reports
   UNASSIGNED-Threading-MultipleThreads-Write ("VkCommandPool simultaneously used in thread A and thread B") from vkAllocateCommandBuffers
   and vkBeginCommandBuffer, and a vkQueueSubmit pending-state error. Count: THREADING ERROR lines in val_unfixed.txt below.
@@ -33,3 +33,25 @@ Branch research/2026-11-facade-streams (base e9e6195). Build dir ext/avk-compare
 - `ctest -R facade_threads --repeat until-fail:20`: passed 20 of 20 (about 0.65 s each).
 - Corpus, decimation 2, --iterations 2: found 7146/7348, false 1, error 0.017/0.098 px.
 - Orange Pi: unreachable ("Host does not exist"); nothing ran on the Pi.
+
+## Step 3: threaded test in every mode (follow-up)
+Group `threads` now runs, on a shared device (expected_streams 2) with detectors on streams 0, 0, 1, 3 (one thread each) plus an extra
+detector created and destroyed 6 times meanwhile, six modes; `threads_<mode>` runs one. Checks:
+- sync (300 calls), levels (100 calls, levels dec 2 and 1, kSync): every result equals the single-threaded reference ids for that frame (three many-tags frames in rotation).
+- pipelined depth 1 and 2 (200 calls): ready results arrive in order; the k-th ready result (and the Flush result) equals the reference for frame k mod 3.
+- tracking and tracking async (200 calls): the same one-tag frame repeated (rotating unrelated frames is no sequence); every ready result must have no
+  id other than 316 and 316 exactly once in at least half of all calls (818 of 818 on the fixed tree).
+Whole group about 3.6 s.
+
+Validation-layer counts (`UNASSIGNED-Threading` lines / other "Validation Error" lines), one run per mode:
+| mode | unfixed (e9e6195 library, this test) | fixed |
+| --- | --- | --- |
+| sync | 20 / 43 | 0 / 0 |
+| pipelined1 | 20 / 40 | 0 / 0 |
+| pipelined2 | 13 / 18, process died under the layer | 0 / 0 |
+| tracking | 10 / 20, process died under the layer | 0 / 0 |
+| trackingasync | 20 / 41 | 0 / 0 |
+| levels | 20 / 40, process died under the layer | 0 / 0 |
+Unfixed without the layer: threads_pipelined2 failed 2 of 3 runs (exit 1); tracking and levels passed 3 of 3. The layer's other errors on the unfixed tree
+include VUID-vkResetFences-pFences-01123 (a fence reset while its queue work is pending). Fixed tree: no error, no wrong result in any mode.
+Gate: ctest 47/47, no golden or gpu_trace file changed; `ctest -R facade_threads --repeat until-fail:20` 20 of 20. Library unchanged, so no corpus run.
