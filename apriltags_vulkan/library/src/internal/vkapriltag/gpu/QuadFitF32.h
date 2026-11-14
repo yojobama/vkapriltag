@@ -33,6 +33,10 @@ Centred RangeMoments(const Points &p, size_t n, size_t i0, size_t i1, int32_t bl
 Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
                        int32_t blob_y0);
 
+// The same without SSE2, for comparison: results are identical.
+Centred SegmentMomentsScalar(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
+                             int32_t blob_y0);
+
 // The set of one point with weight w at the offset (x, y).
 Centred SinglePoint(float x, float y, float w);
 
@@ -59,10 +63,7 @@ struct Sides {
 };
 
 // Reusable buffers of the peaks path.
-struct WindowScratch {
-  std::vector<int32_t> ex, ey, ew, cox, coy;
-  std::vector<float> slab;
-};
+struct WindowScratch {};
 struct Scratch {
   WindowScratch window;
   std::vector<float> error, padded, filtered;

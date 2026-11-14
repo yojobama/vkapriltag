@@ -5,6 +5,14 @@
 #include <cmath>
 #include <limits>
 
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#endif
+
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#endif
+
 #if defined(_MSC_VER)
 #define VKA_RESTRICT __restrict
 #else
@@ -26,18 +34,51 @@ constexpr std::array<float, 7> kTaps = {
 // The eight lanes summed in a fixed order.
 inline float Sum8(const float *a) { return ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7])); }
 
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#define VKA_HAVE_SSE2 1
+#else
+#define VKA_HAVE_SSE2 0
+#endif
+
+#if VKA_HAVE_SSE2
+inline __m128 LoadF(const int32_t *p, __m128i origin) { return _mm_cvtepi32_ps(_mm_sub_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p)), origin)); }
+inline __m128 LoadW(const int32_t *p) { return _mm_cvtepi32_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p))); }
+#endif
+
 // First pass over the segments [s[0], s[1]) and [s[2], s[3]): weight and first moments about (ox, oy).
+// With kSimd the full blocks of eight run in SSE2, adding in the same lanes and order as the scalar loop.
+template <bool kSimd>
 void Pass1(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float &W, float &sx, float &sy) {
   float aw[kLanes] = {}, ax[kLanes] = {}, ay[kLanes] = {};
   for (int g = 0; g < 2; ++g) {
     size_t k = s[2 * g];
     const size_t to = s[2 * g + 1];
-    for (; k + kLanes <= to; k += kLanes) {
-      for (int l = 0; l < kLanes; ++l) {
-        const float w = static_cast<float>(p.w[k + l]);
-        aw[l] += w;
-        ax[l] += w * static_cast<float>(p.x[k + l] - ox);
-        ay[l] += w * static_cast<float>(p.y[k + l] - oy);
+#if VKA_HAVE_SSE2
+    if constexpr (kSimd) {
+      const __m128i vox = _mm_set1_epi32(ox), voy = _mm_set1_epi32(oy);
+      __m128 w0 = _mm_loadu_ps(aw), w1 = _mm_loadu_ps(aw + 4), x0 = _mm_loadu_ps(ax), x1 = _mm_loadu_ps(ax + 4),
+             y0 = _mm_loadu_ps(ay), y1 = _mm_loadu_ps(ay + 4);
+      for (; k + kLanes <= to; k += kLanes) {
+        const __m128 fw0 = LoadW(p.w + k), fw1 = LoadW(p.w + k + 4);
+        w0 = _mm_add_ps(w0, fw0);
+        w1 = _mm_add_ps(w1, fw1);
+        x0 = _mm_add_ps(x0, _mm_mul_ps(fw0, LoadF(p.x + k, vox)));
+        x1 = _mm_add_ps(x1, _mm_mul_ps(fw1, LoadF(p.x + k + 4, vox)));
+        y0 = _mm_add_ps(y0, _mm_mul_ps(fw0, LoadF(p.y + k, voy)));
+        y1 = _mm_add_ps(y1, _mm_mul_ps(fw1, LoadF(p.y + k + 4, voy)));
+      }
+      _mm_storeu_ps(aw, w0), _mm_storeu_ps(aw + 4, w1), _mm_storeu_ps(ax, x0), _mm_storeu_ps(ax + 4, x1);
+      _mm_storeu_ps(ay, y0), _mm_storeu_ps(ay + 4, y1);
+    }
+#endif
+    if constexpr (!kSimd || !VKA_HAVE_SSE2) {
+      for (; k + kLanes <= to; k += kLanes) {
+        for (int l = 0; l < kLanes; ++l) {
+          const float w = static_cast<float>(p.w[k + l]);
+          aw[l] += w;
+          ax[l] += w * static_cast<float>(p.x[k + l] - ox);
+          ay[l] += w * static_cast<float>(p.y[k + l] - oy);
+        }
       }
     }
     for (int l = 0; k < to; ++k, ++l) {
@@ -53,22 +94,54 @@ void Pass1(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float &W,
 }
 
 // Second pass: second moments and residual first moments about the offset mean (mux, muy).
+template <bool kSimd>
 void Pass2(const Points &p, const size_t s[4], int32_t ox, int32_t oy, float mux, float muy, float out[5]) {
   float axx[kLanes] = {}, axy[kLanes] = {}, ayy[kLanes] = {}, arx[kLanes] = {}, ary[kLanes] = {};
   for (int g = 0; g < 2; ++g) {
     size_t k = s[2 * g];
     const size_t to = s[2 * g + 1];
-    for (; k + kLanes <= to; k += kLanes) {
-      for (int l = 0; l < kLanes; ++l) {
-        const float w = static_cast<float>(p.w[k + l]);
-        const float dx = static_cast<float>(p.x[k + l] - ox) - mux;
-        const float dy = static_cast<float>(p.y[k + l] - oy) - muy;
-        const float wx = w * dx, wy = w * dy;
-        axx[l] += wx * dx;
-        axy[l] += wx * dy;
-        ayy[l] += wy * dy;
-        arx[l] += wx;
-        ary[l] += wy;
+#if VKA_HAVE_SSE2
+    if constexpr (kSimd) {
+      const __m128i vox = _mm_set1_epi32(ox), voy = _mm_set1_epi32(oy);
+      const __m128 vmx = _mm_set1_ps(mux), vmy = _mm_set1_ps(muy);
+      __m128 xx0 = _mm_loadu_ps(axx), xx1 = _mm_loadu_ps(axx + 4), xy0 = _mm_loadu_ps(axy), xy1 = _mm_loadu_ps(axy + 4),
+             yy0 = _mm_loadu_ps(ayy), yy1 = _mm_loadu_ps(ayy + 4), rx0 = _mm_loadu_ps(arx), rx1 = _mm_loadu_ps(arx + 4),
+             ry0 = _mm_loadu_ps(ary), ry1 = _mm_loadu_ps(ary + 4);
+      for (; k + kLanes <= to; k += kLanes) {
+        const __m128 w0 = LoadW(p.w + k), w1 = LoadW(p.w + k + 4);
+        const __m128 dx0 = _mm_sub_ps(LoadF(p.x + k, vox), vmx), dx1 = _mm_sub_ps(LoadF(p.x + k + 4, vox), vmx);
+        const __m128 dy0 = _mm_sub_ps(LoadF(p.y + k, voy), vmy), dy1 = _mm_sub_ps(LoadF(p.y + k + 4, voy), vmy);
+        const __m128 wx0 = _mm_mul_ps(w0, dx0), wx1 = _mm_mul_ps(w1, dx1);
+        const __m128 wy0 = _mm_mul_ps(w0, dy0), wy1 = _mm_mul_ps(w1, dy1);
+        xx0 = _mm_add_ps(xx0, _mm_mul_ps(wx0, dx0));
+        xx1 = _mm_add_ps(xx1, _mm_mul_ps(wx1, dx1));
+        xy0 = _mm_add_ps(xy0, _mm_mul_ps(wx0, dy0));
+        xy1 = _mm_add_ps(xy1, _mm_mul_ps(wx1, dy1));
+        yy0 = _mm_add_ps(yy0, _mm_mul_ps(wy0, dy0));
+        yy1 = _mm_add_ps(yy1, _mm_mul_ps(wy1, dy1));
+        rx0 = _mm_add_ps(rx0, wx0);
+        rx1 = _mm_add_ps(rx1, wx1);
+        ry0 = _mm_add_ps(ry0, wy0);
+        ry1 = _mm_add_ps(ry1, wy1);
+      }
+      _mm_storeu_ps(axx, xx0), _mm_storeu_ps(axx + 4, xx1), _mm_storeu_ps(axy, xy0), _mm_storeu_ps(axy + 4, xy1);
+      _mm_storeu_ps(ayy, yy0), _mm_storeu_ps(ayy + 4, yy1), _mm_storeu_ps(arx, rx0), _mm_storeu_ps(arx + 4, rx1);
+      _mm_storeu_ps(ary, ry0), _mm_storeu_ps(ary + 4, ry1);
+    }
+#endif
+    if constexpr (!kSimd || !VKA_HAVE_SSE2) {
+      for (; k + kLanes <= to; k += kLanes) {
+        for (int l = 0; l < kLanes; ++l) {
+          const float w = static_cast<float>(p.w[k + l]);
+          const float dx = static_cast<float>(p.x[k + l] - ox) - mux;
+          const float dy = static_cast<float>(p.y[k + l] - oy) - muy;
+          const float wx = w * dx, wy = w * dy;
+          axx[l] += wx * dx;
+          axy[l] += wx * dy;
+          ayy[l] += wy * dy;
+          arx[l] += wx;
+          ary[l] += wy;
+        }
       }
     }
     for (int l = 0; k < to; ++k, ++l) {
@@ -112,8 +185,9 @@ inline void LineKernel(float W, float N, float sxx, float sxy, float syy, float 
 
 }  // namespace
 
-Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
-                       int32_t blob_y0) {
+template <bool kSimd>
+Centred SegmentMomentsImpl(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
+                          int32_t blob_y0) {
   Centred c;
   c.N = static_cast<float>((a1 - a0) + (b1 - b0));
   if (c.N == 0) return c;
@@ -121,13 +195,13 @@ Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t 
   const size_t first = a0 < a1 ? a0 : b0;
   const int32_t ox = p.x[first], oy = p.y[first];
   float W, sx, sy;
-  Pass1(p, s, ox, oy, W, sx, sy);
+  Pass1<kSimd>(p, s, ox, oy, W, sx, sy);
   c.W = W;
   if (!(W > 0.0f)) return c;
   const float inv = 1.0f / W;
   const float mux = sx * inv, muy = sy * inv;
   float m[5];
-  Pass2(p, s, ox, oy, mux, muy, m);
+  Pass2<kSimd>(p, s, ox, oy, mux, muy, m);
   const float rx = m[3] * inv, ry = m[4] * inv;
   c.sxx = m[0] - m[3] * rx;
   c.sxy = m[1] - m[3] * ry;
@@ -135,6 +209,16 @@ Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t 
   c.mx = static_cast<float>(ox - blob_x0) + (mux + rx);
   c.my = static_cast<float>(oy - blob_y0) + (muy + ry);
   return c;
+}
+
+Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
+                       int32_t blob_y0) {
+  return SegmentMomentsImpl<true>(p, a0, a1, b0, b1, blob_x0, blob_y0);
+}
+
+Centred SegmentMomentsScalar(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
+                             int32_t blob_y0) {
+  return SegmentMomentsImpl<false>(p, a0, a1, b0, b1, blob_x0, blob_y0);
 }
 
 Centred RangeMoments(const Points &p, size_t n, size_t i0, size_t i1, int32_t blob_x0, int32_t blob_y0) {
@@ -187,92 +271,98 @@ void LineParams(const Centred &c, int32_t blob_x0, int32_t blob_y0, double out[4
   out[3] = f.ny;
 }
 
-void WindowErrors(const Points &p, size_t n, size_t k, WindowScratch &s, float *VKA_RESTRICT error) {
-  const size_t L = 2 * k + 1;
-  const size_t chunks = (n + 2 * k + L) / L;
-  const size_t E = chunks * L;
-  s.ex.resize(E);
-  s.ey.resize(E);
-  s.ew.resize(E);
-  s.cox.resize(E);
-  s.coy.resize(E);
-  s.slab.resize(18 * E);
-  int32_t *VKA_RESTRICT ex = s.ex.data(), *VKA_RESTRICT ey = s.ey.data(), *VKA_RESTRICT ew = s.ew.data();
-  int32_t *VKA_RESTRICT cox = s.cox.data(), *VKA_RESTRICT coy = s.coy.data();
+namespace {
 
-  // Extended arrays: element e is point (e - k) of the contour, wrapping.
-  size_t idx = n - k;
-  for (size_t e = 0; e < E; ++e) {
-    ex[e] = p.x[idx];
-    ey[e] = p.y[idx];
-    ew[e] = p.w[idx];
-    if (++idx == n) idx = 0;
-  }
-  for (size_t c = 0; c < chunks; ++c) {
-    std::fill(cox + c * L, cox + (c + 1) * L, ex[c * L]);
-    std::fill(coy + c * L, coy + (c + 1) * L, ey[c * L]);
-  }
+constexpr size_t kMaxWindow = 48;
 
-  float *T[6], *P[6], *S[6];
-  for (int q = 0; q < 6; ++q) {
-    T[q] = s.slab.data() + static_cast<size_t>(q) * E;
-    P[q] = s.slab.data() + static_cast<size_t>(6 + q) * E;
-    S[q] = s.slab.data() + static_cast<size_t>(12 + q) * E;
-  }
+// Exclusive prefix sums, within one chunk of the extended contour, of the per-point terms about the
+// chunk's first point; tot holds the sums over the whole chunk.
+struct Chunk {
+  float P[6][kMaxWindow];
+  float tot[6];
+  int32_t ox, oy;
+};
 
-  // Per-point terms about the chunk origin.
-  {
-    float *VKA_RESTRICT t0 = T[0], *VKA_RESTRICT t1 = T[1], *VKA_RESTRICT t2 = T[2], *VKA_RESTRICT t3 = T[3],
-                        *VKA_RESTRICT t4 = T[4], *VKA_RESTRICT t5 = T[5];
-    for (size_t e = 0; e < E; ++e) {
-      const float w = static_cast<float>(ew[e]);
-      const float dx = static_cast<float>(ex[e] - cox[e]), dy = static_cast<float>(ey[e] - coy[e]);
-      const float wx = w * dx, wy = w * dy;
-      t0[e] = w;
-      t1[e] = wx;
-      t2[e] = wy;
-      t3[e] = wx * dx;
-      t4[e] = wx * dy;
-      t5[e] = wy * dy;
-    }
+// Chunk c covers extended elements [c*L, (c+1)*L); element e is point (e - k) of the contour, wrapping.
+void BuildChunk(const Points &p, size_t n, size_t k, size_t L, size_t c, Chunk &ch) {
+  int32_t lx[kMaxWindow], ly[kMaxWindow], lw[kMaxWindow];
+  const size_t src = (c * L + n - k) % n;
+  const size_t head = std::min(L, n - src);
+  for (size_t j = 0; j < head; ++j) {
+    lx[j] = p.x[src + j];
+    ly[j] = p.y[src + j];
+    lw[j] = p.w[src + j];
   }
-
-  // Exclusive prefix sums and inclusive suffix sums within each chunk.
-  for (size_t c = 0; c < chunks; ++c) {
-    const size_t base = c * L;
-    float a[6] = {};
-    for (size_t j = 0; j < L; ++j) {
-      for (int q = 0; q < 6; ++q) P[q][base + j] = a[q];
-      for (int q = 0; q < 6; ++q) a[q] += T[q][base + j];
-    }
-    float b[6] = {};
-    for (size_t j = L; j-- > 0;) {
-      for (int q = 0; q < 6; ++q) b[q] += T[q][base + j];
-      for (int q = 0; q < 6; ++q) S[q][base + j] = b[q];
-    }
+  for (size_t j = head; j < L; ++j) {
+    lx[j] = p.x[j - head];
+    ly[j] = p.y[j - head];
+    lw[j] = p.w[j - head];
   }
+  ch.ox = lx[0];
+  ch.oy = ly[0];
+  float a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
+  for (size_t j = 0; j < L; ++j) {
+    const float w = static_cast<float>(lw[j]);
+    const float dx = static_cast<float>(lx[j] - ch.ox), dy = static_cast<float>(ly[j] - ch.oy);
+    const float wx = w * dx, wy = w * dy;
+    ch.P[0][j] = a0;
+    ch.P[1][j] = a1;
+    ch.P[2][j] = a2;
+    ch.P[3][j] = a3;
+    ch.P[4][j] = a4;
+    ch.P[5][j] = a5;
+    a0 += w;
+    a1 += wx;
+    a2 += wy;
+    a3 += wx * dx;
+    a4 += wx * dy;
+    a5 += wy * dy;
+  }
+  ch.tot[0] = a0;
+  ch.tot[1] = a1;
+  ch.tot[2] = a2;
+  ch.tot[3] = a3;
+  ch.tot[4] = a4;
+  ch.tot[5] = a5;
+}
 
-  // Window of point i: the suffix of its chunk plus the translated prefix of the next one.
+// Errors of the `rows` windows starting in chunk `cur`: the rest of the chunk (its total less its
+// prefix) plus the prefix of the next chunk moved to this chunk's origin.
+void CombineChunk(const Chunk &cur, const Chunk &next, size_t L, size_t rows, float *VKA_RESTRICT error) {
+  const float dx = static_cast<float>(next.ox - cur.ox), dy = static_cast<float>(next.oy - cur.oy);
   const float Lf = static_cast<float>(L);
-  const float *VKA_RESTRICT s0 = S[0], *VKA_RESTRICT s1 = S[1], *VKA_RESTRICT s2 = S[2], *VKA_RESTRICT s3 = S[3],
-                            *VKA_RESTRICT s4 = S[4], *VKA_RESTRICT s5 = S[5];
-  const float *VKA_RESTRICT p0 = P[0] + L, *VKA_RESTRICT p1 = P[1] + L, *VKA_RESTRICT p2 = P[2] + L,
-                            *VKA_RESTRICT p3 = P[3] + L, *VKA_RESTRICT p4 = P[4] + L, *VKA_RESTRICT p5 = P[5] + L;
-  const int32_t *VKA_RESTRICT cx1 = cox + L, *VKA_RESTRICT cy1 = coy + L;
-  for (size_t i = 0; i < n; ++i) {
-    const float dx = static_cast<float>(cx1[i] - cox[i]), dy = static_cast<float>(cy1[i] - coy[i]);
-    const float W = s0[i] + p0[i];
-    const float Mx = s1[i] + p1[i] + dx * p0[i];
-    const float My = s2[i] + p2[i] + dy * p0[i];
-    const float Mxx = s3[i] + p3[i] + 2.0f * dx * p1[i] + dx * dx * p0[i];
-    const float Mxy = s4[i] + p4[i] + dx * p2[i] + dy * p1[i] + dx * dy * p0[i];
-    const float Myy = s5[i] + p5[i] + 2.0f * dy * p2[i] + dy * dy * p0[i];
+  const float t0 = cur.tot[0], t1 = cur.tot[1], t2 = cur.tot[2], t3 = cur.tot[3], t4 = cur.tot[4], t5 = cur.tot[5];
+  const float *VKA_RESTRICT c0 = cur.P[0], *VKA_RESTRICT c1 = cur.P[1], *VKA_RESTRICT c2 = cur.P[2],
+                            *VKA_RESTRICT c3 = cur.P[3], *VKA_RESTRICT c4 = cur.P[4], *VKA_RESTRICT c5 = cur.P[5];
+  const float *VKA_RESTRICT n0 = next.P[0], *VKA_RESTRICT n1 = next.P[1], *VKA_RESTRICT n2 = next.P[2],
+                            *VKA_RESTRICT n3 = next.P[3], *VKA_RESTRICT n4 = next.P[4], *VKA_RESTRICT n5 = next.P[5];
+  for (int r = 0; r < static_cast<int>(rows); ++r) {
+    const float W = (t0 - c0[r]) + n0[r];
+    const float Mx = (t1 - c1[r]) + (n1[r] + dx * n0[r]);
+    const float My = (t2 - c2[r]) + (n2[r] + dy * n0[r]);
+    const float Mxx = (t3 - c3[r]) + (n3[r] + 2.0f * dx * n1[r] + dx * dx * n0[r]);
+    const float Mxy = (t4 - c4[r]) + (n4[r] + dx * n2[r] + dy * n1[r] + dx * dy * n0[r]);
+    const float Myy = (t5 - c5[r]) + (n5[r] + 2.0f * dy * n2[r] + dy * dy * n0[r]);
     const float inv = 1.0f / W;
     const float vxx = (Mxx - Mx * Mx * inv) * inv, vxy = (Mxy - Mx * My * inv) * inv;
     const float vyy = (Myy - My * My * inv) * inv;
     const float diff = vxx - vyy;
     const float hyp = std::sqrt(diff * diff + 4.0f * vxy * vxy);
-    error[i] = Lf * 0.125f * ((vxx + vyy) - hyp);
+    error[r] = Lf * 0.125f * ((vxx + vyy) - hyp);
+  }
+}
+
+}  // namespace
+
+void WindowErrors(const Points &p, size_t n, size_t k, WindowScratch &, float *error) {
+  const size_t L = 2 * k + 1;
+  Chunk store[2];
+  int cur = 0;
+  BuildChunk(p, n, k, L, 0, store[cur]);
+  for (size_t c = 0; c * L < n; ++c) {
+    BuildChunk(p, n, k, L, c + 1, store[cur ^ 1]);
+    CombineChunk(store[cur], store[cur ^ 1], L, std::min(L, n - c * L), error + c * L);
+    cur ^= 1;
   }
 }
 

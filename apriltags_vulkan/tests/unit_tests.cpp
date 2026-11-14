@@ -741,6 +741,9 @@ void TestQuadFitF32() {
         }
         const qf::Centred c = qf::RangeMoments(p, n, rg[0], rg[1], x0, y0);
         CHECK(SameSet(c, RefMoments(x, y, w, idx, x0, y0)));
+        const qf::Centred sc = rg[0] < rg[1] ? qf::SegmentMomentsScalar(p, rg[0], rg[1] + 1, 0, 0, x0, y0)
+                                             : qf::SegmentMomentsScalar(p, rg[0], n, 0, rg[1] + 1, x0, y0);
+        CHECK(std::memcmp(&c, &sc, sizeof c) == 0);
       }
 
       // A merge of two halves equals the whole.
