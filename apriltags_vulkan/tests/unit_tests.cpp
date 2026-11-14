@@ -893,8 +893,188 @@ void TestHullF32() {
   if (disagreements > 0) std::printf("  outlier test: %d of %d decisions differ\n", disagreements, decisions);
 }
 
+// The hull geometry as it was before the column hull: copies of the earlier routines, as references.
+double RefLineDistance(double ax, double ay, double bx, double by, double x, double y) {
+  const double dx = bx - ax, dy = by - ay;
+  const double len = std::sqrt(dx * dx + dy * dy);
+  if (len < 1e-9) return std::hypot(x - ax, y - ay);
+  return std::fabs(dx * (y - ay) - dy * (x - ax)) / len;
+}
+
+void RefSimplifyChain(const std::vector<std::pair<int32_t, int32_t>> &hull, size_t i, size_t j, double eps,
+                      std::vector<char> &keep) {
+  const size_t m = hull.size();
+  if (j <= i + 1) return;
+  double best = -1;
+  size_t best_k = i;
+  for (size_t k = i + 1; k < j; ++k) {
+    const double d = RefLineDistance(hull[i % m].first, hull[i % m].second, hull[j % m].first, hull[j % m].second,
+                                     hull[k % m].first, hull[k % m].second);
+    if (d > best) {
+      best = d;
+      best_k = k;
+    }
+  }
+  if (best <= eps) return;
+  keep[best_k % m] = 1;
+  RefSimplifyChain(hull, i, best_k, eps, keep);
+  RefSimplifyChain(hull, best_k, j, eps, keep);
+}
+
+using IntPoint = std::pair<int32_t, int32_t>;
+
+std::vector<IntPoint> RefHull(const std::vector<int32_t> &x, const std::vector<int32_t> &y, size_t n) {
+  std::vector<uint32_t> keys;
+  for (size_t i = 0; i < n; ++i) keys.push_back(uint32_t(x[i]) << 14 | uint32_t(y[i]));
+  std::sort(keys.begin(), keys.end());
+  keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+  std::vector<IntPoint> pts, hull;
+  for (const uint32_t key : keys) pts.emplace_back(int32_t(key >> 14), int32_t(key & 0x3FFF));
+  auto cross = [](const IntPoint &o, const IntPoint &a, const IntPoint &b) {
+    return int64_t(a.first - o.first) * (b.second - o.second) - int64_t(a.second - o.second) * (b.first - o.first);
+  };
+  hull.assign(2 * pts.size(), {0, 0});
+  hull.resize(av::geom::MonotoneChain(pts.data(), pts.size(), hull.data(), cross));
+  return hull;
+}
+
+std::vector<IntPoint> NewHull(const std::vector<int32_t> &x, const std::vector<int32_t> &y, size_t n, bool *enough) {
+  std::vector<int32_t> px(x), py(y), pw(n + 8, 1);
+  px.resize(n + 8), py.resize(n + 8);
+  const qf::Points p{px.data(), py.data(), pw.data()};
+  int32_t b[4];
+  qf::BoundsAndKeys(p, n, b, nullptr);
+  qf::HullGeom g;
+  std::vector<IntPoint> pts, hull;
+  qf::ColumnCandidates(p, n, b[0], b[1], g, pts);
+  *enough = pts.size() >= 8;
+  auto cross = [](const IntPoint &o, const IntPoint &a, const IntPoint &c) {
+    return int64_t(a.first - o.first) * (c.second - o.second) - int64_t(a.second - o.second) * (c.first - o.first);
+  };
+  hull.assign(2 * pts.size(), {0, 0});
+  hull.resize(av::geom::MonotoneChain(pts.data(), pts.size(), hull.data(), cross));
+  return hull;
+}
+
+void TestHullGeomF32() {
+  std::mt19937 rng(23);
+  int hulls = 0, kept_total = 0, compared_edges = 0;
+  for (int trial = 0; trial < 600; ++trial) {
+    std::vector<int32_t> x, y;
+    const int kind = trial % 8;
+    const int32_t base = (trial % 3 == 0) ? 0 : (trial % 3 == 1) ? 7000 : 16000;
+    auto add = [&](double px, double py) {
+      x.push_back(std::min<int32_t>(16383, std::max<int32_t>(0, int32_t(std::lround(px)))));
+      y.push_back(std::min<int32_t>(16383, std::max<int32_t>(0, int32_t(std::lround(py)))));
+    };
+    const double w = 60 + double(rng() % 300), h = (kind == 3 ? 3 : 40) + double(rng() % 200);
+    const double ang = (kind == 1 || kind == 5 || kind == 6) ? double(rng() % 90) * kPi / 180 : 0.0;
+    const double ca = std::cos(ang), sa = std::sin(ang);
+    auto place = [&](double u, double v) {
+      add(base + 200 + u * ca - v * sa + double(rng() % 3) * (kind >= 4 ? 1 : 0), base + 200 + u * sa + v * ca + double(rng() % 3) * (kind >= 4 ? 1 : 0));
+    };
+    if (kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5) {
+      // Rectangle outline, possibly rotated, with noise.
+      for (double u = 0; u <= w; u += 2) place(u, 0), place(u, h);
+      for (double v = 0; v <= h; v += 2) place(0, v), place(w, v);
+    } else if (kind == 2) {
+      // Random cloud.
+      for (int i = 0; i < 400; ++i) add(base + 100 + double(rng() % 400), base + 100 + double(rng() % 300));
+    } else if (kind == 6) {
+      // Rectangle outline with every point twice and a covered corner.
+      for (double u = 0; u <= w; u += 2) place(u, 0), place(u, 0), place(u, h);
+      for (double v = 0; v <= h; v += 2) place(0, v), place(w, v), place(w, v);
+    } else {
+      // A disc outline: many columns with two points.
+      for (int i = 0; i < 360; ++i) add(base + 300 + w * std::cos(i * kPi / 180), base + 300 + h * std::sin(i * kPi / 180));
+    }
+    const size_t n = x.size();
+    bool enough = false;
+    const std::vector<IntPoint> got = NewHull(x, y, n, &enough);
+    if (!enough) continue;
+    const std::vector<IntPoint> want = RefHull(x, y, n);
+    CHECK(got == want);
+    if (got != want) std::printf("  hull differs: trial %d kind %d n %zu got %zu want %zu\n", trial, kind, n, got.size(), want.size());
+    ++hulls;
+    if (want.size() < 4) continue;
+
+    // The far vertex and the simplification against the double routines.
+    const size_t m = want.size();
+    std::vector<int32_t> hx(m + 1), hy(m + 1);
+    for (size_t i = 0; i < m; ++i) hx[i] = want[i].first, hy[i] = want[i].second;
+    hx[m] = hx[0], hy[m] = hy[0];
+    size_t far = 0;
+    double far_d = -1;
+    for (size_t i = 1; i < m; ++i) {
+      const double d = std::hypot(double(want[i].first - want[0].first), double(want[i].second - want[0].second));
+      if (d > far_d) far_d = d, far = i;
+    }
+    CHECK(qf::FarVertex(hx.data(), hy.data(), m) == far);
+    for (const double eps : {2.4, 0.5, 8.0}) {
+      std::vector<char> ref(m, 0), cur(m, 0);
+      ref[0] = ref[far] = 1;
+      cur[0] = cur[far] = 1;
+      RefSimplifyChain(want, 0, far, eps, ref);
+      RefSimplifyChain(want, far, m, eps, ref);
+      qf::SimplifyHull(hx.data(), hy.data(), 0, far, eps, cur.data());
+      qf::SimplifyHull(hx.data(), hy.data(), far, m, eps, cur.data());
+      CHECK(ref == cur);
+      if (ref != cur) std::printf("  simplify differs: trial %d eps %g\n", trial, eps);
+      if (eps != 2.4) continue;
+
+      // The edge choice against the nested-loop form that evaluated every pair again.
+      std::array<std::pair<double, double>, 16> v;
+      size_t k = 0;
+      for (size_t i = 0; i < m && k < 10; ++i) {
+        if (cur[i]) v[k++] = {double(hx[i]), double(hy[i])};
+      }
+      kept_total += int(k);
+      if (k < 4) continue;
+      std::array<double, 16> len, ux, uy;
+      for (size_t i = 0; i < k; ++i) {
+        const auto &a = v[i], &c = v[(i + 1) % k];
+        len[i] = std::hypot(c.first - a.first, c.second - a.second);
+        ux[i] = len[i] > 0 ? (c.first - a.first) / len[i] : 0;
+        uy[i] = len[i] > 0 ? (c.second - a.second) / len[i] : 0;
+      }
+      for (const double reach_unused : {0.0}) {
+        (void)reach_unused;
+        auto corner_ok = [&](size_t a, size_t b) {
+          if (std::fabs(ux[a] * ux[b] + uy[a] * uy[b]) > 0.8) return false;
+          const auto &pa = v[a], &pb = v[b];
+          double cx, cy;
+          if (!av::geom::IntersectDirected(pa.first, pa.second, ux[a], uy[a], pb.first, pb.second, ux[b], uy[b], &cx, &cy)) return false;
+          const auto &ea = v[(a + 1) % k];
+          return std::hypot(cx - ea.first, cy - ea.second) <= 0.4 * len[a] && std::hypot(cx - pb.first, cy - pb.second) <= 0.4 * len[b];
+        };
+        double best_len = 0;
+        size_t best[4] = {};
+        for (size_t a = 0; a < k; ++a)
+          for (size_t b = a + 1; b < k; ++b) {
+            if (!corner_ok(a, b)) continue;
+            for (size_t c = b + 1; c < k; ++c) {
+              if (!corner_ok(b, c)) continue;
+              for (size_t d = c + 1; d < k; ++d) {
+                if (!corner_ok(c, d) || !corner_ok(d, a)) continue;
+                const double total = len[a] + len[b] + len[c] + len[d];
+                if (total > best_len) best_len = total, best[0] = a, best[1] = b, best[2] = c, best[3] = d;
+              }
+            }
+          }
+        size_t got_best[4] = {};
+        const double got_len = qf::ChooseEdges(v.data(), k, len.data(), ux.data(), uy.data(), got_best);
+        CHECK(got_len == best_len && std::memcmp(best, got_best, sizeof best) == 0);
+        compared_edges += best_len > 0;
+      }
+    }
+  }
+  std::printf("  hull geometry: %d hulls, %d kept vertices, %d edge choices with a result\n", hulls, kept_total, compared_edges);
+  CHECK(hulls > 300 && compared_edges > 50);
+}
+
 void TestQuadFitF32() {
   TestHullF32();
+  TestHullGeomF32();
   std::mt19937 rng(7);
   // Origins: near the corner of the image, and far out where the coordinates approach 16383.
   for (const int32_t base : {0, 2000, 16000}) {

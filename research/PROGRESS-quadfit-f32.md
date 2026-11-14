@@ -123,3 +123,26 @@ Vectorisation of the new loops (MSVC /Qvec-report:2; gcc 16.1 `-O3 -fno-math-err
 | masked kernel A passes | SSE2 intrinsics, bit-equal to portable | vectorised |
 | HasOutliers | SSE2 intrinsics (portable loop 1106/1305) | vectorised after the fabs clamp |
 `FitLine`, `Int128`, `NeedsWide` and the integer hull code in QuadDecode.cpp now serve only `APRILTAG_VK_QUADFIT_F32=0`.
+
+## Part E: exact, cheaper hull geometry
+Step 0, the split of "hull pre" (db38944, F32=1, `APRILTAG_VK_HULL_QUAD=1`, dec 2; counters from `hull_stat2.py` on top of `hull_stat.py`/`qf32_stat3.py`; `bash $S/benchlock.sh bash $S/hull_stat_pre.sh $E 2 "<scenarios>" "1"`; ms over the scenario, best of 5):
+| scenario | bbox + keys | sort + unique + copy | monotone chain | far vertex | simplify + vertex list | lengths + edge choice | calls | n per call | unique per call | m per call | k per call |
+| border-occlusion | 0.48 | 6.12 | 2.08 | 0.04 | 0.13 | 0.17 | 191 | 1190 | 1190 | 16.7 | 6.3 |
+| jpeg | 1.27 | 22.06 | 6.77 | 0.14 | 0.46 | 0.05 | 886 | 860 | 860 | 9.9 | 5.2 |
+| busy-background | 0.18 | 2.63 | 0.95 | 0.02 | 0.07 | 0.03 | 327 | 297 | 297 | 3.4 | 2.5 |
+| family16h5 | 0.13 | 2.13 | 0.73 | 0.03 | 0.11 | 0.04 | 300 | 296 | 296 | 4.9 | 3.6 |
+(The jpeg and busy-background numbers include calls that return early; sizes are sums over calls divided by calls.) No duplicate points occur in practice (unique = n). The sort/unique/copy is about 70% of the pre stage and the monotone chain about 25%; far vertex, simplification and edge choice together are under 5%, so the column hull (steps 1) is the one that pays; steps 2 to 4 are small and done for exactness-checked cleanliness.
+
+Implementation (shared by the float and the integer per-side paths, no switch): the points are unpacked first in both paths; `BoundsAndKeys` with null keys gives the box; `ColumnCandidates` fills the lowest and highest y of each column and lists them in (x, y) order; fewer than 8 candidates falls back to keys + sort + unique (the old path); `geom::MonotoneChain` unchanged; `FarVertex` (first maximum of the integer squared distance, one `std::hypot` of the winner for the `far_d < min_side_x2` test); `SimplifyHull` (first maximum of the integer cross product over separate x and y arrays with vertex 0 repeated at m, then `|cross| / sqrt(dx*dx + dy*dy)` as the same double expression as the old `LineDistance`; the old coincident-ends metric is kept for dx = dy = 0); `ChooseEdges` (lazy memo of `corner_ok` per ordered pair, the nested loops and tie order unchanged); `keep`, `hull`, the vertex arrays, `near` and `hist` live in the scratch. The old `LineDistance` and `SimplifyChain` are gone from QuadDecode.cpp and survive as references in the unit test.
+Exactness evidence:
+- Unit test (group quadfit32, `TestHullGeomF32`): 600 random shapes (rectangle outlines axis-aligned and rotated, thin rectangles of height 3 to 10, random clouds, discs, outlines with every point twice and with noise; coordinates near 0, 7000 and 16383): the column hull equals keys + sort + unique + `MonotoneChain` vertex for vertex in all 600 (including the vertical sides of the axis-aligned rectangles); `FarVertex` equals the double hypot loop; the `keep` array of `SimplifyHull` equals the old `SimplifyChain` for eps 2.4, 0.5 and 8.0 on all hulls (3424 kept vertices at eps 2.4); `ChooseEdges` equals the old nested-loop form (same four indices, same total) on 453 polygons with a result.
+- Corpus dumps, new binary against a build of db38944 (`bash $S/exact_runs.sh <db38944 exe> <new exe> $A/qf32/ex`, scenario dumps compared with `exact_cmp.py`: files differing, lines, largest value difference; the first number of each pair is base against base, the noise level):
+  | run | base vs base | new vs base |
+  | hull dec 2, F32 default | 3 files, 3 lines, 0.0027 | 2 files, 2 lines, 0.0000 |
+  | hull dec 2, F32=0 | 1, 1, 0.0027 | 1, 1, 0.0027 |
+  | hull dec 1, F32 default | 8, 11, 0.0022 | 9, 14, 0.0012 |
+  | hull dec 1, F32=0 | 8, 8, 0.0022 | 6, 6, 0.0012 |
+  | hull + rescue dec 2, F32 default | 3, 3, 0.0000 | 4, 4, 0.0027 |
+  | hull + rescue dec 2, F32=0 | 1, 1, 0.0027 | 1, 1, 0.0027 |
+  | default (hull off) dec 2 | not repeated | 1, 1, 0.0000 |
+  The differences of the new binary are of the size and number of the base-against-base run-to-run noise.

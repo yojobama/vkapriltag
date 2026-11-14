@@ -1,8 +1,11 @@
 #include "vkapriltag/gpu/QuadFitF32.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 #if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(VKAPRILTAG_NO_SSE2)
@@ -631,7 +634,7 @@ void BoundsAndKeys(const Points &p, size_t n, int32_t bounds[4], uint32_t *keys)
     vly = _mm_or_si128(_mm_and_si128(m, y), _mm_andnot_si128(m, vly));
     m = _mm_cmpgt_epi32(y, vhy);
     vhy = _mm_or_si128(_mm_and_si128(m, y), _mm_andnot_si128(m, vhy));
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(keys + i), _mm_or_si128(_mm_slli_epi32(x, 14), y));
+    if (keys != nullptr) _mm_storeu_si128(reinterpret_cast<__m128i *>(keys + i), _mm_or_si128(_mm_slli_epi32(x, 14), y));
   }
   int32_t t[4];
   _mm_storeu_si128(reinterpret_cast<__m128i *>(t), vlx);
@@ -649,7 +652,7 @@ void BoundsAndKeys(const Points &p, size_t n, int32_t bounds[4], uint32_t *keys)
     hix = std::max(hix, x);
     loy = std::min(loy, y);
     hiy = std::max(hiy, y);
-    keys[i] = static_cast<uint32_t>(x) << 14 | static_cast<uint32_t>(y);
+    if (keys != nullptr) keys[i] = static_cast<uint32_t>(x) << 14 | static_cast<uint32_t>(y);
   }
   bounds[0] = lox, bounds[1] = hix, bounds[2] = loy, bounds[3] = hiy;
 }
@@ -855,6 +858,112 @@ bool HasOutliers(const Points &p, size_t n, const double corners[4][2], double t
     if (outliers > allowed) return true;
   }
   return false;
+}
+
+void ColumnCandidates(const Points &p, size_t n, int32_t lo_x, int32_t hi_x, HullGeom &g,
+                      std::vector<std::pair<int32_t, int32_t>> &out) {
+  const size_t width = static_cast<size_t>(hi_x - lo_x) + 1;
+  g.colmin.assign(width, INT32_MAX);
+  g.colmax.assign(width, -1);
+  int32_t *VKA_RESTRICT cmin = g.colmin.data(), *VKA_RESTRICT cmax = g.colmax.data();
+  for (size_t i = 0; i < n; ++i) {
+    const size_t c = static_cast<size_t>(p.x[i] - lo_x);
+    const int32_t y = p.y[i];
+    cmin[c] = std::min(cmin[c], y);
+    cmax[c] = std::max(cmax[c], y);
+  }
+  out.clear();
+  for (size_t c = 0; c < width; ++c) {
+    if (cmin[c] == INT32_MAX) continue;
+    const int32_t x = lo_x + static_cast<int32_t>(c);
+    out.emplace_back(x, cmin[c]);
+    if (cmax[c] != cmin[c]) out.emplace_back(x, cmax[c]);
+  }
+}
+
+size_t FarVertex(const int32_t *hx, const int32_t *hy, size_t m) {
+  int32_t top = -1;
+  for (size_t i = 1; i < m; ++i) {
+    const int32_t dx = hx[i] - hx[0], dy = hy[i] - hy[0];
+    top = std::max(top, dx * dx + dy * dy);
+  }
+  size_t i = 1;
+  while (i + 1 < m && (hx[i] - hx[0]) * (hx[i] - hx[0]) + (hy[i] - hy[0]) * (hy[i] - hy[0]) != top) ++i;
+  return i;
+}
+
+void SimplifyHull(const int32_t *hx, const int32_t *hy, size_t i, size_t j, double eps, char *keep) {
+  if (j <= i + 1) return;
+  const int32_t ax = hx[i], ay = hy[i], dx = hx[j] - ax, dy = hy[j] - ay;
+  size_t best_k = i;
+  double best;
+  if (dx == 0 && dy == 0) {
+    // Coincident ends: the distance to the point itself.
+    best = -1;
+    for (size_t k = i + 1; k < j; ++k) {
+      const double d = std::hypot(static_cast<double>(hx[k] - ax), static_cast<double>(hy[k] - ay));
+      if (d > best) {
+        best = d;
+        best_k = k;
+      }
+    }
+  } else {
+    int32_t top = -1;
+    for (size_t k = i + 1; k < j; ++k) {
+      const int32_t c = dx * (hy[k] - ay) - dy * (hx[k] - ax);
+      const int32_t a = c < 0 ? -c : c;
+      if (a > top) {
+        top = a;
+        best_k = k;
+      }
+    }
+    const double ddx = dx, ddy = dy;
+    best = static_cast<double>(top) / std::sqrt(ddx * ddx + ddy * ddy);
+  }
+  if (best <= eps) return;
+  keep[best_k] = 1;
+  SimplifyHull(hx, hy, i, best_k, eps, keep);
+  SimplifyHull(hx, hy, best_k, j, eps, keep);
+}
+
+double ChooseEdges(const std::pair<double, double> *v, size_t k, const double *len, const double *ux,
+                   const double *uy, size_t best[4]) {
+  constexpr double kMaxCos = 0.8, kReach = 0.4;
+  signed char memo[16][16];
+  std::memset(memo, -1, sizeof memo);
+  auto corner_ok = [&](size_t a, size_t b) {
+    signed char &m = memo[a][b];
+    if (m >= 0) return m != 0;
+    bool ok = false;
+    if (!(std::fabs(ux[a] * ux[b] + uy[a] * uy[b]) > kMaxCos)) {
+      const auto &pa = v[a], &pb = v[b];
+      double cx, cy;
+      if (geom::IntersectDirected(pa.first, pa.second, ux[a], uy[a], pb.first, pb.second, ux[b], uy[b], &cx, &cy)) {
+        const auto &ea = v[(a + 1) % k];
+        ok = std::hypot(cx - ea.first, cy - ea.second) <= kReach * len[a] &&
+             std::hypot(cx - pb.first, cy - pb.second) <= kReach * len[b];
+      }
+    }
+    m = ok ? 1 : 0;
+    return ok;
+  };
+  double best_len = 0;
+  for (size_t a = 0; a < k; ++a)
+    for (size_t b = a + 1; b < k; ++b) {
+      if (!corner_ok(a, b)) continue;
+      for (size_t c = b + 1; c < k; ++c) {
+        if (!corner_ok(b, c)) continue;
+        for (size_t d = c + 1; d < k; ++d) {
+          if (!corner_ok(c, d) || !corner_ok(d, a)) continue;
+          const double total = len[a] + len[b] + len[c] + len[d];
+          if (total > best_len) {
+            best_len = total;
+            best[0] = a, best[1] = b, best[2] = c, best[3] = d;
+          }
+        }
+      }
+    }
+  return best_len;
 }
 
 }  // namespace apriltag_vulkan::quadf32
