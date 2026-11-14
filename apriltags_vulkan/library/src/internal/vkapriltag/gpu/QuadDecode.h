@@ -7,6 +7,7 @@
 
 #include "vkapriltag/common/WorkerPool.h"
 #include "vkapriltag/gpu/GpuDetector.h"
+#include "vkapriltag/gpu/QuadFitF32.h"
 #include "vkapriltag/gpu/Types.h"
 
 namespace apriltag_vulkan {
@@ -24,6 +25,7 @@ struct QuadFitScratch {
   std::vector<std::pair<int32_t, int32_t>> hull_points;
   std::vector<std::pair<int32_t, int32_t>> hull;
   std::vector<uint32_t> hull_keys;
+  quadf32::Scratch f32;
 };
 
 // A worker pool sized and pinned as QuadDecode(config) would build its own.

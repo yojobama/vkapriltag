@@ -121,6 +121,7 @@ add_library(vkapriltag STATIC
   src/gpu/StageTable.cpp
   src/gpu/CpuDecimate.cpp
   src/gpu/QuadDecode.cpp
+  src/gpu/QuadFitF32.cpp
   src/gpu/MultiLevelDetector.cpp
   src/gpu/KeepAlive.cpp
   src/vk/CompletionFlag.cpp

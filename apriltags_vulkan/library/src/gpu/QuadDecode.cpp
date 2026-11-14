@@ -5,6 +5,7 @@
 #include "vkapriltag/common/Profiler.h"
 
 #include "Geometry.h"
+#include "vkapriltag/gpu/QuadFitF32.h"
 
 #include <algorithm>
 #include <array>
@@ -211,6 +212,9 @@ struct FitQuadResult {
   LineFitMoments moments[4];
   // The moments' origin: the blob's first point.
   int32_t x0 = 0, y0 = 0;
+  // Set when the float32 fit produced the sides: they are then in f32_sides, not moments.
+  bool f32 = false;
+  quadf32::Sides f32_sides;
 };
 
 // Index of the largest value(i) over [begin, end), the lowest such index on ties, folded into
@@ -345,6 +349,38 @@ FitQuadResult TryDpQuad(const DetectorConfig &config, const UnpackedPoints &pts,
   return result;
 }
 
+// The float32 fit of one blob: DP seeding on the four arcs, falling back to the peaks search.
+FitQuadResult FitQuadForBlobF32(const DetectorConfig &config, std::span<const RawLineFitPoint> points, size_t begin,
+                                size_t end, QuadFitScratch &scratch) {
+  FitQuadResult result;
+  const size_t n = end - begin;
+  scratch.px.resize(n);
+  scratch.py.resize(n);
+  scratch.pw.resize(n);
+  for (size_t k = 0; k < n; ++k) {
+    const RawLineFitPoint &p = points[begin + k];
+    scratch.px[k] = p.x2();
+    scratch.py[k] = p.y2();
+    scratch.pw[k] = p.W();
+  }
+  const quadf32::Points pts{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
+  result.f32 = true;
+  result.x0 = pts.x[0];
+  result.y0 = pts.y[0];
+  if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
+    result.dp_attempted = true;
+    uint32_t idx[4];
+    const UnpackedPoints unpacked{pts.x, pts.y, pts.w};
+    if (FindDpCornerIndices(unpacked, n, idx) && quadf32::FitArcs(pts, n, idx, config.max_line_fit_mse, &result.f32_sides)) {
+      result.valid = result.dp_used = true;
+      for (int k = 0; k < 4; ++k) result.indices[k] = idx[k];
+      return result;
+    }
+  }
+  result.valid = quadf32::FitPeaks(config, pts, n, scratch.f32, result.indices, &result.f32_sides);
+  return result;
+}
+
 // Windowed error, 7-tap Gaussian filter and peak detection, then a combinatorial search over the
 // top 10 peaks, for one blob. Its points are `points[begin, end)`, in perimeter (theta) order.
 FitQuadResult FitQuadForBlob(const DetectorConfig &config,
@@ -354,6 +390,7 @@ FitQuadResult FitQuadForBlob(const DetectorConfig &config,
   const size_t total_points = end - begin;
   // LineFitMoments::W is 32-bit and a point's W at most 1023: far more points than any tag border.
   if (total_points < 4 || total_points > INT32_MAX / 1023) return result;
+  if (config.quad_fit_f32) return FitQuadForBlobF32(config, points, begin, end, scratch);
 
   if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
     result.dp_attempted = true;  // sticks even if we fall through to peaks below
@@ -820,8 +857,12 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
       std::max(3.0, config.tag_width / static_cast<double>(config.decimation));
   double lines[4][4];
   for (int i = 0; i < 4; ++i) {
-    double err, mse;
-    FitLine(quad.moments[i], quad.x0, quad.y0, lines[i], lines[i] + 2, &err, &mse);
+    if (quad.f32) {
+      quadf32::LineParams(quad.f32_sides.side[i], quad.x0, quad.y0, lines[i]);
+    } else {
+      double err, mse;
+      FitLine(quad.moments[i], quad.x0, quad.y0, lines[i], lines[i] + 2, &err, &mse);
+    }
   }
 
   double corners[4][2];
@@ -939,6 +980,7 @@ QuadDecode::QuadDecode(const DetectorConfig &config, std::shared_ptr<WorkerPool>
   config_.quad_fit_method = ResolveQuadFitMethod(env, config_.quad_fit_method);
   config_.small_tag_rescue = ResolveSmallTagRescue(env, config_.small_tag_rescue);
   config_.hull_quad = env.Bool("APRILTAG_VK_HULL_QUAD", config_.hull_quad);
+  config_.quad_fit_f32 = env.Bool("APRILTAG_VK_QUADFIT_F32", config_.quad_fit_f32);
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
