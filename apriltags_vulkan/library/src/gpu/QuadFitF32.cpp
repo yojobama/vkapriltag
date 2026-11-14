@@ -45,6 +45,10 @@ inline __m128i LaneMask(int base, int rem) {
 }
 #endif
 
+#if VKA_HAVE_SSE2
+inline int Popcount4(int m) { return (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1); }
+#endif
+
 // First pass over the segments [s[0], s[1]) and [s[2], s[3]): weight and first moments about (ox, oy).
 // With kSimd the blocks of eight and the tail run in SSE2 (the arrays need 7 readable elements past the
 // end), adding in the same lanes and order as the scalar loop.
@@ -191,14 +195,12 @@ inline void LineKernel(float W, float N, float sxx, float sxy, float syy, float 
 }  // namespace
 
 template <bool kSimd>
-Centred SegmentMomentsImpl(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
-                          int32_t blob_y0) {
+Centred SegmentMomentsAboutImpl(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t ox, int32_t oy,
+                                int32_t blob_x0, int32_t blob_y0) {
   Centred c;
   c.N = static_cast<float>((a1 - a0) + (b1 - b0));
   if (c.N == 0) return c;
   const size_t s[4] = {a0, a1, b0, b1};
-  const size_t first = a0 < a1 ? a0 : b0;
-  const int32_t ox = p.x[first], oy = p.y[first];
   float W, sx, sy;
   Pass1<kSimd>(p, s, ox, oy, W, sx, sy);
   c.W = W;
@@ -214,6 +216,23 @@ Centred SegmentMomentsImpl(const Points &p, size_t a0, size_t a1, size_t b0, siz
   c.mx = static_cast<float>(ox - blob_x0) + (mux + rx);
   c.my = static_cast<float>(oy - blob_y0) + (muy + ry);
   return c;
+}
+
+template <bool kSimd>
+Centred SegmentMomentsImpl(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
+                          int32_t blob_y0) {
+  const size_t first = a0 < a1 ? a0 : b0;
+  return SegmentMomentsAboutImpl<kSimd>(p, a0, a1, b0, b1, p.x[first], p.y[first], blob_x0, blob_y0);
+}
+
+Centred SegmentMomentsAbout(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t ox, int32_t oy,
+                            int32_t blob_x0, int32_t blob_y0) {
+  return SegmentMomentsAboutImpl<true>(p, a0, a1, b0, b1, ox, oy, blob_x0, blob_y0);
+}
+
+Centred SegmentMomentsAboutScalar(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t ox, int32_t oy,
+                                  int32_t blob_x0, int32_t blob_y0) {
+  return SegmentMomentsAboutImpl<false>(p, a0, a1, b0, b1, ox, oy, blob_x0, blob_y0);
 }
 
 Centred SegmentMoments(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t blob_x0,
@@ -594,6 +613,237 @@ bool FitPeaks(const DetectorConfig &config, const Points &p, size_t n, Scratch &
     out->side[j] = from < to ? get(fwd(from, to)) : closing_set(from, to);
   }
   return true;
+}
+
+void BoundsAndKeys(const Points &p, size_t n, int32_t bounds[4], uint32_t *keys) {
+  int32_t lox = INT32_MAX, hix = 0, loy = INT32_MAX, hiy = 0;
+  size_t i = 0;
+#if VKA_HAVE_SSE2
+  __m128i vlx = _mm_set1_epi32(INT32_MAX), vhx = _mm_setzero_si128(), vly = vlx, vhy = vhx;
+  for (; i + 4 <= n; i += 4) {
+    const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p.x + i));
+    const __m128i y = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p.y + i));
+    __m128i m = _mm_cmplt_epi32(x, vlx);
+    vlx = _mm_or_si128(_mm_and_si128(m, x), _mm_andnot_si128(m, vlx));
+    m = _mm_cmpgt_epi32(x, vhx);
+    vhx = _mm_or_si128(_mm_and_si128(m, x), _mm_andnot_si128(m, vhx));
+    m = _mm_cmplt_epi32(y, vly);
+    vly = _mm_or_si128(_mm_and_si128(m, y), _mm_andnot_si128(m, vly));
+    m = _mm_cmpgt_epi32(y, vhy);
+    vhy = _mm_or_si128(_mm_and_si128(m, y), _mm_andnot_si128(m, vhy));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(keys + i), _mm_or_si128(_mm_slli_epi32(x, 14), y));
+  }
+  int32_t t[4];
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(t), vlx);
+  for (int l = 0; l < 4; ++l) lox = std::min(lox, t[l]);
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(t), vhx);
+  for (int l = 0; l < 4; ++l) hix = std::max(hix, t[l]);
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(t), vly);
+  for (int l = 0; l < 4; ++l) loy = std::min(loy, t[l]);
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(t), vhy);
+  for (int l = 0; l < 4; ++l) hiy = std::max(hiy, t[l]);
+#endif
+  for (; i < n; ++i) {
+    const int32_t x = p.x[i], y = p.y[i];
+    lox = std::min(lox, x);
+    hix = std::max(hix, x);
+    loy = std::min(loy, y);
+    hiy = std::max(hiy, y);
+    keys[i] = static_cast<uint32_t>(x) << 14 | static_cast<uint32_t>(y);
+  }
+  bounds[0] = lox, bounds[1] = hix, bounds[2] = loy, bounds[3] = hiy;
+}
+
+bool FitHullSide(const Points &p, size_t n, int32_t blob_x0, int32_t blob_y0, const HullEdge &e, double band,
+                 HullScratch &h, Centred *out, bool simd) {
+  const float ux = static_cast<float>(e.ux), uy = static_cast<float>(e.uy);
+  const float len = static_cast<float>(e.len), window = static_cast<float>(e.window), fband = static_cast<float>(band);
+  const float lo = -fband, hi = len + fband;
+  h.mask.resize(n);
+  h.nx.resize(n + 1);
+  h.ny.resize(n + 1);
+  h.idx.resize(n + 1);
+  h.wm.resize(n + 8);
+  int32_t *VKA_RESTRICT mask = h.mask.data();
+  {
+    size_t i = 0;
+#if VKA_HAVE_SSE2
+    if (simd) {
+      const __m128i opx = _mm_set1_epi32(e.p0x), opy = _mm_set1_epi32(e.p0y);
+      const __m128 vux = _mm_set1_ps(ux), vuy = _mm_set1_ps(uy), vwin = _mm_set1_ps(window), vlo = _mm_set1_ps(lo),
+                   vhi = _mm_set1_ps(hi), vabs = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+      for (; i + 4 <= n; i += 4) {
+        const __m128 dx = LoadF(p.x + i, opx), dy = LoadF(p.y + i, opy);
+        const __m128 along = _mm_add_ps(_mm_mul_ps(dx, vux), _mm_mul_ps(dy, vuy));
+        const __m128 across = _mm_sub_ps(_mm_mul_ps(dx, vuy), _mm_mul_ps(dy, vux));
+        const __m128 keep = _mm_and_ps(_mm_and_ps(_mm_cmple_ps(_mm_and_ps(across, vabs), vwin), _mm_cmpge_ps(along, vlo)),
+                                       _mm_cmple_ps(along, vhi));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(mask + i), _mm_srli_epi32(_mm_castps_si128(keep), 31));
+      }
+    }
+#endif
+    for (; i < n; ++i) {
+      const float dx = static_cast<float>(p.x[i] - e.p0x), dy = static_cast<float>(p.y[i] - e.p0y);
+      const float along = dx * ux + dy * uy, across = dx * uy - dy * ux;
+      mask[i] = static_cast<int32_t>(std::fabs(across) <= window) & static_cast<int32_t>(along >= lo) &
+                static_cast<int32_t>(along <= hi);
+    }
+  }
+  float *VKA_RESTRICT nearx = h.nx.data(), *VKA_RESTRICT neary = h.ny.data();
+  size_t count = 0;
+  for (size_t i = 0; i < n; ++i) {
+    nearx[count] = static_cast<float>(p.x[i] - e.p0x);
+    neary[count] = static_cast<float>(p.y[i] - e.p0y);
+    count += static_cast<size_t>(mask[i]);
+  }
+
+  // The line of greatest support within 10 degrees of the edge: four histograms, so that neighbouring
+  // increments of one bin do not wait for each other.
+  const size_t bins = static_cast<size_t>(e.window) + 2;
+  const unsigned ubins = static_cast<unsigned>(bins);
+  const size_t stride = bins + 1;
+  h.hist.resize(4 * stride);
+  int32_t *VKA_RESTRICT idx = h.idx.data();
+  int best_support = -1;
+  double best_cos = 1, best_sin = 0, best_offset = 0;
+  const float shift = static_cast<float>(e.window * 0.5);
+  for (int step = 0; step < 21; ++step) {
+    const int deg = (step + 1) / 2 * ((step & 1) ? 1 : -1);
+    const double a = deg * 0.017453292519943295, ca = std::cos(a), sa = std::sin(a);
+    const double nx = e.uy * ca + e.ux * sa, ny = -(e.ux * ca - e.uy * sa);
+    const float fnx = static_cast<float>(nx * 0.5), fny = static_cast<float>(ny * 0.5);
+    for (int j = 0; j < static_cast<int>(count); ++j) {
+      const int b = static_cast<int>(nearx[j] * fnx + neary[j] * fny + shift);
+      const int in_range = static_cast<int>(static_cast<unsigned>(b) < ubins);
+      idx[j] = (b & -in_range) | (static_cast<int>(bins) & ~-in_range);
+    }
+    std::fill(h.hist.begin(), h.hist.end(), 0);
+    int32_t *h0 = h.hist.data(), *h1 = h0 + stride, *h2 = h1 + stride, *h3 = h2 + stride;
+    size_t j = 0;
+    for (; j + 4 <= count; j += 4) {
+      ++h0[idx[j]];
+      ++h1[idx[j + 1]];
+      ++h2[idx[j + 2]];
+      ++h3[idx[j + 3]];
+    }
+    for (; j < count; ++j) ++h0[idx[j]];
+    for (size_t b = 0; b + 1 < bins; ++b) {
+      const int support = (h0[b] + h1[b] + h2[b] + h3[b]) + (h0[b + 1] + h1[b + 1] + h2[b + 1] + h3[b + 1]);
+      if (support > best_support) {
+        best_support = support;
+        best_cos = ca;
+        best_sin = sa;
+        best_offset = static_cast<double>(b) * 2.0 - e.window + 2.0;
+      }
+    }
+  }
+
+  // The points within the band of the winning line, as a weight array for the masked moments.
+  const float nxf = static_cast<float>(e.uy * best_cos + e.ux * best_sin);
+  const float nyf = static_cast<float>(-(e.ux * best_cos - e.uy * best_sin));
+  const float offf = static_cast<float>(best_offset);
+  int32_t *VKA_RESTRICT wm = h.wm.data();
+  int32_t inside = 0;
+  {
+    size_t i = 0;
+#if VKA_HAVE_SSE2
+    if (simd) {
+      const __m128i opx = _mm_set1_epi32(e.p0x), opy = _mm_set1_epi32(e.p0y);
+      const __m128 vux = _mm_set1_ps(ux), vuy = _mm_set1_ps(uy), vnx = _mm_set1_ps(nxf), vny = _mm_set1_ps(nyf),
+                   voff = _mm_set1_ps(offf), vband = _mm_set1_ps(fband), vlo = _mm_set1_ps(lo), vhi = _mm_set1_ps(hi),
+                   vabs = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+      __m128i vin = _mm_setzero_si128();
+      for (; i + 4 <= n; i += 4) {
+        const __m128 dx = LoadF(p.x + i, opx), dy = LoadF(p.y + i, opy);
+        const __m128 along = _mm_add_ps(_mm_mul_ps(dx, vux), _mm_mul_ps(dy, vuy));
+        const __m128 dist = _mm_sub_ps(_mm_add_ps(_mm_mul_ps(dx, vnx), _mm_mul_ps(dy, vny)), voff);
+        const __m128i keep = _mm_castps_si128(_mm_and_ps(
+            _mm_and_ps(_mm_cmple_ps(_mm_and_ps(dist, vabs), vband), _mm_cmpge_ps(along, vlo)), _mm_cmple_ps(along, vhi)));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(wm + i),
+                         _mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p.w + i)), keep));
+        vin = _mm_sub_epi32(vin, keep);
+      }
+      int32_t t[4];
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(t), vin);
+      inside = t[0] + t[1] + t[2] + t[3];
+    }
+#endif
+    for (; i < n; ++i) {
+      const float dx = static_cast<float>(p.x[i] - e.p0x), dy = static_cast<float>(p.y[i] - e.p0y);
+      const float along = dx * ux + dy * uy;
+      const int32_t keep = static_cast<int32_t>(std::fabs(dx * nxf + dy * nyf - offf) <= fband) &
+                           static_cast<int32_t>(along >= lo) & static_cast<int32_t>(along <= hi);
+      wm[i] = p.w[i] & -keep;
+      inside += keep;
+    }
+  }
+  if (inside < 6) return false;
+  const Points masked{p.x, p.y, wm};
+  *out = simd ? SegmentMomentsAbout(masked, 0, n, 0, 0, e.p0x, e.p0y, blob_x0, blob_y0)
+              : SegmentMomentsAboutScalar(masked, 0, n, 0, 0, e.p0x, e.p0y, blob_x0, blob_y0);
+  out->N = static_cast<float>(inside);
+  return true;
+}
+
+bool HasOutliers(const Points &p, size_t n, const double corners[4][2], double tolerance, double fraction, bool simd) {
+  float cx[4], cy[4], dx[4], dy[4], il[4];
+  for (int i = 0; i < 4; ++i) {
+    const double ddx = corners[(i + 1) & 3][0] - corners[i][0], ddy = corners[(i + 1) & 3][1] - corners[i][1];
+    const double l2 = ddx * ddx + ddy * ddy;
+    cx[i] = static_cast<float>(corners[i][0]);
+    cy[i] = static_cast<float>(corners[i][1]);
+    dx[i] = static_cast<float>(ddx);
+    dy[i] = static_cast<float>(ddy);
+    il[i] = l2 > 0 ? static_cast<float>(1.0 / l2) : 0.0f;
+  }
+  const float limit = static_cast<float>(tolerance * tolerance);
+  const size_t allowed = static_cast<size_t>(fraction * static_cast<double>(n));
+  size_t outliers = 0;
+  constexpr size_t kBlock = 64;
+  for (size_t base = 0; base < n; base += kBlock) {
+    const size_t stop = std::min(base + kBlock, n);
+    size_t i = base;
+    int block = 0;
+#if VKA_HAVE_SSE2
+    if (simd) {
+      const __m128 vlimit = _mm_set1_ps(limit), zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
+      __m128 vcx[4], vcy[4], vdx[4], vdy[4], vil[4];
+      for (int s = 0; s < 4; ++s) {
+        vcx[s] = _mm_set1_ps(cx[s]);
+        vcy[s] = _mm_set1_ps(cy[s]);
+        vdx[s] = _mm_set1_ps(dx[s]);
+        vdy[s] = _mm_set1_ps(dy[s]);
+        vil[s] = _mm_set1_ps(il[s]);
+      }
+      for (; i + 4 <= stop; i += 4) {
+        const __m128 x = LoadW(p.x + i), y = LoadW(p.y + i);
+        __m128 hit = zero;
+        for (int s = 0; s < 4; ++s) {
+          const __m128 ex = _mm_sub_ps(x, vcx[s]), ey = _mm_sub_ps(y, vcy[s]);
+          const __m128 raw = _mm_mul_ps(_mm_add_ps(_mm_mul_ps(ex, vdx[s]), _mm_mul_ps(ey, vdy[s])), vil[s]);
+          const __m128 t = _mm_min_ps(_mm_max_ps(raw, zero), one);
+          const __m128 rx = _mm_sub_ps(ex, _mm_mul_ps(t, vdx[s])), ry = _mm_sub_ps(ey, _mm_mul_ps(t, vdy[s]));
+          hit = _mm_or_ps(hit, _mm_cmple_ps(_mm_add_ps(_mm_mul_ps(rx, rx), _mm_mul_ps(ry, ry)), vlimit));
+        }
+        block += 4 - Popcount4(_mm_movemask_ps(hit));
+      }
+    }
+#endif
+    for (; i < stop; ++i) {
+      const float x = static_cast<float>(p.x[i]), y = static_cast<float>(p.y[i]);
+      int hit = 0;
+      for (int s = 0; s < 4; ++s) {
+        const float ex = x - cx[s], ey = y - cy[s];
+        const float t = std::min(1.0f, std::max(0.0f, (ex * dx[s] + ey * dy[s]) * il[s]));
+        const float rx = ex - t * dx[s], ry = ey - t * dy[s];
+        hit |= static_cast<int>(rx * rx + ry * ry <= limit);
+      }
+      block += 1 - hit;
+    }
+    outliers += static_cast<size_t>(block);
+    if (outliers > allowed) return true;
+  }
+  return false;
 }
 
 }  // namespace apriltag_vulkan::quadf32

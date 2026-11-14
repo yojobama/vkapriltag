@@ -40,6 +40,38 @@ Centred SegmentMomentsScalar(const Points &p, size_t a0, size_t a1, size_t b0, s
 // Splits n raw points into the three arrays.
 void Unpack(const RawLineFitPoint *pts, size_t n, int32_t *x, int32_t *y, int32_t *w);
 
+// As SegmentMoments about the given origin, which need not be a point of the range; zero weights drop points.
+Centred SegmentMomentsAbout(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t ox, int32_t oy,
+                            int32_t blob_x0, int32_t blob_y0);
+Centred SegmentMomentsAboutScalar(const Points &p, size_t a0, size_t a1, size_t b0, size_t b1, int32_t ox, int32_t oy,
+                                  int32_t blob_x0, int32_t blob_y0);
+
+// Bounding box {lo x, hi x, lo y, hi y} of n points and their packed keys x << 14 | y.
+void BoundsAndKeys(const Points &p, size_t n, int32_t bounds[4], uint32_t *keys);
+
+// A hull edge: its start (a point of the blob's grid), unit direction, length and the half width of the
+// strip searched for support, all in half-pixel units.
+struct HullEdge {
+  int32_t p0x, p0y;
+  double ux, uy, len, window;
+};
+
+// Buffers of the hull side fit.
+struct HullScratch {
+  std::vector<int32_t> mask, wm, idx, hist;
+  std::vector<float> nx, ny;
+};
+
+// Fits one hull side: the line of greatest support near the edge, then the moments of the points within
+// band of it. False when fewer than 6 points are inside the band. simd false runs the portable loops.
+bool FitHullSide(const Points &p, size_t n, int32_t blob_x0, int32_t blob_y0, const HullEdge &e, double band,
+                 HullScratch &scratch, Centred *out, bool simd = true);
+
+// Whether more than `fraction` of the n points are farther than `tolerance` from every side of the quad
+// whose corners are in half-pixel units.
+bool HasOutliers(const Points &p, size_t n, const double corners[4][2], double tolerance, double fraction,
+                 bool simd = true);
+
 // The set of one point with weight w at the offset (x, y).
 Centred SinglePoint(float x, float y, float w);
 
@@ -66,6 +98,7 @@ struct Sides {
 
 // Reusable buffers of the peaks path.
 struct Scratch {
+  HullScratch hull;
   std::vector<float> error, padded, filtered;
   std::vector<int32_t> mask;
   std::vector<std::pair<float, uint32_t>> peaks;

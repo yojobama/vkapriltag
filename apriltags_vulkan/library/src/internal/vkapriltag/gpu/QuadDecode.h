@@ -26,6 +26,8 @@ struct QuadFitScratch {
   std::vector<std::pair<int32_t, int32_t>> hull;
   std::vector<uint32_t> hull_keys;
   quadf32::Scratch f32;
+  // The blob (first point index and length) whose points px, py, pw hold; SIZE_MAX when none.
+  size_t unpacked_begin = 0, unpacked_n = SIZE_MAX;
 };
 
 // A worker pool sized and pinned as QuadDecode(config) would build its own.
