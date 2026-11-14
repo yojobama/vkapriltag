@@ -161,21 +161,32 @@ void TestSharedDevice() {
   CHECK(Ids(second.Detect(frames[0].grey.data())).count(316) == 1);
 }
 
+// One mode of the threaded test: how a detector is configured and what its results are compared with.
+struct ThreadMode {
+  const char *name;
+  std::function<void(av::DetectorOptions &)> configure;
+  bool tracking;   // results are checked for the tag of the one-tag scenario, not frame by frame
+  bool pipelined;  // results arrive in order and lag the calls
+  int calls;
+};
+
 // Detectors on one shared device, each driven by its own thread, with another made and destroyed meanwhile.
-void TestSharedDeviceThreads() {
-  auto frames = Frames("many-tags");
-  if (frames.size() > 3) frames.resize(3);
+void RunThreadMode(const ThreadMode &mode) {
+  auto frames = Frames(mode.tracking ? "one-tag" : "many-tags");
+  frames.resize(mode.tracking ? 1 : std::min<size_t>(frames.size(), 3));
   av::DeviceOptions d;
   d.expected_streams = 2;
   auto device = av::Device::Create(d);
-  const av::DetectorOptions base = Options(frames[0]);
+  av::DetectorOptions base = Options(frames[0]);
+  mode.configure(base);
   std::vector<std::multiset<int>> expected;
   {
-    av::Detector reference(base);
+    av::DetectorOptions ro = base;
+    ro.mode = av::Mode::kSync;
+    av::Detector reference(ro);
     for (const eval::Image &im : frames) expected.push_back(Ids(reference.Detect(im.grey.data())));
   }
   const std::vector<uint32_t> streams = {0, 0, 1, 3};
-  const int kCalls = 300;
   std::vector<std::unique_ptr<av::Detector>> owned;
   for (uint32_t s : streams) {
     av::DetectorOptions o = base;
@@ -183,16 +194,31 @@ void TestSharedDeviceThreads() {
     owned.push_back(std::make_unique<av::Detector>(o, device));
   }
   std::atomic<bool> go{false};
-  std::atomic<int> bad{0}, errors{0};
+  std::atomic<int> bad{0}, errors{0}, hits{0}, calls{0};
+  const auto drive = [&](av::Detector &det, int n) {
+    size_t ready = 0;
+    const auto check = [&](const av::Result &r) {
+      if (!r.ready) return;
+      if (mode.tracking) {
+        const std::multiset<int> ids = Ids(r);
+        if (ids.count(316) == 1) ++hits;
+        if (ids.size() > 1) ++bad;
+      } else if (Ids(r) != expected[ready++ % frames.size()]) {
+        ++bad;
+      }
+    };
+    for (int i = 0; i < n; ++i) {
+      check(det.Detect(frames[static_cast<size_t>(i) % frames.size()].grey.data()));
+      ++calls;
+    }
+    if (mode.pipelined) check(det.Flush());
+  };
   std::vector<std::thread> threads;
   for (auto &det : owned) {
     threads.emplace_back([&, p = det.get()] {
       while (!go) std::this_thread::yield();
       try {
-        for (int i = 0; i < kCalls; ++i) {
-          const size_t f = static_cast<size_t>(i) % frames.size();
-          if (Ids(p->Detect(frames[f].grey.data())) != expected[f]) ++bad;
-        }
+        drive(*p, mode.calls);
       } catch (const std::exception &) {
         ++errors;
       }
@@ -201,11 +227,11 @@ void TestSharedDeviceThreads() {
   threads.emplace_back([&] {
     while (!go) std::this_thread::yield();
     try {
-      for (int i = 0; i < 10; ++i) {
+      for (int i = 0; i < 6; ++i) {
         av::DetectorOptions o = base;
         o.stream = static_cast<uint32_t>(i % 3);
         av::Detector extra(o, device);
-        if (Ids(extra.Detect(frames[0].grey.data())) != expected[0]) ++bad;
+        drive(extra, 3);
       }
     } catch (const std::exception &) {
       ++errors;
@@ -213,8 +239,33 @@ void TestSharedDeviceThreads() {
   });
   go = true;
   for (std::thread &t : threads) t.join();
+  if (bad != 0 || errors != 0) std::printf("threads %s: %d wrong, %d errors\n", mode.name, bad.load(), errors.load());
   CHECK(bad == 0);
   CHECK(errors == 0);
+  if (mode.tracking) {
+    CHECK(hits * 2 >= calls);
+  }
+}
+
+void TestSharedDeviceThreads(const std::string &only) {
+  const std::vector<ThreadMode> modes = {
+      {"sync", [](av::DetectorOptions &) {}, false, false, 300},
+      {"pipelined1", [](av::DetectorOptions &o) { o.mode = av::Mode::kPipelined; o.pipeline_depth = 1; }, false, true, 200},
+      {"pipelined2", [](av::DetectorOptions &o) { o.mode = av::Mode::kPipelined; o.pipeline_depth = 2; }, false, true, 200},
+      {"tracking", [](av::DetectorOptions &o) { o.mode = av::Mode::kTracking; }, true, false, 200},
+      {"trackingasync", [](av::DetectorOptions &o) { o.mode = av::Mode::kTracking; o.tracking_async = true; }, true, false, 200},
+      {"levels",
+       [](av::DetectorOptions &o) {
+         av::Level a, b;
+         a.decimation = 2;
+         b.decimation = 1;
+         o.levels = {a, b};
+       },
+       false, false, 100},
+  };
+  for (const ThreadMode &m : modes) {
+    if (only.empty() || only == m.name) RunThreadMode(m);
+  }
 }
 
 void TestErrors() {
@@ -266,7 +317,7 @@ int main(int argc, char **argv) {
     if (all || which == "pose") TestPose();
     if (all || which == "stride") TestStride();
     if (all || which == "device") TestSharedDevice();
-    if (all || which == "threads") TestSharedDeviceThreads();
+    if (all || which.rfind("threads", 0) == 0) TestSharedDeviceThreads(which.size() > 8 ? which.substr(8) : "");
     if (all || which == "errors") TestErrors();
   } catch (const std::exception &e) {
     std::printf("FAIL: unexpected exception: %s\n", e.what());
