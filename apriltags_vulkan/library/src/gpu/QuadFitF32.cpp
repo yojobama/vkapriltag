@@ -806,7 +806,8 @@ bool HasOutliers(const Points &p, size_t n, const double corners[4][2], double t
     int block = 0;
 #if VKA_HAVE_SSE2
     if (simd) {
-      const __m128 vlimit = _mm_set1_ps(limit), zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f);
+      const __m128 vlimit = _mm_set1_ps(limit), zero = _mm_setzero_ps(), one = _mm_set1_ps(1.0f), half = _mm_set1_ps(0.5f);
+      const __m128 vabs = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
       __m128 vcx[4], vcy[4], vdx[4], vdy[4], vil[4];
       for (int s = 0; s < 4; ++s) {
         vcx[s] = _mm_set1_ps(cx[s]);
@@ -821,7 +822,7 @@ bool HasOutliers(const Points &p, size_t n, const double corners[4][2], double t
         for (int s = 0; s < 4; ++s) {
           const __m128 ex = _mm_sub_ps(x, vcx[s]), ey = _mm_sub_ps(y, vcy[s]);
           const __m128 raw = _mm_mul_ps(_mm_add_ps(_mm_mul_ps(ex, vdx[s]), _mm_mul_ps(ey, vdy[s])), vil[s]);
-          const __m128 t = _mm_min_ps(_mm_max_ps(raw, zero), one);
+          const __m128 t = _mm_mul_ps(half, _mm_add_ps(_mm_sub_ps(_mm_and_ps(raw, vabs), _mm_and_ps(_mm_sub_ps(raw, one), vabs)), one));
           const __m128 rx = _mm_sub_ps(ex, _mm_mul_ps(t, vdx[s])), ry = _mm_sub_ps(ey, _mm_mul_ps(t, vdy[s]));
           hit = _mm_or_ps(hit, _mm_cmple_ps(_mm_add_ps(_mm_mul_ps(rx, rx), _mm_mul_ps(ry, ry)), vlimit));
         }
@@ -829,16 +830,26 @@ bool HasOutliers(const Points &p, size_t n, const double corners[4][2], double t
       }
     }
 #endif
-    for (; i < stop; ++i) {
-      const float x = static_cast<float>(p.x[i]), y = static_cast<float>(p.y[i]);
-      int hit = 0;
-      for (int s = 0; s < 4; ++s) {
-        const float ex = x - cx[s], ey = y - cy[s];
-        const float t = std::min(1.0f, std::max(0.0f, (ex * dx[s] + ey * dy[s]) * il[s]));
-        const float rx = ex - t * dx[s], ry = ey - t * dy[s];
-        hit |= static_cast<int>(rx * rx + ry * ry <= limit);
+    {
+      const float cx0 = cx[0], cx1 = cx[1], cx2 = cx[2], cx3 = cx[3], cy0 = cy[0], cy1 = cy[1], cy2 = cy[2], cy3 = cy[3];
+      const float dx0 = dx[0], dx1 = dx[1], dx2 = dx[2], dx3 = dx[3], dy0 = dy[0], dy1 = dy[1], dy2 = dy[2], dy3 = dy[3];
+      const float il0 = il[0], il1 = il[1], il2 = il[2], il3 = il[3];
+      const int32_t *VKA_RESTRICT px = p.x, *VKA_RESTRICT py = p.y;
+      auto side_hit = [limit](float x, float y, float cxs, float cys, float dxs, float dys, float ils) {
+        const float ex = x - cxs, ey = y - cys;
+        float t = (ex * dxs + ey * dys) * ils;
+        t = 0.5f * ((std::fabs(t) - std::fabs(t - 1.0f)) + 1.0f);
+        const float rx = ex - t * dxs, ry = ey - t * dys;
+        return static_cast<int>(rx * rx + ry * ry <= limit);
+      };
+      int tail = 0;
+      for (int k = static_cast<int>(i); k < static_cast<int>(stop); ++k) {
+        const float x = static_cast<float>(px[k]), y = static_cast<float>(py[k]);
+        const int hit = side_hit(x, y, cx0, cy0, dx0, dy0, il0) | side_hit(x, y, cx1, cy1, dx1, dy1, il1) |
+                        side_hit(x, y, cx2, cy2, dx2, dy2, il2) | side_hit(x, y, cx3, cy3, dx3, dy3, il3);
+        tail += 1 - hit;
       }
-      block += 1 - hit;
+      block += tail;
     }
     outliers += static_cast<size_t>(block);
     if (outliers > allowed) return true;

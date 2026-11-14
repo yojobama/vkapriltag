@@ -90,3 +90,36 @@ Stage table after (same method, best of 5, ms over the scenario, old integer -> 
 | busy-background | 4.36 -> 1.39 | 1.09 -> 1.12 | 0.38 -> 0.19 | 1.06 -> 0.81 | 0.27 -> 0.15 |
 | family16h5 | 3.66 -> 1.21 | 0.99 -> 1.01 | 0.42 -> 0.18 | 0.97 -> 0.73 | 0.29 -> 0.14 |
 First attempt (plain float loops, no SSE2, no sub-histograms) was not faster: HasOutliers 3.2 -> 4.8 ms on jpeg (all four sides evaluated for every point against the integer code's early exit per point) and selection 0.74 -> 0.53; with SSE2 and the sub-histograms every stage wins. "Hull pre" is dominated by the key sort, hull and simplify, which stay shared.
+
+Portable clamp: the first float HasOutliers used min/max for the clamp, which gcc will not vectorise without fast-math ("unsupported control flow"); both forms now clamp with 0.5 * ((|t| - |t - 1|) + 1), which gcc vectorises and which keeps SIMD and portable bit-equal. The SSE2 path pays two more operations: final HasOutliers numbers below.
+
+Final stage table (best of 5, ms over the scenario, `APRILTAG_VK_HULL_QUAD=1`, dec 2, old integer -> new f32):
+| scenario | HasOutliers | hull pre (shared) | selection | vote | moments |
+| border-occlusion | 0.39 -> 0.17 | 8.82 -> 8.86 | 2.55 -> 1.23 | 6.40 -> 4.45 | 2.16 -> 1.05 |
+| jpeg | 3.14 -> 1.43 | 1.94 -> 1.95 | 0.78 -> 0.32 | 1.24 -> 0.82 | 0.56 -> 0.23 |
+| busy-background | 4.37 -> 1.76 | 1.15 -> 1.11 | 0.39 -> 0.20 | 1.05 -> 0.79 | 0.28 -> 0.15 |
+| family16h5 | 3.65 -> 1.46 | 0.97 -> 0.95 | 0.41 -> 0.16 | 0.98 -> 0.73 | 0.29 -> 0.14 |
+
+Gate (clean build, same binary, APRILTAG_VK_QUADFIT_F32=0 against default; found, false, err med/p95 off -> on, corner diff max / p99 / nonzero):
+- hull, dec 2: 7204/7348, 1, 0.0170/0.0943 -> 0.0170/0.0940, 0.186 / 0.0015 / 4219 of 28820
+- hull, dec 1: 7233/7348, 0, 0.0169/0.0929 -> 0.0169/0.0916, 0.173 / 0.0017 / 5183 of 28932
+- hull + rescue, dec 2: 7228/7348, 0, 0.0170/0.0980 -> 0.0170/0.0976, 0.186 / 0.0015 / 4219
+- hull + rescue, dec 1: 7233/7348, 0, 0.0169/0.0929 -> 0.0169/0.0916, 0.173 / 0.0017 / 5183
+- No scenario differs in found count. Hull quads cannot be told apart in the dumps, so the corner differences are over all detections.
+- Default (hull off) dec 2 against the dump of 2493da8: identical found/false/error; corner differences max 0.0029 px on 5 corners (GPU noise).
+- ctest 46/46 (golden profile rescue-hull enables the hull; untouched).
+- Corpus A/B with the hull on (`bash $S/benchlock.sh bash $S/qf32_ab.sh $E $A/qf32/t4 2 3 "APRILTAG_VK_HULL_QUAD=1"`, 3 interleaved rounds): total median off 0.286/0.283/0.284, on 0.277/0.279/0.284 ms; cpu median off 0.092/0.095/0.096, on 0.087/0.087/0.094 ms (about 5 to 8% lower cpu).
+- Pi: `sh $S/pi.sh 'echo ok'` -> "Host does not exist"; not run.
+
+Vectorisation of the new loops (MSVC /Qvec-report:2; gcc 16.1 `-O3 -fno-math-errno -DVKAPRILTAG_NO_SSE2`):
+| Loop | MSVC | gcc portable |
+| --- | --- | --- |
+| bounds and keys | SSE2 intrinsics (scalar tail 1200) | vectorised |
+| strip mask | SSE2 intrinsics | vectorised |
+| compaction of near points | scalar (1203) | scalar by design |
+| vote bin indices | vectorised | vectorised |
+| vote increments (four sub-histograms) | scalar (1505) | scalar by design |
+| band mask and weights | SSE2 intrinsics | vectorised |
+| masked kernel A passes | SSE2 intrinsics, bit-equal to portable | vectorised |
+| HasOutliers | SSE2 intrinsics (portable loop 1106/1305) | vectorised after the fabs clamp |
+`FitLine`, `Int128`, `NeedsWide` and the integer hull code in QuadDecode.cpp now serve only `APRILTAG_VK_QUADFIT_F32=0`.
