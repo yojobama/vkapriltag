@@ -146,3 +146,15 @@ Exactness evidence:
   | hull + rescue dec 2, F32=0 | 1, 1, 0.0027 | 1, 1, 0.0027 |
   | default (hull off) dec 2 | not repeated | 1, 1, 0.0000 |
   The differences of the new binary are of the size and number of the base-against-base run-to-run noise.
+
+Stage table after (same counters, same method, ms over the scenario, best of 5, F32 default, hull on, dec 2). The stage boundaries moved with the code: "unpack + box" replaces "bbox + keys", "columns + copy" replaces "sort + unique + copy".
+| scenario | bbox + keys -> unpack + box | sort + unique + copy -> columns + copy | monotone chain | far vertex | simplify + vertex list | lengths + edge choice | pre total |
+| border-occlusion | 0.48 -> 0.34 | 6.12 -> 0.68 | 2.08 -> 0.84 | 0.04 -> 0.05 | 0.13 -> 0.07 | 0.17 -> 0.15 | 9.02 -> 2.13 |
+| jpeg | 1.27 -> 1.05 | 22.06 -> 1.82 | 6.77 -> 2.28 | 0.14 -> 0.17 | 0.46 -> 0.19 | 0.05 -> 0.04 | 30.75 -> 5.55 |
+| busy-background | 0.18 -> 0.14 | 2.63 -> 0.48 | 0.95 -> 0.47 | 0.02 -> 0.04 | 0.07 -> 0.04 | 0.03 -> 0.03 | 3.88 -> 1.20 |
+| family16h5 | 0.13 -> 0.11 | 2.13 -> 0.30 | 0.73 -> 0.37 | 0.03 -> 0.04 | 0.11 -> 0.05 | 0.04 -> 0.04 | 3.17 -> 0.91 |
+Candidates handed to the chain per call: border-occlusion 456 of 1190 points, jpeg 225 of 860, busy-background 133 of 297, family16h5 131 of 296 (hull size m and kept k are unchanged: 16.7/6.3, 9.9/5.2, 3.4/2.5, 4.9/3.6). The far vertex got a little dearer because the stage now includes copying the hull into the x and y arrays; it is below 0.2 ms everywhere.
+Whole hull stage (pre + selection + vote + moments, ms over the scenario): border-occlusion 15.8 -> 9.0 (-43%), jpeg 32.2 -> 7.0 (-78%).
+Corpus A/B with the hull on, db38944 against this commit, interleaved under the lock (`bash $S/benchlock.sh bash $S/ab.sh $A/basebin/vk_eval_db38944.exe $A/basebin/vk_eval_e_new.exe $A/qf32/t5 "APRILTAG_VK_HULL_QUAD=1" 3`, dec 2): total median base 0.273/0.265/0.263, new 0.263/0.265/0.262 ms; total mean 0.299/0.284/0.283 -> 0.282/0.280/0.279 ms; total p95 0.517/0.488/0.485 -> 0.479/0.471/0.472 ms; cpu median 0.092/0.087/0.087 -> 0.088/0.091/0.086 ms (noise). The gain is in the frames with large blobs (the p95), not in the median.
+ctest 46/46 (golden profile rescue-hull included, nothing regenerated). Pi: `sh $S/pi.sh 'echo ok'` timed out / host does not exist; not run.
+Vectorisation of the new loops: column fill (scatter, scalar by design: MSVC 1203, gcc not), column listing (scalar by design), `FarVertex` maximum pass (gcc 16.1 vectorises it, MSVC 1104), the simplification and edge choice loops run over at most 16 vertices and stay scalar. The cost that remains in the pre stage is the chain over the candidates (about a third of the pre total on jpeg) and the unpack and box.
