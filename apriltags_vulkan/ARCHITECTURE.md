@@ -346,7 +346,7 @@ separate.
 ### 8.2 The Vulkan lanes
 
 `vk::Context` creates the device, the compute queue(s) and a pipeline cache; a `vk::Lane` is one queue's submission state
-(a command pool, a ring of command buffers and their fences) and is used by one thread at a time. A detector submits through its lane (`ctx.default_lane()` by default). `ContextOptions::expected_streams`
+(a command pool, a ring of command buffers and their fences) and is used by one thread at a time. A detector on a device it opened submits through `ctx.default_lane()`; a detector on a shared `Device` always creates its own lane, `CreateLane(StreamSlot(stream))`, in every mode (sync, pipelined, tracking, multi-level), so detectors on different threads never share a command pool or ring. `ContextOptions::expected_streams`
 and `Context::StreamSlot` spread several streams over two compute families where the device has them (discrete only; one
 shared queue is faster on the Mali). `CreateSiblingLane` gives the pre-warm helper its own lane on the same queue.
 

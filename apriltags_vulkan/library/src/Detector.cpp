@@ -102,6 +102,7 @@ struct Detector::Impl {
         Fail(ErrorCode::kUnsupported, "families in one detector must share their border width and polarity");
       }
     }
+    const bool shared_device = device != nullptr;
     if (!device) device = Device::Create();
     vk::Context &ctx = device->impl().context ? *device->impl().context : throw Error(ErrorCode::kDevice, "no device");
 
@@ -120,14 +121,10 @@ struct Detector::Impl {
     decoder_config.refine_edges = options.refine_edges;
 
     vk::Lane *lane_ptr = &ctx.default_lane();
-    if (options.stream > 0) {
-      // A device with fewer queues than streams shares its first queue between them.
-      try {
-        lane = ctx.CreateLane(options.stream);
-      } catch (const std::runtime_error &) {
-        lane.reset();
-      }
-      if (lane) lane_ptr = lane.get();
+    if (shared_device || options.stream > 0) {
+      // Detectors on a shared device never share a lane; streams beyond the queue count wrap onto the queues.
+      lane = ctx.CreateLane(ctx.StreamSlot(options.stream));
+      lane_ptr = lane.get();
     }
 
     pool = MakeWorkerPool(config);
@@ -144,14 +141,14 @@ struct Detector::Impl {
         specs.push_back(spec);
         decimation = std::max(decimation, l.decimation);
       }
-      multi = std::make_unique<MultiLevelDetector>(ctx, config, specs);
+      multi = std::make_unique<MultiLevelDetector>(ctx, config, specs, lane_ptr);
     }
 
     if (options.mode == Mode::kTracking) {
       TrackingConfig tracking;
       tracking.enabled = true;
       tracking.async = options.tracking_async;
-      tracker = std::make_unique<TrackingDetector>(ctx, decoder_config, config, tracking);
+      tracker = std::make_unique<TrackingDetector>(ctx, decoder_config, config, tracking, lane_ptr);
     } else {
       decoder = std::make_unique<TagDecoder>(decoder_config, decimation, options.cpu_threads, RefineEdgesMethod::kProfile,
                                              0.0f, WorkerPoolOptions(), false, options.small_tag_rescue, pool);

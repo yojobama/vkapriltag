@@ -95,7 +95,7 @@ struct DetectorOptions {
   double tag_size = 0.0;
 
   uint32_t cpu_threads = 0;        // threads for the CPU stages including the caller's; 0 uses the whole CPU
-  uint32_t stream = 0;             // which queue of a shared device this detector uses
+  uint32_t stream = 0;             // queue of a shared device (wraps past the queue count); every detector has its own lane
 };
 
 // Per-frame times in milliseconds. The GPU figure is a wall-clock time from upload to readback.
@@ -116,6 +116,8 @@ struct Result {
   Timing timing;
 };
 
+// One detector is used by one thread at a time; detectors sharing a device may run on different threads at once,
+// each with its own or a shared queue.
 class Detector {
  public:
   // Opens its own device.
