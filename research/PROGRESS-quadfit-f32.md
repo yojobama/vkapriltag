@@ -29,3 +29,10 @@ Commands: MSVC `cl /std:c++20 /O2 /EHsc /DNDEBUG /Qvec-report:2 /c /I<src/intern
 | 7-tap filter (l.412) | vectorised | vectorised (versioned for aliasing) | |
 | peak mask (l.425) | vectorised | vectorised | |
 | peak compaction, 4-deep search, merges | scalar | scalar | by design |
+
+## Final timing and decision
+- Clean build, corpus A/B, 3 interleaved rounds, dec 2 (`bash $S/benchlock.sh bash $S/qf32_ab.sh $B/tools/vk_eval.exe $A/qf32/t2 2 3 "X=1"`; summarise with `python $S/cmpn/sum.py ...`): all-frames total median off 0.283/0.282/0.274, on 0.277/0.284/0.281 ms; cpu median off 0.083/0.093/0.092, on 0.088/0.093/0.092. No difference beyond noise; per-scenario (jpeg, dense-tags, busy-background, clutter-only, one-tag, many-tags) totals also within noise.
+- Fit stage only (QFSTAT, above): -5 to -19% default; peaks forced +4 to +10% on busy scenarios.
+- Decision: option kept, default on (gate passes, output equivalent); benefit on the desktop is confined to the fit stage. Pi not reachable ('Host does not exist'), nothing run there; gcc/NEON scalar-lane path untested at run time.
+- Hull fit (D) not done. Integer fit left in place; deleting it would remove about 370 lines of QuadDecode.cpp (TryDpQuad, SumMomentsWindow, the peaks body of FitQuadForBlob, prefix helpers); FitLine/Int128 stay for the hull fit.
+- Docs: DECISIONS.md section 11 row, CHANGELOG Unreleased, ARCHITECTURE quad fit bullet, PERFORMANCE options table. ctest 46/46.

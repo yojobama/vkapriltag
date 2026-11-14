@@ -207,7 +207,7 @@ scheduling.
   point of maximum perpendicular deviation on each arc; each segment's line is fitted from its integer moments. If a
   segment exceeds `max_line_fit_mse` (10) the blob falls back to **peaks** (`kPeaks`): windowed line-fit error, a 7-tap
   Gaussian filter, peak detection and a combinatorial search over the 10 best peaks. `APRILTAG_VK_QUADFIT=peaks` forces
-  peaks. Moments use `int64` with an exact 128-bit fallback for very large blobs.
+  peaks. Moments use `int64` with an exact 128-bit fallback for very large blobs. By default (`APRILTAG_VK_QUADFIT_F32`) both paths run in float32 instead (`gpu/QuadFitF32.cpp`): centred moments in eight fixed float lanes, parallel-axis merges of the arcs between peaks, and a chunked windowed error; `=0` selects the integer code above. The hull fit stays integer.
 - **`UpdateFitQuad`** refits the four lines, intersects neighbours (rejects a determinant below 0.001), checks the area
   (at least `0.95 * max(3, tag_width / decimation)^2`), convexity and winding (`cos_critical_rad` 0.98), and scales the corners
   to full resolution.
