@@ -184,6 +184,7 @@ Pi is the Orange Pi 5 / 5 Plus (Mali-G610).
 | Edge-case audit (1.9.x) | default | large blobs, odd frame sizes, pose input checks, pool, resource release | see P §8aa | P §8aa | none |
 | Mesa PanVK instead of libmali | dropped | | rejected at 141 ms per frame **(unverified: from the idea files)** | `survey` | none |
 | Persistent record of the research process | process | one branch per idea, one progress log per topic, A/B interleaved (ABBA) | the Pi's run-to-run variance is about +/-5%; the build type must match across both sides | P §8 (old), PERFORMANCE.md section 5 | none |
+| Compiler tuning options | opt-in (2026-11) | `VKAPRILTAG_LTO`, `VKAPRILTAG_TUNE`, `VKAPRILTAG_CODEGEN`, `VKAPRILTAG_PGO`; defaults empty so the build is portable and bit-identical | desktop `/arch:AVX2`: cpu part -9% to -17%, corpus median 0 to -5%, `ctest` 44/44 and dumps equal; LTO, `/Gw`, `/Ob3 /GS-`, MSVC PGO: within noise; Pi (pinned to the A76 cores) every flag set under 1%, `-O2` +19% cpu | `PR build-tuning` | none |
 
 ## 10. Documents (2026-11)
 
