@@ -358,6 +358,8 @@ FitQuadResult FitQuadForBlobF32(const DetectorConfig &config, std::span<const Ra
   scratch.py.resize(n + 8);
   scratch.pw.resize(n + 8);
   quadf32::Unpack(points.data() + begin, n, scratch.px.data(), scratch.py.data(), scratch.pw.data());
+  scratch.unpacked_begin = begin;
+  scratch.unpacked_n = n;
   const quadf32::Points pts{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
   result.f32 = true;
   result.x0 = pts.x[0];
@@ -665,7 +667,22 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   pts.clear();
   auto &keys = scratch.hull_keys;
   keys.clear();
-  {
+  const bool f32 = config.quad_fit_f32;
+  quadf32::Points up{};
+  if (f32) {
+    scratch.px.resize(n + 8);
+    scratch.py.resize(n + 8);
+    scratch.pw.resize(n + 8);
+    quadf32::Unpack(points.data() + begin, n, scratch.px.data(), scratch.py.data(), scratch.pw.data());
+    scratch.unpacked_begin = begin;
+    scratch.unpacked_n = n;
+    up = {scratch.px.data(), scratch.py.data(), scratch.pw.data()};
+    keys.resize(n);
+    int32_t b[4];
+    quadf32::BoundsAndKeys(up, n, b, keys.data());
+    const int32_t long_side = std::max(b[1] - b[0], b[3] - b[2]), short_side = std::min(b[1] - b[0], b[3] - b[2]);
+    if (long_side < kMinHullExtent || short_side * 5 < long_side * 3) return result;
+  } else {
     int32_t lo_x = INT32_MAX, lo_y = INT32_MAX, hi_x = 0, hi_y = 0;
     for (size_t k = begin; k < end; ++k) {
       const int32_t x = points[k].x2(), y = points[k].y2();
@@ -768,6 +785,21 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   result.x0 = points[begin].x2();
   result.y0 = points[begin].y2();
   constexpr double kBand = 3.0;  // 1.5 pixels
+  if (f32) {
+    result.f32 = true;
+    result.f32_sides.x0 = result.x0;
+    result.f32_sides.y0 = result.y0;
+    for (int s = 0; s < 4; ++s) {
+      const size_t e = best[s];
+      const quadf32::HullEdge edge{static_cast<int32_t>(v[e].first), static_cast<int32_t>(v[e].second), ux[e], uy[e], len[e],
+                                   std::max(10.0, 0.25 * len[e])};
+      quadf32::Centred &side = result.f32_sides.side[s];
+      if (!quadf32::FitHullSide(up, n, result.x0, result.y0, edge, kBand, scratch.f32.hull, &side)) return result;
+      if (quadf32::FitLine(side).mse > config.max_line_fit_mse) return result;
+    }
+    result.valid = true;
+    return result;
+  }
   std::vector<std::array<float, 2>> near;
   std::vector<int> hist;
   for (int s = 0; s < 4; ++s) {
@@ -960,6 +992,26 @@ bool HasOutliers(std::span<const RawLineFitPoint> points, size_t begin, size_t e
   return false;
 }
 
+// HasOutliers over the unpacked points of the blob [begin, end), unpacking it when the slot does not hold it.
+bool HasOutliersF32(std::span<const RawLineFitPoint> points, size_t begin, size_t end, const DetectedQuad &quad,
+                    double decimation, double tolerance, double fraction, QuadFitScratch &scratch) {
+  const size_t n = end - begin;
+  if (scratch.unpacked_begin != begin || scratch.unpacked_n != n) {
+    scratch.px.resize(n + 8);
+    scratch.py.resize(n + 8);
+    scratch.pw.resize(n + 8);
+    quadf32::Unpack(points.data() + begin, n, scratch.px.data(), scratch.py.data(), scratch.pw.data());
+    scratch.unpacked_begin = begin;
+    scratch.unpacked_n = n;
+  }
+  double c[4][2];
+  for (int i = 0; i < 4; ++i) {
+    c[i][0] = quad.p[i][0] * 2.0 / decimation;
+    c[i][1] = quad.p[i][1] * 2.0 / decimation;
+  }
+  return quadf32::HasOutliers({scratch.px.data(), scratch.py.data(), scratch.pw.data()}, n, c, tolerance, fraction);
+}
+
 }  // namespace
 
 std::shared_ptr<WorkerPool> MakeWorkerPool(const DetectorConfig &config) {
@@ -981,6 +1033,7 @@ QuadDecode::QuadDecode(const DetectorConfig &config, std::shared_ptr<WorkerPool>
 std::vector<DetectedQuad> QuadDecode::Decode(
     std::span<const RawLineFitPoint> line_fit_points) const {
   VKA_PROF_SCOPE("quad.decode_all");
+  for (QuadFitScratch &s : scratch_) s.unpacked_n = SIZE_MAX;
   std::vector<DetectedQuad> output;
 
   // Group the points into contiguous per-blob spans (sorted by blob_index, then theta).
@@ -1048,8 +1101,10 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     if (config_.hull_quad) {
       const bool large = !r.has_quad || std::hypot(r.quad.p[0][0] - r.quad.p[2][0], r.quad.p[0][1] - r.quad.p[2][1]) >=
                                             kMinHullExtent * config_.decimation * 0.5;
-      r.hull_candidate = large && (!r.has_quad || HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
-                                               config_.decimation, 4.0, kSuspectFraction));
+      r.hull_candidate = large && (!r.has_quad || (config_.quad_fit_f32 ? HasOutliersF32(line_fit_points, spans[s].begin, spans[s].end, r.quad,
+                                                                config_.decimation, 4.0, kSuspectFraction, scratch_[slot])
+                                                  : HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
+                                                                config_.decimation, 4.0, kSuspectFraction)));
     }
   });
 

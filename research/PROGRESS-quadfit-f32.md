@@ -71,3 +71,55 @@ Targets met: forced peaks faster than the integer fit in all six scenarios; defa
 | batch line fit | SSE2 intrinsics, bit-equal to LineKernel (tail of up to 3 sets scalar) | scalar tail only without SSE2; the portable loop under gcc was vectorised with -fno-math-errno earlier, not re-checked in this form |
 | 7-tap filter, peak mask | vectorised | vectorised |
 | merges, search, closing fits | scalar by design | scalar by design |
+
+## Part D: the hull fit in float32
+Baseline (integer path, `APRILTAG_VK_HULL_QUAD=1`, dec 2, QFSTAT counters, run with `bash $S/hull_stat.sh $E 2 "<scenarios>" "0 1"` after applying `qf32_stat3.py` and `hull_stat.py`). Counters: S16 HasOutliers total, S17 hull bounding box, keys, sort, hull, simplify, edge choice, S18 selection pass (4 sides), S19 vote, S20 moments + FitLine; S24 FitQuadHull calls past the size test, S25 hull candidates, S26 accepted hull quads, S27 HasOutliers calls. ms over the scenario (first of 5 runs, the min-selection was broken by a missing bc and is fixed afterwards):
+| scenario | HasOutliers | hull pre | selection | vote | moments | attempts | candidates | accepted | HasOutliers calls |
+| border-occlusion | 0.39 | 8.30 | 2.65 | 6.33 | 2.15 | 191 | 302 | 188 | 152 |
+| jpeg | 3.11 | 1.85 | 0.76 | 1.25 | 0.57 | 886 | 17464 | 34 | 1925 |
+| busy-background | 4.41 | 1.07 | 0.41 | 1.04 | 0.26 | 327 | 2241 | 39 | 1051 |
+| family16h5 | 3.66 | 0.93 | 0.43 | 0.97 | 0.29 | 300 | 1325 | 51 | 1460 |
+Other scenarios: HasOutliers 0.5 to 3.5 ms and few or no hull attempts (obstruction 5 attempts, grey-margin 34, clutter-only 274). Hull-heavy: border-occlusion; HasOutliers-heavy: busy-background, family16h5, jpeg, clutter-only.
+
+Implementation: `quadf32::FitHullSide` (strip mask in SSE2, compaction, vote with an int bin array and four sub-histograms, band mask as a weight array fed to kernel A about the edge start via `SegmentMomentsAbout`), `quadf32::HasOutliers` (blocks of 64, SSE2 over four points, all four sides branch-free, leave after a block once the count exceeds `allowed`), `quadf32::BoundsAndKeys` (SSE2 min/max and keys), `HasOutliersF32` in QuadDecode.cpp reusing the blob's unpacked arrays (tagged by first index and length, reset at the start of each Decode). `FitQuadHull` branches on `config.quad_fit_f32` in the bounding box pass and in the per-side loop; sort, hull, simplify and edge choice are shared.
+Unit tests (group quadfit32): bounds and keys against a loop; masked kernel SIMD == scalar (memcmp) and against a double sum over the weighted points; `FitHullSide` against a double copy of the integer algorithm on rotated rectangles with a bump and clutter (angles 0, 7, -23, 41), SIMD == portable bit-equal; `HasOutliers` against the double version on 60 random quads x 3 fractions (at most 1 decision may differ; none did), SIMD == portable.
+Stage table after (same method, best of 5, ms over the scenario, old integer -> new f32):
+| scenario | HasOutliers | hull pre (shared) | selection | vote | moments |
+| border-occlusion | 0.40 -> 0.13 | 8.89 -> 8.82 | 2.63 -> 1.24 | 6.43 -> 4.48 | 2.16 -> 1.05 |
+| jpeg | 3.13 -> 1.18 | 1.93 -> 1.94 | 0.74 -> 0.34 | 1.23 -> 0.82 | 0.56 -> 0.23 |
+| busy-background | 4.36 -> 1.39 | 1.09 -> 1.12 | 0.38 -> 0.19 | 1.06 -> 0.81 | 0.27 -> 0.15 |
+| family16h5 | 3.66 -> 1.21 | 0.99 -> 1.01 | 0.42 -> 0.18 | 0.97 -> 0.73 | 0.29 -> 0.14 |
+First attempt (plain float loops, no SSE2, no sub-histograms) was not faster: HasOutliers 3.2 -> 4.8 ms on jpeg (all four sides evaluated for every point against the integer code's early exit per point) and selection 0.74 -> 0.53; with SSE2 and the sub-histograms every stage wins. "Hull pre" is dominated by the key sort, hull and simplify, which stay shared.
+
+Portable clamp: the first float HasOutliers used min/max for the clamp, which gcc will not vectorise without fast-math ("unsupported control flow"); both forms now clamp with 0.5 * ((|t| - |t - 1|) + 1), which gcc vectorises and which keeps SIMD and portable bit-equal. The SSE2 path pays two more operations: final HasOutliers numbers below.
+
+Final stage table (best of 5, ms over the scenario, `APRILTAG_VK_HULL_QUAD=1`, dec 2, old integer -> new f32):
+| scenario | HasOutliers | hull pre (shared) | selection | vote | moments |
+| border-occlusion | 0.39 -> 0.17 | 8.82 -> 8.86 | 2.55 -> 1.23 | 6.40 -> 4.45 | 2.16 -> 1.05 |
+| jpeg | 3.14 -> 1.43 | 1.94 -> 1.95 | 0.78 -> 0.32 | 1.24 -> 0.82 | 0.56 -> 0.23 |
+| busy-background | 4.37 -> 1.76 | 1.15 -> 1.11 | 0.39 -> 0.20 | 1.05 -> 0.79 | 0.28 -> 0.15 |
+| family16h5 | 3.65 -> 1.46 | 0.97 -> 0.95 | 0.41 -> 0.16 | 0.98 -> 0.73 | 0.29 -> 0.14 |
+
+Gate (clean build, same binary, APRILTAG_VK_QUADFIT_F32=0 against default; found, false, err med/p95 off -> on, corner diff max / p99 / nonzero):
+- hull, dec 2: 7204/7348, 1, 0.0170/0.0943 -> 0.0170/0.0940, 0.186 / 0.0015 / 4219 of 28820
+- hull, dec 1: 7233/7348, 0, 0.0169/0.0929 -> 0.0169/0.0916, 0.173 / 0.0017 / 5183 of 28932
+- hull + rescue, dec 2: 7228/7348, 0, 0.0170/0.0980 -> 0.0170/0.0976, 0.186 / 0.0015 / 4219
+- hull + rescue, dec 1: 7233/7348, 0, 0.0169/0.0929 -> 0.0169/0.0916, 0.173 / 0.0017 / 5183
+- No scenario differs in found count. Hull quads cannot be told apart in the dumps, so the corner differences are over all detections.
+- Default (hull off) dec 2 against the dump of 2493da8: identical found/false/error; corner differences max 0.0029 px on 5 corners (GPU noise).
+- ctest 46/46 (golden profile rescue-hull enables the hull; untouched).
+- Corpus A/B with the hull on (`bash $S/benchlock.sh bash $S/qf32_ab.sh $E $A/qf32/t4 2 3 "APRILTAG_VK_HULL_QUAD=1"`, 3 interleaved rounds): total median off 0.286/0.283/0.284, on 0.277/0.279/0.284 ms; cpu median off 0.092/0.095/0.096, on 0.087/0.087/0.094 ms (about 5 to 8% lower cpu).
+- Pi: `sh $S/pi.sh 'echo ok'` -> "Host does not exist"; not run.
+
+Vectorisation of the new loops (MSVC /Qvec-report:2; gcc 16.1 `-O3 -fno-math-errno -DVKAPRILTAG_NO_SSE2`):
+| Loop | MSVC | gcc portable |
+| --- | --- | --- |
+| bounds and keys | SSE2 intrinsics (scalar tail 1200) | vectorised |
+| strip mask | SSE2 intrinsics | vectorised |
+| compaction of near points | scalar (1203) | scalar by design |
+| vote bin indices | vectorised | vectorised |
+| vote increments (four sub-histograms) | scalar (1505) | scalar by design |
+| band mask and weights | SSE2 intrinsics | vectorised |
+| masked kernel A passes | SSE2 intrinsics, bit-equal to portable | vectorised |
+| HasOutliers | SSE2 intrinsics (portable loop 1106/1305) | vectorised after the fabs clamp |
+`FitLine`, `Int128`, `NeedsWide` and the integer hull code in QuadDecode.cpp now serve only `APRILTAG_VK_QUADFIT_F32=0`.

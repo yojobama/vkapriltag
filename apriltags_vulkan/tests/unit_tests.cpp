@@ -1,6 +1,7 @@
 // CPU-only unit tests of the pure helpers and the CPU stages; no Vulkan device is used.
 // usage: unit_tests [decode|geometry|geom|edges|quadfit|quadfit32|options|steps|pool]   (no argument runs all)
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -715,7 +716,185 @@ bool SameSet(const qf::Centred &c, const RefSet &r) {
          std::fabs(c.syy - r.syy) < 2e-6 * scale;
 }
 
+// The per-side hull fit in double, as the integer code defines it: the strip, the vote and the band.
+bool RefHullSide(const std::vector<int32_t> &x, const std::vector<int32_t> &y, const std::vector<int32_t> &w, size_t n,
+                 const qf::HullEdge &e, double band, int32_t bx, int32_t by, RefSet *out, size_t *inside) {
+  std::vector<std::array<float, 2>> near;
+  for (size_t i = 0; i < n; ++i) {
+    const double dx = x[i] - e.p0x, dy = y[i] - e.p0y;
+    const double along = dx * e.ux + dy * e.uy, across = dx * e.uy - dy * e.ux;
+    if (std::fabs(across) > e.window || along < -band || along > e.len + band) continue;
+    near.push_back({static_cast<float>(dx), static_cast<float>(dy)});
+  }
+  const size_t bins = static_cast<size_t>(e.window) + 2;
+  double best_support = -1, best_cos = 1, best_sin = 0, best_offset = 0;
+  std::vector<int> hist;
+  for (int step = 0; step < 21; ++step) {
+    const int deg = (step + 1) / 2 * ((step & 1) ? 1 : -1);
+    const double a = deg * 0.017453292519943295, ca = std::cos(a), sa = std::sin(a);
+    const double nx = e.uy * ca + e.ux * sa, ny = -(e.ux * ca - e.uy * sa);
+    hist.assign(bins, 0);
+    const float fnx = static_cast<float>(nx * 0.5), fny = static_cast<float>(ny * 0.5);
+    const float shift = static_cast<float>(e.window * 0.5);
+    for (const auto &q : near) {
+      const int b = static_cast<int>(q[0] * fnx + q[1] * fny + shift);
+      if (static_cast<unsigned>(b) < bins) ++hist[b];
+    }
+    for (size_t b = 0; b + 1 < bins; ++b) {
+      const double support = hist[b] + hist[b + 1];
+      if (support > best_support) {
+        best_support = support, best_cos = ca, best_sin = sa;
+        best_offset = static_cast<double>(b) * 2.0 - e.window + 2.0;
+      }
+    }
+  }
+  const double nx = e.uy * best_cos + e.ux * best_sin, ny = -(e.ux * best_cos - e.uy * best_sin);
+  std::vector<size_t> idx;
+  for (size_t i = 0; i < n; ++i) {
+    const double dx = x[i] - e.p0x, dy = y[i] - e.p0y;
+    const double along = dx * e.ux + dy * e.uy;
+    if (std::fabs(dx * nx + dy * ny - best_offset) > band || along < -band || along > e.len + band) continue;
+    idx.push_back(i);
+  }
+  *inside = idx.size();
+  if (idx.size() < 6) return false;
+  *out = RefMoments(x, y, w, idx, bx, by);
+  return true;
+}
+
+// The outlier test in double, as the integer code defines it.
+bool RefHasOutliers(const std::vector<int32_t> &x, const std::vector<int32_t> &y, size_t n, const double c[4][2],
+                    double tolerance, double fraction) {
+  double d[4][2], inv_l2[4];
+  for (int i = 0; i < 4; ++i) {
+    d[i][0] = c[(i + 1) & 3][0] - c[i][0];
+    d[i][1] = c[(i + 1) & 3][1] - c[i][1];
+    const double l2 = d[i][0] * d[i][0] + d[i][1] * d[i][1];
+    inv_l2[i] = l2 > 0 ? 1.0 / l2 : 0.0;
+  }
+  const double limit = tolerance * tolerance;
+  const size_t allowed = static_cast<size_t>(fraction * static_cast<double>(n));
+  size_t out = 0;
+  for (size_t k = 0; k < n; ++k) {
+    bool near_side = false;
+    for (int i = 0; i < 4 && !near_side; ++i) {
+      const double ex = x[k] - c[i][0], ey = y[k] - c[i][1];
+      const double t = std::min(1.0, std::max(0.0, (ex * d[i][0] + ey * d[i][1]) * inv_l2[i]));
+      const double rx = ex - t * d[i][0], ry = ey - t * d[i][1];
+      near_side = rx * rx + ry * ry <= limit;
+    }
+    if (!near_side && ++out > allowed) return true;
+  }
+  return false;
+}
+
+void TestHullF32() {
+  std::mt19937 rng(11);
+  // Bounding box and keys.
+  for (const size_t n : {1u, 3u, 4u, 9u, 250u}) {
+    std::vector<int32_t> x(n + 8), y(n + 8), w(n + 8);
+    for (size_t i = 0; i < n; ++i) x[i] = int32_t(rng() % 16384), y[i] = int32_t(rng() % 16384);
+    std::vector<uint32_t> keys(n);
+    int32_t b[4];
+    qf::BoundsAndKeys({x.data(), y.data(), w.data()}, n, b, keys.data());
+    int32_t lx = 1 << 30, hx = 0, ly = 1 << 30, hy = 0;
+    bool same = true;
+    for (size_t i = 0; i < n; ++i) {
+      lx = std::min(lx, x[i]), hx = std::max(hx, x[i]), ly = std::min(ly, y[i]), hy = std::max(hy, y[i]);
+      same = same && keys[i] == (uint32_t(x[i]) << 14 | uint32_t(y[i]));
+    }
+    CHECK(same && b[0] == lx && b[1] == hx && b[2] == ly && b[3] == hy);
+  }
+
+  // The masked moments: bit-equal to the scalar form, and equal to the sums over the points with weight.
+  {
+    const size_t n = 301;
+    std::vector<int32_t> x(n + 8), y(n + 8), w(n + 8);
+    for (size_t i = 0; i < n; ++i) {
+      x[i] = 15000 + int32_t(rng() % 300);
+      y[i] = 14000 + int32_t(rng() % 300);
+      w[i] = (rng() % 3 == 0) ? 0 : 1 + int32_t(rng() % 1023);
+    }
+    const qf::Points p{x.data(), y.data(), w.data()};
+    const qf::Centred a = qf::SegmentMomentsAbout(p, 0, n, 0, 0, 15100, 14100, 15000, 14000);
+    const qf::Centred b = qf::SegmentMomentsAboutScalar(p, 0, n, 0, 0, 15100, 14100, 15000, 14000);
+    CHECK(std::memcmp(&a, &b, sizeof a) == 0);
+    std::vector<size_t> idx;
+    for (size_t i = 0; i < n; ++i) {
+      if (w[i] > 0) idx.push_back(i);
+    }
+    RefSet r = RefMoments(x, y, w, idx, 15000, 14000);
+    r.N = a.N;
+    CHECK(SameSet(a, r));
+  }
+
+  // One hull side against the double version, on a rotated rectangle with a bump and clutter.
+  for (const double angle : {0.0, 7.0, -23.0, 41.0}) {
+    const double ca = std::cos(angle * kPi / 180), sa = std::sin(angle * kPi / 180);
+    std::vector<int32_t> x, y, w;
+    auto add = [&](double u, double v) {
+      x.push_back(int32_t(std::lround(600 + u * ca - v * sa)));
+      y.push_back(int32_t(std::lround(600 + u * sa + v * ca)));
+      w.push_back(1 + int32_t(rng() % 1023));
+    };
+    for (int i = 0; i <= 300; i += 2) add(i, double(rng() % 3));
+    for (int i = 0; i <= 200; i += 2) add(300 + double(rng() % 3), i);
+    for (int i = 300; i >= 0; i -= 2) add(i, 200 + double(rng() % 3) + ((i > 100 && i < 140) ? 12 : 0));
+    for (int i = 200; i >= 0; i -= 2) add(double(rng() % 3), i);
+    for (int i = 0; i < 40; ++i) add(double(rng() % 300), double(rng() % 200));
+    const size_t n = x.size();
+    const int32_t bx = x[0], by = y[0];
+    const qf::HullEdge e{x[0], y[0], ca, sa, 300.0, 75.0};
+    std::vector<int32_t> px(x), py(y), pw(w);
+    px.resize(n + 8), py.resize(n + 8), pw.resize(n + 8);
+    qf::HullScratch scratch;
+    qf::Centred got;
+    const bool ok = qf::FitHullSide({px.data(), py.data(), pw.data()}, n, bx, by, e, 3.0, scratch, &got);
+    RefSet ref;
+    size_t inside = 0;
+    const bool rok = RefHullSide(x, y, w, n, e, 3.0, bx, by, &ref, &inside);
+    CHECK(ok && rok);
+    qf::Centred plain;
+    CHECK(qf::FitHullSide({px.data(), py.data(), pw.data()}, n, bx, by, e, 3.0, scratch, &plain, false) == ok);
+    CHECK(std::memcmp(&got, &plain, sizeof got) == 0);
+    if (ok && rok) {
+      ref.N = double(inside);
+      CHECK(got.N == float(inside));
+      CHECK(SameSet(got, ref));
+      if (!SameSet(got, ref)) std::printf("  hull side angle %g: W %g vs %g, N %g vs %zu\n", angle, double(got.W), ref.W, double(got.N), inside);
+    }
+  }
+
+  // The outlier test against the double version: random quads, point sets with a known share far away.
+  int disagreements = 0, decisions = 0;
+  for (int trial = 0; trial < 60; ++trial) {
+    const double cx = 400 + double(rng() % 400), cy = 400 + double(rng() % 400), side = 100 + double(rng() % 200);
+    double c[4][2];
+    SquareCorners(cx, cy, side, double(rng() % 90), c);
+    const size_t n = 200 + rng() % 300;
+    std::vector<int32_t> x(n + 8), y(n + 8), w(n + 8, 1);
+    const double far_share = (rng() % 100) / 1000.0;
+    for (size_t i = 0; i < n; ++i) {
+      const int s = int(rng() % 4);
+      const double t = double(rng() % 1000) / 1000.0;
+      double px = c[s][0] + t * (c[(s + 1) & 3][0] - c[s][0]), py = c[s][1] + t * (c[(s + 1) & 3][1] - c[s][1]);
+      if (double(rng() % 1000) / 1000.0 < far_share) px += 30, py -= 30;
+      x[i] = int32_t(std::lround(px)), y[i] = int32_t(std::lround(py));
+    }
+    for (const double fraction : {0.005, 0.02, 0.05}) {
+      const bool a = qf::HasOutliers({x.data(), y.data(), w.data()}, n, c, 4.0, fraction);
+      const bool b = RefHasOutliers(x, y, n, c, 4.0, fraction);
+      CHECK(a == qf::HasOutliers({x.data(), y.data(), w.data()}, n, c, 4.0, fraction, false));
+      ++decisions;
+      disagreements += a != b;
+    }
+  }
+  CHECK(disagreements <= 1);
+  if (disagreements > 0) std::printf("  outlier test: %d of %d decisions differ\n", disagreements, decisions);
+}
+
 void TestQuadFitF32() {
+  TestHullF32();
   std::mt19937 rng(7);
   // Origins: near the corner of the image, and far out where the coordinates approach 16383.
   for (const int32_t base : {0, 2000, 16000}) {
