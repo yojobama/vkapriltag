@@ -82,3 +82,27 @@ Against `base` the same variants are +0.2..-5% / -4.6..-13%: AVX2 helps the cpu 
 Group a (base 0.7143, cpu 0.1496): -fno-math-errno +0.3% / cpu +0.6%; -fno-trapping-math +0.2% / +0.6%; -fno-semantic-interposition -fno-plt +0.4% / -0.2%. Nothing.
 Group b (base 0.7175, cpu 0.1499): all four codegen flags -0.1% / +0.8%; + -mcpu=cortex-a76 -0.5% / -1.1%; + lto -0.7% / -1.9%. Dumps identical (0 to 1 lines).
 The unpinned -5.8% / -6.9% of E3 was scheduler noise. Conclusion: on the Pi no compiler flag moves the pipeline by more than 1% (cpu part is 0.15 of 0.72 ms).
+
+### E6 desktop MSVC PGO (`VKAPRILTAG_PGO=GENERATE`, `tools/pgo/train.sh`, `pgomgr /merge`, `USE`; /GL /LTCG implied), 7 rounds
+Train: 4 scenarios at decimation 1 and 2 plus the 10 sequences through track_eval (54 s). MSVC writes the .pgc files beside the executable and the
+link does not merge them: `pgomgr /merge "<exe>!*.pgc" <dir>\<exe>.pgd` is needed before the USE link (train.sh does not do it yet: TODO).
+Result against base2: d2 med +1.7%, p95 +2.9%, cpu +1.5% (base itself +1.4%); d1 +4.0%, cpu -1.8%. No gain; the link printed nothing about the profile, so
+whether it applied is unverified. MSVC PGO also only tunes the executable that is linked, not an installed static `.lib` used by a consumer.
+Dumps equal within noise.
+
+### Pi status at the end
+Unreachable (ping and plink time out) from the E5 / PGO stage on. Done on the Pi before that: E3, E5 (`p1c`: a76, lto, lse pinned, first rounds only seen), vectorisation report,
+gcc PGO generate build (`b-pgo`) and its training run (gcda written under `~/w/build-tuning/b-pgo/pgo`). NOT run: the gcc PGO USE build and its timing, `ctest` on the Pi for any
+tuned build, SWIG, track_eval on tuned builds, the 4-flag combinations at decimation 1 pinned.
+
+### Gate (defaults are unchanged, nothing is on by default)
+Default configure: flags identical to 1879a92 (base2 build.ninja has the same compile lines; dumps equal; deps_lint and options_lint pass).
+Desktop `ctest` 44/44 for base, lto, avx2, avx2+/fp:contract, avx2+/Ob3 /GS-, lto+avx2 (own_decode_*, goldens and installed_package_consumer included; LTO consumer works because the
+MSVC linker handles /GL objects of the installed .lib with the same compiler). Not run: SWIG with LTO, track_eval of tuned builds, anything on the Pi.
+
+### Recommendation
+- Default: all off (portable, bit-identical). Keep as is.
+- x86-64 Windows, desktop only (not the release artefact): `-DVKAPRILTAG_TUNE=/arch:AVX2` (cpu part -9% to -17%, bit-equality tests pass). gcc: `-march=x86-64-v3` untested here; it would contract to FMA in files without `-ffp-contract=off`, so check dumps first.
+- Pi / aarch64: no flag helps (under 1%). The `.deb` and release.yml stay on the default flags; do not use LSE or `-mcpu` (breaks Cortex-A53/A72 era boards for ~0%). `-O2` is worse (+19% cpu): keep `-O3`.
+- LTO and PGO: no measurable gain on either machine; leave off. If PGO is revisited, offer it only as the opt-in `VKAPRILTAG_PGO` with `tools/pgo/train.sh`, never in the default or release build.
+- Allocator and threading (item 5): not measured (budget). Outline atomics helpers stay (1% on the Pi) because LSE-only builds are not portable.

@@ -53,6 +53,10 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ### Changed (build)
 
+- **Opt-in compiler tuning** (`cmake/BuildTuning.cmake`, all off by default, so the default build is unchanged and portable): `VKAPRILTAG_LTO`
+  (`-flto` with fat objects on GCC, `/GL` `/LTCG` on MSVC), `VKAPRILTAG_TUNE` (target flags such as `-mcpu=cortex-a76` or `/arch:AVX2`),
+  `VKAPRILTAG_CODEGEN` (extra flags) and `VKAPRILTAG_PGO=GENERATE|USE` with `tools/pgo/train.sh`. Measured on the desktop only `/arch:AVX2`
+  helps (cpu part -9% to -17%, corpus median 0 to -5%); on the Orange Pi nothing moves the pipeline by more than 1%. See `ARCHITECTURE.md` 9.4.
 - **The project no longer depends on libapriltag.** A default configure fetches nothing (no network, no C
   compiler needed), applies no patches, and the library, the tests, the install tree and the `.deb` packages hold
   nothing from AprilRobotics' library; `find_package(vkapriltag)` needs only Vulkan and Threads. The decode is the

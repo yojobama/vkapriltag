@@ -422,6 +422,11 @@ CMake 3.16, C++20, Vulkan headers and loader, `glslangValidator` (the integer do
 `VKAPRILTAG_BUILD_TOOLS`, `VKAPRILTAG_BUILD_TESTS` (default on), `VKAPRILTAG_EMBED_SHADERS` (SPIR-V compiled into the library, default
 on), `VKAPRILTAG_UPSTREAM_VALIDATION` (default off: fetches stock libapriltag v3.4.5 into `tools/upstream` for the reference tools;
 excluded from `all`, install and packages) and `VKAPRILTAG_REGEN_VECTORS` (also patches it to rewrite the decode test vectors).
+Compiler tuning (`cmake/BuildTuning.cmake`), all off by default so the default build is portable and bit-identical: `VKAPRILTAG_LTO`
+(`-flto -ffat-lto-objects`; MSVC `/GL` `/LTCG`, which ties consumers of the installed `.lib` to the same MSVC version),
+`VKAPRILTAG_TUNE` (flags such as `-mcpu=cortex-a76`, `-march=x86-64-v3`, `/arch:AVX2`; the binary then needs that CPU, so never for the generic `.deb`),
+`VKAPRILTAG_CODEGEN` (extra flags) and `VKAPRILTAG_PGO=GENERATE|USE` (`VKAPRILTAG_PGO_DIR`; train with `tools/pgo/train.sh`; GCC needs the same build directory for both steps).
+Measurements are in `research/PROGRESS-build-tuning.md`: `/arch:AVX2` is the only measurable gain (desktop cpu part -9% to -17%, pipeline 0 to -5%); the Pi gains under 1%.
 `find_package(vkapriltag)` needs only Vulkan and Threads. `.github/workflows/release.yml` builds the `.deb` packages (glslang 16.2.0)
 and checks they contain the dot product shader and nothing from upstream; `vkapriltag-parity.yml` runs the default `ctest` on
 lavapipe, then the upstream parity gate.
