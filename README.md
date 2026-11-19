@@ -99,7 +99,8 @@ for (const Detection &tag : result.detections) {
 
 Everything else is an option: `options.mode` is `Mode::kSync`, `kPipelined` (the GPU works on this frame while the CPU decodes
 the previous one) or `kTracking` (slow scenes skip the GPU on most frames); `options.levels` runs several decimations;
-`options.small_tag_rescue`, `hull_quad` and `polish` trade time for recall and precision; `options.tag_size` with
+`options.small_tag_rescue`, `hull_quad` and `polish` trade time for recall and precision; `options.min_white_black_diff`,
+`min_cluster_pixels`, `min_tag_pixels` and `probe_margin` filter candidates; `options.tag_size` with
 `options.intrinsics` adds a pose per detection (`result.poses`); several cameras share one `Device`. Failures throw
 `apriltag_vulkan::Error` with a code. `apps/apriltag_vulkan/main.cpp` is a complete V4L2 example.
 
