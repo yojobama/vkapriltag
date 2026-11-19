@@ -55,3 +55,21 @@ Validation-layer counts (`UNASSIGNED-Threading` lines / other "Validation Error"
 Unfixed without the layer: threads_pipelined2 failed 2 of 3 runs (exit 1); tracking and levels passed 3 of 3. The layer's other errors on the unfixed tree
 include VUID-vkResetFences-pFences-01123 (a fence reset while its queue work is pending). Fixed tree: no error, no wrong result in any mode.
 Gate: ctest 47/47, no golden or gpu_trace file changed; `ctest -R facade_threads --repeat until-fail:20` 20 of 20. Library unchanged, so no corpus run.
+
+## Step 4: Orange Pi round (2026-11-19, Mali-G610, one compute queue)
+Unfixed tree = e889f8b with the library files of e9e6195 (as on the desktop). Every run limited to 120 s (a hang counts as a failure).
+
+| mode | unfixed, no layer, 3 runs | unfixed, ThreadSanitizer | unfixed, validation layer (sync validation) | fixed, 3 runs / TSan / layer |
+| --- | --- | --- | --- | --- |
+| sync | 0/3 (2 hung, 1 with 201 wrong) | 68 race reports | 30 errors, abort | 3/3 / 0 / 0 |
+| pipelined1 | 0/3 (2 hung, 1 abort) | 4 | 14, abort | 3/3 / 0 / 0 |
+| pipelined2 | 0/3 (323 to 393 wrong) | 4 | 30, abort | 3/3 / 0 / 0 |
+| tracking | 3/3 | 52 | 24, abort | 3/3 / 0 / 0 |
+| trackingasync | 2/3 (1 hung) | 8 | 16, abort | 3/3 / 0 / 0 |
+| levels | 0/3 (about 210 wrong) | 6 | 40, abort | 3/3 / 0 / 0 |
+
+Layer errors on the unfixed tree: VUID-vkResetFences-pFences-01123 and VUID-vkQueueSubmit-fence-00064. A hung run (sync, first attempt, without
+a time limit) sat for 5 h 50 min: the main thread joins the detector threads, which wait in libmali's fence wait that never completes.
+Fixed tree: ctest 48/48, `ctest -R facade_threads --repeat until-fail:20` 20 of 20, ASan+UBSan and TSan clean on unit_tests, every facade
+group, vk_eval (dec 1 and 2; default, hull+small+polish, peaks; one thread) and track_eval; validation layer clean on all six threaded modes,
+vk_eval and track_eval.

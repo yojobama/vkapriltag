@@ -158,3 +158,30 @@ Whole hull stage (pre + selection + vote + moments, ms over the scenario): borde
 Corpus A/B with the hull on, db38944 against this commit, interleaved under the lock (`bash $S/benchlock.sh bash $S/ab.sh $A/basebin/vk_eval_db38944.exe $A/basebin/vk_eval_e_new.exe $A/qf32/t5 "APRILTAG_VK_HULL_QUAD=1" 3`, dec 2): total median base 0.273/0.265/0.263, new 0.263/0.265/0.262 ms; total mean 0.299/0.284/0.283 -> 0.282/0.280/0.279 ms; total p95 0.517/0.488/0.485 -> 0.479/0.471/0.472 ms; cpu median 0.092/0.087/0.087 -> 0.088/0.091/0.086 ms (noise). The gain is in the frames with large blobs (the p95), not in the median.
 ctest 46/46 (golden profile rescue-hull included, nothing regenerated). Pi: `sh $S/pi.sh 'echo ok'` timed out / host does not exist; not run.
 Vectorisation of the new loops: column fill (scatter, scalar by design: MSVC 1203, gcc not), column listing (scalar by design), `FarVertex` maximum pass (gcc 16.1 vectorises it, MSVC 1104), the simplification and edge choice loops run over at most 16 vertices and stay scalar. The cost that remains in the pre stage is the chain over the candidates (about a third of the pre total on jpeg) and the unpack and box.
+
+## Pi round (2026-11-19, Orange Pi 5 Plus, Mali-G610, gcc 14.2, tree e889f8b against 950c7a2)
+- Build: Release `-O3`, no `-march`; the portable lane loops are the ARM path. `-fopt-info-vec` on `QuadFitF32.cpp`: 29 loops and 16 basic blocks
+  vectorised with 16-byte (NEON) vectors, including every moment, window-error and unpack loop (lines 93, 146, 158, 260, 339, 415, 488, 649, 688,
+  718, 774, 849). gcc 14 warns `-Warray-bounds` at the `std::sort` in `FitPeaks`; the range is capped at `kNMaxima` two lines above, a false positive.
+- ctest: 48/48; with `APRILTAG_VK_QUADFIT_F32=0` 45/45 (lint and consumer excluded); base 45/45.
+- Corpus (5,323 frames without 1920x1080, `--iterations 2`), found / false / error median / p95 px:
+
+| variant | dec 2 base | dec 2 new | dec 1 base | dec 1 new |
+| --- | --- | --- | --- | --- |
+| default | 4819 / 35 / 0.017 / 0.100 | 4819 / 35 / 0.017 / 0.099 | 4827 / 23 / 0.017 / 0.100 | 4827 / 23 / 0.017 / 0.100 |
+| `QUADFIT_F32=0` (new only) | | 4819 / 35 / 0.017 / 0.100 | | 4827 / 23 / 0.017 / 0.100 |
+| hull | 4852 / 63 / 0.017 / 0.096 | 4852 / 63 / 0.017 / 0.095 | 4880 / 61 / 0.017 / 0.097 | 4880 / 61 / 0.017 / 0.096 |
+| peaks | 4814 / 30 / 0.017 / 0.096 | 4814 / 30 / 0.017 / 0.096 | 4826 / 22 / 0.017 / 0.095 | 4826 / 22 / 0.017 / 0.097 |
+| hull + small rescue | 4876 / 62 / 0.017 / 0.100 | 4876 / 62 / 0.017 / 0.099 | 4880 / 61 / 0.017 / 0.097 | 4880 / 61 / 0.017 / 0.096 |
+
+- Sequences (`track_eval`, full and keyframe): recall and false detections identical; p95 corner error within 0.01 px (fast-1tag-1280 0.114 -> 0.118,
+  fast-2tag-640 0.697 -> 0.707 in full mode; the rest equal).
+- Timing, `lumenvision` stopped, `performance` governors, dec 2, four interleaved rounds (order reversed on even rounds), 5 iterations, mean of the
+  26 scenario medians (ms): base 0.752 0.745 0.755 0.752 (mean 0.751); new 0.748 0.745 0.759 0.753 (0.751); new integer fit 0.752 0.749 0.760 0.753
+  (0.754); new hull 0.760 0.763 0.768 0.779 (0.768); base hull 0.800 0.781 0.780 0.780 (0.785). The float32 fit does not move the Pi frame time;
+  with the hull on, this tree (float32 hull and the hull geometry without a sort together) is 2.2% faster.
+- Sequences at 0 ms gaps (mean of 10 medians, full / key): base 0.741 / 0.361, new 0.742 / 0.363 and 0.747 / 0.364. At 16 ms gaps the first run
+  (base, new, new) gave base 0.755 / 0.365 against new 0.782 / 0.404 and 0.778 / 0.371; reversed order (new, base, base, new) gave new 0.760 / 0.368
+  and 0.762 / 0.375 against base 0.778 / 0.399 and 0.799 / 0.431, so the difference follows run order, not the tree.
+- perf (dec 2): `ProfilePass` 34% of samples on jpeg and 16% on border-occlusion; `CpuDecimate` 15% on border-occlusion; with the hull
+  `FitHullSide` 13%; the float32 fit functions 1 to 5% each (`SegmentMomentsAboutImpl` 5.4%, `FitPeaks` 4.0%, `BuildChunk` 2.7% on jpeg).
