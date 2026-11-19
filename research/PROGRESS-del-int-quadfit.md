@@ -35,4 +35,28 @@ built with `vsbuild.bat`, `ctest --test-dir lib-<t>` through `vs.bat`.
    APRILTAG_VK_SMALL_RESCUE=1`. Dumps compared with `cmp`; scored with `score_corpus.py`.
 3. `git grep -n -i "quadfit_f32\|quad_fit_f32"`: only the CHANGELOG entry and research history text remain.
 
-(Results of the corpus comparison are appended below.)
+
+## Results
+
+ctest: 47/47 before and 47/47 after.
+
+Corpus, base (446aa2b) against new, summed over the 26 scenarios (tags 7348 in every run); per-scenario found,
+false and winding counts are equal in all eight runs, and the p50/p95/max corner error columns of the score tables
+are equal at three decimals:
+
+| mode | dec 2 found / false | dec 1 found / false |
+| --- | --- | --- |
+| default | 7146 / 1 | 7129 / 0 |
+| `QUADFIT=peaks` | 7140 / 0 | 7128 / 1 |
+| `HULL_QUAD=1` | 7204 / 1 | 7233 / 0 |
+| `HULL_QUAD=1 SMALL_RESCUE=1` | 7228 / 0 | 7233 / 0 |
+
+Byte identity: the dumps are not byte-reproducible from run to run even for the unchanged binary. The first
+base run and the first new run differed in 1 to 12 of 26 files per mode, so base was run a second time ("base2",
+`corpus2.sh`). base against base2 (same binary) differs in 1 to 11 files per mode, base against new in 1 to 12, base2
+against new in 2 to 10. In every comparison the detection ids, counts and order are identical; only the last digits of
+corners differ, by at most 0.0046 px (base against base2 at most 0.0030, base against new at most 0.0046). Three
+repeats of base on `noise` at dec 2 were identical to each other and to new but not to the first base run, so the
+source is intermittent (not caused by this change). The cause was not investigated.
+
+`git grep -n -i "quadfit_f32\|quad_fit_f32"` finds only the CHANGELOG entry and research history text.
