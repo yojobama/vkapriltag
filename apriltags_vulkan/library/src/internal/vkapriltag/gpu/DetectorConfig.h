@@ -90,10 +90,6 @@ struct DetectorConfig {
   // border is partly covered. Env override: APRILTAG_VK_HULL_QUAD=0|1
   bool hull_quad = false;
 
-  // Fits the quad's sides in float32 over centred moments instead of exact integer sums.
-  // Env override: APRILTAG_VK_QUADFIT_F32=0|1
-  bool quad_fit_f32 = true;
-
   // Caps on the raw (pre-selection) blob count.
   uint32_t max_raw_blobs = 65536;
   // Ceiling on blobs surviving selection. 0 sizes it from the frame (scaled with

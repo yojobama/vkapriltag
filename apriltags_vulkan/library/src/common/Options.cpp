@@ -24,8 +24,6 @@ const OptionDescriptor kTable[] = {
      "Retry a failed quad fit on the convex hull of the blob (partly covered border)."},
     {"APRILTAG_VK_QUADFIT", T::kEnum, "dp", C::kFeature, P::kEnvWins, "DetectorConfig::quad_fit_method",
      "Corner seeding: dp or peaks (other values are ignored)."},
-    {"APRILTAG_VK_QUADFIT_F32", T::kBool, "on", C::kFeature, P::kEnvWins, "DetectorConfig::quad_fit_f32",
-     "Quad fit in float32 over centred moments (vectorised); off: the exact integer fit."},
     {"APRILTAG_VK_REFINE", T::kEnum, "profile", C::kFeature, P::kEnvWins, "TagDecoder refine_method",
      "Edge refinement: exact or profile (other values are ignored); used when TagDecoderConfig::refine_edges is set."},
     {"APRILTAG_VK_POLISH", T::kBool, "off", C::kFeature, P::kEnvWins, "TagDecoder::SetPolish",

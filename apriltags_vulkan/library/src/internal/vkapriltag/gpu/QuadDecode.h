@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <memory>
 #include <span>
 #include <utility>
@@ -13,23 +12,15 @@
 
 namespace apriltag_vulkan {
 
-// Reusable per-blob-fit scratch for the peaks-based fit path. One instance per
+// Reusable per-blob-fit scratch. One instance per
 // WorkerPool slot, indexed by the `slot` ParallelFor passes to each task.
 struct QuadFitScratch {
   std::vector<int32_t> px, py, pw;
-  std::vector<LineFitMoments> cs;
-  std::vector<double> error;
-  std::vector<double> filtered;
-  std::vector<double> padded;
-  std::vector<float> win_diff, win_xy2, win_sum, win_w8;
-  std::vector<std::pair<double, uint32_t>> peaks;
   std::vector<std::pair<int32_t, int32_t>> hull_points;
   std::vector<std::pair<int32_t, int32_t>> hull;
   std::vector<uint32_t> hull_keys;
   quadf32::Scratch f32;
   quadf32::HullGeom geom;
-  std::vector<std::array<float, 2>> hull_near;
-  std::vector<int> hull_hist;
   // The blob (first point index and length) whose points px, py, pw hold; SIZE_MAX when none.
   size_t unpacked_begin = 0, unpacked_n = SIZE_MAX;
 };
