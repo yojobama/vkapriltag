@@ -90,9 +90,9 @@ variables with no configuration field are environment only. For the reasoning be
 | `APRILTAG_VK_BORDER_PRECHECK` | bool | on |  | environment only | Reject a quad whose border cells are not mostly dark before refining. |
 | `APRILTAG_VK_DARK_REJECT` | bool | on |  | environment only | Reject a quad whose payload has fewer white cells than any code. |
 | `APRILTAG_VK_EARLY_REJECT` | bool | on |  | environment only | With grey margin on, the border and dark checks reject a quad only if its inner cells fail them too. |
-| `APRILTAG_VK_PROBE_MARGIN` | float | 0 (constructor argument) | `TagDecoder probe_margin` | environment wins | Margin gate in grey levels before edge refinement; 0 is off. |
-| `APRILTAG_VK_MIN_DIFF` | int | 5 | `DetectorConfig::min_white_black_diff` | environment wins | Minimum white-black difference for a block to be labelled. |
-| `APRILTAG_VK_MIN_TAG_PX` | int | 0 | `DetectorConfig::min_tag_pixels` | environment wins | Smallest tag side in full-resolution pixels; raises the minimum cluster size. |
+| `APRILTAG_VK_PROBE_MARGIN` | float | 0 | `DetectorOptions::probe_margin` | environment wins | Margin gate in grey levels before edge refinement; 0 is off. |
+| `APRILTAG_VK_MIN_DIFF` | int | 5 | `DetectorOptions::min_white_black_diff` | environment wins | Minimum white-black difference for a block to be labelled. |
+| `APRILTAG_VK_MIN_TAG_PX` | int | 0 | `DetectorOptions::min_tag_pixels` | environment wins | Smallest tag side in full-resolution pixels; raises the minimum cluster size. |
 | `APRILTAG_VK_BOX_DECIMATE` | bool | on | `DetectorConfig::box_decimate` | environment wins | Average each decimation block instead of copying its top-left pixel. |
 | `APRILTAG_VK_ADAPTIVE_FLOOR` | float | 2.0 | `DetectorConfig::adaptive_floor_scale` | environment wins | Contrast floor as a multiple of the frame's median block range; 0 keeps the fixed floor. |
 | `APRILTAG_VK_TRACKING` | bool | off | `TrackingConfig::enabled` | environment wins | Track tags between keyframes instead of running the full detector every frame. |

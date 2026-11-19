@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <utility>
@@ -86,6 +87,10 @@ struct Detector::Impl {
     if (options.families.empty() || options.families.size() > 8) {
       Fail(ErrorCode::kInvalidArgument, "between 1 and 8 families are needed");
     }
+    if (!std::isfinite(options.probe_margin) || options.probe_margin < 0.0f) {
+      Fail(ErrorCode::kInvalidArgument, "probe_margin must be finite and not negative");
+    }
+    if (options.min_white_black_diff > 255) Fail(ErrorCode::kInvalidArgument, "min_white_black_diff must be at most 255");
     if (options.mode == Mode::kPipelined && options.pipeline_depth != 1 && options.pipeline_depth != 2) {
       Fail(ErrorCode::kInvalidArgument, "pipeline_depth must be 1 or 2");
     }
@@ -114,6 +119,10 @@ struct Detector::Impl {
     config.normal_border = !families[0]->reversed_border;
     config.small_tag_rescue = options.small_tag_rescue;
     config.hull_quad = options.hull_quad;
+    config.min_white_black_diff = options.min_white_black_diff;
+    config.min_cluster_pixels = options.min_cluster_pixels;
+    config.min_tag_pixels = options.min_tag_pixels;
+    config.probe_margin = options.probe_margin;
     config.cpu_threads = options.cpu_threads;
 
     TagDecoderConfig decoder_config;
@@ -136,7 +145,7 @@ struct Detector::Impl {
         LevelSpec spec;
         spec.decimation = l.decimation;
         spec.box = l.box;
-        spec.min_tag_pixels = l.min_tag_pixels;
+        spec.min_tag_pixels = l.min_tag_pixels != 0 ? l.min_tag_pixels : options.min_tag_pixels;
         spec.max_tag_pixels = l.max_tag_pixels;
         specs.push_back(spec);
         decimation = std::max(decimation, l.decimation);
@@ -151,7 +160,7 @@ struct Detector::Impl {
       tracker = std::make_unique<TrackingDetector>(ctx, decoder_config, config, tracking, lane_ptr);
     } else {
       decoder = std::make_unique<TagDecoder>(decoder_config, decimation, options.cpu_threads, RefineEdgesMethod::kProfile,
-                                             0.0f, WorkerPoolOptions(), false, options.small_tag_rescue, pool);
+                                             options.probe_margin, WorkerPoolOptions(), false, options.small_tag_rescue, pool);
       if (options.polish) decoder->SetPolish(true);
       if (!multi) {
         gpu = std::make_unique<GpuDetector>(ctx, *lane_ptr, config);

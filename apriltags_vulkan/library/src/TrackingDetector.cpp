@@ -86,7 +86,7 @@ TrackingDetector::TrackingDetector(vk::Context &ctx, const TagDecoderConfig &dec
   pool_ = MakeWorkerPool(config_);
   quad_decode_ = std::make_unique<QuadDecode>(config_, pool_);
   full_decoder_ = std::make_unique<TagDecoder>(decoder_config_, config_.decimation, config_.cpu_threads, RefineEdgesMethod::kProfile,
-                                              0.0f, config_.PoolOptions(), false, config_.small_tag_rescue, pool_);
+                                              config_.probe_margin, config_.PoolOptions(), false, config_.small_tag_rescue, pool_);
 }
 
 TrackingDetector::~TrackingDetector() {
@@ -198,7 +198,7 @@ void TrackingDetector::EnsureBackground() {
   // The background thread runs quad_decode_ while the caller tracks with full_decoder_: separate pools.
   quad_decode_ = std::make_unique<QuadDecode>(config_);
   bg_decoder_ = std::make_unique<TagDecoder>(decoder_config_, config_.decimation, tracking_.async_threads, RefineEdgesMethod::kProfile,
-                                          0.0f, config_.PoolOptions(), true, config_.small_tag_rescue);
+                                          config_.probe_margin, config_.PoolOptions(), true, config_.small_tag_rescue);
   bg_stop_ = false;
   bg_thread_ = std::thread([this] { BackgroundMain(); });
 }
