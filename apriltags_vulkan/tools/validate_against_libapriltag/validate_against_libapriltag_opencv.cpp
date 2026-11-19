@@ -184,23 +184,14 @@ int Run(int argc, char **argv) {
       // Initialise the vkapriltag pipeline.
       profile_opt.Begin();
       apriltag_vulkan::vk::Context ctx;
-      apriltag_family_t* tf = nullptr;
+      const apriltag_vulkan::Family* tf = nullptr;
       if (!setup_tag_family(&tf, family_name.c_str())) {
           return 1;
       }
-      // Torn down at the end of the iteration, after the detectors that use it.
-      struct FamilyOwner {
-        apriltag_family_t *tf;
-        const std::string &name;
-        ~FamilyOwner() { teardown_tag_family(&tf, name.c_str()); }
-      } family_owner{tf, family_name};
-      apriltag_detector_t* td_ours = apriltag_detector_create();
-      // Destroyed after the TagDecoder declared below.
-      std::unique_ptr<apriltag_detector_t, decltype(&apriltag_detector_destroy)> td_ours_owner(
-          td_ours, &apriltag_detector_destroy);
-      apriltag_detector_add_family(td_ours, tf);
       // td_ref runs with upstream's default config (refine_edges = true), so match it here.
-      td_ours->refine_edges = true;
+      apriltag_vulkan::TagDecoderConfig decoder_config;
+      decoder_config.families = {tf};
+      decoder_config.refine_edges = true;
       apriltag_vulkan::DetectorConfig config;
       config.width = width;
       config.height = height;
@@ -220,7 +211,7 @@ int Run(int argc, char **argv) {
         second_detector = std::make_unique<apriltag_vulkan::GpuDetector>(ctx, *second_lane, config);
       }
       apriltag_vulkan::QuadDecode quad_decode(config);
-      apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
+      apriltag_vulkan::TagDecoder tag_decoder(decoder_config, decimation);
 
       if (ingest_ab) {
         if (!ctx.caps().has_external_memory_host) {
@@ -253,7 +244,7 @@ int Run(int argc, char **argv) {
       tag_decode_totals.reserve(static_cast<size_t>(iterations));
       pipeline_totals.reserve(static_cast<size_t>(iterations));
 
-      zarray_t* ours = nullptr;
+      const apriltag_vulkan::DetectionList* ours = nullptr;
       apriltag_vulkan::GpuDetector::DetectProfile profile;
       std::vector<apriltag_vulkan::DetectedQuad> quads;
 
@@ -271,18 +262,18 @@ int Run(int argc, char **argv) {
         if (!dump_quads_path.empty()) dump.open(dump_quads_path, std::ios::trunc);
         if (!dump_detections_path.empty()) dump_dets.open(dump_detections_path, std::ios::trunc);
         int returned = 0;
-        auto record = [&](zarray_t *dets) {
+        auto record = [&](const apriltag_vulkan::DetectionList *dets) {
           if (dump.is_open()) {
             apriltag_vulkan::validate::DumpCanonicalQuads(dump, returned, pipe.last_quads());
           }
           if (dump_dets.is_open()) {
-            apriltag_vulkan::validate::DumpDetections(dump_dets, returned, dets);
+            apriltag_vulkan::validate::DumpDetections(dump_dets, returned, *dets);
           }
           ++returned;
         };
         for (int it = 0; it < iterations; ++it) {
           const auto t0 = std::chrono::steady_clock::now();
-          zarray_t *done = pipe.Push(image.data, width, height, config.reversed_border);
+          const apriltag_vulkan::DetectionList *done = pipe.Push(image.data, width, height, config.reversed_border);
           const auto t1 = std::chrono::steady_clock::now();
           // Wall time per pushed frame (the throughput number); the stage vectors stay empty in this mode.
           pipeline_totals.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
@@ -293,7 +284,7 @@ int Run(int argc, char **argv) {
             record(done);
           }
         }
-        while (zarray_t *tail = pipe.Flush()) {
+        while (const apriltag_vulkan::DetectionList *tail = pipe.Flush()) {
           ours = tail;
           profile = pipe.last_profile();
           gpu_totals.push_back(profile.total_ms);
@@ -367,7 +358,7 @@ int Run(int argc, char **argv) {
               std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());
 
           const auto t_dec0 = std::chrono::steady_clock::now();
-          ours = tag_decoder.Decode(quads, frame, width, height, config.reversed_border);
+          ours = &tag_decoder.Decode(quads, frame, width, height, config.reversed_border);
           const auto t_dec1 = std::chrono::steady_clock::now();
           tag_decode_totals.push_back(
               std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count());
@@ -375,7 +366,7 @@ int Run(int argc, char **argv) {
           pipeline_totals.push_back(
               std::chrono::duration<double, std::milli>(t_dec1 - t0).count());
           if (dump.is_open()) apriltag_vulkan::validate::DumpCanonicalQuads(dump, it, quads);
-          if (dump_dets.is_open()) apriltag_vulkan::validate::DumpDetections(dump_dets, it, ours);
+          if (dump_dets.is_open()) apriltag_vulkan::validate::DumpDetections(dump_dets, it, *ours);
       }
       std::cout << "Retry frames (submits > 1): " << retry_frames << " of " << iterations
                 << "; labelling iterations per frame:";
@@ -469,14 +460,20 @@ int Run(int argc, char **argv) {
       }
 
       std::cout << "--- Our detections ---" << std::endl;
-      print_detections(ours);
-      std::vector<apriltag_vulkan::validate::DetectionInfo> our_dets = ExtractDetections(ours);
+      print_detections(*ours);
+      std::vector<apriltag_vulkan::validate::DetectionInfo> our_dets = ExtractDetections(*ours);
       std::vector<int> our_ids = SortedIds(our_dets);
 
+      apriltag_family_t* up_family = upstream::CreateFamily(family_name.c_str());
+      struct UpstreamFamilyOwner {
+        apriltag_family_t *family;
+        const std::string &name;
+        ~UpstreamFamilyOwner() { upstream::DestroyFamily(family, name.c_str()); }
+      } up_family_owner{up_family, family_name};
       apriltag_detector_t* td_ref = apriltag_detector_create();
       std::unique_ptr<apriltag_detector_t, decltype(&apriltag_detector_destroy)> td_ref_owner(
           td_ref, &apriltag_detector_destroy);
-      apriltag_detector_add_family(td_ref, tf);
+      apriltag_detector_add_family(td_ref, up_family);
       td_ref->quad_decimate = static_cast<float>(decimation);
       td_ref->nthreads = 1;
 
@@ -493,8 +490,9 @@ int Run(int argc, char **argv) {
           << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count()
           << " ms" << std::endl;
       std::cout << "--- Reference (official libapriltag) detections ---" << std::endl;
-      print_detections(ref);
-      std::vector<apriltag_vulkan::validate::DetectionInfo> ref_dets = ExtractDetections(ref);
+      const std::vector<apriltag_vulkan::Detection> ref_list = upstream::ToDetections(ref);
+      print_detections(ref_list);
+      std::vector<apriltag_vulkan::validate::DetectionInfo> ref_dets = ExtractDetections(ref_list);
       std::vector<int> ref_ids = SortedIds(ref_dets);
       apriltag_detections_destroy(ref);
 

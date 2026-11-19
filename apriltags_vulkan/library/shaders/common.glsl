@@ -64,7 +64,7 @@ uint ExtentsSlot(uint bi, uint copy, uint max_raw_blobs) {
 
 // Field order matters: `count` and `pxgx_plus_pygy_sum` are adjacent at byte
 // offset 16, forming one aligned 64-bit word (u64 index slot * 4 + 2) used by
-// reduce_extents_hash_atomic64.comp.
+// reduce_extents_hash_atomic64_x4.comp.
 struct MinMaxExtentsGpu {
   int min_x;
   int min_y;

@@ -1,5 +1,6 @@
 #include "vkapriltag/vk/PipelineCache.h"
 
+#include "vkapriltag/common/Options.h"
 #include "vkapriltag/vk/Context.h"
 
 #include <algorithm>
@@ -77,19 +78,20 @@ uint64_t HashShaderDir(const std::string &shader_dir) {
 
 // Cache directory: APRILTAG_VK_CACHE_DIR, then platform conventions; empty disables caching.
 std::string CacheDirectory() {
-  if (const char *override_dir = std::getenv("APRILTAG_VK_CACHE_DIR")) {
-    if (override_dir[0] != '\0') return override_dir;
+  const Options env = Options::FromEnvironment();
+  if (const auto override_dir = env.String("APRILTAG_VK_CACHE_DIR")) {
+    if (!override_dir->empty()) return *override_dir;
   }
 #ifdef _WIN32
-  if (const char *local_appdata = std::getenv("LOCALAPPDATA")) {
-    if (local_appdata[0] != '\0') return std::string(local_appdata) + "\\vkapriltag";
+  if (const auto local_appdata = env.String("LOCALAPPDATA")) {
+    if (!local_appdata->empty()) return *local_appdata + "\\vkapriltag";
   }
 #else
-  if (const char *xdg_cache = std::getenv("XDG_CACHE_HOME")) {
-    if (xdg_cache[0] != '\0') return std::string(xdg_cache) + "/vkapriltag";
+  if (const auto xdg_cache = env.String("XDG_CACHE_HOME")) {
+    if (!xdg_cache->empty()) return *xdg_cache + "/vkapriltag";
   }
-  if (const char *home = std::getenv("HOME")) {
-    if (home[0] != '\0') return std::string(home) + "/.cache/vkapriltag";
+  if (const auto home = env.String("HOME")) {
+    if (!home->empty()) return *home + "/.cache/vkapriltag";
   }
 #endif
   return "";

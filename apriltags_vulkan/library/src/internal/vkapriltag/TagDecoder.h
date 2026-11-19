@@ -1,0 +1,174 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "vkapriltag/Detection.h"
+#include "vkapriltag/Family.h"
+#include "vkapriltag/RefineEdges.h"
+#include "vkapriltag/Types.h"
+#include "vkapriltag/common/WorkerPool.h"
+#include "vkapriltag/gpu/GpuDetector.h"
+
+namespace apriltag_vulkan {
+
+// Decodes CPU-computed quad candidates (DetectedQuad from QuadDecode) into tags (a port of the `apriltag`
+// library's quad_decode_index and reconcile_detections, see OwnDecode): id, hamming distance, decision margin,
+// centre and homography-refined corners. If `refine_edges` is set, each quad is refined
+// (see RefineEdgesMethod) before decoding. Stops at 2D detection; pose is not computed here.
+// Quads are decoded in parallel over a WorkerPool and merged in quad order, so the output does
+// not depend on thread count.
+// The family's codes bucketed by each of four disjoint bit blocks: a code within three bits of a word
+// equals it exactly in at least one block, so only those buckets need checking.
+struct ThirdBitIndex {
+  const Family *family = nullptr;
+  int shift[4] = {};
+  int bits[4] = {};
+  std::vector<uint32_t> start[4];  // bucket b of block k holds ids[k][start[k][b] .. start[k][b + 1])
+  std::vector<uint32_t> ids[4];
+};
+
+struct DecodeEnv;
+namespace own {
+class Decoder;
+}
+
+// What the decode reads from the detector's settings.
+struct TagDecoderConfig {
+  std::vector<const Family *> families;  // not owned; they must outlive the decoder. At most 8.
+  bool refine_edges = true;  // refine each quad's corners before decoding
+  double decode_sharpening = 0.25;  // weight of the sharpening kernel on the cell values
+};
+
+class TagDecoder {
+ public:
+  // `config` is copied; its families must be supported (width at most 32 cells, at most 63 bits,
+  // max_hamming 0 to 3), else Decode() throws std::invalid_argument.
+  // `decimation` must match DetectorConfig::decimation (it sets the edge refinement's search radius).
+  // `cpu_threads` is the total parallelism (0 = hardware_concurrency, or APRILTAG_CPU_THREADS).
+  // `refine_method` may be overridden by APRILTAG_VK_REFINE; used only if `config.refine_edges` is set.
+  // Margin gate in grey levels (0 = off); APRILTAG_VK_PROBE_MARGIN overrides it.
+  // `small_tag_rescue` is DetectorConfig::small_tag_rescue; APRILTAG_VK_SMALL_RESCUE overrides it.
+  // `pool`, if given, is used instead of a pool of its own (`cpu_threads` and `pool_options` are then
+  // ignored); share it only with stages that run one after another with this decoder.
+  explicit TagDecoder(const TagDecoderConfig &config, uint32_t decimation = 1, uint32_t cpu_threads = 0,
+                      RefineEdgesMethod refine_method = RefineEdgesMethod::kProfile,
+                      float probe_margin = 0.0f, const WorkerPoolOptions &pool_options = WorkerPoolOptions(),
+                      bool background_thread = false, bool small_tag_rescue = false,
+                      std::shared_ptr<WorkerPool> pool = nullptr);
+  ~TagDecoder();
+
+  TagDecoder(const TagDecoder &) = delete;
+  TagDecoder &operator=(const TagDecoder &) = delete;
+
+  // Decodes `quads` against the full-resolution grayscale frame. `reversed_border` must match the border
+  // polarity of the family (one polarity per run). Returns detections owned by this TagDecoder, valid
+  // until the next Decode() or destruction. The pointer overload takes a tightly packed frame.
+  const DetectionList &Decode(const std::vector<DetectedQuad> &quads, const Image &image, bool reversed_border);
+  const DetectionList &Decode(const std::vector<DetectedQuad> &quads, const uint8_t *gray_frame, uint32_t width,
+                              uint32_t height, bool reversed_border);
+
+  // Timings of the last Decode(), filled only while profiling is enabled; CPU times are summed
+  // over threads.
+  struct Stats {
+    uint32_t quads = 0;    // candidates received
+    uint32_t decoded = 0;  // candidates that produced a detection (before reconcile_detections)
+    double wall_ms = 0.0;  // Decode() start to return, including the merge and reconcile
+    double probe_ms = 0.0;  // unrefined sampling before refinement
+    // Refinement time, split by whether the quad went on to decode.
+    double refine_ms_decoded = 0.0;
+    double refine_ms_rejected = 0.0;
+    double decode_ms = 0.0;      // final quad_decode_index
+    double busy_ms_max = 0.0;    // busiest thread; with busy_ms_mean, the load imbalance
+    double busy_ms_mean = 0.0;   // over the threads that did any work
+    double cpu_ms() const {
+      return probe_ms + refine_ms_decoded + refine_ms_rejected + decode_ms;
+    }
+  };
+  const Stats &last_stats() const { return last_stats_; }
+
+  // Whole-tag photometric polish of decoded tags (off by default; APRILTAG_VK_POLISH=1 turns it on).
+  void SetPolish(bool on) { polish_ = on; }
+  bool polish() const { return polish_; }
+
+  // Margin gate (off by default): quads whose unrefined decision margin is below this, or whose
+  // border polarity is wrong, skip refinement. APRILTAG_VK_PROBE_MARGIN overrides it.
+  void SetProbeMargin(float grey_levels) { probe_margin_ = grey_levels; }
+  float probe_margin() const { return probe_margin_; }
+
+  // With APRILTAG_VK_PROBE_STATS=1, histograms each unrefined quad's Hamming distance to the nearest
+  // code by outcome (bins 0-14, 15 = farther, 16 = rejected before the lookup).
+  struct ProbeHistogram {
+    uint64_t decoded[17] = {};
+    uint64_t rejected[17] = {};
+  };
+  const ProbeHistogram &probe_histogram() const { return probe_hist_; }
+
+ private:
+  // Runs the decode steps on quads[i] on thread `slot`; the detections go to per_quad_[i].
+  void ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, size_t i, unsigned slot);
+  // The per-frame inputs and switches of a Decode() call; builds the third-bit index if it is stale.
+  DecodeEnv MakeEnv(const Image *im, bool reversed_border, bool timing);
+  // Folds the per-thread probe histograms and rows into probe_hist_ and rows_.
+  void MergeSlotRecords();
+  // Sums the per-thread accumulators; wall_ms is left for the caller.
+  Stats SumSlotStats() const;
+
+  TagDecoderConfig config_;
+  std::shared_ptr<WorkerPool> pool_;
+  RefineEdgesMethod refine_method_;
+  int decimation_;
+  // APRILTAG_VK_GREY_MARGIN=0 turns off: retry a quad that did not decode as its inner square.
+  bool grey_margin_ = true;
+  // APRILTAG_VK_SMALL_RESCUE=1 turns on: refit boxes and small undecoded quads from the full-resolution image.
+  bool small_rescue_ = false;
+  // APRILTAG_VK_POLISH=1 turns on: refit each decoded tag's homography to every cell edge of its code.
+  bool polish_ = false;
+  // APRILTAG_VK_SIDE_ONE_OUT=0 turns off: refit a side whose border cells read white, one cell further in.
+  bool side_one_out_ = true;
+  // APRILTAG_VK_THIRD_BIT=0 turns off: accept a third corrected bit when the three wrong cells touch.
+  bool third_bit_ = true;
+  ThirdBitIndex third_index_;
+  // APRILTAG_VK_FAMILY_LIMITS=0 turns off: reject detections that needed more corrected bits than their
+  // family's codes can bear.
+  bool family_limits_ = true;
+  // APRILTAG_VK_BORDER_PRECHECK=0 turns off: reject a quad whose border cells are not mostly dark before refining.
+  bool border_precheck_ = true;
+  // APRILTAG_VK_DARK_REJECT=0 turns off: reject a quad whose payload has fewer white cells than any code.
+  bool dark_reject_ = true;
+  // APRILTAG_VK_EARLY_REJECT=0 turns off: with grey margin on, the two checks above skip the quad.
+  // On: they reject it only if its inner W cells fail them too.
+  bool early_reject_ = true;
+  std::unique_ptr<own::Decoder> own_decoder_;
+  DetectionList detections_;
+  // One scratch list per candidate quad; grown, never shrunk, and cleared when reused.
+  std::vector<DetectionList> per_quad_;
+  // Per-thread scratch for the unrefined decodes before refinement.
+  std::vector<DetectionList> probe_;
+
+  // One cache line per thread so the per-quad accumulators do not false-share.
+  struct alignas(64) SlotStats {
+    double probe_ms, refine_ms_decoded, refine_ms_rejected, decode_ms, busy_ms;
+    uint32_t quads, decoded;
+  };
+  std::vector<SlotStats> slot_stats_;
+  bool collect_probe_ = false;
+  float probe_margin_ = 0.0f;
+  std::vector<ProbeHistogram> slot_probe_;  // per thread, merged into probe_hist_ per Decode()
+  ProbeHistogram probe_hist_;
+  // One row per quad, written to APRILTAG_VK_PROBE_CSV at destruction.
+  struct ProbeRow {
+    int distance;
+    float margin;
+    float perimeter;
+    bool decoded;
+  };
+  std::vector<std::vector<ProbeRow>> slot_rows_;
+  std::vector<ProbeRow> rows_;
+  std::string probe_csv_;
+  Stats last_stats_;
+};
+
+}  // namespace apriltag_vulkan

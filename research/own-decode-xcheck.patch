@@ -1,0 +1,55 @@
+diff --git a/apriltags_vulkan/library/src/TagDecoder.cpp b/apriltags_vulkan/library/src/TagDecoder.cpp
+index 7674869..564c03e 100755
+--- a/apriltags_vulkan/library/src/TagDecoder.cpp
++++ b/apriltags_vulkan/library/src/TagDecoder.cpp
+@@ -3,6 +3,7 @@
+ #include "vkapriltag/common/Options.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <bit>
+ #include <cmath>
+ #include <cstdio>
+@@ -690,6 +691,42 @@ void TagDecoder::ProcessCandidate(const DecodeEnv &env, const DetectedQuad &q, s
+   prof::Scope quad_scope("tag.quad");
+   Candidate c(env, q, per_quad_[i], probe_[slot]);
+   const Outcome outcome = RunSteps(env, c);
++  if (env.own && std::getenv("OWN_XCHECK")) {
++    struct Totals {
++      std::atomic<long> total{0}, bad{0}, withdet{0};
++      ~Totals() { std::fprintf(stderr, "XCHECK candidates %ld with detections %ld mismatches %ld\n", total.load(), withdet.load(), bad.load()); }
++    };
++    static Totals totals;
++    DecodeEnv env2 = env;
++    env2.own = nullptr;
++    zarray_t *f2 = zarray_create(sizeof(apriltag_detection_t *));
++    zarray_t *p2 = zarray_create(sizeof(apriltag_detection_t *));
++    {
++      Candidate c2(env2, q, f2, p2);
++      const Outcome o2 = RunSteps(env2, c2);
++      bool same = o2 == outcome && zarray_size(f2) == zarray_size(c.found) &&
++                  std::memcmp(c.quad.q.p, c2.quad.q.p, sizeof(c.quad.q.p)) == 0;
++      for (int k = 0; same && k < zarray_size(f2); ++k) {
++        apriltag_detection_t *a, *b;
++        zarray_get(f2, k, &a);
++        zarray_get(c.found, k, &b);
++        same = a->id == b->id && a->family == b->family && a->hamming == b->hamming &&
++               std::memcmp(&a->decision_margin, &b->decision_margin, sizeof(float)) == 0 &&
++               std::memcmp(a->H->data, b->H->data, 9 * sizeof(double)) == 0 && std::memcmp(a->p, b->p, sizeof(a->p)) == 0 &&
++               std::memcmp(a->c, b->c, sizeof(a->c)) == 0;
++      }
++      totals.total++;
++      if (zarray_size(f2) > 0) totals.withdet++;
++      if (!same) {
++        totals.bad++;
++        std::fprintf(stderr, "XCHECK MISMATCH outcome %d vs %d, found %d vs %d, quad %.9g %.9g\n", static_cast<int>(outcome),
++                     static_cast<int>(o2), zarray_size(c.found), zarray_size(f2), q.p[0][0], q.p[0][1]);
++      }
++    }
++    ClearDetections(f2);
++    zarray_destroy(f2);
++    zarray_destroy(p2);
++  }
+   const bool decoded = zarray_size(c.found) > 0;
+   if (outcome == Outcome::kMarginGate && env.collect_probe) slot_probe_[slot].rejected[c.probe_bin]++;
+   if (outcome == Outcome::kFinished && env.collect_probe && c.probe_bin >= 0) {

@@ -6,38 +6,6 @@
 find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 
-# ---------------------------------------------------------------------------
-# Upstream AprilRobotics apriltag, patched to expose quad_decode_index() and reconcile_detections()
-# so the GPU pipeline can feed its own quads to the CPU decode.
-# ---------------------------------------------------------------------------
-include(FetchContent)
-set(APRILTAG_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-decode-steps.patch)
-# Patch scoping the pthreads_cross emulation to "_WIN32 and not MinGW" so MinGW uses its real pthread.h.
-set(APRILTAG_MINGW_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-mingw-real-pthreads.patch)
-# Patch exposing the bit-sampling step without the code lookup (quad_sample_code, apriltag_min_hamming).
-set(APRILTAG_PROBE_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-expose-code-probe.patch)
-# Patch removing the decode's per-quad heap allocations (the unused inverse homography, the quad copy
-# per family and two scratch buffers), with identical results.
-set(APRILTAG_NOALLOC_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/apriltag-decode-no-alloc.patch)
-FetchContent_Declare(
-  apriltag
-  GIT_REPOSITORY https://github.com/AprilRobotics/apriltag.git
-  GIT_TAG v3.4.5
-  # Applied via ApplyPatches.cmake, which skips patches already present.
-  # Comma-separated, not semicolon-separated.
-  PATCH_COMMAND ${CMAKE_COMMAND}
-        "-DPATCHES=${APRILTAG_PATCH_FILE},${APRILTAG_PROBE_PATCH_FILE},${APRILTAG_MINGW_PATCH_FILE},${APRILTAG_NOALLOC_PATCH_FILE}"
-        -P ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/patches/ApplyPatches.cmake
-)
-# Disable upstream's example binaries so they are not installed.
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(apriltag)
-
-# Pin gnu17: newer GCC defaults turn the old C sources' incompatible pointer calls into errors.
-if(TARGET apriltag)
-  target_compile_options(apriltag PRIVATE -std=gnu17)
-endif()
-
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CompileShaders.cmake)
 
 set(SHADER_SOURCES
@@ -81,8 +49,6 @@ set(SHADER_SOURCES
   shaders/sort_points_large_u8.comp
   shaders/hash_group.comp
   shaders/build_indirect_args.comp
-  shaders/reduce_extents_hash.comp
-  shaders/reduce_extents_hash_atomic64.comp
   shaders/reduce_extents_hash_atomic64_x4.comp
   shaders/reduce_extents_hash_x4.comp
   shaders/reduce_extents_hash_subgroup.comp
@@ -149,22 +115,43 @@ add_library(vkapriltag STATIC
   src/vk/ComputePipeline.cpp
   src/vk/PipelineCache.cpp
   src/vk/QueryPool.cpp
+  src/Detector.cpp
   src/gpu/GpuDetector.cpp
+  src/gpu/PipelinePlan.cpp
+  src/gpu/StageTable.cpp
+  src/gpu/CpuDecimate.cpp
   src/gpu/QuadDecode.cpp
+  src/gpu/QuadFitF32.cpp
   src/gpu/MultiLevelDetector.cpp
   src/gpu/KeepAlive.cpp
   src/vk/CompletionFlag.cpp
   src/apriltag_family.cpp
+  src/Family.cpp
+  src/families/tag36h11.cpp
+  src/families/tag25h9.cpp
+  src/families/tag16h5.cpp
+  src/families/tagCircle21h7.cpp
+  src/families/tagCircle49h12.cpp
+  src/families/tagStandard41h12.cpp
+  src/families/tagStandard52h13.cpp
+  src/families/tagCustom48h12.cpp
   src/TagDecoder.cpp
+  src/OwnDecode.cpp
+  src/TrackingDetector.cpp
+  src/SmallQuad.cpp
   src/RefineEdges.cpp
+  src/PolishFit.cpp
   src/BorderSample.cpp
   src/FramePipeline.cpp
   src/PoseEstimator.cpp
   src/common/pgm_io.cpp
   src/common/WorkerPool.cpp
   src/common/Profiler.cpp
+  src/common/Options.cpp
 )
 add_library(vkapriltag::vkapriltag ALIAS vkapriltag)
+# The static library can be linked into a shared object (the language bindings).
+set_target_properties(vkapriltag PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_dependencies(vkapriltag vkapriltag_shaders)
 
@@ -172,6 +159,13 @@ target_include_directories(vkapriltag PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+# Internal headers (the stages, the Vulkan layer, Geometry.h), found by every source file and by the in-tree
+# tools and tests that link vkapriltag::internal; they are not installed.
+target_include_directories(vkapriltag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/internal)
+add_library(vkapriltag_internal INTERFACE)
+target_link_libraries(vkapriltag_internal INTERFACE vkapriltag)
+target_include_directories(vkapriltag_internal INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/internal)
+add_library(vkapriltag::internal ALIAS vkapriltag_internal)
 
 if(VKAPRILTAG_HAVE_DOT_SHADER)
   target_compile_definitions(vkapriltag PRIVATE VKAPRILTAG_HAVE_DOT_SHADER=1)
@@ -185,7 +179,6 @@ target_compile_definitions(vkapriltag PUBLIC
 target_link_libraries(vkapriltag PUBLIC
   Vulkan::Vulkan
   Threads::Threads
-  apriltag
 )
 
 # Tracing hooks (common/Profiler.h); OFF compiles every scope away.
@@ -200,8 +193,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(vkapriltag PRIVATE -Wall -Wextra -Wno-unused-parameter)
   # No fused multiply-adds in the quad fit: which ones GCC fuses depends on how the code is
   # arranged, so its corners would change with the code's layout rather than its arithmetic.
-  set_source_files_properties(src/gpu/QuadDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+  set_source_files_properties(src/gpu/QuadDecode.cpp src/OwnDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+  # The float32 quad fit: square roots without errno, so the line fit loops vectorise.
+  set_source_files_properties(src/gpu/QuadFitF32.cpp PROPERTIES COMPILE_OPTIONS -fno-math-errno)
 endif()
+
+vkapriltag_tune_target(vkapriltag)
 
 set_target_properties(vkapriltag PROPERTIES OUTPUT_NAME vkapriltag)
 

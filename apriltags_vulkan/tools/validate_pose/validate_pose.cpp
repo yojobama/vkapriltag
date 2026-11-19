@@ -513,11 +513,11 @@ int Run(int argc, char **argv) {
       std::fprintf(stderr, "could not load %s as a P5 PGM\n", data_path.c_str());
       return 1;
     }
-    apriltag_family_t *tf = nullptr;
+    const apriltag_vulkan::Family *tf = nullptr;
     if (!setup_tag_family(&tf, "tag36h11")) return 1;
-    apriltag_detector_t *td = apriltag_detector_create();
-    apriltag_detector_add_family(td, tf);
-    td->refine_edges = false;
+    apriltag_vulkan::TagDecoderConfig decoder_config;
+    decoder_config.families = {tf};
+    decoder_config.refine_edges = false;
 
     apriltag_vulkan::vk::Context ctx;
     apriltag_vulkan::DetectorConfig cfg;
@@ -530,29 +530,26 @@ int Run(int argc, char **argv) {
 
     apriltag_vulkan::GpuDetector detector(ctx, cfg);
     apriltag_vulkan::QuadDecode quad_decode(cfg);
-    apriltag_vulkan::TagDecoder tag_decoder(td, decimation);
+    apriltag_vulkan::TagDecoder tag_decoder(decoder_config, decimation);
 
     detector.Detect(gray.data());
     const std::vector<apriltag_vulkan::DetectedQuad> quads =
         quad_decode.Decode(detector.last_line_fit_points);
-    zarray_t *dets =
+    const apriltag_vulkan::DetectionList &dets =
         tag_decoder.Decode(quads, gray.data(), width, height, cfg.reversed_border);
 
     LadderStats real;
     int real_cases = 0;
-    for (int i = 0; i < zarray_size(dets); ++i) {
-      apriltag_detection_t *det = nullptr;
-      zarray_get(dets, i, &det);
-      if (det == nullptr || det->H == nullptr) continue;
+    for (const apriltag_vulkan::Detection &det : dets) {
       double H[3][3], corners[4][2];
       for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 3; ++b) H[a][b] = MATD_EL(det->H, a, b);
+        for (int b = 0; b < 3; ++b) H[a][b] = det.H[a * 3 + b];
       for (int c = 0; c < 4; ++c) {
-        corners[c][0] = det->p[c][0];
-        corners[c][1] = det->p[c][1];
+        corners[c][0] = det.p[c][0];
+        corners[c][1] = det.p[c][1];
       }
       char label[64];
-      std::snprintf(label, sizeof(label), "real tag id=%d", det->id);
+      std::snprintf(label, sizeof(label), "real tag id=%d", det.id);
       RunCase(est, intr, tagsize, corners, H, label, &real, nullptr, nullptr);
       ++real_cases;
     }
@@ -567,14 +564,13 @@ int Run(int argc, char **argv) {
 
     // ---------------- timing, on a real detection ----------------
     if (real_cases > 0 && timing_iters > 0) {
-      apriltag_detection_t *det = nullptr;
-      zarray_get(dets, 0, &det);
+      const apriltag_vulkan::Detection &det = dets[0];
       double H[3][3], corners[4][2];
       for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 3; ++b) H[a][b] = MATD_EL(det->H, a, b);
+        for (int b = 0; b < 3; ++b) H[a][b] = det.H[a * 3 + b];
       for (int c = 0; c < 4; ++c) {
-        corners[c][0] = det->p[c][0];
-        corners[c][1] = det->p[c][1];
+        corners[c][0] = det.p[c][0];
+        corners[c][1] = det.p[c][1];
       }
       RefDetection rd;
       FillRefDetection(&rd, corners, H);
@@ -639,7 +635,6 @@ int Run(int argc, char **argv) {
                   early_pair.solution1.iterations, early_pair.solution2.iterations);
     }
 
-    apriltag_detector_destroy(td);
     teardown_tag_family(&tf, "tag36h11");
   }
 
@@ -659,13 +654,15 @@ int Run(int argc, char **argv) {
       }
     }
 
-    std::vector<RefDetection> rds(cases.size());
-    std::vector<const apriltag_detection_t *> dets;
-    dets.reserve(cases.size());
+    std::vector<apriltag_vulkan::Detection> dets(cases.size());
     for (size_t i = 0; i < cases.size(); ++i) {
-      FillRefDetection(&rds[i], cases[i].corners, cases[i].H);
-      rds[i].det.id = static_cast<int>(i);
-      dets.push_back(&rds[i].det);
+      dets[i].id = static_cast<int>(i);
+      for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b) dets[i].H[a * 3 + b] = cases[i].H[a][b];
+      for (int k = 0; k < 4; ++k) {
+        dets[i].p[k][0] = cases[i].corners[k][0];
+        dets[i].p[k][1] = cases[i].corners[k][1];
+      }
     }
 
     // Serial reference: single-detection path, default tolerance, single-threaded.

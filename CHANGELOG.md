@@ -1,8 +1,178 @@
 # Changelog
 
 All notable changes to vkapriltag. Per-version detail with measurements for 1.8.0 and 1.9.0 is in the
-"What changed" sections of [README.md](README.md); the measurements behind every change are in
-[apriltags_vulkan/PERFORMANCE.md](apriltags_vulkan/PERFORMANCE.md).
+"What changed" sections of the old README ([archive](apriltags_vulkan/archive/README-1.10-history.md)); the current
+measurements are in [apriltags_vulkan/PERFORMANCE.md](apriltags_vulkan/PERFORMANCE.md), and the measurements behind older
+changes (sections such as 8ac or 8bb cited below) are in
+[apriltags_vulkan/archive/PERFORMANCE-history.md](apriltags_vulkan/archive/PERFORMANCE-history.md). The decision log is
+[apriltags_vulkan/DECISIONS.md](apriltags_vulkan/DECISIONS.md).
+
+## 2.0.0-pre1 (2026-11-19)
+
+- **Quad fit in float32** (the only fit; see Removed): the four sides are fitted from centred moments summed in eight fixed float lanes, so the compilers vectorise the sums; the corners differ from the integer fit by 0.002 px at the 99th percentile and the corpus scores are unchanged. The fit stage is 24 to 31% cheaper on the desktop (MSVC; SSE2 kernels on x86-64, portable lanes elsewhere); frame times are unchanged within noise. With `APRILTAG_VK_HULL_QUAD=1` the hull fit (per-side support, band moments) and the outlier test that picks its candidates run in float32 too (SSE2 on x86-64): the outlier test is 2.2 to 2.9 times faster, the side selection about 2 times, the vote 1.4 times, the moments 2 times, and the cpu median with the hull on is about 5 to 8% lower. The hull geometry is cheaper with identical output: the convex hull is built from the lowest and highest point of each column instead of a sort, the far vertex, the simplification and the edge choice avoid repeated square roots and repeated evaluation (hull preparation 4 to 5.5 times cheaper on the hull-heavy scenarios, p95 frame time with the hull on about 3 to 7% lower). On the Orange Pi 5 Plus (gcc 14, NEON through the portable lanes) the corpus scores are the same as before at decimation 1 and 2 in every mode, the default frame time is unchanged (0.751 ms both, four interleaved rounds) and with the hull on it is 2.2% lower (0.785 to 0.768 ms).
+- **CPU decimation while uploading** (decimation 2 and 4): the host writes the decimated image into a mapped buffer (NEON / SSE2 kernels), so the
+  full-frame copy and the GPU decimate dispatch are gone; detections are bit-identical. `APRILTAG_VK_CPU_DECIMATE=0` restores the GPU decimation.
+
+### Fixed
+
+- **Detectors on a shared `Device` no longer share a lane.** Two detectors with the same `stream`, or with a `stream` beyond the queue count (every stream on a device with one compute queue), used the device's default lane and raced on its command pool and command buffer ring when driven from different threads. A detector on a shared device now always creates its own lane on the queue its stream maps to (streams wrap onto the existing queues), in every mode including tracking and multi-level; the new `facade_threads` test runs four detectors on four threads. On the Orange Pi's Mali-G610 (one compute queue) the old code hung, aborted or returned wrong tags in five of the six threaded modes; the fixed code passes them all, with no ThreadSanitizer report and no validation-layer error.
+
+### Breaking: version 2.0.0, one public `Detector`
+
+- **`vkapriltag/Detector.h` is the public interface.** One `Detector` owns the device, the GPU stages, the CPU tail, the worker pool and
+  the pose estimator; `DetectorOptions` selects families, decimation, `Mode` (sync, pipelined depth 1 or 2, tracking keyframe or async),
+  `levels`, the accuracy features and pose. Failures throw `Error` with an `ErrorCode`. `Device` lets several detectors (cameras) share a GPU.
+- **The stage classes are no longer installed.** `GpuDetector`, `QuadDecode`, `TagDecoder`, `FramePipeline`, `TrackingDetector`,
+  `MultiLevelDetector`, `PoseEstimator` (its `CameraIntrinsics` and `TagPose` are now in `Pose.h`), `RefineEdges`, `PolishFit`, the Vulkan layer,
+  `WorkerPool`, the options registry and the profiler moved to `library/src/internal`; in-tree tools and tests link `vkapriltag::internal`.
+  The installed headers are `Detector.h`, `Detection.h`, `Family.h`, `Pose.h` and `Version.h`, and none includes a Vulkan header.
+- **SWIG bindings** (`VKAPRILTAG_BUILD_SWIG=ON`): Python is built and tested (numpy and buffer input, no copy), Java and C# are generated from the same interface.
+- Migration: construct a `Detector` from `DetectorOptions` instead of `Context` + `DetectorConfig` + `GpuDetector` + `QuadDecode` + `TagDecoder`
+  (`options.width/height/families/decimation`, `refine_edges`, `small_tag_rescue`, `hull_quad`, `polish`, `cpu_threads`); call `Detect(grey)` and read
+  `result.detections`; `FramePipeline` is `Mode::kPipelined`, `TrackingDetector` is `Mode::kTracking`, `MultiLevelDetector` is `options.levels`,
+  `PoseEstimator` is `options.tag_size` with `options.intrinsics` (`result.poses`). Environment overrides are unchanged.
+
+### Changed (GPU internals)
+
+- Quad fit: integer point arrays for the corner seeding and a two-stage windowed error on the peaks path (bit-identical; the fit is about a third cheaper on candidate-rich frames on the Pi).
+
+- `WorkerPool::ParallelFor` wakes only as many workers as the batch has items to spare (desktop corpus median -3.7%, Pi neutral).
+
+- `PipelinePlan` resolves every GPU variant choice once from the device, the configuration and the options (`ResolvePlan`, `FinalisePlan`);
+  `DetectorConfig` has its own header; a stage table (`StageDesc`) builds each of the 26 pipelines; one recorder serves the group, extents,
+  select, scan and scatter stages of the fused, lean and unfused flows. Detections and the recorded GPU work are unchanged
+  (`gpu_trace_*` and `unit_plan` guard them). `MemoryKind::DeviceLocalReadback` removed.
+
+### Documentation
+
+- `ARCHITECTURE.md` and `DECISIONS.md` added; `DESIGN.md` is now a short rationale page; `OPTIMIZATION_NOTES.md`, the two root idea
+  files, the chronological sections of `PERFORMANCE.md` and the old `DESIGN.md` and README moved unchanged to `apriltags_vulkan/archive/`;
+  `tools/check_links.py` checks the Markdown links.
+
+### Changed (API)
+
+- **The library no longer uses libapriltag's types.** `Detection` (id, hamming, decision margin, centre, corners,
+  `double H[9]`, `const Family *`), `Family` (the built-in tag tables plus an explicit `max_hamming`; `Family::ByName`),
+  `Image` (data, width, height, stride) and `Quad` replace `apriltag_detection_t`, `apriltag_family_t`, `image_u8_t`
+  and `struct quad`. `TagDecoder` and `TrackingDetector` take a `TagDecoderConfig` (families, `refine_edges`,
+  `decode_sharpening`) instead of an `apriltag_detector_t *`; `Decode()`, `FramePipeline::Push()/Flush()` and
+  `TrackingDetector::Detect()` return `DetectionList` (`std::vector<Detection>`), valid until the next call;
+  `PoseEstimator::EstimateAll` takes a `std::span<const Detection>`; `setup_tag_family` returns a `const Family *`.
+  Output is unchanged. The patched-upstream decode (`APRILTAG_VK_OWN_DECODE=0`) is removed; upstream is only needed by
+  the differential test and the reference validation tools (`VKAPRILTAG_UPSTREAM_VALIDATION`).
+
+### Changed (build)
+
+- **Opt-in compiler tuning** (`cmake/BuildTuning.cmake`, all off by default, so the default build is unchanged and portable): `VKAPRILTAG_LTO`
+  (`-flto` with fat objects on GCC, `/GL` `/LTCG` on MSVC), `VKAPRILTAG_TUNE` (target flags such as `-mcpu=cortex-a76` or `/arch:AVX2`),
+  `VKAPRILTAG_CODEGEN` (extra flags) and `VKAPRILTAG_PGO=GENERATE|USE` with `tools/pgo/train.sh`. Measured on the desktop only `/arch:AVX2`
+  helps (cpu part -9% to -17%, corpus median 0 to -5%); on the Orange Pi nothing moves the pipeline by more than 1%. See `ARCHITECTURE.md` 9.4.
+- **The project no longer depends on libapriltag.** A default configure fetches nothing (no network, no C
+  compiler needed), applies no patches, and the library, the tests, the install tree and the `.deb` packages hold
+  nothing from AprilRobotics' library; `find_package(vkapriltag)` needs only Vulkan and Threads. The decode is the
+  in-house `OwnDecode` and the family tables are generated into `library/src/families/`; both derive from upstream
+  and `NOTICE` says so and carries upstream's BSD-2-Clause licence.
+- `VKAPRILTAG_UPSTREAM_VALIDATION` now defaults to `OFF`. With `ON`, stock upstream v3.4.5 is fetched (excluded from the
+  `all` target and the install rules) for the reference validation tools (`apriltag_vulkan_validate`,
+  `apriltag_pose_validate`, `apriltag_pose_e2e_validate`, `apriltag_synth_ground_truth`, `vk_eval --ref`), which are no
+  longer installed. The parity workflow turns it on for the parity gate and runs the default `ctest` first.
+- The differential decode test (`own_decode_*`, `families_match_upstream`) compares the library with upstream's results
+  recorded in `tests/own_decode_vectors.bin` (4.8 MB: 3120 random and 2974 corpus quads, 2500 reconcile sets and the
+  family table hashes), still bit for bit and with the `comparison_can_fail` self-test. `-DVKAPRILTAG_REGEN_VECTORS=ON`
+  (with the validation option) patches upstream and builds `gen_decode_vectors` to rewrite the file.
+- New tests: `installed_package_consumer` (installs to a temporary prefix, checks it holds nothing from upstream, builds
+  and runs a `find_package(vkapriltag)` consumer on a corpus frame) and a stricter `deps_lint`.
+
+- Detections with equal ids are now ordered stably (reconcile's surviving order); the output used to order them as the C
+  library's `qsort` happened to, which differs between MSVC and glibc. Other output is unchanged.
+
+### Removed (build)
+
+- The FetchContent of upstream in the default build, `cmake/patches/` (the decode patches and `ApplyPatches.cmake` now
+  live in `tools/upstream/patches/` and are used only to regenerate the test vectors; the decode no-alloc patch and the
+  `-std=gnu17` / `-ffp-contract=off` pins for the apriltag target are gone from the default build), and the project's
+  C language.
+
+### Added
+
+- **Pre-warm for frames that arrive at camera rate.** A GPU idle for a few milliseconds takes about 0.5 ms
+  longer to start the next frame (640x480 one tag at 16 ms gaps: 0.83 ms per frame against 0.21 back to
+  back). `Detect()` now learns the frame period and a helper thread submits two trivial dispatches 3 ms before
+  the next frame is due, giving 0.36 to 0.42 ms; back-to-back frames and irregular cadences are unaffected.
+  `DetectorConfig::prewarm_lead_us`, `prewarm_burst`, `prewarm_gap_us` (`APRILTAG_VK_PREWARM_LEAD_US=0` turns it
+  off), and `GpuDetector::Prewarm()` for an application that knows a frame is about to arrive.
+  `TrackingDetector` pre-warms before each keyframe (Orange Pi, keyframe 1.11 -> 0.87 ms at 16 ms gaps).
+
+### Performance
+
+- **Profile refinement samples four taps at once.** `ProfilePass` blends and differences its taps with SSE2 (x86-64) and NEON (aarch64)
+  kernels in `TapKernels.h` (scalar fallback unchanged). Output is bit-identical on x86; on aarch64 the blend uses fused
+  multiply-add as gcc already did, so corners may move by about 1e-5 px. Orange Pi 5 Plus `perf`: `ProfilePass` events -13% (one-tag),
+  -19% (many-tags), -20% (dense-tags); CPU part of the corpus median 0.148 -> 0.129 ms. New option `APRILTAG_VK_REFINE_ABORT`
+  (off by default) gives up a quad whose first pass finds too few usable profiles.
+- **Early reject of non-tag candidates with grey margin on.** The border pre-check and the dark reject were
+  skipped whenever grey margin was on (the default), so every candidate was refined. They now run on the
+  unrefined quad and reject it only if its inner W cells (what the grey margin retry decodes) fail them too;
+  quads under 1.5 pixels per cell, coarse boxes and quads the small rescue would refit are kept. No tag is lost
+  on the corpus (decimation 1 and 2, with and without the rescue and polish options) or the ten sequences; the
+  CPU part of the frame falls 5 to 22% on clutter, busy background and jpeg frames and rises 0 to 6% on
+  frames full of real tags. `tag16h5` false detections fall (3 to 1 at decimation 2).
+  `APRILTAG_VK_EARLY_REJECT=0` restores the previous behaviour.
+
+### Accuracy
+
+- **Motion-blurred edges are placed by the halfway crossing.** When more than a quarter of the profile fit's
+  first-pass profiles run into the window ends, each side is refitted from half a cell outside to half a cell
+  inside, at the mid level between its white and black (exact for any symmetric blur). Worst-corner error on
+  the fast `napa-seq` sequences (decimation 2, median / p95): fast-1tag-1280 0.360 / 1.463 to 0.059 / 0.114
+  px (NAPA 0.047 / 0.117), fast-2tag-640 0.537 / 1.747 to 0.138 / 0.701; corpus `blur` p95 0.162 to 0.068,
+  `motion-blur` 0.456 to 0.181; no other scenario changes. Costs about 0.07 ms on blurred frames, nothing
+  measurable on sharp ones. `APRILTAG_VK_PROFILE_FEATURES=15` (bit 16 off) restores the previous output.
+
+### Removed
+
+- **The integer quad fit and `APRILTAG_VK_QUADFIT_F32`.** The float32 fit is the only fit; the integer fit (int64 moments with a 128-bit fallback), its integer hull fit and outlier test, and the switch are gone. It had the same found, false and error scores in every mode at decimation 1 and 2 on the desktop (RX 9060 XT, MSVC) and the Orange Pi 5 Plus (gcc 14); the fit stage was 24 to 31% cheaper on the desktop and the Pi frame time equal.
+- **The `fast`, `ultrafast` and `upstream` edge-refinement methods.** `APRILTAG_VK_REFINE` now accepts only
+  `exact` and `profile`; any other value is ignored and the default (`profile`) runs. The `refine_edges`
+  export in the upstream patch is gone with `upstream`.
+- **A/B-only environment switches whose choice is settled.** `APRILTAG_VK_FIND_MODE`,
+  `APRILTAG_VK_MERGE_FLAG_MODE`, `APRILTAG_VK_DEC1_ALIAS`, `APRILTAG_VK_UF_INIT_RUN`, `APRILTAG_VK_THRESH_RUN`,
+  `APRILTAG_VK_SORT_CHUNK`, `APRILTAG_VK_REDUCE_X4` and `APRILTAG_VK_GRAY_MAPPED` are ignored; each keeps the
+  behaviour it had by default on its device. The naive union-find walk, the sorting-network path of
+  `sort_points_local`, and the one-point-per-thread extents shaders `reduce_extents_hash.comp` and
+  `reduce_extents_hash_atomic64.comp` (with `reduce_extents_hash_body.glsl`) are deleted.
+
+- **Tracking experiments that lost.** `TrackingConfig::roi_search`, `capture`, `capture_speed_px` and
+  `max_speed_px` (`APRILTAG_VK_TRACKING_SEARCH`, `_CAPTURE`, `_CAPTURE_SPEED`, `_MAX_SPEED`) are gone, with
+  `Path::kSearch` and `kCapture`, the matching `Stats` fields and the `keycap` and `asynccap` modes of
+  `track_eval`. The keyframe and asynchronous modes are unchanged; the decimated start of background tracks
+  (`coarse_pad_frac`, `coarse_converge_px`, formerly `capture_pad_frac`, `capture_converge_px`) stays.
+- **Worker spinning, cold inline batches and caller pinning.** `cpu_spin_us`, `cpu_inline_max`,
+  `cpu_inline_idle_us`, `cpu_pin_caller` and `APRILTAG_CPU_SPIN_US`, `_SPIN_YIELD`, `_SPIN_WORKERS`,
+  `APRILTAG_CPU_INLINE`, `_INLINE_IDLE_US`, `APRILTAG_CPU_PIN_CALLER` are ignored; none beat the default on the
+  Orange Pi or the desktop. `WorkerPool::Warm`/`WarmAll`, `KeepAlive::Options::on_warm` and the `warm_pool`
+  argument of `NoteFrame` (which only served spinning) are removed. Big-core pinning
+  (`cpu_big_cores`, `APRILTAG_CPU_BIG_CORES`) and `APRILTAG_CPU_THREADS` stay.
+- **Dead code.** The unused `QuadCorners` type, and the dead `fuse` branches and duplicated timestamp
+  post-processing in the unfused GPU flow (the flow itself stays, as the fallback for devices without
+  host-cached memory).
+
+### Changed
+
+- **One options registry.** Every `APRILTAG_*` variable is a row of `library/src/common/Options.cpp` and is read
+  once, where the detector, decoder or context is constructed; the switch reference in `PERFORMANCE.md` is
+  generated from it (`vk_eval --list-options`) and a test fails if the library reads the environment elsewhere.
+  Precedence is one rule, the environment overrides the configuration, with `cpu_threads` (a configured value
+  wins) and the switches that can only enable or only disable listed in the table. No behaviour changes with
+  the environment as it was.
+
+### Fixed
+
+- **Setting `DetectorConfig::small_tag_rescue` in code enables the whole rescue.** `TagDecoder` had no
+  configuration input for it and discarded the boxes; it now takes the configured value through a new
+  trailing constructor argument (`TrackingDetector` passes it; other callers construct `TagDecoder` as before).
+- **The keep-alive works on Windows.** Its wait rounded up to the 15.6 ms timer tick; it now uses a
+  high-resolution waitable timer, so `APRILTAG_VK_KEEPALIVE_MS=1` to `4` keeps a discrete GPU awake.
 
 ## 1.10.1 (2026-11-04)
 

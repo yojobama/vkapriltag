@@ -1,5 +1,7 @@
 #include "vkapriltag/common/Profiler.h"
 
+#include "vkapriltag/common/Options.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -119,9 +121,9 @@ void Enable(bool on) {
 }
 
 bool EnableFromEnv() {
-  const char *path = std::getenv("APRILTAG_VK_TRACE");
-  if (path == nullptr || *path == '\0') return false;
-  Reg().env_trace_path = path;
+  const std::optional<std::string> path = Options::FromEnvironment().String("APRILTAG_VK_TRACE");
+  if (!path || path->empty()) return false;
+  Reg().env_trace_path = *path;
   Enable(true);
   return Enabled();
 }

@@ -1,0 +1,16 @@
+== threads: --threads 1
+one-tag off 0.3143 old 2.0232 new 0.6738
+dense-tags off 1.6037 old 81.1327 new 14.1886
+motion-blur off 0.3983 old 26.0402 new 4.2397
+blur off 0.7105 old 11.8985 new 2.2486
+jpeg off 2.2346 old 7.1048 new 2.8855
+range off 0.1712 old 3.1381 new 0.7208
+== threads: default
+one-tag off 0.3116 old 1.9855 new 0.6428
+dense-tags off 0.5936 old 12.8182 new 2.4204
+motion-blur off 0.3625 old 20.8424 new 3.2758
+blur off 0.3671 old 7.9359 new 1.3822
+jpeg off 0.7251 old 3.6491 new 1.3269
+range off 0.1717 old 3.1382 new 0.7147
+
+[exited with code 0]

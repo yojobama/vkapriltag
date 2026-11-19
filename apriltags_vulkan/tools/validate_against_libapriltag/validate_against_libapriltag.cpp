@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
   }
   std::cout << "Loaded " << pgm_path << " (" << width << "x" << height << ")" << std::endl;
 
-  apriltag_family_t *tf = nullptr;
+  const apriltag_vulkan::Family *tf = nullptr;
   if (!setup_tag_family(&tf, family_name.c_str())) {
     return 1;
   }
@@ -105,10 +105,10 @@ int main(int argc, char **argv) {
   int result = 1;
   try {
     // --- Our pipeline: Vulkan GPU detector + CPU QuadDecode + TagDecoder ---
-    apriltag_detector_t *td_ours = apriltag_detector_create();
-    apriltag_detector_add_family(td_ours, tf);
     // td_ref runs with upstream's default config (refine_edges = true), so match it here.
-    td_ours->refine_edges = true;
+    apriltag_vulkan::TagDecoderConfig decoder_config;
+    decoder_config.families = {tf};
+    decoder_config.refine_edges = true;
 
     profile_opt.Begin();
     apriltag_vulkan::vk::Context ctx;
@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
 
     apriltag_vulkan::GpuDetector detector(ctx, config);
     apriltag_vulkan::QuadDecode quad_decode(config);
-    apriltag_vulkan::TagDecoder tag_decoder(td_ours, decimation);
+    apriltag_vulkan::TagDecoder tag_decoder(decoder_config, decimation);
 
     ImageMetrics metrics;
     metrics.file = pgm_path;
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
     tag_decode_totals.reserve(static_cast<size_t>(iterations));
     pipeline_totals.reserve(static_cast<size_t>(iterations));
 
-    zarray_t *ours = nullptr;
+    const apriltag_vulkan::DetectionList *ours = nullptr;
     apriltag_vulkan::GpuDetector::DetectProfile profile;
     std::vector<apriltag_vulkan::DetectedQuad> quads;
 
@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
           std::chrono::duration<double, std::milli>(t_quad1 - t_quad0).count());
 
       const auto t_dec0 = std::chrono::steady_clock::now();
-      ours = tag_decoder.Decode(quads, gray.data(), width, height, config.reversed_border);
+      ours = &tag_decoder.Decode(quads, gray.data(), width, height, config.reversed_border);
       const auto t_dec1 = std::chrono::steady_clock::now();
       tag_decode_totals.push_back(
           std::chrono::duration<double, std::milli>(t_dec1 - t_dec0).count());
@@ -209,17 +209,16 @@ int main(int argc, char **argv) {
     }
 
     std::cout << "--- Our detections ---" << std::endl;
-    print_detections(ours);
-    std::vector<apriltag_vulkan::validate::DetectionInfo> our_dets = ExtractDetections(ours);
+    print_detections(*ours);
+    std::vector<apriltag_vulkan::validate::DetectionInfo> our_dets = ExtractDetections(*ours);
     std::vector<int> our_ids = SortedIds(our_dets);
-
-    apriltag_detector_destroy(td_ours);
 
     // --- Reference: the fetched apriltag library's own, unmodified,
     // full CPU detection pipeline (threshold -> quad detection -> decode),
     // run independently on the exact same pixels. ---
+    apriltag_family_t *up_family = upstream::CreateFamily(family_name.c_str());
     apriltag_detector_t *td_ref = apriltag_detector_create();
-    apriltag_detector_add_family(td_ref, tf);
+    apriltag_detector_add_family(td_ref, up_family);
     td_ref->quad_decimate = static_cast<float>(decimation);
     td_ref->nthreads = 1;
 
@@ -236,8 +235,9 @@ int main(int argc, char **argv) {
               << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count()
               << " ms" << std::endl;
     std::cout << "--- Reference (official libapriltag) detections ---" << std::endl;
-    print_detections(ref);
-    std::vector<apriltag_vulkan::validate::DetectionInfo> ref_dets = ExtractDetections(ref);
+    const std::vector<apriltag_vulkan::Detection> ref_list = upstream::ToDetections(ref);
+    print_detections(ref_list);
+    std::vector<apriltag_vulkan::validate::DetectionInfo> ref_dets = ExtractDetections(ref_list);
     std::vector<int> ref_ids = SortedIds(ref_dets);
 
     PrintIds("Our tag IDs", our_ids);
@@ -266,6 +266,7 @@ int main(int argc, char **argv) {
 
     apriltag_detections_destroy(ref);
     apriltag_detector_destroy(td_ref);
+    upstream::DestroyFamily(up_family, family_name.c_str());
   } catch (const std::exception &e) {
     std::cerr << "Fatal error: " << e.what() << std::endl;
     result = 1;

@@ -30,10 +30,6 @@
 #include "vkapriltag/gpu/QuadDecode.h"
 #include "vkapriltag/vk/Context.h"
 
-extern "C" {
-#include "apriltag.h"
-}
-
 namespace {
 
 void *AlignedAlloc(size_t alignment, size_t bytes) {
@@ -62,7 +58,7 @@ struct Stream {
   std::unique_ptr<apriltag_vulkan::vk::Lane> lane2, transfer_lane2;
   std::unique_ptr<apriltag_vulkan::GpuDetector> detector, detector2;
   std::unique_ptr<apriltag_vulkan::QuadDecode> quad_decode;
-  apriltag_detector_t *td = nullptr;
+  apriltag_vulkan::TagDecoderConfig decoder_config;
   std::unique_ptr<apriltag_vulkan::TagDecoder> tag_decoder;
   std::unique_ptr<apriltag_vulkan::FramePipeline> pipeline;
   // Aligned so they can be imported; depth + 1 of them are used in turn.
@@ -75,7 +71,6 @@ struct Stream {
   ~Stream() {
     pipeline.reset();
     tag_decoder.reset();
-    if (td != nullptr) apriltag_detector_destroy(td);
     detector2.reset();
     detector.reset();
     for (uint8_t *frame : frames) AlignedFree(frame);
@@ -87,18 +82,14 @@ std::vector<int> g_expected_ids;
 bool g_have_expected = false;
 std::atomic<int> g_mismatches{0};
 
-std::vector<int> SortedIds(const zarray_t *dets) {
+std::vector<int> SortedIds(const apriltag_vulkan::DetectionList &dets) {
   std::vector<int> ids;
-  for (int i = 0; i < zarray_size(dets); ++i) {
-    apriltag_detection_t *d = nullptr;
-    zarray_get(const_cast<zarray_t *>(dets), i, &d);
-    ids.push_back(d->id);
-  }
+  for (const apriltag_vulkan::Detection &d : dets) ids.push_back(d.id);
   std::sort(ids.begin(), ids.end());
   return ids;
 }
 
-void CheckResult(const zarray_t *dets) {
+void CheckResult(const apriltag_vulkan::DetectionList &dets) {
   const std::vector<int> ids = SortedIds(dets);
   std::lock_guard<std::mutex> lock(g_expected_mutex);
   if (!g_have_expected) {
@@ -170,7 +161,7 @@ int main(int argc, char **argv) {
     std::cerr << "Failed to load PGM: " << pgm_path << std::endl;
     return 1;
   }
-  apriltag_family_t *tf = nullptr;
+  const apriltag_vulkan::Family *tf = nullptr;
   if (!setup_tag_family(&tf, "tag36h11")) return 1;
 
   apriltag_vulkan::DetectorConfig config;
@@ -222,11 +213,10 @@ int main(int argc, char **argv) {
       st.detector = std::make_unique<apriltag_vulkan::GpuDetector>(
           ctx, *st.lane, st.transfer_lane.get(), config);
       st.quad_decode = std::make_unique<apriltag_vulkan::QuadDecode>(config);
-      st.td = apriltag_detector_create();
-      apriltag_detector_add_family(st.td, tf);
-      st.td->refine_edges = true;
+      st.decoder_config.families = {tf};
+      st.decoder_config.refine_edges = true;
       st.tag_decoder = std::make_unique<apriltag_vulkan::TagDecoder>(
-          st.td, decimation, static_cast<uint32_t>(cpu_threads),
+          st.decoder_config, decimation, static_cast<uint32_t>(cpu_threads),
           apriltag_vulkan::RefineEdgesMethod::kExact, probe_margin);
       if (depth == 2) {
         st.lane2 = ctx.CreateLane(slot);
@@ -253,11 +243,11 @@ int main(int argc, char **argv) {
 
     for (Stream &st : pool) {  // warm-up, serial
       for (int i = 0; i < 20; ++i) {
-        zarray_t *r = st.pipeline->Push(st.frames[i % (depth + 1)], width, height,
-                                        config.reversed_border);
-        if (r != nullptr) CheckResult(r);
+        const apriltag_vulkan::DetectionList *r = st.pipeline->Push(st.frames[i % (depth + 1)], width, height,
+                                                                    config.reversed_border);
+        if (r != nullptr) CheckResult(*r);
       }
-      while (zarray_t *r = st.pipeline->Flush()) CheckResult(r);
+      while (const apriltag_vulkan::DetectionList *r = st.pipeline->Flush()) CheckResult(*r);
     }
 
     std::atomic<int> ready{0};
@@ -277,19 +267,19 @@ int main(int argc, char **argv) {
             if (Ms(Clock::now() - due).count() > 0.5 * period_ms) ++sp->late;
           }
           pushed[static_cast<size_t>(k)] = Clock::now();
-          zarray_t *r = sp->pipeline->Push(sp->frames[k % (depth + 1)], width, height,
-                                           config.reversed_border);
+          const apriltag_vulkan::DetectionList *r = sp->pipeline->Push(sp->frames[k % (depth + 1)], width, height,
+                                                                       config.reversed_border);
           if (r != nullptr && k >= depth) {
             sp->latency_ms.push_back(
                 Ms(Clock::now() - pushed[static_cast<size_t>(k - depth)]).count());
-            CheckResult(r);
+            CheckResult(*r);
           }
         }
         // The frames still in flight finish in push order.
         size_t drained = static_cast<size_t>(std::max(0, iterations - depth));
-        while (zarray_t *r = sp->pipeline->Flush()) {
+        while (const apriltag_vulkan::DetectionList *r = sp->pipeline->Flush()) {
           sp->latency_ms.push_back(Ms(Clock::now() - pushed[drained++]).count());
-          CheckResult(r);
+          CheckResult(*r);
         }
       });
     }

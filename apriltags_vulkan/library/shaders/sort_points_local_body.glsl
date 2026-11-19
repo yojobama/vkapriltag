@@ -9,9 +9,8 @@ layout(local_size_x_id = 0, local_size_x = 256) in;
 // Shared-memory slots per workgroup (one word per point), independent of the workgroup size; see
 // local_sort_split_ in GpuDetector.cpp.
 layout(constant_id = 3) const uint kLocalCap = 1024;
-// Non-zero (a power of two) selects the rank-merge sort: runs of kChunk points are ranked, then
-// merged pairwise by binary search. 0 selects the sorting network.
-layout(constant_id = 4) const uint kChunk = 0;
+// A power of two: runs of kChunk points are ranked, then merged pairwise by binary search.
+layout(constant_id = 4) const uint kChunk = 16;
 layout(constant_id = 5) const uint kMode = 0;
 // Largest blob that is sorted; larger ones are written unsorted (kLargeSortCap, GpuDetector.cpp).
 layout(constant_id = 6) const uint kLargeCap = 1024;
@@ -88,7 +87,7 @@ const uint kMaxThetaKey = (1u << (32u - kLocalIndexBits)) - 1u;
 
 shared uint s_packed[kLocalCap];
 // Ping-pong partner of s_packed for the rank-merge sort.
-shared uint s_merge[kChunk != 0u ? kLocalCap : 1u];
+shared uint s_merge[kLocalCap];
 // The keys of a blob of at most kRankAll points, 4 to an entry, padded with 0xFFFFFFFF.
 shared uvec4 s_rank[kRankAll != 0u ? kRankAll / 4u : 1u];
 
@@ -131,135 +130,70 @@ void SortRange(uint base, uint first, uint count) {
     return;
   }
 
-  if (kChunk != 0u) {
-    for (uint idx = tid; idx < count; idx += threads) {
-      s_packed[idx] = PackedKey(base, first, idx);
-    }
-    memoryBarrierShared();
-    barrier();
-
-    if (count <= kChunk) {
-      for (uint idx = tid; idx < count; idx += threads) {
-        uint v = s_packed[idx];
-        uint rank = 0u;
-        for (uint j = 0u; j < count; ++j) rank += uint(s_packed[j] < v);
-        Emit(base, first, rank, v);
-      }
-      return;
-    }
-
-    // Sorts each run of kChunk points by ranking, into s_merge.
-    for (uint idx = tid; idx < count; idx += threads) {
-      uint run_start = idx & ~(kChunk - 1u);
-      uint run_end = min(run_start + kChunk, count);
-      uint v = s_packed[idx];
-      uint rank = 0u;
-      for (uint j = run_start; j < run_end; ++j) rank += uint(s_packed[j] < v);
-      s_merge[run_start + rank] = v;
-    }
-    memoryBarrierShared();
-    barrier();
-
-    // Merges pairs of runs, doubling the run length each round; the last round emits.
-    bool in_merge = true;
-    for (uint run = kChunk; run < count; run <<= 1u) {
-      const bool last = (run << 1u) >= count;
-      for (uint idx = tid; idx < count; idx += threads) {
-        uint v = SortedAt(in_merge, idx);
-        uint pair_start = idx & ~((run << 1u) - 1u);
-        bool left = (idx - pair_start) < run;
-        uint own_start = left ? pair_start : pair_start + run;
-        uint other_start = left ? pair_start + run : pair_start;
-        // The right run of the last pair can be short or empty; the left run is always full.
-        uint other_len = other_start < count ? min(run, count - other_start) : 0u;
-        uint lo = 0u;
-        uint hi = other_len;
-        while (lo < hi) {
-          uint mid = (lo + hi) >> 1u;
-          if (SortedAt(in_merge, other_start + mid) < v) {
-            lo = mid + 1u;
-          } else {
-            hi = mid;
-          }
-        }
-        uint pos = pair_start + (idx - own_start) + lo;
-        if (last) {
-          Emit(base, first, pos, v);
-        } else if (in_merge) {
-          s_packed[pos] = v;
-        } else {
-          s_merge[pos] = v;
-        }
-      }
-      if (!last) {
-        memoryBarrierShared();
-        barrier();
-        in_merge = !in_merge;
-      }
-    }
-    return;
-  }
-
-  // Sizes the network to this range; count is uniform across the workgroup, so cap is too.
-  uint cap = 1u;
-  uint log2_cap = 0u;
-  while (cap < count) {
-    cap <<= 1u;
-    log2_cap += 1u;
-  }
-
-  for (uint idx = tid; idx < cap; idx += threads) {
-    s_packed[idx] = (idx < count) ? PackedKey(base, first, idx)
-                                  : ((kMaxThetaKey << kLocalIndexBits) | idx);
+  for (uint idx = tid; idx < count; idx += threads) {
+    s_packed[idx] = PackedKey(base, first, idx);
   }
   memoryBarrierShared();
   barrier();
 
-  // Batcher odd-even mergesort over the padded cap slots. The (p, q, r, d) schedule depends only
-  // on cap. Comparators are enumerated directly (n_active per round) using shifts and masks,
-  // without divide or modulo.
-  if (log2_cap >= 1u) {
-    uint p = 1u << (log2_cap - 1u);
-    uint log2p = log2_cap - 1u;
-    while (p >= 1u) {
-      uint q = 1u << (log2_cap - 1u);
-      uint r = 0u;
-      uint d = p;
-      while (d >= 1u) {
-        uint two_p = p << 1u;
-        uint region_below = cap - d;
-        uint full_periods = region_below >> (log2p + 1u);
-        uint remainder = region_below & (two_p - 1u);
-        int partial_signed = int(remainder) - int(r);
-        uint partial = uint(clamp(partial_signed, 0, int(p)));
-        uint n_active = full_periods * p + partial;
-        for (uint c = tid; c < n_active; c += threads) {
-          uint idx = ((c >> log2p) << (log2p + 1u)) | r | (c & (p - 1u));
-          uint partner = idx + d;
-          uint a = s_packed[idx];
-          uint b = s_packed[partner];
-          if (a > b) {
-            s_packed[idx] = b;
-            s_packed[partner] = a;
-          }
-        }
-        memoryBarrierShared();
-        barrier();
-        if (d == q) {
-          d = 0u;
-        } else {
-          d = q - p;
-          q >>= 1u;
-          r = p;
-        }
-      }
-      p >>= 1u;
-      log2p -= 1u;
+  if (count <= kChunk) {
+    for (uint idx = tid; idx < count; idx += threads) {
+      uint v = s_packed[idx];
+      uint rank = 0u;
+      for (uint j = 0u; j < count; ++j) rank += uint(s_packed[j] < v);
+      Emit(base, first, rank, v);
     }
+    return;
   }
 
+  // Sorts each run of kChunk points by ranking, into s_merge.
   for (uint idx = tid; idx < count; idx += threads) {
-    Emit(base, first, idx, s_packed[idx]);
+    uint run_start = idx & ~(kChunk - 1u);
+    uint run_end = min(run_start + kChunk, count);
+    uint v = s_packed[idx];
+    uint rank = 0u;
+    for (uint j = run_start; j < run_end; ++j) rank += uint(s_packed[j] < v);
+    s_merge[run_start + rank] = v;
+  }
+  memoryBarrierShared();
+  barrier();
+
+  // Merges pairs of runs, doubling the run length each round; the last round emits.
+  bool in_merge = true;
+  for (uint run = kChunk; run < count; run <<= 1u) {
+    const bool last = (run << 1u) >= count;
+    for (uint idx = tid; idx < count; idx += threads) {
+      uint v = SortedAt(in_merge, idx);
+      uint pair_start = idx & ~((run << 1u) - 1u);
+      bool left = (idx - pair_start) < run;
+      uint own_start = left ? pair_start : pair_start + run;
+      uint other_start = left ? pair_start + run : pair_start;
+      // The right run of the last pair can be short or empty; the left run is always full.
+      uint other_len = other_start < count ? min(run, count - other_start) : 0u;
+      uint lo = 0u;
+      uint hi = other_len;
+      while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (SortedAt(in_merge, other_start + mid) < v) {
+          lo = mid + 1u;
+        } else {
+          hi = mid;
+        }
+      }
+      uint pos = pair_start + (idx - own_start) + lo;
+      if (last) {
+        Emit(base, first, pos, v);
+      } else if (in_merge) {
+        s_packed[pos] = v;
+      } else {
+        s_merge[pos] = v;
+      }
+    }
+    if (!last) {
+      memoryBarrierShared();
+      barrier();
+      in_merge = !in_merge;
+    }
   }
 }
 

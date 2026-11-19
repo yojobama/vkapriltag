@@ -1,0 +1,7 @@
+{
+  "d1": {"decimation": 1, "env": {}},
+  "d2": {"decimation": 2, "env": {}},
+  "rescue-hull": {"decimation": 2, "env": {"APRILTAG_VK_SMALL_RESCUE": "1", "APRILTAG_VK_HULL_QUAD": "1"}},
+  "polish": {"decimation": 2, "env": {"APRILTAG_VK_POLISH": "1"}},
+  "features15": {"decimation": 2, "env": {"APRILTAG_VK_PROFILE_FEATURES": "15"}}
+}

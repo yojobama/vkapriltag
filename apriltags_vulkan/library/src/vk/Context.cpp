@@ -1,7 +1,9 @@
 #include "vkapriltag/vk/Context.h"
+#include "vkapriltag/vk/ComputePipeline.h"
 
 #include "vkapriltag/vk/CompletionFlag.h"
 #include "vkapriltag/vk/EmbeddedShaders.h"
+#include "vkapriltag/common/Options.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -112,39 +114,6 @@ bool SupportsConditionalRendering(VkPhysicalDevice physical_device) {
   return conditional.conditionalRendering == VK_TRUE;
 }
 
-bool EnvFlag(const char *name) {
-  const char *v = std::getenv(name);
-  return v != nullptr && v[0] != '\0' && v[0] != '0';
-}
-
-bool EnvInt(const char *name, int *out) {
-  const char *v = std::getenv(name);
-  if (v == nullptr || v[0] == '\0') return false;
-  char *end = nullptr;
-  errno = 0;
-  const long parsed = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX) {
-    throw std::runtime_error(std::string(name) + "=" + v + " is not an integer");
-  }
-  *out = static_cast<int>(parsed);
-  return true;
-}
-
-// Parses "WxH" (e.g. "32x8"); returns false, leaving *w/*h untouched, if unset or malformed.
-bool EnvWxH(const char *name, uint32_t *w, uint32_t *h) {
-  const char *v = std::getenv(name);
-  if (v == nullptr || v[0] == '\0') return false;
-  char *end = nullptr;
-  long parsed_w = std::strtol(v, &end, 10);
-  if (end == v || *end != 'x' || parsed_w <= 0) return false;
-  const char *h_start = end + 1;
-  long parsed_h = std::strtol(h_start, &end, 10);
-  if (end == h_start || *end != '\0' || parsed_h <= 0) return false;
-  *w = static_cast<uint32_t>(parsed_w);
-  *h = static_cast<uint32_t>(parsed_h);
-  return true;
-}
-
 // Largest power of two <= v (v >= 1).
 uint32_t FloorPow2(uint32_t v) {
   uint32_t r = 1;
@@ -212,25 +181,27 @@ void Context::Init(const ContextOptions &options_in, const std::string *device_n
   } cleanup{this};
   ContextOptions options = options_in;
   // Environment overrides, so the same binary can be retargeted at runtime.
-  if (EnvFlag("APRILTAG_VK_ALLOW_CPU")) options.allow_cpu_device = true;
-  if (EnvFlag("APRILTAG_VK_VALIDATION")) options.enable_validation = true;
-  int env_int = 0;
-  if (EnvInt("APRILTAG_VK_DEVICE", &env_int)) options.device_index = env_int;
-  if (EnvInt("APRILTAG_VK_WG", &env_int) && env_int > 0) {
-    options.workgroup_size_override = static_cast<uint32_t>(env_int);
+  const Options env = Options::FromEnvironment();
+  if (env.Flag("APRILTAG_VK_ALLOW_CPU")) options.allow_cpu_device = true;
+  if (env.Flag("APRILTAG_VK_VALIDATION")) options.enable_validation = true;
+  if (const auto v = env.StrictInt("APRILTAG_VK_DEVICE")) options.device_index = *v;
+  if (const auto v = env.StrictInt("APRILTAG_VK_WG"); v && *v > 0) {
+    options.workgroup_size_override = static_cast<uint32_t>(*v);
   }
-  EnvWxH("APRILTAG_VK_WG2D", &options.workgroup_size_2d_x, &options.workgroup_size_2d_y);
-  if (EnvFlag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
-  if (EnvFlag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
-  if (EnvFlag("APRILTAG_VK_FORCE_NO_INT64_ATOMIC")) options.force_no_int64_atomics = true;
-  if (EnvFlag("APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING")) {
+  if (const auto v = env.WxH("APRILTAG_VK_WG2D")) {
+    options.workgroup_size_2d_x = v->first;
+    options.workgroup_size_2d_y = v->second;
+  }
+  if (env.Flag("APRILTAG_VK_FORCE_NO_8BIT")) options.force_no_8bit_storage = true;
+  if (env.Flag("APRILTAG_VK_FORCE_NO_SUBGROUP")) options.force_no_subgroup = true;
+  if (env.Flag("APRILTAG_VK_FORCE_NO_INT64_ATOMIC")) options.force_no_int64_atomics = true;
+  if (env.Flag("APRILTAG_VK_FORCE_NO_CONDITIONAL_RENDERING")) {
     options.force_no_conditional_rendering = true;
   }
-  if (EnvInt("APRILTAG_VK_MAX_INVOCATIONS", &env_int) && env_int > 0) {
-    options.max_invocations_override = static_cast<uint32_t>(env_int);
+  if (const auto v = env.StrictInt("APRILTAG_VK_MAX_INVOCATIONS"); v && *v > 0) {
+    options.max_invocations_override = static_cast<uint32_t>(*v);
   }
-  if (std::getenv("APRILTAG_VK_PIPELINE_CACHE") != nullptr &&
-      !EnvFlag("APRILTAG_VK_PIPELINE_CACHE")) {
+  if (env.Has("APRILTAG_VK_PIPELINE_CACHE") && !env.Flag("APRILTAG_VK_PIPELINE_CACHE")) {
     options.use_pipeline_cache = false;
   }
 
@@ -478,7 +449,7 @@ void Context::CreateLogicalDevice(const ContextOptions &options) {
   // 8-bit-storage variants selected via caps().has_8bit_storage.
   supports_8bit_storage_ = !options.force_no_8bit_storage && Supports8BitStorage(physical_device_);
 
-  // Optional feature with a shader variant behind it; see reduce_extents_hash_atomic64.comp.
+  // Optional feature with a shader variant behind it; see reduce_extents_hash_atomic64_x4.comp.
   supports_int64_atomics_ =
       !options.force_no_int64_atomics && SupportsInt64Atomics(physical_device_);
 
@@ -1060,8 +1031,7 @@ namespace {
 // which avoids the thread wake-up latency of a blocking wait.
 void WaitFence(VkDevice device, VkFence fence) {
   static const bool spin = [] {
-    const char *v = std::getenv("APRILTAG_VK_SPIN_WAIT");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    return Options::FromEnvironment().Flag("APRILTAG_VK_SPIN_WAIT");
   }();
   if (spin) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
@@ -1140,6 +1110,7 @@ void Lane::SubmitRing(size_t i, const VkSubmitInfo &submit_info) {
     CheckVk(result, "vkQueueSubmit");
   }
   ++submit_count;
+  if (DispatchTrace::Active()) DispatchTrace::Note("submit");
 }
 
 void Lane::SubmitAndWait(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage) {
@@ -1215,6 +1186,7 @@ void Lane::SubmitPersistentAndWait(VkCommandBuffer cmd, VkSemaphore wait,
     CheckVk(vkQueueSubmit(queue_, 1, &submit_info, persistent_fence_), "vkQueueSubmit");
   }
   ++submit_count;
+  if (DispatchTrace::Active()) DispatchTrace::Note("submit");
   if (flag != nullptr && flag->Wait(std::chrono::milliseconds(2))) {
     persistent_pending_ = true;
     return;

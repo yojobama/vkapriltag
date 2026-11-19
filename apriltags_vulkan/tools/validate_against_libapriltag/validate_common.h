@@ -25,9 +25,7 @@
 #include "vkapriltag/gpu/GpuDetector.h"
 #include "vkapriltag/gpu/QuadDecode.h"
 
-extern "C" {
-#include "apriltag.h"
-}
+#include "upstream/UpstreamAdapter.h"
 
 namespace apriltag_vulkan {
 namespace validate {
@@ -138,16 +136,14 @@ struct DetectionInfo {
   double p[4][2] = {};
 };
 
-inline std::vector<DetectionInfo> ExtractDetections(const zarray_t *detections) {
+inline std::vector<DetectionInfo> ExtractDetections(const DetectionList &detections) {
   std::vector<DetectionInfo> out;
-  for (int i = 0; i < zarray_size(detections); ++i) {
-    apriltag_detection_t *det;
-    zarray_get(const_cast<zarray_t *>(detections), i, &det);
+  for (const Detection &det : detections) {
     DetectionInfo info;
-    info.id = det->id;
+    info.id = det.id;
     for (int c = 0; c < 4; ++c) {
-      info.p[c][0] = det->p[c][0];
-      info.p[c][1] = det->p[c][1];
+      info.p[c][0] = det.p[c][0];
+      info.p[c][1] = det.p[c][1];
     }
     out.push_back(info);
   }
@@ -341,21 +337,17 @@ inline double MaxQuadDeviation(const std::vector<apriltag_vulkan::DetectedQuad> 
 // Appends frame `index`'s quads to `out` sorted by corner values at full precision, so dumps can be
 // diffed between runs.
 // Writes one line per decoded tag, sorted by id then centre, with every value at full precision.
-inline void DumpDetections(std::ostream &out, int index, const zarray_t *detections) {
-  std::vector<const apriltag_detection_t *> dets;
-  for (int i = 0; i < zarray_size(detections); ++i) {
-    apriltag_detection_t *det;
-    zarray_get(const_cast<zarray_t *>(detections), i, &det);
-    dets.push_back(det);
-  }
+inline void DumpDetections(std::ostream &out, int index, const DetectionList &detections) {
+  std::vector<const Detection *> dets;
+  for (const Detection &det : detections) dets.push_back(&det);
   std::sort(dets.begin(), dets.end(),
-            [](const apriltag_detection_t *a, const apriltag_detection_t *b) {
+            [](const Detection *a, const Detection *b) {
     if (a->id != b->id) return a->id < b->id;
     return std::lexicographical_compare(a->c, a->c + 2, b->c, b->c + 2);
   });
   out << "F " << index << ' ' << dets.size() << '\n';
   char line[512];
-  for (const apriltag_detection_t *d : dets) {
+  for (const Detection *d : dets) {
     std::snprintf(line, sizeof line,
                   "%d %d %.9g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", d->id,
                   d->hamming, d->decision_margin, d->c[0], d->c[1], d->p[0][0], d->p[0][1],

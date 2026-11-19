@@ -1,5 +1,7 @@
 #include "vkapriltag/gpu/MultiLevelDetector.h"
 
+#include "Geometry.h"
+
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -12,12 +14,8 @@ struct QuadShape {
 };
 
 QuadShape ShapeOf(const DetectedQuad &q) {
-  QuadShape s{0, 0, 0};
-  for (int k = 0; k < 4; ++k) {
-    s.cx += 0.25 * q.p[k][0];
-    s.cy += 0.25 * q.p[k][1];
-    s.side += 0.25 * std::hypot(q.p[(k + 1) & 3][0] - q.p[k][0], q.p[(k + 1) & 3][1] - q.p[k][1]);
-  }
+  QuadShape s{0, 0, geom::MeanSide(q.p)};
+  geom::QuadCentre(q.p, &s.cx, &s.cy);
   return s;
 }
 
@@ -30,7 +28,8 @@ bool SameTag(const QuadShape &a, const QuadShape &b) {
 }  // namespace
 
 MultiLevelDetector::MultiLevelDetector(vk::Context &ctx, const DetectorConfig &base,
-                                       std::vector<LevelSpec> levels) {
+                                       std::vector<LevelSpec> levels, vk::Lane *lane) {
+  pool_ = MakeWorkerPool(base);
   // Coarsest first, so a finer level's duplicate of a quad is the one dropped.
   std::stable_sort(levels.begin(), levels.end(),
                    [](const LevelSpec &a, const LevelSpec &b) { return a.decimation > b.decimation; });
@@ -42,8 +41,8 @@ MultiLevelDetector::MultiLevelDetector(vk::Context &ctx, const DetectorConfig &b
     config.max_tag_pixels = spec.max_tag_pixels;
     Level level;
     level.spec = spec;
-    level.detector = std::make_unique<GpuDetector>(ctx, config);
-    level.quad_decode = std::make_unique<QuadDecode>(config);
+    level.detector = std::make_unique<GpuDetector>(ctx, lane != nullptr ? *lane : ctx.default_lane(), config);
+    level.quad_decode = std::make_unique<QuadDecode>(config, pool_);
     levels_.push_back(std::move(level));
   }
 }

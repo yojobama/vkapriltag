@@ -1,5 +1,0 @@
-#version 450
-// Scalar, 32-bit-atomic variant. See reduce_extents_hash_body.glsl.
-#extension GL_GOOGLE_include_directive : require
-#include "common.glsl"
-#include "reduce_extents_hash_body.glsl"

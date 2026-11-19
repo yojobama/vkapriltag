@@ -2,7 +2,7 @@
 // Filters raw blob extents down to tag-quad candidates by size, bounding box and border polarity
 // (mirrors SelectBlobs). Survivors are compacted into selected[], capped at max_blobs; remap[]
 // maps each raw blob index to its selected index, or 0xFFFFFFFF if rejected. Folds
-// reduce_extents_hash.comp's private accumulator copies into each blob's extents first.
+// the extents reduction's private accumulator copies into each blob's extents first.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
@@ -30,7 +30,7 @@ layout(push_constant) uniform PushConstants {
   uint max_cluster_pixels;
   uint reversed_border; // bool as uint
   uint normal_border;   // bool as uint
-  // Non-zero when extents[] came from reduce_extents_hash_atomic64.comp, which stores
+  // Non-zero when extents[] came from reduce_extents_hash_atomic64_x4.comp, which stores
   // gx_sum/gy_sum as (true sum + count).
   uint gx_gy_biased;
   // Geometric prefilters; 0 disables each. See DetectorConfig::aspect_max/fill_min/fill_max.

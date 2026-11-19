@@ -1,0 +1,64 @@
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=4800
+fill offset=0 bytes=4
+fill offset=0 bytes=262144
+fill offset=0 bytes=8192
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=4
+fill offset=0 bytes=32
+barrier compute+transfer
+dispatch block_minmax_u8 grid=20,15,1 push=16:2f73c6a6fe9e0416
+barrier compute
+dispatch noise_floor grid=1,1,1 push=12:bfbe537f60d414d7
+barrier compute
+dispatch threshold_block_u8 grid=20,15,1 push=20:41233cded3bfba23
+barrier compute
+dispatch cell_args grid=1,1,1 push=0:14650fb0739d0383
+barrier compute
+barrier indirect
+dispatch_indirect uf_init_scan_u8 offset=0 push=12:d8c9e923f6312fb6
+barrier compute
+dispatch_indirect uf_merge_x4_u8 offset=0 push=16:d23781c83e195d0e
+barrier compute
+dispatch_indirect uf_count_runs_u8 offset=0 push=16:c8b8bc262302d256
+barrier compute
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=0
+barrier host_read
+submit
+dispatch_indirect blob_diff_u8 offset=0 push=20:9aee6afa8cd25737
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=4
+barrier host_read
+submit
+dispatch hash_group grid=16,1,1 push=20:9cfd1d7084034a17
+barrier compute
+dispatch build_indirect_args grid=1,1,1 push=20:d1690bc32d4a3a57
+dispatch reduce_extents_hash_atomic64_x4 grid=4,1,1 push=12:e452be53319652a1
+barrier compute
+barrier indirect
+dispatch_indirect select_blobs offset=0 push=44:7a087f15cb9259d7
+barrier compute
+dispatch scan_blob_counts grid=1,1,1 push=8:7d6f8523cab9fe7a
+barrier compute
+dispatch scatter_index_points grid=16,1,1 push=16:81b2eafc302fe0cc
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=16
+copy bytes=4 src_offset=0 dst_offset=20
+copy bytes=4 src_offset=8188 dst_offset=12
+copy bytes=4 src_offset=0 dst_offset=8
+barrier host_read
+submit
+dispatch sort_points_local_u8 grid=3,1,1 push=20:eb62fe0dd9265a59
+barrier compute
+barrier indirect
+dispatch_indirect sort_points_large_u8 offset=0 push=20:eb62fe0dd9265a59
+barrier compute
+dispatch_indirect sort_points_large_u8 offset=12 push=20:eb62fe0dd9265a59
+barrier compute+transfer
+copy bytes=4 src_offset=0 dst_offset=24
+barrier host_read
+submit
