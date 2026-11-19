@@ -204,10 +204,10 @@ blob in parallel on the worker pool; results are collected in span order so the 
 scheduling.
 
 - **DP seeding (`quad_fit_method = kDp`, the default).** Four corner seeds from the two mutually farthest points and the
-  point of maximum perpendicular deviation on each arc; each segment's line is fitted from its integer moments. If a
+  point of maximum perpendicular deviation on each arc; each segment's line is fitted from its float32 centred moments. If a
   segment exceeds `max_line_fit_mse` (10) the blob falls back to **peaks** (`kPeaks`): windowed line-fit error, a 7-tap
   Gaussian filter, peak detection and a combinatorial search over the 10 best peaks. `APRILTAG_VK_QUADFIT=peaks` forces
-  peaks. Moments use `int64` with an exact 128-bit fallback for very large blobs. By default (`APRILTAG_VK_QUADFIT_F32`) both paths run in float32 instead (`gpu/QuadFitF32.cpp`): centred moments in eight fixed float lanes, parallel-axis merges of the arcs between peaks, and a chunked windowed error; `=0` selects the integer code above. The hull fit (per-side support vote and band moments) and `HasOutliers` also run in float32 under the same switch; the hull geometry is shared and exact: the convex hull is taken over the lowest and highest point of each column (no sort), the farthest vertex and the Douglas-Peucker simplification use integer distances, and the edge choice memoises its corner tests.
+  peaks. Both paths run in float32 (`gpu/QuadFitF32.cpp`): centred moments in eight fixed float lanes, parallel-axis merges of the arcs between peaks, and a chunked windowed error. The hull fit (per-side support vote and band moments) and `HasOutliers` also run in float32; the hull geometry is shared and exact: the convex hull is taken over the lowest and highest point of each column (no sort), the farthest vertex and the Douglas-Peucker simplification use integer distances, and the edge choice memoises its corner tests.
 - **`UpdateFitQuad`** refits the four lines, intersects neighbours (rejects a determinant below 0.001), checks the area
   (at least `0.95 * max(3, tag_width / decimation)^2`), convexity and winding (`cos_critical_rad` 0.98), and scales the corners
   to full resolution.
@@ -284,7 +284,7 @@ bit for bit against the results recorded from upstream (section 10).
 `Geometry.h` (namespace `geom`): bilinear sampling, side sampler taps, line and corner intersection, homography
 projection, 3x3 inverse and Gaussian solve, monotone-chain hull, side and bounds helpers. `BorderSample.cpp` reads the
 border and quiet-ring grey levels from a homography. `SmallQuad.cpp` is the rescue refit. These are deliberately not
-shared with the integer moment arithmetic of `QuadDecode` (`FitLine`) or the float inner loops of `PolishFit`, whose
+shared with the float32 moment arithmetic of `QuadFitF32` (`FitLine`) or the float inner loops of `PolishFit`, whose
 rounding they would change.
 
 ## 7. Composites and pose

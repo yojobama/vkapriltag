@@ -48,25 +48,7 @@ struct RawLineFitPoint {
   int32_t y2() const { return static_cast<int32_t>((xy2 >> 14) & 0x3FFFu); }
   int32_t W() const { return static_cast<int32_t>(w_blob & 0x3FFu); }
   uint32_t blob_index() const { return w_blob >> 10; }
-
-  int32_t Mx() const { return W() * x2(); }
-  int32_t My() const { return W() * y2(); }
-  int64_t Mxx() const { return static_cast<int64_t>(W()) * x2() * x2(); }
-  int64_t Mxy() const { return static_cast<int64_t>(W()) * x2() * y2(); }
-  int64_t Myy() const { return static_cast<int64_t>(W()) * y2() * y2(); }
 };
 static_assert(sizeof(RawLineFitPoint) == 8, "RawLineFitPoint must match std430 layout");
-
-// Cumulative line-fit moments for a range of points, prefix-summed from RawLineFitPoint with x2
-// and y2 taken relative to the blob's first point.
-struct LineFitMoments {
-  int64_t Mx = 0;
-  int64_t My = 0;
-  int64_t Mxx = 0;
-  int64_t Myy = 0;
-  int64_t Mxy = 0;
-  int32_t W = 0;
-  int32_t N = 0;
-};
 
 }  // namespace apriltag_vulkan

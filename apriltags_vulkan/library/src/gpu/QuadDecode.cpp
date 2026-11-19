@@ -12,21 +12,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
 #include <span>
 #include <string>
 
 namespace apriltag_vulkan {
 namespace {
-
-// Gaussian filter taps applied to the windowed error.
-constexpr std::array<double, 7> kFilterCoefficients = {
-    0.01110899634659290314, 0.13533528149127960205, 0.60653066635131835938,
-    1.00000000000000000000, 0.60653066635131835938, 0.13533528149127960205,
-    0.01110899634659290314,
-};
-
-constexpr int kNMaxima = 10;
 
 // Largest bounding box, in full-resolution pixels, of a blob handed on for the small-tag rescue.
 constexpr double kMaxRescueBox = 40.0;
@@ -42,165 +32,6 @@ constexpr size_t kMaxRescueRefits = 4;
 constexpr double kRescueIdealSide = 14.0;
 constexpr double kRescueGradientWeight = 0.05;
 
-// Hypotenuse of two floats, evaluated in double and rounded once to float.
-inline float Hypot(float x, float y) {
-  const double dx = x, dy = y;
-  return static_cast<float>(std::sqrt(dx * dx + dy * dy));
-}
-
-// LineFitMoments addition and subtraction.
-LineFitMoments Add(const LineFitMoments &a, const LineFitMoments &b) {
-  LineFitMoments r;
-  r.Mx = a.Mx + b.Mx;
-  r.My = a.My + b.My;
-  r.W = a.W + b.W;
-  r.Mxx = a.Mxx + b.Mxx;
-  r.Myy = a.Myy + b.Myy;
-  r.Mxy = a.Mxy + b.Mxy;
-  return r;
-}
-
-LineFitMoments Sub(const LineFitMoments &a, const LineFitMoments &b) {
-  LineFitMoments r;
-  r.Mx = a.Mx - b.Mx;
-  r.My = a.My - b.My;
-  r.W = a.W - b.W;
-  r.Mxx = a.Mxx - b.Mxx;
-  r.Myy = a.Myy - b.Myy;
-  r.Mxy = a.Mxy - b.Mxy;
-  return r;
-}
-
-// Cumulative moments over the circular index range [index0, index1] inclusive, from prefix sums
-// `cs` (cs[k] = sum of points [0, k]) of length total_points. index0 >= index1 takes the
-// wrap-around branch.
-inline LineFitMoments ReadMomentsWindow(const std::vector<LineFitMoments> &cs, size_t total_points,
-                                size_t index0, size_t index1) {
-  LineFitMoments result;
-  if (index0 < index1) {
-    result = cs[index1];
-    if (index0 > 0) {
-      result = Sub(result, cs[index0 - 1]);
-    }
-    result.N = static_cast<int32_t>(index1 - index0 + 1);
-  } else {
-    LineFitMoments lfsz = cs[total_points - 1];
-    result = lfsz;
-    if (index0 > 0) {
-      result = Sub(lfsz, cs[index0 - 1]);
-    }
-    result = Add(result, cs[index1]);
-    result.N = static_cast<int32_t>(total_points - index0 + index1 + 1);
-  }
-  return result;
-}
-
-// A two's-complement 128-bit integer, for the covariances of blobs too large for int64.
-struct Int128 {
-  uint64_t hi = 0, lo = 0;
-};
-
-Int128 Mul128(int64_t a, int64_t b) {
-  const uint64_t ua = a < 0 ? 0 - static_cast<uint64_t>(a) : static_cast<uint64_t>(a);
-  const uint64_t ub = b < 0 ? 0 - static_cast<uint64_t>(b) : static_cast<uint64_t>(b);
-  const uint64_t a0 = ua & 0xFFFFFFFFu, a1 = ua >> 32, b0 = ub & 0xFFFFFFFFu, b1 = ub >> 32;
-  const uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0;
-  const uint64_t mid = (p00 >> 32) + (p01 & 0xFFFFFFFFu) + (p10 & 0xFFFFFFFFu);
-  Int128 r{a1 * b1 + (p01 >> 32) + (p10 >> 32) + (mid >> 32), (mid << 32) | (p00 & 0xFFFFFFFFu)};
-  if ((a < 0) != (b < 0)) r = {~r.hi + (r.lo == 0 ? 1u : 0u), ~r.lo + 1};
-  return r;
-}
-Int128 Add128(Int128 a, Int128 b) { return {a.hi + b.hi + (a.lo + b.lo < a.lo ? 1u : 0u), a.lo + b.lo}; }
-Int128 Sub128(Int128 a, Int128 b) { return {a.hi - b.hi - (a.lo < b.lo ? 1u : 0u), a.lo - b.lo}; }
-
-// Rounded to float: once, as from int64, whenever the value fits in an int64.
-float ToFloat(Int128 v) {
-  const int64_t lo = static_cast<int64_t>(v.lo);
-  if (v.hi == static_cast<uint64_t>(lo >> 63)) return static_cast<float>(lo);
-  return static_cast<float>(static_cast<double>(static_cast<int64_t>(v.hi)) * 0x1p64 +
-                            static_cast<double>(v.lo));
-}
-
-// Whether a moments window's covariance terms can exceed int64: its Mx^2, My^2 and |Mxy*W| are at
-// most Mxx*W or Myy*W (Cauchy-Schwarz), so below 2^61 every term is exact.
-inline bool NeedsWide(const LineFitMoments &m) {
-  return static_cast<double>(m.Mxx) * static_cast<double>(m.W) >= 0x1p61 ||
-         static_cast<double>(m.Myy) * static_cast<double>(m.W) >= 0x1p61;
-}
-
-// Cxx - Cyy, Cxx + Cyy and Cxy of a moments window, from exact integers rounded once to float:
-// in int64, or in 128 bits (kWide) for a window that NeedsWide.
-struct LineCovariances {
-  float diff, sum, xy;
-};
-
-template <bool kWide>
-inline LineCovariances Covariances(const LineFitMoments &m) {
-  const int64_t W = m.W;
-  if constexpr (!kWide) {
-    const int64_t Cxx = m.Mxx * W - m.Mx * m.Mx;
-    const int64_t Cxy = m.Mxy * W - m.Mx * m.My;
-    const int64_t Cyy = m.Myy * W - m.My * m.My;
-    return {static_cast<float>(Cxx - Cyy), static_cast<float>(Cxx + Cyy), static_cast<float>(Cxy)};
-  } else {
-    const Int128 Cxx = Sub128(Mul128(m.Mxx, W), Mul128(m.Mx, m.Mx));
-    const Int128 Cxy = Sub128(Mul128(m.Mxy, W), Mul128(m.Mx, m.My));
-    const Int128 Cyy = Sub128(Mul128(m.Myy, W), Mul128(m.My, m.My));
-    return {ToFloat(Sub128(Cxx, Cyy)), ToFloat(Add128(Cxx, Cyy)), ToFloat(Cxy)};
-  }
-}
-
-// Sum of squared error of a line fit from its moments, for the peak search's windows: at most 41
-// points of W <= 1023 within 16383 of the origin, so Mxx*W < 4.8e17 and int64 is always exact.
-inline double FitLineError(const LineFitMoments &m) {
-  const LineCovariances c = Covariances<false>(m);
-  const float hypot_cached = Hypot(c.diff, 2 * c.xy);
-  const float eight_w_squared = static_cast<float>(static_cast<double>(m.W) * m.W * 8.0);
-  const float eig_small = (c.sum - hypot_cached) / eight_w_squared;
-  return m.N * eig_small;
-}
-
-// Point-on-line (lineparam01), unit normal (lineparam23), sum and mean squared error from a
-// moments window whose coordinates are relative to (x0, y0).
-void FitLine(const LineFitMoments &moments, int64_t x0, int64_t y0, double *lineparam01,
-             double *lineparam23, double *err, double *mse) {
-  const int64_t W = moments.W;
-  const LineCovariances c =
-      NeedsWide(moments) ? Covariances<true>(moments) : Covariances<false>(moments);
-
-  const float hypot_cached = Hypot(c.diff, 2 * c.xy);
-  const float eight_w_squared = static_cast<float>(static_cast<double>(W) * W * 8.0);
-  const float eig_small = (c.sum - hypot_cached) / eight_w_squared;
-
-  if (lineparam01) {
-    lineparam01[0] = static_cast<float>(moments.Mx + x0 * W) / static_cast<float>(W * 2);
-    lineparam01[1] = static_cast<float>(moments.My + y0 * W) / static_cast<float>(W * 2);
-  }
-  if (lineparam23) {
-    const float nx1 = c.diff - hypot_cached;
-    const float ny1 = c.xy * 2;
-    const float M1 = nx1 * nx1 + ny1 * ny1;
-    const float nx2 = c.xy * 2;
-    const float ny2 = (0.0f - c.diff) - hypot_cached;  // float(Cyy - Cxx), +0 when equal
-    const float M2 = nx2 * nx2 + ny2 * ny2;
-
-    float nx, ny;
-    if (M1 > M2) {
-      nx = nx1;
-      ny = ny1;
-    } else {
-      nx = nx2;
-      ny = ny2;
-    }
-    float length = Hypot(nx, ny);
-    lineparam23[0] = nx / length;
-    lineparam23[1] = ny / length;
-  }
-
-  *err = moments.N * eig_small;
-  *mse = eig_small;
-}
-
 // Per-blob quad fit result (combinatorial search or DP seeding).
 struct FitQuadResult {
   bool valid = false;
@@ -209,11 +40,8 @@ struct FitQuadResult {
   bool dp_attempted = false;
   bool dp_used = false;
   uint32_t indices[4] = {};
-  LineFitMoments moments[4];
-  // The moments' origin: the blob's first point.
+  // The sides' origin is the blob's first point.
   int32_t x0 = 0, y0 = 0;
-  // Set when the float32 fit produced the sides: they are then in f32_sides, not moments.
-  bool f32 = false;
   quadf32::Sides f32_sides;
 };
 
@@ -292,68 +120,13 @@ bool FindDpCornerIndices(const UnpackedPoints &pts, size_t n, uint32_t out_indic
   return true;
 }
 
-// The moments of the circular, inclusive index range [i0, i1] of pts[0, n), relative to (x0, y0);
-// i0 >= i1 wraps, as ReadMomentsWindow. The same integers as the prefix-sum difference.
-inline LineFitMoments SumMomentsWindow(const UnpackedPoints &pts, size_t n, size_t i0, size_t i1,
-                                       int32_t x0, int32_t y0) {
-  int64_t mx = 0, my = 0, w_sum = 0, mxx = 0, mxy = 0, myy = 0;
-  auto add = [&](size_t from, size_t to) {
-    for (size_t k = from; k < to; ++k) {
-      const int32_t x2 = pts.x[k] - x0, y2 = pts.y[k] - y0, w = pts.w[k];
-      const int32_t wx = w * x2, wy = w * y2;
-      mx += wx;
-      my += wy;
-      w_sum += w;
-      mxx += static_cast<int64_t>(wx) * x2;
-      mxy += static_cast<int64_t>(wx) * y2;
-      myy += static_cast<int64_t>(wy) * y2;
-    }
-  };
-  if (i0 < i1) {
-    add(i0, i1 + 1);
-  } else {
-    add(i0, n);
-    add(0, i1 + 1);
-  }
-  LineFitMoments m;
-  m.Mx = mx;
-  m.My = my;
-  m.W = static_cast<int32_t>(w_sum);
-  m.Mxx = mxx;
-  m.Myy = myy;
-  m.Mxy = mxy;
-  m.N = static_cast<int32_t>(i0 < i1 ? i1 - i0 + 1 : n - i0 + i1 + 1);
-  return m;
-}
-
-// Tries DP corner seeding for one blob, summing each segment's moments directly. Returns an
-// invalid result if seeding fails or a segment exceeds max_line_fit_mse (the caller then falls
-// back to peaks).
-FitQuadResult TryDpQuad(const DetectorConfig &config, const UnpackedPoints &pts, size_t total_points) {
-  FitQuadResult result;
-  uint32_t idx[4];
-  if (!FindDpCornerIndices(pts, total_points, idx)) return result;
-
-  result.x0 = pts.x[0];
-  result.y0 = pts.y[0];
-  for (int k = 0; k < 4; ++k) {
-    result.moments[k] =
-        SumMomentsWindow(pts, total_points, idx[k], idx[(k + 1) % 4], result.x0, result.y0);
-    double err, mse;
-    FitLine(result.moments[k], 0, 0, nullptr, nullptr, &err, &mse);
-    if (mse > config.max_line_fit_mse) return result;
-  }
-
-  result.valid = true;
-  for (int k = 0; k < 4; ++k) result.indices[k] = idx[k];
-  return result;
-}
-
-// The float32 fit of one blob: DP seeding on the four arcs, falling back to the peaks search.
-FitQuadResult FitQuadForBlobF32(const DetectorConfig &config, std::span<const RawLineFitPoint> points, size_t begin,
-                                size_t end, QuadFitScratch &scratch) {
+// The fit of one blob: DP seeding on the four arcs, falling back to the peaks search.
+FitQuadResult FitQuadForBlob(const DetectorConfig &config, std::span<const RawLineFitPoint> points, size_t begin,
+                             size_t end, QuadFitScratch &scratch) {
   FitQuadResult result;
   const size_t n = end - begin;
+  // A point's W is at most 1023 and sums are 32-bit: far more points than any tag border.
+  if (n < 4 || n > INT32_MAX / 1023) return result;
   scratch.px.resize(n + 8);
   scratch.py.resize(n + 8);
   scratch.pw.resize(n + 8);
@@ -361,7 +134,6 @@ FitQuadResult FitQuadForBlobF32(const DetectorConfig &config, std::span<const Ra
   scratch.unpacked_begin = begin;
   scratch.unpacked_n = n;
   const quadf32::Points pts{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
-  result.f32 = true;
   result.x0 = pts.x[0];
   result.y0 = pts.y[0];
   if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
@@ -378,250 +150,6 @@ FitQuadResult FitQuadForBlobF32(const DetectorConfig &config, std::span<const Ra
   return result;
 }
 
-// Windowed error, 7-tap Gaussian filter and peak detection, then a combinatorial search over the
-// top 10 peaks, for one blob. Its points are `points[begin, end)`, in perimeter (theta) order.
-FitQuadResult FitQuadForBlob(const DetectorConfig &config,
-                            std::span<const RawLineFitPoint> points, size_t begin,
-                            size_t end, QuadFitScratch &scratch) {
-  FitQuadResult result;
-  const size_t total_points = end - begin;
-  // LineFitMoments::W is 32-bit and a point's W at most 1023: far more points than any tag border.
-  if (total_points < 4 || total_points > INT32_MAX / 1023) return result;
-  if (config.quad_fit_f32) return FitQuadForBlobF32(config, points, begin, end, scratch);
-
-  if (config.quad_fit_method == DetectorConfig::QuadFitMethod::kDp) {
-    result.dp_attempted = true;  // sticks even if we fall through to peaks below
-    scratch.px.resize(total_points);
-    scratch.py.resize(total_points);
-    scratch.pw.resize(total_points);
-    for (size_t k = 0; k < total_points; ++k) {
-      const RawLineFitPoint &p = points[begin + k];
-      scratch.px[k] = p.x2();
-      scratch.py[k] = p.y2();
-      scratch.pw[k] = p.W();
-    }
-    const UnpackedPoints unpacked{scratch.px.data(), scratch.py.data(), scratch.pw.data()};
-    FitQuadResult dp_result = TryDpQuad(config, unpacked, total_points);
-    if (dp_result.valid) {
-      dp_result.dp_attempted = true;
-      dp_result.dp_used = true;
-      return dp_result;
-    }
-    // Fall back to the peaks-based search.
-  }
-
-  // scratch is reused across blobs on this slot; the buffers only grow.
-  std::vector<LineFitMoments> &cs = scratch.cs;
-  std::vector<double> &error = scratch.error;
-  std::vector<double> &filtered = scratch.filtered;
-  std::vector<std::pair<double, uint32_t>> &peaks = scratch.peaks;
-  cs.resize(total_points);
-  error.resize(total_points);
-  filtered.resize(total_points);
-  peaks.clear();
-
-  const int32_t x0 = points[begin].x2(), y0 = points[begin].y2();
-  result.x0 = x0;
-  result.y0 = y0;
-  {
-    // Running sums stay in registers; each field of cs[k] is stored separately.
-    int64_t mx = 0, my = 0, w_sum = 0, mxx = 0, mxy = 0, myy = 0;
-    for (size_t k = 0; k < total_points; ++k) {
-      const RawLineFitPoint &p = points[begin + k];
-      // Unpack once: the accessors are bit extractions and cs may alias points as far as the compiler knows.
-      const int32_t x2 = p.x2() - x0, y2 = p.y2() - y0, w = p.W();
-      const int64_t wx = static_cast<int64_t>(w) * x2;
-      const int64_t wy = static_cast<int64_t>(w) * y2;
-      mx += wx;
-      my += wy;
-      w_sum += w;
-      mxx += wx * x2;
-      mxy += wx * y2;
-      myy += wy * y2;
-      LineFitMoments &c = cs[k];
-      c.Mx = mx;
-      c.My = my;
-      c.W = static_cast<int32_t>(w_sum);
-      c.Mxx = mxx;
-      c.Myy = myy;
-      c.Mxy = mxy;
-      c.N = 0;
-    }
-  }
-
-  const int ksz = std::min<int>(20, static_cast<int>(total_points / 12));
-
-  // Windowed error per point. Windows that do not wrap are evaluated in two vectorisable stages;
-  // the rest use circular indices with conditional subtraction instead of `%`.
-  const size_t n = total_points;
-  const size_t k_off = static_cast<size_t>(ksz);
-  if (k_off >= 1 && n > 2 * k_off + 1) {
-    const size_t first = k_off + 1, last = n - k_off - 1;  // i0 >= 1 and i1 < n inside [first, last]
-    const size_t count = last - first + 1;
-    scratch.win_diff.resize(count);
-    scratch.win_xy2.resize(count);
-    scratch.win_sum.resize(count);
-    scratch.win_w8.resize(count);
-    float *wd = scratch.win_diff.data(), *wx = scratch.win_xy2.data(), *wsum = scratch.win_sum.data(),
-          *w8 = scratch.win_w8.data();
-    const LineFitMoments *cp = cs.data();
-    for (size_t j = 0; j < count; ++j) {
-      const size_t i = first + j;
-      const LineFitMoments &hi = cp[i + k_off], &lo = cp[i - k_off - 1];
-      const int64_t W = static_cast<int32_t>(hi.W - lo.W);
-      const int32_t mx = static_cast<int32_t>(hi.Mx - lo.Mx), my = static_cast<int32_t>(hi.My - lo.My);
-      const int64_t Cxx = (hi.Mxx - lo.Mxx) * W - static_cast<int64_t>(mx) * mx;
-      const int64_t Cxy = (hi.Mxy - lo.Mxy) * W - static_cast<int64_t>(mx) * my;
-      const int64_t Cyy = (hi.Myy - lo.Myy) * W - static_cast<int64_t>(my) * my;
-      wd[j] = static_cast<float>(Cxx - Cyy);
-      wsum[j] = static_cast<float>(Cxx + Cyy);
-      wx[j] = 2 * static_cast<float>(Cxy);
-      w8[j] = static_cast<float>(static_cast<double>(W) * W * 8.0);
-    }
-    const int32_t window_n = static_cast<int32_t>(2 * k_off + 1);
-    double *err = error.data() + first;
-    for (size_t j = 0; j < count; ++j) {
-      const double dx = wd[j], dy = wx[j];
-      const float h = static_cast<float>(std::sqrt(dx * dx + dy * dy));
-      const float eig_small = (wsum[j] - h) / w8[j];
-      err[j] = window_n * eig_small;
-    }
-    for (size_t i = 0; i < first; ++i) {
-      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
-      size_t i1 = i + k_off;
-      if (i1 >= n) i1 -= n;
-      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
-    }
-    for (size_t i = last + 1; i < n; ++i) {
-      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
-      size_t i1 = i + k_off;
-      if (i1 >= n) i1 -= n;
-      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
-    }
-  } else {
-    for (size_t i = 0; i < n; ++i) {
-      const size_t i0 = (i >= k_off) ? (i - k_off) : (i + n - k_off);
-      size_t i1 = i + k_off;
-      if (i1 >= n) i1 -= n;
-      error[i] = FitLineError(ReadMomentsWindow(cs, n, i0, i1));
-    }
-  }
-
-  // 7-tap Gaussian filter, applied circularly, over the errors padded with their wrap-around.
-  constexpr size_t kHalf = kFilterCoefficients.size() / 2;  // 3
-  std::vector<double> &padded = scratch.padded;
-  padded.resize(n + 2 * kHalf);
-  for (size_t j = 0; j < kHalf; ++j) {
-    padded[j] = error[(j + n - kHalf) % n];
-    padded[n + kHalf + j] = error[j % n];
-  }
-  std::copy(error.begin(), error.begin() + static_cast<std::ptrdiff_t>(n), padded.begin() + kHalf);
-  {
-    const double *e = padded.data();
-    double *f = filtered.data();
-    for (size_t i = 0; i < n; ++i) {
-      double accumulated = 0.0;
-      for (size_t j = 0; j < kFilterCoefficients.size(); ++j) accumulated += e[i + j] * kFilterCoefficients[j];
-      f[i] = accumulated;
-    }
-  }
-
-  // Peaks are strict local maxima of the filtered error, stored negated so an ascending sort
-  // puts the strongest first.
-  {
-    double before = filtered[n - 1];
-    double cur = filtered[0];
-    for (size_t i = 0; i < n; ++i) {
-      const double after = filtered[(i + 1 == n) ? 0 : (i + 1)];
-      if (cur > before && cur > after) {
-        peaks.emplace_back(-cur, static_cast<uint32_t>(i));
-      }
-      before = cur;
-      cur = after;
-    }
-  }
-
-  const size_t K = std::min<size_t>(peaks.size(), kNMaxima);
-  if (K < 4) return result;
-
-  std::partial_sort(peaks.begin(), peaks.begin() + static_cast<std::ptrdiff_t>(K), peaks.end(),
-                    [](const auto &a, const auto &b) { return a.first != b.first ? a.first < b.first : a.second < b.second; });
-  std::array<uint32_t, kNMaxima> point_indices{};
-  for (size_t k = 0; k < K; ++k) point_indices[k] = peaks[k].second;
-  std::sort(point_indices.begin(), point_indices.begin() + K);
-
-  // Line fit of the segment between every ordered pair of peaks; (b, a) with b > a closes the quad.
-  double seg_err[kNMaxima][kNMaxima];
-  double seg_mse[kNMaxima][kNMaxima];
-  double seg_params[kNMaxima][kNMaxima][2];
-  for (size_t a = 0; a < K; ++a) {
-    for (size_t b = a + 1; b < K; ++b) {
-      FitLine(ReadMomentsWindow(cs, total_points, point_indices[a], point_indices[b]), 0, 0, nullptr,
-              seg_params[a][b], &seg_err[a][b], &seg_mse[a][b]);
-    }
-  }
-  // The closing segments (b, a) are fitted when the search first needs them.
-  bool closing_done[kNMaxima][kNMaxima] = {};
-  auto closing = [&](size_t b, size_t a) {
-    if (!closing_done[b][a]) {
-      closing_done[b][a] = true;
-      FitLine(ReadMomentsWindow(cs, total_points, point_indices[b], point_indices[a]), 0, 0, nullptr,
-              nullptr, &seg_err[b][a], &seg_mse[b][a]);
-    }
-  };
-  const double max_mse = config.max_line_fit_mse;
-
-  // Brute force all C(10, 4) = 210 combinations, keeping the minimum total error.
-  double best_error = std::numeric_limits<double>::max();
-  uint32_t best[4] = {0, 0, 0, 0};
-
-  for (uint32_t m0 = 0; m0 < kNMaxima - 3; ++m0) {
-    for (uint32_t m1 = m0 + 1; m1 < kNMaxima - 2; ++m1) {
-      if (m1 >= K) break;
-      if (seg_mse[m0][m1] > max_mse) continue;
-      const double errm0m1 = seg_err[m0][m1];
-      const double *paramsm0m123 = seg_params[m0][m1];
-
-      for (uint32_t m2 = m1 + 1; m2 < kNMaxima - 1; ++m2) {
-        if (m2 >= K) break;
-        if (seg_mse[m1][m2] > max_mse) continue;
-        const double errm1m2 = seg_err[m1][m2];
-        const double *paramsm1m223 = seg_params[m1][m2];
-
-        const double dot = paramsm0m123[0] * paramsm1m223[0] + paramsm0m123[1] * paramsm1m223[1];
-        if (std::fabs(dot) > config.cos_critical_rad) continue;
-
-        for (uint32_t m3 = m2 + 1; m3 < kNMaxima; ++m3) {
-          if (m3 >= K) break;
-          if (seg_mse[m2][m3] > max_mse) continue;
-          closing(m3, m0);
-          if (seg_mse[m3][m0] > max_mse) continue;
-
-          const double total = errm0m1 + errm1m2 + seg_err[m2][m3] + seg_err[m3][m0];
-          if (total < best_error) {
-            best_error = total;
-            best[0] = m0;
-            best[1] = m1;
-            best[2] = m2;
-            best[3] = m3;
-          }
-        }
-      }
-    }
-  }
-
-  if (best_error == std::numeric_limits<double>::max()) return result;
-  if (!(best_error < config.max_line_fit_mse * total_points)) return result;
-
-  result.valid = true;
-  for (int k = 0; k < 4; ++k) result.indices[k] = point_indices[best[k]];
-  for (int k = 0; k < 4; ++k) {
-    result.moments[k] =
-        ReadMomentsWindow(cs, total_points, result.indices[k], result.indices[(k + 1) % 4]);
-  }
-  return result;
-}
-
 // Smallest bounding-box side, in half-pixel units, of a blob worth a hull fit.
 constexpr int32_t kMinHullExtent = 40;
 
@@ -635,7 +163,6 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   auto &pts = scratch.hull_points;
   auto &hull = scratch.hull;
   auto &g = scratch.geom;
-  const bool f32 = config.quad_fit_f32;
   scratch.px.resize(n + 8);
   scratch.py.resize(n + 8);
   scratch.pw.resize(n + 8);
@@ -718,83 +245,15 @@ FitQuadResult FitQuadHull(const DetectorConfig &config, std::span<const RawLineF
   result.x0 = points[begin].x2();
   result.y0 = points[begin].y2();
   constexpr double kBand = 3.0;  // 1.5 pixels
-  if (f32) {
-    result.f32 = true;
-    result.f32_sides.x0 = result.x0;
-    result.f32_sides.y0 = result.y0;
-    for (int s = 0; s < 4; ++s) {
-      const size_t e = best[s];
-      const quadf32::HullEdge edge{static_cast<int32_t>(v[e].first), static_cast<int32_t>(v[e].second), ux[e], uy[e], len[e],
-                                   std::max(10.0, 0.25 * len[e])};
-      quadf32::Centred &side = result.f32_sides.side[s];
-      if (!quadf32::FitHullSide(up, n, result.x0, result.y0, edge, kBand, scratch.f32.hull, &side)) return result;
-      if (quadf32::FitLine(side).mse > config.max_line_fit_mse) return result;
-    }
-    result.valid = true;
-    return result;
-  }
-  auto &near = scratch.hull_near;
-  auto &hist = scratch.hull_hist;
+  result.f32_sides.x0 = result.x0;
+  result.f32_sides.y0 = result.y0;
   for (int s = 0; s < 4; ++s) {
     const size_t e = best[s];
-    const auto &p0 = v[e];
-    const double window = std::max(10.0, 0.25 * len[e]);
-    near.clear();
-    for (size_t i = begin; i < end; ++i) {
-      const double dx = points[i].x2() - p0.first, dy = points[i].y2() - p0.second;
-      const double along = dx * ux[e] + dy * uy[e], across = dx * uy[e] - dy * ux[e];
-      if (std::fabs(across) > window || along < -kBand || along > len[e] + kBand) continue;
-      near.push_back({static_cast<float>(dx), static_cast<float>(dy)});
-    }
-    // The line of greatest support within 10 degrees of the edge: a hull edge can be a chord that
-    // bridges a protrusion.
-    const size_t bins = static_cast<size_t>(window) + 2;
-    double best_support = -1, best_cos = 1, best_sin = 0, best_offset = 0;
-    for (int step = 0; step < 21; ++step) {
-      const int deg = (step + 1) / 2 * ((step & 1) ? 1 : -1);
-      const double a = deg * 0.017453292519943295, ca = std::cos(a), sa = std::sin(a);
-      const double nx = uy[e] * ca + ux[e] * sa, ny = -(ux[e] * ca - uy[e] * sa);
-      hist.assign(bins, 0);
-      const float fnx = static_cast<float>(nx * 0.5), fny = static_cast<float>(ny * 0.5);
-      const float shift = static_cast<float>(window * 0.5);
-      for (const auto &q : near) {
-        const int b = static_cast<int>(q[0] * fnx + q[1] * fny + shift);
-        if (static_cast<unsigned>(b) < bins) ++hist[b];
-      }
-      for (size_t b = 0; b + 1 < bins; ++b) {
-        const double support = hist[b] + hist[b + 1];
-        if (support > best_support) {
-          best_support = support;
-          best_cos = ca;
-          best_sin = sa;
-          best_offset = static_cast<double>(b) * 2.0 - window + 2.0;
-        }
-      }
-    }
-    const double nx = uy[e] * best_cos + ux[e] * best_sin, ny = -(ux[e] * best_cos - uy[e] * best_sin);
-    int64_t mx = 0, my = 0, w_sum = 0, mxx = 0, mxy = 0, myy = 0;
-    int32_t count = 0;
-    for (size_t i = begin; i < end; ++i) {
-      const double dx = points[i].x2() - p0.first, dy = points[i].y2() - p0.second;
-      const double along = dx * ux[e] + dy * uy[e];
-      if (std::fabs(dx * nx + dy * ny - best_offset) > kBand || along < -kBand || along > len[e] + kBand) continue;
-      const int32_t x2 = points[i].x2() - result.x0, y2 = points[i].y2() - result.y0, w = points[i].W();
-      const int64_t wx = static_cast<int64_t>(w) * x2, wy = static_cast<int64_t>(w) * y2;
-      mx += wx;
-      my += wy;
-      w_sum += w;
-      mxx += wx * x2;
-      mxy += wx * y2;
-      myy += wy * y2;
-      ++count;
-    }
-    if (count < 6) return result;
-    LineFitMoments &fit = result.moments[s];
-    fit.Mx = mx, fit.My = my, fit.W = static_cast<int32_t>(w_sum), fit.Mxx = mxx, fit.Myy = myy, fit.Mxy = mxy;
-    fit.N = count;
-    double err, mse;
-    FitLine(fit, 0, 0, nullptr, nullptr, &err, &mse);
-    if (mse > config.max_line_fit_mse) return result;
+    const quadf32::HullEdge edge{static_cast<int32_t>(v[e].first), static_cast<int32_t>(v[e].second), ux[e], uy[e], len[e],
+                                 std::max(10.0, 0.25 * len[e])};
+    quadf32::Centred &side = result.f32_sides.side[s];
+    if (!quadf32::FitHullSide(up, n, result.x0, result.y0, edge, kBand, scratch.f32.hull, &side)) return result;
+    if (quadf32::FitLine(side).mse > config.max_line_fit_mse) return result;
   }
   result.valid = true;
   return result;
@@ -817,12 +276,7 @@ bool UpdateFitQuad(const DetectorConfig &config, const FitQuadResult &quad, Dete
       std::max(3.0, config.tag_width / static_cast<double>(config.decimation));
   double lines[4][4];
   for (int i = 0; i < 4; ++i) {
-    if (quad.f32) {
-      quadf32::LineParams(quad.f32_sides.side[i], quad.x0, quad.y0, lines[i]);
-    } else {
-      double err, mse;
-      FitLine(quad.moments[i], quad.x0, quad.y0, lines[i], lines[i] + 2, &err, &mse);
-    }
+    quadf32::LineParams(quad.f32_sides.side[i], quad.x0, quad.y0, lines[i]);
   }
 
   double corners[4][2];
@@ -893,41 +347,10 @@ bool SameCorners(const DetectedQuad &a, const DetectedQuad &b, double tolerance)
   return true;
 }
 
-// Whether more than `fraction` of the boundary points are farther than `tolerance` (half-pixel
-// units) from every side of the quad, whose corners are in full-resolution pixels.
+// Whether more than `fraction` of the blob's points are farther than `tolerance` (half-pixel units) from every
+// side of the quad (full-resolution pixels); unpacks the blob [begin, end) when the slot does not hold it.
 bool HasOutliers(std::span<const RawLineFitPoint> points, size_t begin, size_t end, const DetectedQuad &quad,
-                 double decimation, double tolerance, double fraction) {
-  double c[4][2], d[4][2], inv_l2[4];
-  for (int i = 0; i < 4; ++i) {
-    c[i][0] = quad.p[i][0] * 2.0 / decimation;
-    c[i][1] = quad.p[i][1] * 2.0 / decimation;
-  }
-  for (int i = 0; i < 4; ++i) {
-    d[i][0] = c[(i + 1) & 3][0] - c[i][0];
-    d[i][1] = c[(i + 1) & 3][1] - c[i][1];
-    const double l2 = d[i][0] * d[i][0] + d[i][1] * d[i][1];
-    inv_l2[i] = l2 > 0 ? 1.0 / l2 : 0.0;
-  }
-  const double limit = tolerance * tolerance;
-  const size_t allowed = static_cast<size_t>(fraction * static_cast<double>(end - begin));
-  size_t out = 0;
-  for (size_t k = begin; k < end; ++k) {
-    const double x = points[k].x2(), y = points[k].y2();
-    bool near_side = false;
-    for (int i = 0; i < 4 && !near_side; ++i) {
-      const double ex = x - c[i][0], ey = y - c[i][1];
-      const double t = std::min(1.0, std::max(0.0, (ex * d[i][0] + ey * d[i][1]) * inv_l2[i]));
-      const double rx = ex - t * d[i][0], ry = ey - t * d[i][1];
-      near_side = rx * rx + ry * ry <= limit;
-    }
-    if (!near_side && ++out > allowed) return true;
-  }
-  return false;
-}
-
-// HasOutliers over the unpacked points of the blob [begin, end), unpacking it when the slot does not hold it.
-bool HasOutliersF32(std::span<const RawLineFitPoint> points, size_t begin, size_t end, const DetectedQuad &quad,
-                    double decimation, double tolerance, double fraction, QuadFitScratch &scratch) {
+                 double decimation, double tolerance, double fraction, QuadFitScratch &scratch) {
   const size_t n = end - begin;
   if (scratch.unpacked_begin != begin || scratch.unpacked_n != n) {
     scratch.px.resize(n + 8);
@@ -960,7 +383,6 @@ QuadDecode::QuadDecode(const DetectorConfig &config, std::shared_ptr<WorkerPool>
   config_.quad_fit_method = ResolveQuadFitMethod(env, config_.quad_fit_method);
   config_.small_tag_rescue = ResolveSmallTagRescue(env, config_.small_tag_rescue);
   config_.hull_quad = env.Bool("APRILTAG_VK_HULL_QUAD", config_.hull_quad);
-  config_.quad_fit_f32 = env.Bool("APRILTAG_VK_QUADFIT_F32", config_.quad_fit_f32);
 }
 
 std::vector<DetectedQuad> QuadDecode::Decode(
@@ -1034,10 +456,8 @@ std::vector<DetectedQuad> QuadDecode::Decode(
     if (config_.hull_quad) {
       const bool large = !r.has_quad || std::hypot(r.quad.p[0][0] - r.quad.p[2][0], r.quad.p[0][1] - r.quad.p[2][1]) >=
                                             kMinHullExtent * config_.decimation * 0.5;
-      r.hull_candidate = large && (!r.has_quad || (config_.quad_fit_f32 ? HasOutliersF32(line_fit_points, spans[s].begin, spans[s].end, r.quad,
-                                                                config_.decimation, 4.0, kSuspectFraction, scratch_[slot])
-                                                  : HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad,
-                                                                config_.decimation, 4.0, kSuspectFraction)));
+      r.hull_candidate = large && (!r.has_quad || HasOutliers(line_fit_points, spans[s].begin, spans[s].end, r.quad, config_.decimation, 4.0,
+                                                  kSuspectFraction, scratch_[slot]));
     }
   });
 
