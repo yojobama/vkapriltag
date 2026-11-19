@@ -412,7 +412,11 @@ const Result &result = detector.Detect(grey);       // detections, poses (when o
 
 One `WorkerPool` serves the quad fit, the decode and the pose estimator. `PoseEstimator` runs on the result when `tag_size` is positive.
 Combinations the stages cannot do (levels with tracking or pipelining, families of different border width) throw
-`Error(ErrorCode::kUnsupported)`. `DetectorOptions::stream` picks a queue of a shared `Device`; a device with fewer queues than
+`Error(ErrorCode::kUnsupported)`. The candidate filters `min_white_black_diff` (block contrast, at most 255), `min_cluster_pixels` (raised to 2),
+`min_tag_pixels` (a level's own non-zero value wins for that level) and `probe_margin` (finite, not negative) reach `DetectorConfig` and the
+`TagDecoder` of every mode; the matching environment variables override them, and small-tag rescue still adjusts the first two on top
+(`probe_margin` drops a candidate whose unrefined margin is below it, only with edge refinement and one family).
+`DetectorOptions::stream` picks a queue of a shared `Device`; a device with fewer queues than
 streams shares its first queue.
 
 ### 9.4 Build and dependencies

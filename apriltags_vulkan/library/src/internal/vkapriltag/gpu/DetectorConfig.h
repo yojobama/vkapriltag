@@ -45,6 +45,10 @@ struct DetectorConfig {
   // Env override: APRILTAG_VK_SMALL_RESCUE=0|1
   bool small_tag_rescue = false;
 
+  // Grey-level decision margin below which TagDecoder drops a candidate before refining it; 0 disables.
+  // Env override: APRILTAG_VK_PROBE_MARGIN=<grey levels>
+  float probe_margin = 0.0f;
+
   // Largest tag side in full-resolution pixels; 0 disables. Otherwise max_cluster_pixels is lowered
   // to twice the boundary-point count of a square tag of that size.
   uint32_t max_tag_pixels = 0;

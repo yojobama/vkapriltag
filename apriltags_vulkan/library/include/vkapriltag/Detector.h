@@ -90,6 +90,13 @@ struct DetectorOptions {
   bool hull_quad = false;          // recover tags whose border is partly covered
   bool polish = false;             // fit the whole tag's appearance for the most precise corners (slower)
 
+  // Candidate filters. The APRILTAG_VK_MIN_DIFF, APRILTAG_VK_MIN_TAG_PX and APRILTAG_VK_PROBE_MARGIN
+  // environment variables override the matching field. Small-tag rescue adjusts the first two on top of these.
+  uint32_t min_white_black_diff = 5;  // smallest grey-level contrast of a block that is labelled, 0 to 255 (rescue: at least 8)
+  uint32_t min_cluster_pixels = 24;   // fewest boundary points of a blob in the decimated image (below 2: 2; rescue: at most 8)
+  uint32_t min_tag_pixels = 0;        // smallest tag side in full-resolution pixels; raises the cluster minimum (0: off)
+  float probe_margin = 0.0f;          // drops a candidate whose unrefined decision margin (grey levels) is below this (0: off)
+
   // Pose, from the detections' homographies, when `tag_size` is positive (in the unit you want the pose in).
   CameraIntrinsics intrinsics;
   double tag_size = 0.0;

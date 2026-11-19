@@ -85,6 +85,7 @@ o.intrinsics.fx = o.intrinsics.fy = 600.0
 o.intrinsics.cx, o.intrinsics.cy = 320.0, 240.0
 o.tag_size = 0.1
 o.families = vk.StringVector(["tag36h11"])
+o.min_white_black_diff, o.probe_margin = 5, 0.0
 posed = vk.Detector(o).DetectBuffer(frame)
 assert len(posed.poses) == 1 and posed.poses[0].valid and posed.poses[0].translation(2) > 0
 

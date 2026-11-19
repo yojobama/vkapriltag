@@ -7,6 +7,14 @@ changes (sections such as 8ac or 8bb cited below) are in
 [apriltags_vulkan/archive/PERFORMANCE-history.md](apriltags_vulkan/archive/PERFORMANCE-history.md). The decision log is
 [apriltags_vulkan/DECISIONS.md](apriltags_vulkan/DECISIONS.md).
 
+## 2.0.0-pre2 (2026-11-19)
+
+### Added
+
+- **Candidate filters in `DetectorOptions`**: `min_white_black_diff` (default 5), `min_cluster_pixels` (24), `min_tag_pixels` (0, which a `Level`'s own
+  non-zero value overrides) and `probe_margin` (0, off), for every mode. The defaults reproduce the previous behaviour. The environment variables
+  `APRILTAG_VK_MIN_DIFF`, `APRILTAG_VK_MIN_TAG_PX` and `APRILTAG_VK_PROBE_MARGIN` still override them; `min_cluster_pixels` has no variable.
+
 ## 2.0.0-pre1 (2026-11-19)
 
 - **Quad fit in float32** (the only fit; see Removed): the four sides are fitted from centred moments summed in eight fixed float lanes, so the compilers vectorise the sums; the corners differ from the integer fit by 0.002 px at the 99th percentile and the corpus scores are unchanged. The fit stage is 24 to 31% cheaper on the desktop (MSVC; SSE2 kernels on x86-64, portable lanes elsewhere); frame times are unchanged within noise. With `APRILTAG_VK_HULL_QUAD=1` the hull fit (per-side support, band moments) and the outlier test that picks its candidates run in float32 too (SSE2 on x86-64): the outlier test is 2.2 to 2.9 times faster, the side selection about 2 times, the vote 1.4 times, the moments 2 times, and the cpu median with the hull on is about 5 to 8% lower. The hull geometry is cheaper with identical output: the convex hull is built from the lowest and highest point of each column instead of a sort, the far vertex, the simplification and the edge choice avoid repeated square roots and repeated evaluation (hull preparation 4 to 5.5 times cheaper on the hull-heavy scenarios, p95 frame time with the hull on about 3 to 7% lower). On the Orange Pi 5 Plus (gcc 14, NEON through the portable lanes) the corpus scores are the same as before at decimation 1 and 2 in every mode, the default frame time is unchanged (0.751 ms both, four interleaved rounds) and with the hull on it is 2.2% lower (0.785 to 0.768 ms).
