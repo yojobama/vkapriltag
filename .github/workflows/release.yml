@@ -1,7 +1,7 @@
 name: Release .deb packages
 
-# Builds the vkapriltag library natively on amd64 and arm64 for tags matching vMAJOR.MINOR.PATCH,
-# packages each as a .deb via CPack and publishes both to a GitHub Release.
+# Builds the vkapriltag library natively on amd64 and arm64 for tags matching vMAJOR.MINOR.PATCH or
+# vMAJOR.MINOR.PATCH-preN, packages each as a .deb via CPack and publishes both to a GitHub Release.
 
 on:
   push:
@@ -22,14 +22,21 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Derive package version from tag
-        # Accept strict vMAJOR.MINOR.PATCH tags only.
+        # Accept vMAJOR.MINOR.PATCH and vMAJOR.MINOR.PATCH-preN; a pre-release sorts before its final in dpkg.
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH"
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-pre[0-9]+)?$ ]]; then
+            echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-preN"
             exit 1
           fi
-          echo "PKG_VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          echo "PKG_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          if [ -n "${BASH_REMATCH[2]}" ]; then
+            echo "DEB_VERSION=${BASH_REMATCH[1]}~${BASH_REMATCH[2]#-}" >> "$GITHUB_ENV"
+            echo "DEB_FILE_NAME=vkapriltag_${TAG#v}_${{ matrix.arch }}.deb" >> "$GITHUB_ENV"
+          else
+            echo "DEB_VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+            echo "DEB_FILE_NAME=DEB-DEFAULT" >> "$GITHUB_ENV"
+          fi
 
       - name: Install build dependencies
         # No libopencv-dev: only tools/ need OpenCV and they are built with -DVKAPRILTAG_BUILD_TOOLS=OFF.
@@ -65,7 +72,10 @@ jobs:
         run: cmake --build build -j
 
       - name: Package
-        run: cd build && cpack
+        # A pre-release has "~" in its Debian version but not in the asset name, which GitHub would rewrite.
+        run: |
+          cd build && cpack -D CPACK_DEBIAN_PACKAGE_VERSION="${DEB_VERSION}" \
+            -D CPACK_DEBIAN_FILE_NAME="${DEB_FILE_NAME}"
 
       - name: Check the package includes the integer dot product shader
         run: dpkg-deb -c build/*.deb | grep decimate_box_dot_u8.comp.spv
@@ -99,14 +109,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: vkapriltag-deb-*
           path: dist
           merge-multiple: true
 
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        # Takes the section headed "## <version>" up to the next "## "; found=false if there is none.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          awk -v v="## $VERSION" '
+            /^## / { if (f) exit; n = length(v); if (substr($0, 1, n) == v && (length($0) == n || substr($0, n + 1, 1) == " ")) f = 1; next }
+            f { if (!started && $0 == "") next; started = 1; print }
+          ' CHANGELOG.md > release-notes.md
+          if [ -s release-notes.md ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: vkapriltag ${{ steps.notes.outputs.version }}
           files: dist/*.deb
-          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-pre') }}
+          make_latest: ${{ contains(github.ref_name, '-pre') && 'false' || 'legacy' }}
+          body_path: ${{ steps.notes.outputs.found == 'true' && 'release-notes.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
