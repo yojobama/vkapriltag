@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -295,8 +296,110 @@ void TestErrors() {
     av::Detector d(base);
     d.Detect(nullptr);
   }));
+  CHECK(Throws(av::ErrorCode::kInvalidArgument, [&] { av::DetectorOptions o = base; o.probe_margin = -1.0f; av::Detector d(o); }));
+  CHECK(Throws(av::ErrorCode::kInvalidArgument, [&] {
+    av::DetectorOptions o = base;
+    o.probe_margin = std::numeric_limits<float>::quiet_NaN();
+    av::Detector d(o);
+  }));
+  CHECK(Throws(av::ErrorCode::kInvalidArgument, [&] {
+    av::DetectorOptions o = base;
+    o.probe_margin = std::numeric_limits<float>::infinity();
+    av::Detector d(o);
+  }));
+  CHECK(Throws(av::ErrorCode::kInvalidArgument, [&] { av::DetectorOptions o = base; o.min_white_black_diff = 256; av::Detector d(o); }));
+  // A cluster minimum below 2 is raised, not rejected.
+  CHECK(!Throws(av::ErrorCode::kInvalidArgument, [&] { av::DetectorOptions o = base; o.min_cluster_pixels = 0; av::Detector d(o); }));
   // The frame size must divide by the decimation.
   CHECK(Throws(av::ErrorCode::kRuntime, [&] { av::DetectorOptions o = base; o.width = 642; o.decimation = 4; av::Detector d(o); }));
+}
+
+// The candidate filters, on grey-margin frame 0: ids 551 (largest tag), 134 and 340 (smallest).
+std::multiset<int> FilteredIds(const eval::Image &im, const std::function<void(av::DetectorOptions &)> &set,
+                               uint32_t *candidates = nullptr) {
+  av::DetectorOptions o = Options(im);
+  set(o);
+  av::Detector detector(o);
+  const av::Result &r = detector.Detect(im.grey.data());
+  if (candidates != nullptr) *candidates = r.timing.candidates;
+  return Ids(r);
+}
+
+void TestFilters() {
+  const auto frames = Frames("grey-margin");
+  const eval::Image &im = frames[0];
+  const std::multiset<int> all = {551, 134, 340};
+  const std::multiset<int> big = {551};
+  CHECK(FilteredIds(im, [](av::DetectorOptions &) {}) == all);
+
+  // Untouched and explicitly default options agree.
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) {
+          o.min_white_black_diff = 5;
+          o.min_cluster_pixels = 24;
+          o.min_tag_pixels = 0;
+          o.probe_margin = 0.0f;
+        }) == all);
+
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.min_white_black_diff = 255; }).empty());
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.min_tag_pixels = 400; }) == big);
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.min_cluster_pixels = 100000; }).empty());
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.min_cluster_pixels = 800; }) == big);
+  // Below 2 is raised to 2, so the run still detects.
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.min_cluster_pixels = 0; }).count(551) == 1);
+
+  // The margin gate drops a candidate before refinement, so every quad is still handed to the decoder but none
+  // decodes; it needs edge refinement and, as here, one family.
+  uint32_t plain = 0, gated = 0;
+  CHECK(FilteredIds(im, [](av::DetectorOptions &) {}, &plain) == all);
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.probe_margin = 1.0e6f; }, &gated).empty());
+  CHECK(plain >= 3 && gated == plain);
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.probe_margin = 1.0e6f; o.refine_edges = false; }) ==
+        FilteredIds(im, [](av::DetectorOptions &o) { o.refine_edges = false; }));
+  CHECK(FilteredIds(im, [](av::DetectorOptions &o) { o.probe_margin = 1.0f; }) == all);
+
+  // The other modes take the same fields.
+  for (uint32_t depth : {1u, 2u}) {
+    av::DetectorOptions o = Options(im);
+    o.mode = av::Mode::kPipelined;
+    o.pipeline_depth = depth;
+    o.min_white_black_diff = 255;
+    av::Detector detector(o);
+    detector.Detect(im.grey.data());
+    detector.Detect(im.grey.data());
+    CHECK(detector.Flush().detections.empty());
+  }
+  for (bool async : {false, true}) {
+    av::DetectorOptions o = Options(im);
+    o.mode = av::Mode::kTracking;
+    o.tracking_async = async;
+    o.probe_margin = 1.0e6f;
+    av::Detector detector(o);
+    CHECK(detector.Detect(im.grey.data()).detections.empty());
+    o.probe_margin = 0.0f;
+    o.min_tag_pixels = 400;
+    av::Detector sized(o);
+    const av::Result &r = sized.Detect(im.grey.data());
+    CHECK(Ids(r).count(134) == 0 && Ids(r).count(340) == 0);
+  }
+}
+
+// A level's own min_tag_pixels wins for that level; the detector-wide value fills the levels that have none.
+void TestFilterLevels() {
+  const auto frames = Frames("grey-margin");
+  const eval::Image &im = frames[0];
+  av::Level a, b;
+  a.decimation = 2;
+  b.decimation = 1;
+  const auto run = [&](const av::Level &second) {
+    return FilteredIds(im, [&](av::DetectorOptions &o) {
+      o.min_tag_pixels = 400;
+      o.levels = {a, second};
+    });
+  };
+  CHECK(run(b) == std::multiset<int>({551}));
+  av::Level own = b;
+  own.min_tag_pixels = 40;
+  CHECK(run(own) == std::multiset<int>({551, 134, 340}));
 }
 
 }  // namespace
@@ -318,6 +421,7 @@ int main(int argc, char **argv) {
     if (all || which == "stride") TestStride();
     if (all || which == "device") TestSharedDevice();
     if (all || which.rfind("threads", 0) == 0) TestSharedDeviceThreads(which.size() > 8 ? which.substr(8) : "");
+    if (all || which == "filters") TestFilters(), TestFilterLevels();
     if (all || which == "errors") TestErrors();
   } catch (const std::exception &e) {
     std::printf("FAIL: unexpected exception: %s\n", e.what());
