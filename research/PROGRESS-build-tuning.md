@@ -106,3 +106,20 @@ MSVC linker handles /GL objects of the installed .lib with the same compiler). N
 - Pi / aarch64: no flag helps (under 1%). The `.deb` and release.yml stay on the default flags; do not use LSE or `-mcpu` (breaks Cortex-A53/A72 era boards for ~0%). `-O2` is worse (+19% cpu): keep `-O3`.
 - LTO and PGO: no measurable gain on either machine; leave off. If PGO is revisited, offer it only as the opt-in `VKAPRILTAG_PGO` with `tools/pgo/train.sh`, never in the default or release build.
 - Allocator and threading (item 5): not measured (budget). Outline atomics helpers stay (1% on the Pi) because LSE-only builds are not portable.
+
+### E7 Pi, `-mcpu=cortex-a76` with polish (2026-11-19, main 4b3edd5, gcc 14.2)
+Rerun because polish and the float32 quad fit came after E5 and polish is the largest CPU cost. Generic build against
+`-DVKAPRILTAG_TUNE=-mcpu=cortex-a76` (40 library compile lines), pinned to cores 4-7, order alternated per round, lumenvision stopped.
+`ctest` 48/48 on the tuned build. Dense-tags (20 frames, 5 iterations), mean of 4 rounds of the corpus median, total / cpu part in ms:
+
+| | generic | cortex-a76 | change |
+|---|---|---|---|
+| d2, polish on | 3.845 / 3.047 | 3.834 / 3.053 | -0.3% / +0.2% |
+| d2, polish off | 1.253 / 0.477 | 1.269 / 0.493 | +1.3% / +3.3% |
+| d1, polish on | 4.705 / 2.986 | 4.689 / 2.974 | -0.3% / -0.4% |
+| d1, polish off | 2.037 / 0.344 | 2.048 / 0.357 | +0.5% / +3.6% |
+
+Polish off, the tuned cpu part was slower in all 8 rounds (about 0.013 ms). Whole corpus at d2 (mean of 26 scenario medians, 3 iterations):
+polish on 1.3245 (two rounds) against 1.324 ms, polish off 0.732 against 0.735 ms. Accuracy identical (4819/4972 found, 35 false, error
+0.012/0.059 px with polish, 0.017/0.099 without); 3 to 6 of 8177 dump lines differ, as between two generic runs (4).
+Conclusion unchanged: `-mcpu=cortex-a76` gives nothing on the Pi, with or without polish; keep the generic build.
