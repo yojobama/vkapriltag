@@ -15,6 +15,7 @@ changes (sections such as 8ac or 8bb cited below) are in
 
 ### Fixed
 
+- **The float32 quad fit is compiled without floating-point contraction on gcc and clang.** The scalar and SSE2 line fits now agree, and results match across x86-64 levels and ARM. Found when the CI runner moved to Ubuntu 26.04 (x86-64-v3, FMA).
 - **Detectors on a shared `Device` no longer share a lane.** Two detectors with the same `stream`, or with a `stream` beyond the queue count (every stream on a device with one compute queue), used the device's default lane and raced on its command pool and command buffer ring when driven from different threads. A detector on a shared device now always creates its own lane on the queue its stream maps to (streams wrap onto the existing queues), in every mode including tracking and multi-level; the new `facade_threads` test runs four detectors on four threads. On the Orange Pi's Mali-G610 (one compute queue) the old code hung, aborted or returned wrong tags in five of the six threaded modes; the fixed code passes them all, with no ThreadSanitizer report and no validation-layer error.
 
 ### Breaking: version 2.0.0, one public `Detector`

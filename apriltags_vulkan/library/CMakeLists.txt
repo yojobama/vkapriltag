@@ -194,8 +194,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # No fused multiply-adds in the quad fit: which ones GCC fuses depends on how the code is
   # arranged, so its corners would change with the code's layout rather than its arithmetic.
   set_source_files_properties(src/gpu/QuadDecode.cpp src/OwnDecode.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
-  # The float32 quad fit: square roots without errno, so the line fit loops vectorise.
-  set_source_files_properties(src/gpu/QuadFitF32.cpp PROPERTIES COMPILE_OPTIONS -fno-math-errno)
+  # The float32 quad fit: square roots without errno, so the line fit loops vectorise; no
+  # fused multiply-adds, so the scalar and SSE2 line fits agree on every x86-64 level.
+  set_source_files_properties(src/gpu/QuadFitF32.cpp PROPERTIES COMPILE_OPTIONS "-fno-math-errno;-ffp-contract=off")
 endif()
 
 vkapriltag_tune_target(vkapriltag)
